@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "outDir": "./dist",
+    "rootDir": "./src",
+
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+
+    "declaration": true,
+    "sourceMap": true,
+    "removeComments": true,
+    "incremental": true,
+
+    "strict": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+
+    // Explícito porque `@types/bun` declara globais (`Bun`) que colidiriam
+    // com os globais do Node se ambos fossem incluídos automaticamente;
+    // listar os três aqui é o padrão recomendado por `@types/bun` para
+    // projetos NestJS que rodam sob Bun mas ainda usam tipos do Node/Express.
+    "types": ["node", "express", "bun"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -1,0 +1,42 @@
+{
+  "name": "mariela-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MARIELA — API REST (NestJS) consumida pelo Backoffice, PDV, Vitrine Virtual e Integrações.",
+  "type": "module",
+  "scripts": {
+    "build": "nest build",
+    "start": "nest start",
+    "start:dev": "nest start --watch",
+    "start:debug": "nest start --debug --watch",
+    "start:prod": "bun dist/main.js",
+    "typecheck": "tsc --noEmit -p tsconfig.build.json",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "seed:admin": "bun src/scripts/seed-admin.ts"
+  },
+  "dependencies": {
+    "@nestjs/common": "^12.0.1",
+    "@nestjs/config": "^12.0.0",
+    "@nestjs/core": "^12.0.1",
+    "@nestjs/jwt": "^12.0.1",
+    "@nestjs/mongoose": "^12.0.0",
+    "@nestjs/platform-express": "^12.0.1",
+    "@nestjs/swagger": "^12.0.1",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.15.1",
+    "helmet": "^8.3.0",
+    "mongoose": "^9.9.5",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^12.0.0",
+    "@nestjs/testing": "^12.0.1",
+    "@types/bun": "^1.4.1",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.4.1",
+    "source-map-support": "^0.5.21",
+    "typescript": "^6"
+  }
+}
