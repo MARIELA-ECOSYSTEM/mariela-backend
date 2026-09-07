@@ -72,6 +72,18 @@ export class VendedoresRepository {
   }
 
   /**
+   * Busca por `codigo` (credencial de login do MARIELA PDV) — SEM filtrar por
+   * `excluidoEm`/`ativo` de propósito: o chamador (`VendedoresService.verificarSenha`)
+   * precisa distinguir "não existe" de "existe mas está inativo/excluído" para
+   * aplicar a mesma defesa de tempo constante contra enumeração já usada no
+   * login do ADMIN (ver `AuthService.login`), rejeitando os dois casos com a
+   * mesma mensagem genérica.
+   */
+  async encontrarPorCodigo(codigo: string): Promise<VendedorDocument | null> {
+    return this.vendedorModel.findOne({ codigo }).exec();
+  }
+
+  /**
    * Mesmo padrão de concorrência de Clientes/Fornecedores: aplica `mutar` e
    * salva com o versionamento otimista do Mongoose (`__v`); se outra
    * requisição alterou o documento entre a leitura e a gravação, `save()`

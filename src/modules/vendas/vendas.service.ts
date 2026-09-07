@@ -38,6 +38,18 @@ function arredondar(valor: number): number {
 
 @Injectable()
 export class VendasService {
+  /**
+   * Deduplicação de criação EM MEMÓRIA, por processo — ver `criar()`. Mesma
+   * limitação já aceita em outros pontos do projeto (`LoginThrottleService`):
+   * não coordena entre múltiplas instâncias; aceitável para o estágio atual
+   * (instância única). Chave = `idempotencyKey`; valor = a Promise da
+   * execução em andamento, para que uma segunda chamada com a MESMA chave,
+   * chegando enquanto a primeira ainda está no meio da baixa de estoque/
+   * lançamento no caixa, espere o MESMO resultado em vez de reexecutar tudo
+   * do zero (ver "Problemas encontrados" no relatório da Etapa 05 do PDV).
+   */
+  private readonly criacoesEmAndamento = new Map<string, Promise<VendaDocument>>();
+
   constructor(
     private readonly vendasRepository: VendasRepository,
     private readonly produtosService: ProdutosService,
@@ -51,11 +63,35 @@ export class VendasService {
   ) {}
 
   /**
-   * Único ponto de criação de venda. NÃO é exposto por nenhuma rota HTTP
-   * nesta etapa — a criação pertence ao futuro MARIELA PDV (ver relatório).
-   * Usado hoje apenas pelos testes de integração.
+   * Único ponto de criação de venda. Exposto ao MARIELA PDV via
+   * `POST /pdv/vendas` (`PdvVendasService`) — nunca por nenhuma rota
+   * administrativa do Backoffice.
+   *
+   * Camada FINA de deduplicação em torno de `criarInterno` (que contém toda a
+   * regra de negócio, inalterada): se já existe uma execução em andamento
+   * para a MESMA `idempotencyKey` (duas requisições praticamente simultâneas
+   * — ex.: duplo toque no PDV), a segunda chamada aguarda e devolve o MESMO
+   * resultado da primeira, em vez de baixar estoque/lançar caixa/atualizar
+   * agregados duas vezes. Sem chave, nenhuma deduplicação é aplicada (mesmo
+   * comportamento de sempre — usado hoje também pelos testes de integração).
    */
   async criar(dados: DadosCriarVenda, usuarioId: string | null): Promise<VendaDocument> {
+    if (!dados.idempotencyKey) return this.criarInterno(dados, usuarioId);
+
+    const chave = dados.idempotencyKey;
+    const emAndamento = this.criacoesEmAndamento.get(chave);
+    if (emAndamento) return emAndamento;
+
+    const execucao = this.criarInterno(dados, usuarioId);
+    this.criacoesEmAndamento.set(chave, execucao);
+    try {
+      return await execucao;
+    } finally {
+      this.criacoesEmAndamento.delete(chave);
+    }
+  }
+
+  private async criarInterno(dados: DadosCriarVenda, usuarioId: string | null): Promise<VendaDocument> {
     if (dados.idempotencyKey) {
       const existente = await this.vendasRepository.encontrarPorIdempotencyKey(dados.idempotencyKey);
       if (existente) return existente;

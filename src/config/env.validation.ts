@@ -51,6 +51,25 @@ class EnvironmentVariables {
   @IsString()
   JWT_REFRESH_EXPIRES_IN = "7d";
 
+  /**
+   * Segredos e expirações do MARIELA PDV — deliberadamente SEPARADOS dos do
+   * Backoffice (ver `pdv-auth.module.ts`): um vazamento de um segredo nunca
+   * deve comprometer o outro domínio de identidade (Usuario × Vendedor).
+   */
+  @IsString()
+  PDV_JWT_ACCESS_SECRET!: string;
+
+  @IsString()
+  PDV_JWT_REFRESH_SECRET!: string;
+
+  @IsOptional()
+  @IsString()
+  PDV_JWT_ACCESS_EXPIRES_IN = "30m";
+
+  @IsOptional()
+  @IsString()
+  PDV_JWT_REFRESH_EXPIRES_IN = "12h";
+
   @IsOptional()
   @IsString()
   CORS_ORIGINS = "";

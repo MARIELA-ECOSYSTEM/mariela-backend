@@ -50,11 +50,29 @@ export class VendasRepository {
 
   /**
    * Cria a venda a partir de um documento já montado pelo service (`Venda`
-   * completa: itens, pagamentos, parcelas, totais). Nunca chamado por rota
-   * HTTP nesta etapa — só pelo mecanismo interno (`VendasService.criar`).
+   * completa: itens, pagamentos, parcelas, totais). Chamada pelo mecanismo
+   * interno (`VendasService.criar`), hoje exposto via `POST /pdv/vendas`.
+   *
+   * Camada de segurança da idempotência sob concorrência real: a deduplicação
+   * em memória de `VendasService.criar` cobre o caso comum (duas chamadas na
+   * mesma instância do processo), mas não é garantida por construção — se,
+   * ainda assim, duas gravações com a MESMA `idempotencyKey` chegarem aqui
+   * (ex.: janela entre a checagem `encontrarPorIdempotencyKey` e o insert em
+   * `criarInterno`), o índice único parcial do MongoDB garante que só uma
+   * grava; a outra recebe erro de chave duplicada — capturado aqui e
+   * traduzido na venda que efetivamente venceu a corrida, em vez de propagar
+   * um 500. Mesmo padrão de `CaixasRepository.criar` para "só um caixa aberto".
    */
   async criar(dados: DadosPersistirVenda): Promise<VendaDocument> {
-    return this.vendaModel.create(dados as never);
+    try {
+      return await this.vendaModel.create(dados as never);
+    } catch (erro) {
+      if (dados.idempotencyKey && this.ehErroDeIdempotencyKeyDuplicada(erro)) {
+        const existente = await this.encontrarPorIdempotencyKey(dados.idempotencyKey);
+        if (existente) return existente;
+      }
+      throw erro;
+    }
   }
 
   async encontrarPorId(id: string): Promise<VendaDocument | null> {
@@ -199,6 +217,23 @@ export class VendasRepository {
       .sort({ dataVenda: -1 })
       .limit(limite)
       .exec();
+  }
+
+  /**
+   * `Venda` tem TRÊS índices únicos (`codigo`, `numero`, `idempotencyKey`
+   * parcial) — só trata como "conflito de idempotência recuperável" quando o
+   * índice em erro é especificamente `idempotencyKey`; uma colisão em
+   * `codigo`/`numero` (nunca deveria acontecer, dado o gerador atômico de
+   * sequência) é um erro real e deve propagar, não ser mascarada como retry.
+   */
+  private ehErroDeIdempotencyKeyDuplicada(erro: unknown): boolean {
+    if (typeof erro !== "object" || erro === null || !("code" in erro) || (erro as { code: unknown }).code !== 11000) {
+      return false;
+    }
+    const keyPattern = (erro as { keyPattern?: Record<string, unknown> }).keyPattern;
+    if (keyPattern) return "idempotencyKey" in keyPattern;
+    const mensagem = String((erro as { message?: unknown }).message ?? "");
+    return mensagem.includes("idempotencyKey");
   }
 }
 

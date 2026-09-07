@@ -20,6 +20,14 @@ export interface JwtConfig {
   refreshExpiresIn: string;
 }
 
+/** Configuração do JWT do MARIELA PDV — segredos e expirações próprios, nunca compartilhados com `jwt` (ADMIN). */
+export interface PdvJwtConfig {
+  accessSecret: string;
+  refreshSecret: string;
+  accessExpiresIn: string;
+  refreshExpiresIn: string;
+}
+
 export interface CorsConfig {
   origins: string[];
 }
@@ -28,6 +36,7 @@ export interface Configuration {
   app: AppConfig;
   database: DatabaseConfig;
   jwt: JwtConfig;
+  pdvJwt: PdvJwtConfig;
   cors: CorsConfig;
 }
 
@@ -45,6 +54,12 @@ export default (): Configuration => ({
     refreshSecret: process.env["JWT_REFRESH_SECRET"] ?? "",
     accessExpiresIn: process.env["JWT_ACCESS_EXPIRES_IN"] ?? "15m",
     refreshExpiresIn: process.env["JWT_REFRESH_EXPIRES_IN"] ?? "7d",
+  },
+  pdvJwt: {
+    accessSecret: process.env["PDV_JWT_ACCESS_SECRET"] ?? "",
+    refreshSecret: process.env["PDV_JWT_REFRESH_SECRET"] ?? "",
+    accessExpiresIn: process.env["PDV_JWT_ACCESS_EXPIRES_IN"] ?? "30m",
+    refreshExpiresIn: process.env["PDV_JWT_REFRESH_EXPIRES_IN"] ?? "12h",
   },
   cors: {
     origins: (process.env["CORS_ORIGINS"] ?? "")

@@ -12,6 +12,10 @@ import { ColecoesModule } from "./modules/colecoes/colecoes.module.js";
 import { DashboardModule } from "./modules/dashboard/dashboard.module.js";
 import { EstoqueModule } from "./modules/estoque/estoque.module.js";
 import { FornecedoresModule } from "./modules/fornecedores/fornecedores.module.js";
+import { PdvAuthModule } from "./modules/pdv-auth/pdv-auth.module.js";
+import { PdvCaixaModule } from "./modules/pdv-caixa/pdv-caixa.module.js";
+import { PdvProdutosModule } from "./modules/pdv-produtos/pdv-produtos.module.js";
+import { PdvVendasModule } from "./modules/pdv-vendas/pdv-vendas.module.js";
 import { ProdutosModule } from "./modules/produtos/produtos.module.js";
 import { SaudeModule } from "./modules/saude/saude.module.js";
 import { VendasModule } from "./modules/vendas/vendas.module.js";
@@ -49,6 +53,10 @@ import { VendedoresModule } from "./modules/vendedores/vendedores.module.js";
     CaixasModule,
     VendasModule,
     DashboardModule,
+    PdvAuthModule,
+    PdvCaixaModule,
+    PdvProdutosModule,
+    PdvVendasModule,
   ],
 })
 export class AppModule {}

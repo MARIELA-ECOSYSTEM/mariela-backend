@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model, Types } from "mongoose";
@@ -28,6 +29,20 @@ export interface ResultadoListaVendedores {
   meta: ApiMeta;
   facets: ApiFacets;
 }
+
+/**
+ * Hash argon2id de uma senha aleatória, calculado uma única vez no boot —
+ * usado por `verificarSenha` para manter o tempo de resposta do login do
+ * MARIELA PDV constante quando o código informado não existe (mesma defesa
+ * contra canal lateral de temporização de `AuthService.login`, ver
+ * `auth.service.ts`). Duplicado aqui de propósito, não importado do módulo
+ * Auth: `Vendedor` não é `Usuario` (ver `role.type.ts`).
+ */
+const HASH_FANTASMA_VENDEDOR = Bun.password.hashSync(randomBytes(32).toString("hex"), {
+  algorithm: "argon2id",
+  memoryCost: ARGON2_MEMORY_COST,
+  timeCost: ARGON2_TIME_COST,
+});
 
 @Injectable()
 export class VendedoresService {
@@ -169,6 +184,24 @@ export class VendedoresService {
   async listarVendas(id: string): Promise<{ data: never[]; meta: ApiMeta }> {
     await this.vendedoresRepository.encontrarPorIdOuFalhar(id);
     return { data: [], meta: { total: 0 } };
+  }
+
+  /**
+   * Autenticação do MARIELA PDV — NÃO confundir com o login do ADMIN
+   * (`AuthService.login`, módulo separado). Devolve o vendedor só quando
+   * código+senha conferem E o vendedor está ativo e não excluído; qualquer
+   * outro caso (código inexistente, senha errada, inativo, excluído) devolve
+   * `null` uniformemente, para que o chamador (`PdvAuthService`) sempre lance
+   * a mesma mensagem genérica de credenciais inválidas — nunca revelar qual
+   * dessas condições falhou (mesmo padrão de `AuthService.login`).
+   */
+  async verificarSenha(codigo: string, senha: string): Promise<VendedorDocument | null> {
+    const vendedor = await this.vendedoresRepository.encontrarPorCodigo(codigo);
+    // Mesmo quando o código não existe, gasta o tempo de um argon2id real
+    // contra um hash fantasma — ver `HASH_FANTASMA_VENDEDOR`.
+    const senhaConfere = await Bun.password.verify(senha, vendedor?.senhaHash ?? HASH_FANTASMA_VENDEDOR);
+    if (!vendedor || !senhaConfere || !vendedor.ativo || vendedor.excluidoEm) return null;
+    return vendedor;
   }
 
   private validarTelefone(telefone: string): string {
