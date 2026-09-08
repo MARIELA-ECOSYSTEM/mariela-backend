@@ -1,6 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
-import { Type } from "class-transformer";
-import { ArrayMinSize, IsArray, IsInt, IsNotEmpty, IsNumber, IsOptional, IsString, Min, ValidateNested } from "class-validator";
+import { plainToInstance, Transform, Type } from "class-transformer";
+import { ArrayMinSize, IsArray, IsInt, IsNotEmpty, IsOptional, IsString, Min, ValidateNested } from "class-validator";
+import { DescontoDto } from "./desconto-pdv.dto.js";
 import { ItemVendaPdvDto } from "./item-venda-pdv.dto.js";
 import { PagamentoVendaPdvDto } from "./pagamento-venda-pdv.dto.js";
 
@@ -36,12 +37,33 @@ export class CriarVendaPdvDto {
   @Type(() => ItemVendaPdvDto)
   itens!: ItemVendaPdvDto[];
 
-  @ApiPropertyOptional({ example: 0, minimum: 0 })
+  /**
+   * Desconto sobre o subtotal da venda (já com os descontos de item
+   * aplicados). Retrocompatibilidade: um número puro (`20`) é normalizado
+   * aqui mesmo, ANTES da validação, para `{ tipo: "valor", valor: 20 }` — o
+   * formato novo `{ tipo, valor }` também é aceito diretamente. Os limites
+   * que dependem do subtotal (percentual ≤ 100%, valor ≤ subtotal) são
+   * responsabilidade do service, não deste DTO (ver `desconto-pdv.dto.ts`).
+   *
+   * A instanciação de `DescontoDto` é feita AQUI DENTRO do `@Transform` (via
+   * `plainToInstance`), em vez do par usual `@ValidateNested()` + `@Type()`:
+   * como o valor de entrada pode ser um `number` OU um objeto, o `@Type()`
+   * rodaria antes da normalização e nunca veria o objeto já normalizado —
+   * `@Transform` fazendo as duas coisas (normalizar e instanciar) numa única
+   * etapa evita essa corrida entre os dois mecanismos do `class-transformer`.
+   */
+  @ApiPropertyOptional({
+    description: "Desconto sobre o subtotal da venda. Um número puro é interpretado como valor absoluto em R$ (retrocompatibilidade).",
+    oneOf: [{ type: "number", example: 20 }, { $ref: "#/components/schemas/DescontoDto" }],
+  })
   @IsOptional()
-  @Type(() => Number)
-  @IsNumber({ maxDecimalPlaces: 2 }, { message: "Informe um valor com até 2 casas decimais." })
-  @Min(0, { message: "Desconto não pode ser negativo." })
-  descontoVenda?: number;
+  @Transform(({ value }) => {
+    if (value === undefined || value === null) return value;
+    const bruto = typeof value === "number" ? { tipo: "valor", valor: value } : value;
+    return plainToInstance(DescontoDto, bruto);
+  })
+  @ValidateNested()
+  descontoVenda?: DescontoDto;
 
   @ApiProperty({ type: [PagamentoVendaPdvDto] })
   @IsArray()

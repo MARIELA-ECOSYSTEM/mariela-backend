@@ -346,6 +346,122 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     expect(resposta.status).toBe(404);
   });
 
+  it("Etapa 10.3: desconto por item (%) + desconto da venda (formato novo {tipo,valor}) via HTTP real", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [
+          {
+            produtoId: produto.produtoId,
+            varianteId: produto.varianteId,
+            tamanhoId: produto.tamanhoId,
+            quantidade: 2,
+            desconto: { tipo: "percentual", valor: 10 },
+          },
+        ],
+        // base do item = 100×2=200; 10% = 20; subtotalItem = 180.
+        // subtotalVenda = 180; desconto venda R$18 (formato objeto); valorFinal=162.
+        descontoVenda: { tipo: "valor", valor: 18 },
+        pagamentos: [],
+      }),
+    });
+    expect(resposta.status).toBe(201);
+    const corpo = (await resposta.json()) as {
+      data: { itens: { descontoItem: number; subtotal: number }[]; descontoVenda: number; valorFinal: number };
+    };
+    expect(corpo.data.itens[0]?.descontoItem).toBe(20);
+    expect(corpo.data.itens[0]?.subtotal).toBe(180);
+    expect(corpo.data.descontoVenda).toBe(18);
+    expect(corpo.data.valorFinal).toBe(162);
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.3: descontoVenda como number puro continua funcionando via HTTP real (retrocompatibilidade)", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        descontoVenda: 25,
+        pagamentos: [],
+      }),
+    });
+    expect(resposta.status).toBe(201);
+    const corpo = (await resposta.json()) as { data: { descontoVenda: number; valorFinal: number } };
+    expect(corpo.data.descontoVenda).toBe(25);
+    expect(corpo.data.valorFinal).toBe(75);
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.3: desconto de item percentual acima de 100% é rejeitado com 400", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [
+          {
+            produtoId: produto.produtoId,
+            varianteId: produto.varianteId,
+            tamanhoId: produto.tamanhoId,
+            quantidade: 1,
+            desconto: { tipo: "percentual", valor: 150 },
+          },
+        ],
+        pagamentos: [],
+      }),
+    });
+    const corpo = (await resposta.json()) as { code: string };
+    expect(resposta.status).toBe(400);
+    expect(corpo.code).toBe("VALIDATION_ERROR");
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.3: valorFinal enviado no payload é rejeitado pelo whitelist global (nunca usado como autoridade)", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [],
+        valorFinal: 1,
+      }),
+    });
+    // `valorFinal` não é um campo declarado em `CriarVendaPdvDto` —
+    // `forbidNonWhitelisted` já rejeita a requisição inteira (defesa mais
+    // forte que apenas ignorar o campo).
+    expect(resposta.status).toBe(400);
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
   it("GET /docs-json documenta POST /pdv/vendas com o security scheme Bearer", async () => {
     const resposta = await fetch(`${baseUrl}/docs-json`);
     const documento = (await resposta.json()) as { paths: Record<string, Record<string, unknown>> };

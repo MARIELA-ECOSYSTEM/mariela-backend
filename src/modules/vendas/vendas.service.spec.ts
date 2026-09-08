@@ -352,6 +352,500 @@ describe("VendasService (integração — MongoDB real)", () => {
     });
   });
 
+  describe("desconto por item e desconto da venda (Etapa 10.3)", () => {
+    it("sem desconto: descontoItem é 0 e subtotal é o preço praticado × quantidade", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+        },
+        null,
+      );
+      expect(venda.itens[0]?.descontoItem).toBe(0);
+      expect(venda.itens[0]?.subtotal).toBe(200);
+      expect(venda.temDesconto).toBe(false);
+      await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+    });
+
+    it("desconto por item em R$ (valor absoluto)", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            {
+              produtoId: produto.produtoId,
+              varianteId: produto.varianteId,
+              tamanhoId: produto.tamanhoId,
+              quantidade: 1,
+              desconto: { tipo: "valor", valor: 15 },
+            },
+          ],
+          pagamentos: [{ forma: "Dinheiro", valor: 85 }],
+        },
+        null,
+      );
+      expect(venda.itens[0]?.descontoItem).toBe(15);
+      expect(venda.itens[0]?.subtotal).toBe(85);
+      expect(venda.valorFinal).toBe(85);
+      expect(venda.temDesconto).toBe(true);
+      await caixasService.fechar(caixa.id, { valorInformado: 1085 }, null);
+    });
+
+    it("desconto por item em % — considera a quantidade (preço praticado × quantidade é a base, não o unitário)", async () => {
+      const produto = await criarProdutoComEstoque(50, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            {
+              produtoId: produto.produtoId,
+              varianteId: produto.varianteId,
+              tamanhoId: produto.tamanhoId,
+              quantidade: 3,
+              desconto: { tipo: "percentual", valor: 10 },
+            },
+          ],
+          pagamentos: [],
+        },
+        null,
+      );
+      // base = 50 × 3 = 150; 10% = 15; subtotal = 135 (seção 7 do pedido).
+      expect(venda.itens[0]?.descontoItem).toBe(15);
+      expect(venda.itens[0]?.subtotal).toBe(135);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("desconto por item sobre produto em promoção incide sobre o preço PRATICADO, nunca sobre o de tabela", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      await produtosService.definirPromocao(produto.produtoId, { ehPromocao: true, precoPromocional: 80 }, null);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            {
+              produtoId: produto.produtoId,
+              varianteId: produto.varianteId,
+              tamanhoId: produto.tamanhoId,
+              quantidade: 1,
+              desconto: { tipo: "percentual", valor: 10 },
+            },
+          ],
+          pagamentos: [],
+        },
+        null,
+      );
+      // precoOriginal=100, precoPraticado=80 (promoção) → 10% do item incide
+      // sobre 80 (= 8), NUNCA sobre 100 (que daria 10). Resultado: 80-8=72,
+      // exatamente o exemplo da seção 1 do pedido.
+      expect(venda.itens[0]?.precoOriginal).toBe(100);
+      expect(venda.itens[0]?.precoPraticado).toBe(80);
+      expect(venda.itens[0]?.descontoItem).toBe(8);
+      expect(venda.itens[0]?.subtotal).toBe(72);
+      expect(venda.descontoPromocional).toBe(20);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("desconto da venda em R$ (objeto {tipo:'valor', valor})", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          descontoVenda: { tipo: "valor", valor: 20 },
+          pagamentos: [{ forma: "Dinheiro", valor: 80 }],
+        },
+        null,
+      );
+      expect(venda.descontoVenda).toBe(20);
+      expect(venda.valorFinal).toBe(80);
+      await caixasService.fechar(caixa.id, { valorInformado: 1080 }, null);
+    });
+
+    it("desconto da venda em % (objeto {tipo:'percentual', valor})", async () => {
+      const produto = await criarProdutoComEstoque(200, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          descontoVenda: { tipo: "percentual", valor: 15 },
+          pagamentos: [],
+        },
+        null,
+      );
+      // subtotalVenda=200; 15% = 30; valorFinal = 170.
+      expect(venda.descontoVenda).toBe(30);
+      expect(venda.valorFinal).toBe(170);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("payload legado: descontoVenda como number puro continua funcionando (retrocompatibilidade)", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          descontoVenda: 25,
+          pagamentos: [{ forma: "Dinheiro", valor: 75 }],
+        },
+        null,
+      );
+      expect(venda.descontoVenda).toBe(25);
+      expect(venda.valorFinal).toBe(75);
+      await caixasService.fechar(caixa.id, { valorInformado: 1075 }, null);
+    });
+
+    it("desconto de 100% (item) zera o subtotal daquela linha, sem ficar negativo", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            {
+              produtoId: produto.produtoId,
+              varianteId: produto.varianteId,
+              tamanhoId: produto.tamanhoId,
+              quantidade: 1,
+              desconto: { tipo: "percentual", valor: 100 },
+            },
+          ],
+          pagamentos: [],
+        },
+        null,
+      );
+      expect(venda.itens[0]?.descontoItem).toBe(100);
+      expect(venda.itens[0]?.subtotal).toBe(0);
+      expect(venda.valorFinal).toBe(0);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("desconto de item acima de 100% é rejeitado", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await expect(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [
+              {
+                produtoId: produto.produtoId,
+                varianteId: produto.varianteId,
+                tamanhoId: produto.tamanhoId,
+                quantidade: 1,
+                desconto: { tipo: "percentual", valor: 101 },
+              },
+            ],
+            pagamentos: [],
+          },
+          null,
+        ),
+      ).rejects.toThrow(ApiException);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("desconto de venda acima de 100% é rejeitado", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await expect(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            descontoVenda: { tipo: "percentual", valor: 101 },
+            pagamentos: [],
+          },
+          null,
+        ),
+      ).rejects.toThrow(ApiException);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("desconto monetário de item maior que a base (preço praticado × quantidade) é rejeitado", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await expect(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [
+              {
+                produtoId: produto.produtoId,
+                varianteId: produto.varianteId,
+                tamanhoId: produto.tamanhoId,
+                quantidade: 1,
+                desconto: { tipo: "valor", valor: 101 },
+              },
+            ],
+            pagamentos: [],
+          },
+          null,
+        ),
+      ).rejects.toThrow(ApiException);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("desconto monetário da venda maior que o subtotal é rejeitado", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await expect(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            descontoVenda: { tipo: "valor", valor: 101 },
+            pagamentos: [],
+          },
+          null,
+        ),
+      ).rejects.toThrow(ApiException);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("desconto de item negativo é rejeitado", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await expect(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [
+              {
+                produtoId: produto.produtoId,
+                varianteId: produto.varianteId,
+                tamanhoId: produto.tamanhoId,
+                quantidade: 1,
+                desconto: { tipo: "valor", valor: -10 },
+              },
+            ],
+            pagamentos: [],
+          },
+          null,
+        ),
+      ).rejects.toThrow(ApiException);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("desconto da venda negativo é rejeitado", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await expect(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            descontoVenda: { tipo: "valor", valor: -1 },
+            pagamentos: [],
+          },
+          null,
+        ),
+      ).rejects.toThrow(ApiException);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("desconto por item + desconto da venda combinados: aplica na ordem correta (item primeiro, depois venda)", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            {
+              produtoId: produto.produtoId,
+              varianteId: produto.varianteId,
+              tamanhoId: produto.tamanhoId,
+              quantidade: 2,
+              desconto: { tipo: "percentual", valor: 10 },
+            },
+          ],
+          // base do item = 100×2=200; desconto item 10% = 20; subtotalItem = 180.
+          // subtotalVenda = 180; desconto venda 10% = 18; valorFinal = 162.
+          descontoVenda: { tipo: "percentual", valor: 10 },
+          pagamentos: [],
+        },
+        null,
+      );
+      expect(venda.itens[0]?.descontoItem).toBe(20);
+      expect(venda.itens[0]?.subtotal).toBe(180);
+      expect(venda.descontoVenda).toBe(18);
+      expect(venda.valorFinal).toBe(162);
+      expect(venda.descontoTotal).toBe(38); // 20 (item) + 18 (venda), sem promoção
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("múltiplos itens com descontos diferentes: cada um calculado independentemente", async () => {
+      const produtoA = await criarProdutoComEstoque(100, 5);
+      const produtoB = await criarProdutoComEstoque(50, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            {
+              produtoId: produtoA.produtoId,
+              varianteId: produtoA.varianteId,
+              tamanhoId: produtoA.tamanhoId,
+              quantidade: 1,
+              desconto: { tipo: "percentual", valor: 20 },
+            },
+            {
+              produtoId: produtoB.produtoId,
+              varianteId: produtoB.varianteId,
+              tamanhoId: produtoB.tamanhoId,
+              quantidade: 2,
+              desconto: { tipo: "valor", valor: 10 },
+            },
+          ],
+          pagamentos: [],
+        },
+        null,
+      );
+      const itemA = venda.itens.find((item) => item.produtoId === produtoA.produtoId)!;
+      const itemB = venda.itens.find((item) => item.produtoId === produtoB.produtoId)!;
+      expect(itemA.descontoItem).toBe(20); // 100 × 20%
+      expect(itemA.subtotal).toBe(80);
+      expect(itemB.descontoItem).toBe(10); // valor fixo sobre a base 100 (50×2)
+      expect(itemB.subtotal).toBe(90);
+      expect(venda.valorFinal).toBe(170); // 80 + 90
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("ignora valorFinal forjado no payload e recalcula do zero (backend é a autoridade)", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const dadosForjados = {
+        vendedorId: vendedor.id,
+        caixaId: caixa.id,
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [],
+        valorFinal: 999999,
+        subtotal: 999999,
+      } as unknown as DadosCriarVenda;
+
+      const venda = await service.criar(dadosForjados, null);
+      expect(venda.valorFinal).toBe(100);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("arredondamento determinístico: percentual com dízima resulta em 2 casas decimais, sem resíduo negativo", async () => {
+      const produto = await criarProdutoComEstoque(10, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            {
+              produtoId: produto.produtoId,
+              varianteId: produto.varianteId,
+              tamanhoId: produto.tamanhoId,
+              quantidade: 3,
+              desconto: { tipo: "percentual", valor: 33.33 },
+            },
+          ],
+          pagamentos: [],
+        },
+        null,
+      );
+      // base = 10×3 = 30; 33,33% de 30 = 9,999 → arredonda para 10.
+      expect(venda.itens[0]?.descontoItem).toBe(10);
+      expect(Number.isInteger(venda.itens[0]!.descontoItem * 100)).toBe(true); // no máximo 2 casas decimais
+      expect(venda.itens[0]!.subtotal).toBeGreaterThanOrEqual(0);
+      expect(venda.valorFinal).toBeGreaterThanOrEqual(0);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("snapshot: descontoItem persiste no documento e é recuperável via obterPorId", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            {
+              produtoId: produto.produtoId,
+              varianteId: produto.varianteId,
+              tamanhoId: produto.tamanhoId,
+              quantidade: 1,
+              desconto: { tipo: "valor", valor: 12 },
+            },
+          ],
+          pagamentos: [],
+        },
+        null,
+      );
+
+      const recarregada = await service.obterPorId(venda.id);
+      expect(recarregada.itens[0]?.descontoItem).toBe(12);
+      expect(recarregada.itens[0]?.subtotal).toBe(88);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+  });
+
   describe("integração com Caixa: somente o valor recebido entra", () => {
     it("registra no caixa só o valor pago, não o valor total da venda", async () => {
       const produto = await criarProdutoComEstoque(500, 5);

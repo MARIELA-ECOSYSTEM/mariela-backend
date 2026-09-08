@@ -83,4 +83,67 @@ describe("CriarVendaPdvDto", () => {
     const clienteNulo = plainToInstance(CriarVendaPdvDto, payloadValido({ clienteId: null }));
     expect((await validate(clienteNulo)).length).toBe(0);
   });
+
+  describe("descontoVenda — Etapa 10.3 (number legado + objeto {tipo, valor})", () => {
+    it("aceita descontoVenda como number puro (retrocompatibilidade)", async () => {
+      const dto = plainToInstance(CriarVendaPdvDto, payloadValido({ descontoVenda: 20 }));
+      const erros = await validate(dto);
+      expect(erros).toHaveLength(0);
+      expect(dto.descontoVenda).toEqual({ tipo: "valor", valor: 20 });
+    });
+
+    it("aceita descontoVenda como objeto {tipo:'valor', valor}", async () => {
+      const dto = plainToInstance(CriarVendaPdvDto, payloadValido({ descontoVenda: { tipo: "valor", valor: 20 } }));
+      expect(await validate(dto)).toHaveLength(0);
+    });
+
+    it("aceita descontoVenda como objeto {tipo:'percentual', valor}", async () => {
+      const dto = plainToInstance(CriarVendaPdvDto, payloadValido({ descontoVenda: { tipo: "percentual", valor: 10 } }));
+      expect(await validate(dto)).toHaveLength(0);
+    });
+
+    it("rejeita tipo de desconto inválido", async () => {
+      const dto = plainToInstance(CriarVendaPdvDto, payloadValido({ descontoVenda: { tipo: "cupom", valor: 10 } }));
+      const erros = await validate(dto);
+      expect(erros.some((erro) => erro.property === "descontoVenda")).toBe(true);
+    });
+
+    it("rejeita valor negativo dentro do objeto de desconto", async () => {
+      const dto = plainToInstance(CriarVendaPdvDto, payloadValido({ descontoVenda: { tipo: "valor", valor: -5 } }));
+      const erros = await validate(dto);
+      expect(erros.some((erro) => erro.property === "descontoVenda")).toBe(true);
+    });
+  });
+
+  describe("desconto por item — Etapa 10.3", () => {
+    it("aceita item sem desconto", async () => {
+      const dto = plainToInstance(CriarVendaPdvDto, payloadValido());
+      expect(await validate(dto)).toHaveLength(0);
+    });
+
+    it("aceita item com desconto em valor", async () => {
+      const dto = plainToInstance(
+        CriarVendaPdvDto,
+        payloadValido({ itens: [{ produtoId: "a", varianteId: "b", tamanhoId: "c", quantidade: 1, desconto: { tipo: "valor", valor: 10 } }] }),
+      );
+      expect(await validate(dto)).toHaveLength(0);
+    });
+
+    it("aceita item com desconto em percentual", async () => {
+      const dto = plainToInstance(
+        CriarVendaPdvDto,
+        payloadValido({ itens: [{ produtoId: "a", varianteId: "b", tamanhoId: "c", quantidade: 1, desconto: { tipo: "percentual", valor: 10 } }] }),
+      );
+      expect(await validate(dto)).toHaveLength(0);
+    });
+
+    it("rejeita desconto de item com percentual negativo", async () => {
+      const dto = plainToInstance(
+        CriarVendaPdvDto,
+        payloadValido({ itens: [{ produtoId: "a", varianteId: "b", tamanhoId: "c", quantidade: 1, desconto: { tipo: "percentual", valor: -1 } }] }),
+      );
+      const erros = await validate(dto, { validationError: { target: false } });
+      expect(erros.some((erro) => erro.property === "itens")).toBe(true);
+    });
+  });
 });

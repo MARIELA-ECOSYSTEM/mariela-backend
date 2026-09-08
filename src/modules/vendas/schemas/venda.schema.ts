@@ -51,6 +51,14 @@ export class ItemVenda {
   @Prop({ type: Boolean, default: false })
   emPromocao!: boolean;
 
+  /**
+   * Valor MONETÁRIO efetivamente descontado nesta linha (já considerando a
+   * quantidade) — nunca o percentual solicitado, que não é autoridade do
+   * resultado. `0` quando nenhum desconto de item foi aplicado.
+   */
+  @Prop({ type: Number, default: 0 })
+  descontoItem!: number;
+
   @Prop({ type: Number, required: true })
   subtotal!: number;
 

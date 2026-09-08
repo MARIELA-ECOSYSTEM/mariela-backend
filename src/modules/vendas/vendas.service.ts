@@ -24,7 +24,7 @@ import type { CancelamentoDto } from "./dto/cancelamento.dto.js";
 import type { ListarVendasQueryDto } from "./dto/listar-vendas-query.dto.js";
 import { EventoVenda, type EventoVendaDocument } from "./schemas/evento-venda.schema.js";
 import type { ItemDevolvido, ItemVenda, PagamentoVenda, VendaDocument } from "./schemas/venda.schema.js";
-import type { DadosCriarVenda, DadosPersistirVenda } from "./vendas.types.js";
+import type { DadosCriarVenda, DadosPersistirVenda, Desconto } from "./vendas.types.js";
 
 export interface ResultadoListaVendas {
   data: VendaDocument[];
@@ -135,8 +135,18 @@ export class VendasService {
         ]);
       }
 
-      const precoOriginal = produto.precoVenda;
-      const precoPraticado = precoEfetivo(produto);
+      // Ordem obrigatória (seção 1 da Etapa 10.3): precoOriginal → precoPraticado
+      // (promoção) → desconto do ITEM (sempre sobre o preço PRATICADO, nunca
+      // sobre o de tabela — evita contar a promoção duas vezes) → subtotal do
+      // item. Cada etapa é arredondada individualmente para não acumular erro
+      // de ponto flutuante (mesmo padrão `Number(valor.toFixed(2))` já usado
+      // em todo o projeto).
+      const precoOriginal = arredondar(produto.precoVenda);
+      const precoPraticado = arredondar(precoEfetivo(produto));
+      const valorBrutoItem = arredondar(precoPraticado * solicitado.quantidade);
+      const descontoItem = this.resolverDesconto(solicitado.desconto, valorBrutoItem, "itens");
+      const subtotalItem = arredondar(valorBrutoItem - descontoItem);
+
       itensMontados.push({
         produtoId: produto.id,
         codProduto: produto.codProduto,
@@ -151,7 +161,8 @@ export class VendasService {
         precoOriginal,
         precoPraticado,
         emPromocao: precoPraticado < precoOriginal,
-        subtotal: arredondarMoeda(precoPraticado * solicitado.quantidade),
+        descontoItem,
+        subtotal: subtotalItem,
         quantidadeDevolvida: 0,
       } as ItemVenda);
     }
@@ -184,12 +195,13 @@ export class VendasService {
     const descontoPromocional = arredondar(
       itensMontados.reduce((total, item) => total + (item.precoOriginal - item.precoPraticado) * item.quantidade, 0),
     );
-    const subtotal = arredondar(valorBruto - descontoPromocional);
-    const descontoVenda = arredondar(dados.descontoVenda ?? 0);
-    if (descontoVenda < 0 || descontoVenda > subtotal) {
-      throw ApiException.validation("Dados inválidos.", [{ field: "descontoVenda", message: "Desconto inválido para o subtotal da venda." }]);
-    }
-    const valorFinal = arredondar(subtotal - descontoVenda);
+    const descontoItensTotal = arredondar(itensMontados.reduce((total, item) => total + item.descontoItem, 0));
+    // Subtotal da venda = soma dos subtotais dos itens (seção 1, passo 5) —
+    // já reflete promoção E desconto de item; o desconto da venda incide
+    // sobre ESTE valor, nunca sobre `valorBruto` diretamente.
+    const subtotalVenda = arredondar(itensMontados.reduce((total, item) => total + item.subtotal, 0));
+    const descontoVenda = this.resolverDesconto(dados.descontoVenda, subtotalVenda, "descontoVenda");
+    const valorFinal = arredondar(subtotalVenda - descontoVenda);
 
     const dataVenda = new Date();
     const pagamentos: PagamentoVenda[] = (dados.pagamentos ?? []).map(
@@ -239,13 +251,21 @@ export class VendasService {
       valorBruto,
       descontoPromocional,
       descontoVenda,
-      descontoTotal: arredondar(descontoPromocional + descontoVenda),
+      // Agora soma as TRÊS fontes de desconto (promocional + item + venda) —
+      // generalização direta da fórmula já existente (antes só promocional +
+      // venda, porque desconto de item não existia). Preserva o invariante
+      // `valorFinal = valorBruto - descontoTotal` usado pelo Backoffice
+      // (`descontoConcedido` em `estatisticas()`).
+      descontoTotal: arredondar(descontoPromocional + descontoItensTotal + descontoVenda),
       valorFinal,
       valorPago,
       valorPendente,
       valorDevolvido: 0,
       temPromocao: descontoPromocional > 0,
-      temDesconto: descontoVenda > 0,
+      // Passa a refletir QUALQUER desconto manual (item OU venda), não só o
+      // da venda — mesmo princípio de `temPromocao`, mas para desconto
+      // operado pelo vendedor em vez de automático.
+      temDesconto: descontoItensTotal > 0 || descontoVenda > 0,
       formaPagamento: pagamentos[0]?.forma ?? "A definir",
       totalParcelas: parcelas.length || 1,
       parcelasPagas: 0,
@@ -495,6 +515,48 @@ export class VendasService {
 
     await this.registrarEvento(venda.id, dto.tipo === "integral" ? "venda.cancelada" : "venda.devolvida", usuarioId, { valorDevolvido });
     return venda;
+  }
+
+  /**
+   * Resolve a INTENÇÃO de desconto (percentual ou valor absoluto — seção 2 da
+   * Etapa 10.3) num valor MONETÁRIO concreto, validado contra a base sobre a
+   * qual incide. Compartilhado entre desconto de item (`base` = preço
+   * praticado × quantidade dessa linha) e desconto da venda (`base` =
+   * subtotal da venda, já com os descontos de item aplicados) — mesma regra,
+   * duas bases diferentes, nunca duas implementações.
+   *
+   * Retrocompatibilidade: um `number` puro é tratado como
+   * `{ tipo: "valor", valor }` — o contrato que `descontoVenda` sempre teve
+   * antes desta etapa continua funcionando sem nenhuma mudança no chamador.
+   *
+   * Nunca persiste o percentual como autoridade: o retorno é sempre o valor
+   * monetário já resolvido e arredondado.
+   */
+  private resolverDesconto(bruto: number | Desconto | null | undefined, base: number, campo: string): number {
+    if (bruto === undefined || bruto === null) return 0;
+    const desconto: Desconto = typeof bruto === "number" ? { tipo: "valor", valor: bruto } : bruto;
+
+    if (!Number.isFinite(desconto.valor) || desconto.valor < 0) {
+      throw ApiException.validation("Dados inválidos.", [{ field: campo, message: "Desconto não pode ser negativo." }]);
+    }
+
+    let valorMonetario: number;
+    if (desconto.tipo === "percentual") {
+      if (desconto.valor > 100) {
+        throw ApiException.validation("Dados inválidos.", [{ field: campo, message: "Percentual de desconto não pode ultrapassar 100%." }]);
+      }
+      valorMonetario = arredondar((base * desconto.valor) / 100);
+    } else {
+      valorMonetario = arredondar(desconto.valor);
+    }
+
+    if (valorMonetario > base) {
+      throw ApiException.validation("Dados inválidos.", [
+        { field: campo, message: "Desconto não pode ultrapassar o valor sobre o qual está sendo aplicado." },
+      ]);
+    }
+
+    return valorMonetario;
   }
 
   private async devolverAoEstoque(item: ItemVenda, quantidade: number): Promise<void> {

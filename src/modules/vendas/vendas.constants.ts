@@ -9,6 +9,10 @@ export type StatusVenda = (typeof STATUS_VENDA)[number];
 export const TIPOS_EVENTO_VENDA = ["criacao", "pagamento", "baixa_parcela", "devolucao", "cancelamento"] as const;
 export type TipoEventoVenda = (typeof TIPOS_EVENTO_VENDA)[number];
 
+/** Formato compartilhado de desconto (por item ou da venda) — a INTENÇÃO solicitada, nunca a autoridade do valor final (ver `Desconto` em `vendas.types.ts`). */
+export const TIPOS_DESCONTO = ["percentual", "valor"] as const;
+export type TipoDesconto = (typeof TIPOS_DESCONTO)[number];
+
 export const PREFIXO_CODIGO_VENDA = "VENDA";
 export const CHAVE_SEQUENCIA_VENDA = "venda";
 export const DIGITOS_CODIGO_VENDA = 4;

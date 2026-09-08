@@ -1,3 +1,17 @@
+import type { TipoDesconto } from "./vendas.constants.js";
+
+/**
+ * Formato compartilhado de desconto — usado tanto para o desconto de um item
+ * quanto para o desconto da venda. Representa a INTENÇÃO solicitada (um
+ * percentual ou um valor absoluto); o backend sempre resolve essa intenção
+ * para um valor monetário concreto antes de persistir — o percentual NUNCA é
+ * a autoridade do valor final (ver `VendasService.resolverDesconto`).
+ */
+export interface Desconto {
+  tipo: TipoDesconto;
+  valor: number;
+}
+
 /**
  * Item solicitado na criação interna de uma venda — o service resolve preço,
  * snapshot e baixa de estoque a partir de `produtoId`/`varianteId`/`tamanhoId`.
@@ -8,6 +22,8 @@ export interface ItemVendaSolicitado {
   varianteId: string;
   tamanhoId: string;
   quantidade: number;
+  /** Desconto sobre o preço PRATICADO desta linha (após promoção) — nunca sobre o preço de tabela. Opcional. */
+  desconto?: Desconto;
 }
 
 export interface PagamentoSolicitado {
@@ -29,8 +45,13 @@ export interface DadosCriarVenda {
   vendedorId: string;
   caixaId: string;
   itens: ItemVendaSolicitado[];
-  /** Desconto concedido pelo operador — validado contra o subtotal, nunca recalculado a partir de outra regra. */
-  descontoVenda?: number;
+  /**
+   * Desconto concedido pelo operador sobre o subtotal da venda (já com os
+   * descontos de item aplicados) — validado contra esse subtotal. Um
+   * `number` puro é retrocompatível: interpretado como `{tipo:"valor", valor}`
+   * (mesmo contrato que este campo sempre teve antes desta etapa).
+   */
+  descontoVenda?: number | Desconto;
   /** Pagamentos recebidos NO MOMENTO da venda (pode ser parcial ou vazio). */
   pagamentos: PagamentoSolicitado[];
   /**

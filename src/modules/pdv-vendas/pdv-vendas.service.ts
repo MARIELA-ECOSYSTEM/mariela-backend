@@ -35,11 +35,19 @@ export class PdvVendasService {
       clienteId: dto.clienteId ?? null,
       vendedorId,
       caixaId: caixaAtual.id,
+      // `desconto`/`descontoVenda` são repassados tal como vieram (nunca
+      // reconstruídos campo a campo): `DadosCriarVenda`/`ItemVendaSolicitado`
+      // já aceitam tanto o formato novo (`{tipo, valor}`) quanto, no caso de
+      // `descontoVenda`, um `number` puro — reconstruir o objeto aqui
+      // quebraria essa retrocompatibilidade quando o chamador (ex.: um teste
+      // que invoca `PdvVendasService.criar` diretamente, sem passar pelo
+      // `ValidationPipe`/`@Transform` do DTO) ainda envia um `number` cru.
       itens: dto.itens.map((item) => ({
         produtoId: item.produtoId,
         varianteId: item.varianteId,
         tamanhoId: item.tamanhoId,
         quantidade: item.quantidade,
+        desconto: item.desconto,
       })),
       descontoVenda: dto.descontoVenda,
       pagamentos: dto.pagamentos.map((pagamento) => ({
