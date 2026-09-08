@@ -98,7 +98,15 @@ export class VendasService {
   private async criarInterno(dados: DadosCriarVenda, usuarioId: string | null): Promise<VendaDocument> {
     if (dados.idempotencyKey) {
       const existente = await this.vendasRepository.encontrarPorIdempotencyKey(dados.idempotencyKey);
-      if (existente) return existente;
+      // Etapa 10.6: a Venda já existe (retry) — NÃO cria outra, mas ainda
+      // assim garante os movimentos de caixa dela (idempotentes por chave
+      // determinística). Cobre o cenário "processo morreu entre persistir a
+      // Venda e criar todos os movimentos": o retry cai aqui, encontra a
+      // Venda pronta e só recria o que faltar — nunca duplica o que já existe.
+      if (existente) {
+        await this.garantirMovimentosDeCaixa(existente);
+        return existente;
+      }
     }
 
     if (!dados.itens.length) {
@@ -298,22 +306,9 @@ export class VendasService {
       idempotencyKey: dados.idempotencyKey ?? null,
     } satisfies DadosPersistirVenda);
 
-    // Só o que foi EFETIVAMENTE recebido agora entra no caixa.
-    if (valorPago > 0) {
-      await this.caixasService.registrarMovimentoDeVenda({
-        caixaId: caixa.id,
-        tipo: "venda",
-        descricao: `Venda ${venda.codigo} · ${clienteNome}`,
-        referencia: venda.codigo,
-        vendaId: venda.id,
-        vendaCodigo: venda.codigo,
-        formaPagamento: venda.formaPagamento,
-        valor: valorPago,
-        responsavelId: null,
-        responsavelNome: vendedor.nome,
-        observacao: "",
-      });
-    }
+    // Etapa 10.6: 1 movimento de caixa POR PAGAMENTO (nunca mais um único
+    // agregado usando só a primeira forma) — ver `garantirMovimentosDeCaixa`.
+    await this.garantirMovimentosDeCaixa(venda);
 
     await this.atualizarAgregadosNaCriacao(venda);
     await this.registrarEvento(venda.id, "venda.criada", usuarioId, { codigo: venda.codigo, valorFinal });
@@ -697,6 +692,56 @@ export class VendasService {
     };
 
     return { modalidade, adquirenteId: pagamento.adquirenteId, parcelas, tarifaAplicada };
+  }
+
+  /**
+   * Etapa 10.6 — 1 movimento de caixa POR PAGAMENTO da venda (nunca mais um
+   * único movimento agregado usando só a primeira forma de pagamento).
+   * Idempotente por pagamento via uma chave DETERMINÍSTICA (nunca UUID
+   * aleatório — precisa ser reproduzível em qualquer retry):
+   *
+   *   `${venda.idempotencyKey ?? venda.id}:pagamento:${indice}`
+   *
+   * Chamado em DOIS pontos de `criarInterno`: (1) logo após persistir uma
+   * venda nova, e (2) quando um retry encontra a venda JÁ existente
+   * (idempotência de Venda) — nos dois casos o efeito é o mesmo: cada
+   * pagamento tenta criar seu movimento; o que já existe (mesma chave) é
+   * devolvido sem duplicar pelo mecanismo já corrigido na Etapa 10.2
+   * (`MovimentosCaixaRepository.criar` captura o erro 11000 de
+   * `idempotencyKey` e devolve o vencedor da corrida). Isso cobre
+   * exatamente o cenário "processo morreu entre persistir a Venda e criar
+   * todos os movimentos": o retry não recria a venda, e recria só os
+   * movimentos que estiverem faltando — os que já existem são ignorados
+   * pela idempotência, nunca duplicados.
+   *
+   * A tarifa (Etapa 10.5) NUNCA altera o valor do movimento: cada movimento
+   * sempre representa o valor BRUTO daquele pagamento (`pagamento.valor`),
+   * nunca o valor líquido pós-tarifa — o Caixa reflete o que o cliente
+   * efetivamente pagou, não a liquidação da adquirente.
+   */
+  private async garantirMovimentosDeCaixa(venda: VendaDocument): Promise<void> {
+    if (!venda.caixaId) return;
+    const chaveBase = venda.idempotencyKey ?? venda.id;
+
+    for (let indice = 0; indice < venda.pagamentos.length; indice += 1) {
+      const pagamento = venda.pagamentos[indice]!;
+      if (pagamento.valor <= 0) continue; // defensivo — o DTO já exige valor positivo em cada pagamento.
+
+      await this.caixasService.registrarMovimentoDeVenda({
+        caixaId: venda.caixaId,
+        tipo: "venda",
+        descricao: `Venda ${venda.codigo} · ${venda.clienteNome} · ${pagamento.forma}`,
+        referencia: venda.codigo,
+        vendaId: venda.id,
+        vendaCodigo: venda.codigo,
+        formaPagamento: pagamento.forma,
+        valor: pagamento.valor,
+        responsavelId: null,
+        responsavelNome: venda.vendedorNome,
+        observacao: "",
+        idempotencyKey: `${chaveBase}:pagamento:${indice}`,
+      });
+    }
   }
 
   private async devolverAoEstoque(item: ItemVenda, quantidade: number): Promise<void> {

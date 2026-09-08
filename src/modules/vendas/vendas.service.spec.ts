@@ -1912,6 +1912,398 @@ describe("VendasService (integração — MongoDB real)", () => {
     });
   });
 
+  describe("1 movimento de caixa por pagamento (Etapa 10.6)", () => {
+    async function movimentosDaVenda(vendaId: string) {
+      return connection.collection("movimentos_caixa").find({ vendaId }).toArray();
+    }
+
+    it("A. venda com 1 pagamento → 1 movimento", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+        },
+        null,
+      );
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos).toHaveLength(1);
+      expect(movimentos[0]?.["valor"]).toBe(100);
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("B. venda com 2 pagamentos → 2 movimentos", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [
+            { forma: "Dinheiro", valor: 100 },
+            { forma: "PIX", valor: 200 },
+          ],
+        },
+        null,
+      );
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos).toHaveLength(2);
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("C. venda com 3 pagamentos → 3 movimentos", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [
+            { forma: "Dinheiro", valor: 100 },
+            { forma: "PIX", valor: 100 },
+            { forma: "Débito", valor: 100 },
+          ],
+        },
+        null,
+      );
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos).toHaveLength(3);
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("D. PIX + débito + crédito → 3 movimentos independentes, cada um com sua forma/valor corretos", async () => {
+      const adquirenteDebito = await criarAdquirente({ tabelaTarifas: [{ modalidade: "debito", parcelas: 1, percentual: 2 }] });
+      const adquirenteCredito = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 3, percentual: 5 }] });
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [
+            { forma: "PIX", modalidade: "pix", valor: 200 },
+            { forma: "Débito", modalidade: "debito", adquirenteId: adquirenteDebito.id, valor: 150 },
+            { forma: "Crédito", modalidade: "credito", adquirenteId: adquirenteCredito.id, parcelas: 3, valor: 150 },
+          ],
+        },
+        null,
+      );
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos).toHaveLength(3);
+      const valores = movimentos.map((m) => m["valor"]).sort((a, b) => (a as number) - (b as number));
+      expect(valores).toEqual([150, 150, 200]);
+      expect(movimentos.every((m) => m["tipo"] === "venda" && m["sentido"] === "entrada")).toBe(true);
+      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+    });
+
+    it("E. crédito parcelado: 1 movimento com o valor BRUTO — parcelas continuam disponíveis via a Venda, não duplicadas no movimento", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 6, percentual: 5 }] });
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 6, valor: 300 }],
+        },
+        null,
+      );
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos).toHaveLength(1);
+      expect(movimentos[0]?.["valor"]).toBe(300); // bruto, nunca 285 (líquido)
+      // parcelas continuam recuperáveis via a Venda (snapshot completo) — o movimento não duplica esse dado.
+      expect(venda.pagamentos[0]?.parcelas).toBe(6);
+      expect(movimentos[0]?.["parcelas"]).toBeUndefined();
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("F. crédito com tarifa: tarifa/valor líquido NÃO alteram o valor do movimento nem valorPago", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 5 }] });
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 300 }],
+        },
+        null,
+      );
+      expect(venda.pagamentos[0]?.tarifaAplicada?.valorLiquido).toBe(285);
+      expect(venda.valorPago).toBe(300);
+
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos[0]?.["valor"]).toBe(300); // nunca 285
+
+      const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
+      expect(detalheCaixa.resumo.totalVendas).toBe(300); // nunca 285
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("G. pagamento parcial: só o valor efetivamente recebido gera movimento — nenhum movimento do saldo pendente", async () => {
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "PIX", valor: 200 }],
+        },
+        null,
+      );
+      expect(venda.valorPago).toBe(200);
+      expect(venda.valorPendente).toBe(300);
+
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos).toHaveLength(1);
+      expect(movimentos[0]?.["valor"]).toBe(200);
+      const somaMovimentos = movimentos.reduce((total, m) => total + (m["valor"] as number), 0);
+      expect(somaMovimentos).toBe(200); // nunca 500, nunca 300
+      await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+    });
+
+    it("H. múltiplos pagamentos + saldo pendente: N movimentos, nenhum do saldo pendente", async () => {
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [
+            { forma: "Dinheiro", valor: 100 },
+            { forma: "PIX", valor: 150 },
+          ],
+        },
+        null,
+      );
+      expect(venda.valorPago).toBe(250);
+      expect(venda.valorPendente).toBe(250);
+
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos).toHaveLength(2);
+      const soma = movimentos.reduce((total, m) => total + (m["valor"] as number), 0);
+      expect(soma).toBe(250); // exatamente o pago; o pendente nunca vira movimento
+      await caixasService.fechar(caixa.id, { valorInformado: 1250 }, null);
+    });
+
+    it("I. venda legada sem modalidade continua funcionando: cada pagamento ainda gera seu movimento com formaPagamento preservada", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [
+            { forma: "Dinheiro", valor: 150 },
+            { forma: "Cartão", valor: 150 },
+          ],
+        },
+        null,
+      );
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos).toHaveLength(2);
+      const formas = movimentos.map((m) => m["formaPagamento"]).sort();
+      expect(formas).toEqual(["Cartão", "Dinheiro"]);
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("J. retry com a mesma idempotencyKey (múltiplos pagamentos): nenhuma venda duplicada, movimentos permanecem os mesmos N", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const chave = `venda-caixa-retry-${Date.now()}`;
+
+      const dados: DadosCriarVenda = {
+        vendedorId: vendedor.id,
+        caixaId: caixa.id,
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [
+          { forma: "Dinheiro", valor: 100 },
+          { forma: "PIX", valor: 200 },
+        ],
+        idempotencyKey: chave,
+      };
+
+      const primeira = await service.criar(dados, null);
+      const movimentosAntes = await movimentosDaVenda(primeira.id);
+      expect(movimentosAntes).toHaveLength(2);
+
+      const segunda = await service.criar(dados, null);
+      expect(segunda.id).toBe(primeira.id);
+
+      const totalVendas = await connection.collection("vendas").countDocuments({ idempotencyKey: chave });
+      expect(totalVendas).toBe(1);
+
+      const movimentosDepois = await movimentosDaVenda(primeira.id);
+      expect(movimentosDepois).toHaveLength(2); // não duplicou
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("K. retry após venda criada mas com movimentos INCOMPLETOS: recria só o que falta, nunca duplica o que já existe", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const chave = `venda-caixa-incompleto-${Date.now()}`;
+
+      const dados: DadosCriarVenda = {
+        vendedorId: vendedor.id,
+        caixaId: caixa.id,
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [
+          { forma: "Dinheiro", valor: 100 },
+          { forma: "PIX", valor: 200 },
+        ],
+        idempotencyKey: chave,
+      };
+
+      const venda = await service.criar(dados, null);
+      const movimentosOriginais = await movimentosDaVenda(venda.id);
+      expect(movimentosOriginais).toHaveLength(2);
+
+      // Simula "processo morreu antes de criar todos os movimentos": apaga
+      // manualmente o movimento do pagamento de índice 1 (PIX, R$200),
+      // mantendo o de índice 0 (Dinheiro, R$100) intacto.
+      const movimentoPix = movimentosOriginais.find((m) => m["formaPagamento"] === "PIX")!;
+      await connection.collection("movimentos_caixa").deleteOne({ _id: movimentoPix["_id"] });
+      const apagouSoUm = await movimentosDaVenda(venda.id);
+      expect(apagouSoUm).toHaveLength(1);
+
+      // Retry com a MESMA idempotencyKey: a venda já existe (não recria),
+      // mas o movimento faltante deve ser recriado; o existente não duplica.
+      const retry = await service.criar(dados, null);
+      expect(retry.id).toBe(venda.id);
+
+      const movimentosFinais = await movimentosDaVenda(venda.id);
+      expect(movimentosFinais).toHaveLength(2); // recriou o que faltava
+      const formas = movimentosFinais.map((m) => m["formaPagamento"]).sort();
+      expect(formas).toEqual(["Dinheiro", "PIX"]);
+      const somaFinal = movimentosFinais.reduce((total, m) => total + (m["valor"] as number), 0);
+      expect(somaFinal).toBe(300);
+
+      // O movimento de Dinheiro original NUNCA foi duplicado (mesmo _id de antes).
+      const movimentoDinheiroOriginalId = String(movimentosOriginais.find((m) => m["formaPagamento"] === "Dinheiro")!["_id"]);
+      const movimentosDinheiro = movimentosFinais.filter((m) => m["formaPagamento"] === "Dinheiro");
+      expect(movimentosDinheiro).toHaveLength(1);
+      expect(String(movimentosDinheiro[0]!["_id"])).toBe(movimentoDinheiroOriginalId);
+
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("L. concorrência real: duas chamadas concorrentes registrando o MESMO pagamento (mesma idempotencyKey) resultam em exatamente 1 movimento", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const chaveMovimento = `venda-concorrencia-caixa-${Date.now()}:pagamento:0`;
+
+      // Simula duas requisições genuinamente concorrentes chegando ao mesmo
+      // ponto de registro de caixa (ex.: dois processos/instâncias, onde a
+      // deduplicação em memória de `VendasService.criar` não ajudaria) —
+      // exercita diretamente `CaixasService.registrarMovimentoDeVenda`, o
+      // MESMO método que `garantirMovimentosDeCaixa` chama por pagamento.
+      const criarMovimento = () =>
+        caixasService.registrarMovimentoDeVenda({
+          caixaId: caixa.id,
+          tipo: "venda",
+          descricao: "Venda concorrência · Dinheiro",
+          referencia: "REF-CONCORRENCIA",
+          vendaId: "venda-fake-concorrencia",
+          vendaCodigo: "VENDA-FAKE",
+          formaPagamento: "Dinheiro",
+          valor: 100,
+          responsavelId: null,
+          responsavelNome: vendedor.nome,
+          observacao: "",
+          idempotencyKey: chaveMovimento,
+        });
+
+      await Promise.all([criarMovimento(), criarMovimento()]);
+
+      const movimentos = await connection.collection("movimentos_caixa").find({ idempotencyKey: chaveMovimento }).toArray();
+      expect(movimentos).toHaveLength(1);
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("M. resumo do caixa continua somando corretamente todos os movimentos de uma venda multi-pagamento", async () => {
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [
+            { forma: "Dinheiro", valor: 100 },
+            { forma: "PIX", valor: 200 },
+            { forma: "Débito", valor: 200 },
+          ],
+        },
+        null,
+      );
+      const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
+      expect(detalheCaixa.resumo.totalVendas).toBe(500);
+      expect(detalheCaixa.resumo.saldoEsperado).toBe(1500);
+      expect(detalheCaixa.resumo.quantidadeMovimentacoes).toBe(3);
+      expect(detalheCaixa.resumo.quantidadeVendas).toBe(1); // 3 movimentos, mas 1 única venda (dedupe por vendaId)
+      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+    });
+
+    it("N. listagem de movimentos do caixa exibe os múltiplos movimentos da mesma venda corretamente", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [
+            { forma: "Dinheiro", valor: 100 },
+            { forma: "PIX", valor: 200 },
+          ],
+        },
+        null,
+      );
+
+      const listagem = await caixasService.listarMovimentos(caixa.id, { tipo: [], ordem: "desc", page: 1, limit: 20 });
+      const daVenda = listagem.data.filter((m) => m.vendaId === venda.id);
+      expect(daVenda).toHaveLength(2);
+      expect(listagem.meta.total).toBeGreaterThanOrEqual(2);
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+  });
+
   describe("integração com Caixa: somente o valor recebido entra", () => {
     it("registra no caixa só o valor pago, não o valor total da venda", async () => {
       const produto = await criarProdutoComEstoque(500, 5);
