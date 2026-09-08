@@ -146,4 +146,33 @@ describe("CriarVendaPdvDto", () => {
       expect(erros.some((erro) => erro.property === "itens")).toBe(true);
     });
   });
+
+  describe("modalidade/adquirenteId do pagamento — Etapa 10.4 (validação de FORMATO apenas)", () => {
+    it("aceita pagamento sem modalidade (legado)", async () => {
+      const dto = plainToInstance(CriarVendaPdvDto, payloadValido({ pagamentos: [{ forma: "Dinheiro", valor: 100 }] }));
+      expect(await validate(dto)).toHaveLength(0);
+    });
+
+    it("aceita modalidade dinheiro/pix/debito/credito", async () => {
+      for (const modalidade of ["dinheiro", "pix", "debito", "credito"]) {
+        const dto = plainToInstance(CriarVendaPdvDto, payloadValido({ pagamentos: [{ forma: "X", modalidade, valor: 100 }] }));
+        const erros = await validate(dto);
+        expect(erros).toHaveLength(0);
+      }
+    });
+
+    it("rejeita modalidade fora do conjunto permitido", async () => {
+      const dto = plainToInstance(CriarVendaPdvDto, payloadValido({ pagamentos: [{ forma: "Boleto", modalidade: "boleto", valor: 100 }] }));
+      const erros = await validate(dto, { validationError: { target: false } });
+      expect(erros.some((erro) => erro.property === "pagamentos")).toBe(true);
+    });
+
+    it("aceita adquirenteId como string", async () => {
+      const dto = plainToInstance(
+        CriarVendaPdvDto,
+        payloadValido({ pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId: "66f...", parcelas: 3, valor: 100 }] }),
+      );
+      expect(await validate(dto)).toHaveLength(0);
+    });
+  });
 });

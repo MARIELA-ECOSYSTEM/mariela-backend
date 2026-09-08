@@ -1,3 +1,5 @@
+import { MODALIDADES_TARIFA } from "../adquirentes/adquirentes.constants.js";
+
 /**
  * EM_PAGAMENTO → estoque já baixado, valor pendente > 0.
  * CONCLUIDA    → valor pendente = 0.
@@ -5,6 +7,17 @@
  */
 export const STATUS_VENDA = ["em_pagamento", "concluida", "cancelada"] as const;
 export type StatusVenda = (typeof STATUS_VENDA)[number];
+
+/**
+ * Modalidade estruturada de pagamento (Etapa 10.4) — "dinheiro"/"pix" nunca
+ * têm adquirente; "debito"/"credito" sempre têm. Composta a partir de
+ * `MODALIDADES_TARIFA` (`modules/adquirentes/adquirentes.constants.ts`) em
+ * vez de redeclarar "debito"/"credito" aqui: essas duas strings são a MESMA
+ * autoridade que decide se um pagamento exige adquirente/tarifa configurada
+ * — nunca duas listas divergentes.
+ */
+export const MODALIDADES_PAGAMENTO = ["dinheiro", "pix", ...MODALIDADES_TARIFA] as const;
+export type ModalidadePagamento = (typeof MODALIDADES_PAGAMENTO)[number];
 
 export const TIPOS_EVENTO_VENDA = ["criacao", "pagamento", "baixa_parcela", "devolucao", "cancelamento"] as const;
 export type TipoEventoVenda = (typeof TIPOS_EVENTO_VENDA)[number];

@@ -3,6 +3,7 @@ import { InjectModel } from "@nestjs/mongoose";
 import type { Model, Types } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
+import { AdquirentesService, type AdquirenteRespostaPublica } from "../adquirentes/adquirentes.service.js";
 import { CaixasRepository } from "../caixas/caixas.repository.js";
 import { CaixasService } from "../caixas/caixas.service.js";
 import { ClientesRepository } from "../clientes/clientes.repository.js";
@@ -15,7 +16,9 @@ import {
   CHAVE_SEQUENCIA_VENDA,
   DIGITOS_CODIGO_VENDA,
   DIGITOS_NUMERO_VENDA,
+  MODALIDADES_PAGAMENTO,
   PREFIXO_CODIGO_VENDA,
+  type ModalidadePagamento,
 } from "./vendas.constants.js";
 import type { SelecaoFacetas } from "./vendas-filtros.util.js";
 import { VendasRepository } from "./vendas.repository.js";
@@ -24,7 +27,7 @@ import type { CancelamentoDto } from "./dto/cancelamento.dto.js";
 import type { ListarVendasQueryDto } from "./dto/listar-vendas-query.dto.js";
 import { EventoVenda, type EventoVendaDocument } from "./schemas/evento-venda.schema.js";
 import type { ItemDevolvido, ItemVenda, PagamentoVenda, VendaDocument } from "./schemas/venda.schema.js";
-import type { DadosCriarVenda, DadosPersistirVenda, Desconto } from "./vendas.types.js";
+import type { DadosCriarVenda, DadosPersistirVenda, Desconto, PagamentoSolicitado, TarifaAplicada } from "./vendas.types.js";
 
 export interface ResultadoListaVendas {
   data: VendaDocument[];
@@ -59,6 +62,7 @@ export class VendasService {
     private readonly caixasRepository: CaixasRepository,
     private readonly caixasService: CaixasService,
     private readonly sequenciasService: SequenciasService,
+    private readonly adquirentesService: AdquirentesService,
     @InjectModel(EventoVenda.name) private readonly eventoModel: Model<EventoVendaDocument>,
   ) {}
 
@@ -167,11 +171,58 @@ export class VendasService {
       } as ItemVenda);
     }
 
+    const valorBruto = arredondar(itensMontados.reduce((total, item) => total + item.precoOriginal * item.quantidade, 0));
+    const descontoPromocional = arredondar(
+      itensMontados.reduce((total, item) => total + (item.precoOriginal - item.precoPraticado) * item.quantidade, 0),
+    );
+    const descontoItensTotal = arredondar(itensMontados.reduce((total, item) => total + item.descontoItem, 0));
+    // Subtotal da venda = soma dos subtotais dos itens (seção 1, passo 5) —
+    // já reflete promoção E desconto de item; o desconto da venda incide
+    // sobre ESTE valor, nunca sobre `valorBruto` diretamente.
+    const subtotalVenda = arredondar(itensMontados.reduce((total, item) => total + item.subtotal, 0));
+    const descontoVenda = this.resolverDesconto(dados.descontoVenda, subtotalVenda, "descontoVenda");
+    const valorFinal = arredondar(subtotalVenda - descontoVenda);
+
+    // Validação de pagamentos (Etapa 10.4: inclui modalidade/adquirente/
+    // parcelamento estruturados) ANTES de qualquer baixa de estoque — nunca
+    // vale a pena baixar estoque só para descobrir depois que o pagamento
+    // era inválido (adquirente inexistente/inativa, parcelamento não
+    // configurado, etc.). `adquirentesCache` evita consultar a mesma
+    // adquirente mais de uma vez quando a venda tem múltiplos pagamentos
+    // apontando para o mesmo `adquirenteId` (mesmo padrão de `produtosCache`
+    // acima, para o mesmo tipo de motivo).
+    const dataVenda = new Date();
+    const adquirentesCache = new Map<string, AdquirenteRespostaPublica>();
+    const pagamentos: PagamentoVenda[] = [];
+    for (const pagamento of dados.pagamentos ?? []) {
+      const estruturado = await this.validarPagamentoEstruturado(pagamento, adquirentesCache);
+      pagamentos.push({
+        forma: pagamento.forma,
+        valor: arredondar(pagamento.valor),
+        dataPagamento: dataVenda,
+        parcelas: estruturado.parcelas,
+        observacao: pagamento.observacao ?? null,
+        modalidade: estruturado.modalidade,
+        adquirenteId: estruturado.adquirenteId,
+        tarifaAplicada: estruturado.tarifaAplicada,
+      } as PagamentoVenda);
+    }
+    const valorPago = arredondar(pagamentos.reduce((total, item) => total + item.valor, 0));
+    if (valorPago > valorFinal) {
+      throw ApiException.validation("Dados inválidos.", [{ field: "pagamentos", message: "A soma dos pagamentos não pode exceder o valor final." }]);
+    }
+    const valorPendente = arredondar(Math.max(0, valorFinal - valorPago));
+
+    const parcelas = valorPendente > 0 ? this.montarParcelas(valorPendente, dados.totalParcelas ?? 1, dataVenda) : [];
+
     // Baixa o estoque item a item; se algum falhar (corrida entre a
     // pré-checagem e agora), desfaz (devolve) o que já foi baixado nesta
     // mesma tentativa antes de propagar o erro — nunca deixa a venda "meio
     // baixada". Ver "Pendências" no relatório sobre o limite desta estratégia
-    // sem transações multi-documento.
+    // sem transações multi-documento. Deliberadamente a ÚLTIMA validação
+    // antes de qualquer escrita (Etapa 10.4, seção 19/21 do pedido): todos os
+    // dados (itens, descontos, pagamentos/adquirente/parcelamento) já foram
+    // validados acima sem nenhum efeito colateral no banco.
     const baixados: { produtoId: string; varianteId: string; tamanhoId: string; quantidade: number }[] = [];
     try {
       for (const solicitado of dados.itens) {
@@ -190,37 +241,6 @@ export class VendasService {
       }
       throw erro;
     }
-
-    const valorBruto = arredondar(itensMontados.reduce((total, item) => total + item.precoOriginal * item.quantidade, 0));
-    const descontoPromocional = arredondar(
-      itensMontados.reduce((total, item) => total + (item.precoOriginal - item.precoPraticado) * item.quantidade, 0),
-    );
-    const descontoItensTotal = arredondar(itensMontados.reduce((total, item) => total + item.descontoItem, 0));
-    // Subtotal da venda = soma dos subtotais dos itens (seção 1, passo 5) —
-    // já reflete promoção E desconto de item; o desconto da venda incide
-    // sobre ESTE valor, nunca sobre `valorBruto` diretamente.
-    const subtotalVenda = arredondar(itensMontados.reduce((total, item) => total + item.subtotal, 0));
-    const descontoVenda = this.resolverDesconto(dados.descontoVenda, subtotalVenda, "descontoVenda");
-    const valorFinal = arredondar(subtotalVenda - descontoVenda);
-
-    const dataVenda = new Date();
-    const pagamentos: PagamentoVenda[] = (dados.pagamentos ?? []).map(
-      (pagamento) =>
-        ({
-          forma: pagamento.forma,
-          valor: arredondar(pagamento.valor),
-          dataPagamento: dataVenda,
-          parcelas: pagamento.parcelas ?? 1,
-          observacao: pagamento.observacao ?? null,
-        }) as PagamentoVenda,
-    );
-    const valorPago = arredondar(pagamentos.reduce((total, item) => total + item.valor, 0));
-    if (valorPago > valorFinal) {
-      throw ApiException.validation("Dados inválidos.", [{ field: "pagamentos", message: "A soma dos pagamentos não pode exceder o valor final." }]);
-    }
-    const valorPendente = arredondar(Math.max(0, valorFinal - valorPago));
-
-    const parcelas = valorPendente > 0 ? this.montarParcelas(valorPendente, dados.totalParcelas ?? 1, dataVenda) : [];
 
     const valor = await this.sequenciasService.proximoValor(CHAVE_SEQUENCIA_VENDA);
     const codigo = `${PREFIXO_CODIGO_VENDA}-${dataVenda.toISOString().slice(0, 10)}-${String(valor).padStart(DIGITOS_CODIGO_VENDA, "0")}`;
@@ -557,6 +577,126 @@ export class VendasService {
     }
 
     return valorMonetario;
+  }
+
+  /**
+   * Resolve e valida a modalidade estruturada de um pagamento (Etapa 10.4) e,
+   * quando débito/crédito, calcula e devolve o snapshot da tarifa aplicada
+   * (Etapa 10.5). NUNCA confia no que o PDV exibiu como opções válidas —
+   * sempre consulta o `AdquirentesService` de novo (nunca acesso direto ao
+   * Mongo de Adquirentes a partir daqui). `forma` continua sendo só o texto
+   * histórico/apresentacional e nunca é usado para decidir nenhuma regra
+   * abaixo.
+   *
+   * Retrocompatível: `modalidade` ausente/`null` = pagamento LEGADO — nenhuma
+   * das regras novas se aplica, `modalidade`/`adquirenteId`/`tarifaAplicada`
+   * são persistidos como `null` e `parcelas` mantém o comportamento de sempre
+   * (`?? 1`). Idem para "dinheiro"/"pix": nunca têm `tarifaAplicada` (nunca um
+   * objeto com percentual/valores zerados fingindo que houve tarifa).
+   *
+   * O cálculo (`valorTarifa = valorBruto × percentual / 100`,
+   * `valorLiquido = valorBruto - valorTarifa`) NUNCA reduz `pagamento.valor`
+   * — `valorPago`/`valorPendente`/`valorFinal` continuam inteiramente sobre o
+   * valor BRUTO (seção 1 do pedido); a tarifa é só informação financeira
+   * adicional guardada dentro do próprio pagamento.
+   */
+  private async validarPagamentoEstruturado(
+    pagamento: PagamentoSolicitado,
+    adquirentesCache: Map<string, AdquirenteRespostaPublica>,
+  ): Promise<{ modalidade: ModalidadePagamento | null; adquirenteId: string | null; parcelas: number; tarifaAplicada: TarifaAplicada | null }> {
+    if (pagamento.modalidade === undefined || pagamento.modalidade === null) {
+      return { modalidade: null, adquirenteId: null, parcelas: pagamento.parcelas ?? 1, tarifaAplicada: null };
+    }
+
+    if (!(MODALIDADES_PAGAMENTO as readonly string[]).includes(pagamento.modalidade)) {
+      throw ApiException.validation("Dados inválidos.", [{ field: "pagamentos", message: "Modalidade de pagamento inválida." }]);
+    }
+    const modalidade = pagamento.modalidade;
+
+    // "debito"/"credito" são exatamente as modalidades que existem na tabela
+    // de tarifas de um Adquirente (`MODALIDADES_TARIFA`) — é essa mesma lista
+    // (importada em `vendas.constants.ts`) que decide se a modalidade exige
+    // adquirente, nunca uma segunda lista hardcoded aqui.
+    const exigeAdquirente = modalidade === "debito" || modalidade === "credito";
+
+    if (!exigeAdquirente) {
+      if (pagamento.adquirenteId) {
+        throw ApiException.validation("Dados inválidos.", [
+          { field: "pagamentos", message: `Adquirente não deve ser informado para pagamento em ${modalidade === "dinheiro" ? "dinheiro" : "PIX"}.` },
+        ]);
+      }
+      return { modalidade, adquirenteId: null, parcelas: pagamento.parcelas ?? 1, tarifaAplicada: null };
+    }
+
+    if (!pagamento.adquirenteId) {
+      throw ApiException.validation("Dados inválidos.", [
+        { field: "pagamentos", message: `Adquirente é obrigatório para pagamento no ${modalidade === "credito" ? "crédito" : "débito"}.` },
+      ]);
+    }
+
+    let adquirente = adquirentesCache.get(pagamento.adquirenteId);
+    if (!adquirente) {
+      // `AdquirentesService.obterPorId` já lança NOT_FOUND se não existir —
+      // mesmo padrão de erro já usado em todo o projeto, sem código novo.
+      adquirente = await this.adquirentesService.obterPorId(pagamento.adquirenteId);
+      adquirentesCache.set(pagamento.adquirenteId, adquirente);
+    }
+    if (!adquirente.ativo) {
+      throw ApiException.validation("Dados inválidos.", [{ field: "pagamentos", message: "A adquirente informada está inativa." }]);
+    }
+
+    let parcelas: number;
+    if (modalidade === "debito") {
+      parcelas = pagamento.parcelas ?? 1;
+      if (parcelas !== 1) {
+        throw ApiException.validation("Dados inválidos.", [{ field: "pagamentos", message: "Pagamento no débito deve ser em 1 parcela." }]);
+      }
+    } else {
+      if (pagamento.parcelas === undefined || pagamento.parcelas === null) {
+        throw ApiException.validation("Dados inválidos.", [{ field: "pagamentos", message: "Parcelamento no crédito deve ser informado." }]);
+      }
+      if (pagamento.parcelas < 1 || pagamento.parcelas > 24) {
+        throw ApiException.validation("Dados inválidos.", [
+          { field: "pagamentos", message: "Parcelamento no crédito deve estar entre 1 e 24 parcelas." },
+        ]);
+      }
+      parcelas = pagamento.parcelas;
+    }
+
+    // A CONFIGURAÇÃO é a autoridade (seção 5 do pedido) — 6x só é válido se a
+    // adquirente tiver, de fato, uma tarifa cadastrada para (modalidade,
+    // parcelas), mesmo que 6 esteja dentro do intervalo genérico 1–24. Usa
+    // `find` (não `some`) porque a Etapa 10.5 precisa do `percentual` da
+    // entrada encontrada para calcular a tarifa logo abaixo — mesma consulta,
+    // sem uma segunda busca.
+    const entradaTarifa = adquirente.tabelaTarifas.find((tarifa) => tarifa.modalidade === modalidade && tarifa.parcelas === parcelas);
+    if (!entradaTarifa) {
+      const rotulo = modalidade === "credito" ? `Crédito em ${parcelas}x` : "Pagamento no débito";
+      throw ApiException.validation("Dados inválidos.", [
+        { field: "pagamentos", message: `${rotulo} não está configurado para esta adquirente.` },
+      ]);
+    }
+
+    // Etapa 10.5: `valorBruto` aqui é o mesmo `arredondar(pagamento.valor)`
+    // que o chamador (`criarInterno`) usa para `PagamentoVenda.valor` — a
+    // tarifa é calculada sobre o valor bruto DESTE pagamento, nunca sobre o
+    // total da venda (seção 10 do pedido: cada pagamento é independente).
+    const valorBruto = arredondar(pagamento.valor);
+    const valorTarifa = arredondar((valorBruto * entradaTarifa.percentual) / 100);
+    const valorLiquido = arredondar(valorBruto - valorTarifa);
+
+    const tarifaAplicada: TarifaAplicada = {
+      adquirenteId: adquirente.id,
+      adquirenteNome: adquirente.nome,
+      modalidade,
+      parcelas,
+      percentual: entradaTarifa.percentual,
+      valorBruto,
+      valorTarifa,
+      valorLiquido,
+    };
+
+    return { modalidade, adquirenteId: pagamento.adquirenteId, parcelas, tarifaAplicada };
   }
 
   private async devolverAoEstoque(item: ItemVenda, quantidade: number): Promise<void> {

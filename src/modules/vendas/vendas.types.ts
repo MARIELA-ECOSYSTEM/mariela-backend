@@ -1,4 +1,25 @@
-import type { TipoDesconto } from "./vendas.constants.js";
+import type { ModalidadeTarifa } from "../adquirentes/adquirentes.constants.js";
+import type { ModalidadePagamento, TipoDesconto } from "./vendas.constants.js";
+
+/**
+ * Snapshot histórico da tarifa efetivamente aplicada a um pagamento
+ * débito/crédito no momento da venda (Etapa 10.5) — NUNCA recalculado depois.
+ * Se a tabela de tarifas do adquirente mudar amanhã, esta venda continua
+ * preservando o percentual/valores vigentes quando ela foi criada (mesmo
+ * princípio de snapshot já usado em `ItemVenda`). `modalidade` aqui é
+ * `ModalidadeTarifa` (só "debito"/"credito") — nunca "dinheiro"/"pix", que
+ * nunca têm `tarifaAplicada` (sempre `null`).
+ */
+export interface TarifaAplicada {
+  adquirenteId: string;
+  adquirenteNome: string;
+  modalidade: ModalidadeTarifa;
+  parcelas: number;
+  percentual: number;
+  valorBruto: number;
+  valorTarifa: number;
+  valorLiquido: number;
+}
 
 /**
  * Formato compartilhado de desconto — usado tanto para o desconto de um item
@@ -26,11 +47,20 @@ export interface ItemVendaSolicitado {
   desconto?: Desconto;
 }
 
+/**
+ * `modalidade`/`adquirenteId` são ADITIVOS (Etapa 10.4) e opcionais — um
+ * pagamento legado sem eles continua funcionando exatamente como antes
+ * (`forma` livre, sem nenhuma das novas validações). Quando `modalidade` é
+ * informada, ela — nunca `forma` — é a autoridade para as regras de
+ * adquirente/parcelamento (ver `VendasService.validarPagamentoEstruturado`).
+ */
 export interface PagamentoSolicitado {
   forma: string;
   valor: number;
   parcelas?: number;
   observacao?: string;
+  modalidade?: ModalidadePagamento;
+  adquirenteId?: string;
 }
 
 /**

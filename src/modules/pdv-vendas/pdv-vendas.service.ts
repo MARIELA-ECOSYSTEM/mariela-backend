@@ -55,6 +55,8 @@ export class PdvVendasService {
         valor: pagamento.valor,
         parcelas: pagamento.parcelas,
         observacao: pagamento.observacao,
+        modalidade: pagamento.modalidade,
+        adquirenteId: pagamento.adquirenteId,
       })),
       totalParcelas: dto.totalParcelas,
       observacao: dto.observacao,

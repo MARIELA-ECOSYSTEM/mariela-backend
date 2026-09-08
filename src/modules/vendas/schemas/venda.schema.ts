@@ -1,7 +1,8 @@
 import { Prop, Schema, SchemaFactory } from "@nestjs/mongoose";
 import type { HydratedDocument, Types } from "mongoose";
 import { aplicarSerializacaoPadrao } from "../../../database/mongoose-json.util.js";
-import { STATUS_VENDA, TIPOS_EVENTO_VENDA, type StatusVenda, type TipoEventoVenda } from "../vendas.constants.js";
+import { MODALIDADES_TARIFA, type ModalidadeTarifa } from "../../adquirentes/adquirentes.constants.js";
+import { STATUS_VENDA, TIPOS_EVENTO_VENDA, MODALIDADES_PAGAMENTO, type ModalidadePagamento, type StatusVenda, type TipoEventoVenda } from "../vendas.constants.js";
 
 /**
  * Item vendido — SNAPSHOT histórico: preços, nome e categoria são copiados no
@@ -69,6 +70,42 @@ export class ItemVenda {
 export const ItemVendaSchema = SchemaFactory.createForClass(ItemVenda);
 aplicarSerializacaoPadrao(ItemVendaSchema);
 
+/**
+ * Snapshot histórico da tarifa aplicada a um pagamento débito/crédito (Etapa
+ * 10.5) — NUNCA recalculado depois de persistido, mesmo que a tabela de
+ * tarifas do adquirente mude no futuro (mesmo princípio de `ItemVenda`).
+ * `_id: false`: valor embutido, não uma entidade endereçável (mesmo padrão
+ * de `ItemDevolvido`/`CancelamentoVenda` abaixo) — por isso também não passa
+ * por `aplicarSerializacaoPadrao` (não há `_id`/`__v` para remover).
+ */
+@Schema({ _id: false })
+export class TarifaAplicada {
+  @Prop({ type: String, required: true })
+  adquirenteId!: string;
+
+  @Prop({ type: String, required: true })
+  adquirenteNome!: string;
+
+  @Prop({ type: String, required: true, enum: MODALIDADES_TARIFA })
+  modalidade!: ModalidadeTarifa;
+
+  @Prop({ type: Number, required: true })
+  parcelas!: number;
+
+  @Prop({ type: Number, required: true })
+  percentual!: number;
+
+  @Prop({ type: Number, required: true })
+  valorBruto!: number;
+
+  @Prop({ type: Number, required: true })
+  valorTarifa!: number;
+
+  @Prop({ type: Number, required: true })
+  valorLiquido!: number;
+}
+export const TarifaAplicadaSchema = SchemaFactory.createForClass(TarifaAplicada);
+
 @Schema({ _id: true })
 export class PagamentoVenda {
   @Prop({ type: String, required: true })
@@ -85,6 +122,29 @@ export class PagamentoVenda {
 
   @Prop({ type: String, default: null })
   observacao!: string | null;
+
+  /**
+   * Modalidade estruturada (Etapa 10.4) — ADITIVA e OPCIONAL: `null` em
+   * pagamentos legados (só `forma` livre, sem nenhuma das novas regras) e nos
+   * dois únicos casos sem adquirente (`dinheiro`/`pix`, onde não é obrigatória
+   * mas pode ser informada). Quando presente, é a AUTORIDADE para as regras
+   * de adquirente/parcelamento — `forma` continua sendo só o texto histórico/
+   * apresentacional, nunca usado para decidir regra de negócio.
+   */
+  @Prop({ type: String, enum: [...MODALIDADES_PAGAMENTO, null], default: null })
+  modalidade!: ModalidadePagamento | null;
+
+  /** Obrigatório quando `modalidade` é "debito"/"credito"; sempre `null` para "dinheiro"/"pix"/legado. */
+  @Prop({ type: String, default: null })
+  adquirenteId!: string | null;
+
+  /**
+   * Snapshot da tarifa (Etapa 10.5) — só existe quando `modalidade` é
+   * "debito"/"credito"; sempre `null` para "dinheiro"/"pix"/legado (nunca um
+   * objeto com percentual/valores zerados fingindo que houve tarifa).
+   */
+  @Prop({ type: TarifaAplicadaSchema, default: null })
+  tarifaAplicada!: TarifaAplicada | null;
 }
 export const PagamentoVendaSchema = SchemaFactory.createForClass(PagamentoVenda);
 aplicarSerializacaoPadrao(PagamentoVendaSchema);

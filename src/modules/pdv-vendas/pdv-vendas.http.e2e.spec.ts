@@ -83,6 +83,8 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     await connection.collection("caixas").deleteMany({});
     await connection.collection("movimentos_caixa").deleteMany({});
     await connection.collection("eventos_caixa").deleteMany({});
+    await connection.collection("adquirentes").deleteMany({});
+    await connection.collection("eventos_adquirente").deleteMany({});
     await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "caixa", "usuario"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
@@ -120,6 +122,19 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
 
   async function abrirCaixaViaPdv(token: string, valorInicial = 1000): Promise<string> {
     const resposta = await fetch(`${baseUrl}/api/v1/pdv/caixa/abertura`, { method: "POST", headers: jsonHeaders(token), body: JSON.stringify({ valorInicial }) });
+    const corpo = (await resposta.json()) as { data: { id: string } };
+    return corpo.data.id;
+  }
+
+  async function criarAdquirenteViaHttp(
+    tabelaTarifas: { modalidade: "debito" | "credito"; parcelas: number; percentual: number }[],
+    ativo = true,
+  ): Promise<string> {
+    const resposta = await fetch(`${baseUrl}/api/v1/adquirentes`, {
+      method: "POST",
+      headers: jsonHeaders(adminAccessToken),
+      body: JSON.stringify({ nome: `Adquirente HTTP PDV Vendas ${Date.now()}-${Math.random()}`, ativo, tabelaTarifas }),
+    });
     const corpo = (await resposta.json()) as { data: { id: string } };
     return corpo.data.id;
   }
@@ -458,6 +473,259 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     // `forbidNonWhitelisted` já rejeita a requisição inteira (defesa mais
     // forte que apenas ignorar o campo).
     expect(resposta.status).toBe(400);
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.4: crédito válido com adquirente e parcelas configuradas → 201", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(300, 5);
+    const adquirenteId = await criarAdquirenteViaHttp([{ modalidade: "credito", parcelas: 3, percentual: 5.19 }]);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId, parcelas: 3, valor: 300 }],
+      }),
+    });
+    expect(resposta.status).toBe(201);
+    const corpo = (await resposta.json()) as { data: { pagamentos: { modalidade: string; adquirenteId: string; parcelas: number }[] } };
+    expect(corpo.data.pagamentos[0]?.modalidade).toBe("credito");
+    expect(corpo.data.pagamentos[0]?.adquirenteId).toBe(adquirenteId);
+    expect(corpo.data.pagamentos[0]?.parcelas).toBe(3);
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.4: crédito com parcela NÃO configurada → 400", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+    const adquirenteId = await criarAdquirenteViaHttp([{ modalidade: "credito", parcelas: 1, percentual: 3.49 }]);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId, parcelas: 5, valor: 100 }],
+      }),
+    });
+    const corpo = (await resposta.json()) as { code: string };
+    expect(resposta.status).toBe(400);
+    expect(corpo.code).toBe("VALIDATION_ERROR");
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.4: débito com parcela diferente de 1 → 400", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+    const adquirenteId = await criarAdquirenteViaHttp([{ modalidade: "debito", parcelas: 1, percentual: 1.99 }]);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Débito", modalidade: "debito", adquirenteId, parcelas: 2, valor: 100 }],
+      }),
+    });
+    const corpo = (await resposta.json()) as { code: string };
+    expect(resposta.status).toBe(400);
+    expect(corpo.code).toBe("VALIDATION_ERROR");
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.4: crédito sem adquirente → 400", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Crédito", modalidade: "credito", parcelas: 1, valor: 100 }],
+      }),
+    });
+    const corpo = (await resposta.json()) as { code: string };
+    expect(resposta.status).toBe(400);
+    expect(corpo.code).toBe("VALIDATION_ERROR");
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.4: adquirente inativa → 400", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+    const adquirenteId = await criarAdquirenteViaHttp([{ modalidade: "debito", parcelas: 1, percentual: 1.99 }], false);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Débito", modalidade: "debito", adquirenteId, valor: 100 }],
+      }),
+    });
+    const corpo = (await resposta.json()) as { code: string };
+    expect(resposta.status).toBe(400);
+    expect(corpo.code).toBe("VALIDATION_ERROR");
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.4: adquirente inexistente → 404", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Débito", modalidade: "debito", adquirenteId: "65f1a2b3c4d5e6f7a8b9c0d1", valor: 100 }],
+      }),
+    });
+    expect(resposta.status).toBe(404);
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.4: dinheiro sem adquirente continua funcionando → 201", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Dinheiro", modalidade: "dinheiro", valor: 100 }],
+      }),
+    });
+    expect(resposta.status).toBe(201);
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.4: payload legado (sem modalidade em nenhum pagamento) continua funcionando → 201", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+      }),
+    });
+    expect(resposta.status).toBe(201);
+    const corpo = (await resposta.json()) as { data: { pagamentos: { modalidade: string | null }[] } };
+    expect(corpo.data.pagamentos[0]?.modalidade).toBeNull();
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.5: crédito com adquirente/parcelas configuradas → tarifaAplicada correta na resposta HTTP", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(300, 5);
+    const adquirenteId = await criarAdquirenteViaHttp([{ modalidade: "credito", parcelas: 6, percentual: 5 }]);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId, parcelas: 6, valor: 300 }],
+      }),
+    });
+    expect(resposta.status).toBe(201);
+    const corpo = (await resposta.json()) as {
+      data: {
+        valorPago: number;
+        pagamentos: {
+          modalidade: string;
+          adquirenteId: string;
+          parcelas: number;
+          valor: number;
+          tarifaAplicada: {
+            adquirenteId: string;
+            adquirenteNome: string;
+            modalidade: string;
+            parcelas: number;
+            percentual: number;
+            valorBruto: number;
+            valorTarifa: number;
+            valorLiquido: number;
+          } | null;
+        }[];
+      };
+    };
+    const pagamento = corpo.data.pagamentos[0];
+    expect(pagamento?.valor).toBe(300); // bruto — a tarifa nunca reduz o pagamento
+    expect(corpo.data.valorPago).toBe(300);
+    expect(pagamento?.tarifaAplicada).not.toBeNull();
+    expect(pagamento?.tarifaAplicada?.adquirenteId).toBe(adquirenteId);
+    expect(pagamento?.tarifaAplicada?.modalidade).toBe("credito");
+    expect(pagamento?.tarifaAplicada?.parcelas).toBe(6);
+    expect(pagamento?.tarifaAplicada?.percentual).toBe(5);
+    expect(pagamento?.tarifaAplicada?.valorBruto).toBe(300);
+    expect(pagamento?.tarifaAplicada?.valorTarifa).toBe(15);
+    expect(pagamento?.tarifaAplicada?.valorLiquido).toBe(285);
+
+    await fecharCaixaAbertoSeExistir();
+  });
+
+  it("Etapa 10.5: PIX/dinheiro continuam com tarifaAplicada null na resposta HTTP", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "PIX", modalidade: "pix", valor: 100 }],
+      }),
+    });
+    expect(resposta.status).toBe(201);
+    const corpo = (await resposta.json()) as { data: { pagamentos: { tarifaAplicada: unknown }[] } };
+    expect(corpo.data.pagamentos[0]?.tarifaAplicada).toBeNull();
 
     await fecharCaixaAbertoSeExistir();
   });

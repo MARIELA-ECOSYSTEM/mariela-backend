@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 import { MongooseModule } from "@nestjs/mongoose";
+import { AdquirentesModule } from "../adquirentes/adquirentes.module.js";
 import { CaixasModule } from "../caixas/caixas.module.js";
 import { ClientesModule } from "../clientes/clientes.module.js";
 import { ProdutosModule } from "../produtos/produtos.module.js";
@@ -25,6 +26,11 @@ import { Venda, VendaSchema } from "./schemas/venda.schema.js";
     ClientesModule,
     VendedoresModule,
     CaixasModule,
+    // Consulta de adquirente/tabela de tarifas para validar pagamentos
+    // estruturados (Etapa 10.4) — só leitura, nunca acesso direto ao Mongo de
+    // Adquirentes a partir de Vendas (mesmo padrão de reuso cross-módulo já
+    // usado para Produtos/Clientes/Vendedores/Caixa acima).
+    AdquirentesModule,
   ],
   controllers: [VendasController],
   providers: [VendasService, VendasRepository],
