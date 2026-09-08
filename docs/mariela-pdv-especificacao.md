@@ -1,9 +1,27 @@
 # MARIELA PDV — Especificação Técnica (v1)
 
-> **Status: ESPECIFICAÇÃO — nenhum código de produção foi escrito nesta etapa.**
-> Auditoria realizada em 2026-09-07 contra o estado real do backend (`backend/src/modules/`) no branch `docs/fix-readme-bun-setup`, commit `fcc80e4` ("desenvolviment do backend").
+> **Status: IMPLEMENTADO.** Os módulos `pdv-auth`, `pdv-caixa`, `pdv-produtos`, `pdv-clientes` e `pdv-vendas` existem em `src/modules/` e estão registrados em `app.module.ts`. `bun install && bun run typecheck && bun run build && bun test` passam (617 testes, 0 falhas) na Etapa 08.2 (auditoria de 2026-09-07).
 >
-> Este documento é o contrato definitivo para a implementação do MARIELA PDV. Qualquer decisão arquitetural relevante já foi tomada aqui; a próxima etapa é "implemente o módulo X exatamente conforme esta especificação", módulo por módulo, seguindo o plano na seção S.
+> O texto abaixo (seções A–S) é o rascunho de especificação original desta v1 e permanece como referência histórica das decisões arquiteturais — mas **não foi escrito contra o código real deste repositório** (cita commit `fcc80e4`, que não existe no histórico do projeto) e diverge da implementação em alguns pontos pontuais. **A seção "Divergências confirmadas" logo abaixo tem precedência sobre qualquer trecho conflitante mais adiante no documento.**
+
+---
+
+## Divergências confirmadas na auditoria da Etapa 08.2 (2026-09-07)
+
+Comparação direta entre este documento e o código em `src/modules/pdv-*`. Onde os dois discordam, **o código (e o contrato abaixo) é a fonte de verdade**:
+
+1. **`GET /pdv/me` não existe — o endpoint real é `GET /pdv/auth/me`** (`PdvAuthController`, mesmo controller de login/refresh/logout). Não criar um segundo endpoint `/pdv/me`.
+2. **Login é só por código** (`{ codigo, senha }`, `LoginPdvDto`) — telefone não é aceito como credencial. A decisão C.4 ("telefone OU código") do rascunho não foi implementada; `VendedoresService.verificarSenha(codigo, senha)` e `VendedoresRepository.encontrarPorCodigo` só resolvem por código.
+3. **`POST /pdv/clientes` NÃO existe** — `PdvClientesController` só expõe `GET /pdv/clientes` (somente leitura). Cadastro de cliente continua exclusivo do Backoffice (`POST /clientes`). Decisão confirmada e mantida na Etapa 08.2: não criar este endpoint.
+4. **`GET /pdv/vendas/minhas` NÃO existe** — nenhum endpoint de consulta de vendas é exposto ao PDV nesta v1. Decisão confirmada e mantida na Etapa 08.2: não criar este endpoint.
+5. **`GET /pdv/produtos/:id/variantes` NÃO existe e não deve ser criado** — o detalhe de variantes/tamanhos já vem embutido na resposta de `GET /pdv/produtos/:id`.
+6. **`GET /pdv/caixa/atual` devolve `200 { "data": null }`** quando nenhum caixa está aberto — não `404`. `PdvCaixaService.atual()` delega em `CaixasService.obterAtual()`, que retorna `null` sem lançar.
+7. **`GET /pdv/produtos` e `GET /pdv/produtos/:id` NÃO filtram variantes/tamanhos com `quantidade === 0`** — todos os tamanhos cadastrados aparecem, cada um com um campo `disponivel: boolean` (`quantidade > 0`) para o frontend decidir a exibição. A decisão do rascunho ("excluir da resposta") não foi implementada; a alternativa (expor tudo + flag) é a que está em produção e testada.
+8. **Idempotência de `POST /pdv/vendas` tem DUAS camadas, não uma** (mais forte que o "bugfix pontual" descrito na seção M):
+   - `VendasService.criar` mantém um `Map` em memória (`criacoesEmAndamento`) de `idempotencyKey → Promise` em andamento: uma segunda chamada com a MESMA chave, chegando enquanto a primeira ainda está em execução no mesmo processo, aguarda e recebe o MESMO resultado (nunca reexecuta baixa de estoque/lançamento de caixa).
+   - `VendasRepository.criar` também captura o erro Mongo `11000` no índice único parcial `idempotencyKey` (`venda.schema.ts`) e devolve a venda vencedora da corrida — cobre o caso em que duas gravações concorrentes escapam da deduplicação em memória.
+   - Ambos os mecanismos têm teste de integração dedicado (`vendas.service.spec.ts`, `pdv-vendas.service.spec.ts`): retry sequencial e requisições concorrentes reais (`Promise.all`) com a mesma chave.
+9. Todos os 9 contratos HTTP exigidos (`/pdv/auth/{login,refresh,logout,me}`, `/pdv/caixa/{atual,abertura}`, `/pdv/produtos{,/:id}`, `/pdv/clientes`, `/pdv/vendas`) estão implementados, protegidos por `PdvJwtAuthGuard`, e cobertos por testes unitários + HTTP e2e reais (servidor Nest real, MongoDB real em `mariela_test`).
 
 ---
 
