@@ -4,6 +4,7 @@ import { JwtModule } from "@nestjs/jwt";
 import configuration, { type Configuration } from "./config/configuration.js";
 import { validateEnv } from "./config/env.validation.js";
 import { DatabaseModule } from "./database/database.module.js";
+import { AdquirentesModule } from "./modules/adquirentes/adquirentes.module.js";
 import { AuthModule } from "./modules/auth/auth.module.js";
 import { CaixasModule } from "./modules/caixas/caixas.module.js";
 import { CampanhasModule } from "./modules/campanhas/campanhas.module.js";
@@ -44,6 +45,7 @@ import { VendedoresModule } from "./modules/vendedores/vendedores.module.js";
     }),
     SaudeModule,
     AuthModule,
+    AdquirentesModule,
     ProdutosModule,
     EstoqueModule,
     ClientesModule,
