@@ -217,6 +217,21 @@ export class ItemDevolvido {
 
   @Prop({ type: Number, required: true })
   valor!: number;
+
+  /**
+   * Etapa 10.13 — marca se o estoque desta linha JÁ foi fisicamente
+   * devolvido (`ProdutosService.ajustarQuantidadeTamanho`). `false` até a
+   * restauração de fato acontecer; vira `true` via uma atualização atômica
+   * dedicada (`VendasRepository.marcarItemDevolvidoRestaurado`), NUNCA junto
+   * com a gravação do cancelamento em si — isso é o que permite recuperar um
+   * cancelamento que persistiu mas caiu antes de restaurar o estoque (ou
+   * restaurou só parte dos itens) sem jamais devolver a mesma unidade duas
+   * vezes num retry/reconciliação. `default: true` para qualquer venda
+   * cancelada ANTES desta etapa (nunca existiram sem estoque já restaurado
+   * pelo fluxo síncrono antigo) — nunca reabre uma restauração antiga.
+   */
+  @Prop({ type: Boolean, default: true })
+  restaurado!: boolean;
 }
 export const ItemDevolvidoSchema = SchemaFactory.createForClass(ItemDevolvido);
 
@@ -239,6 +254,17 @@ export class CancelamentoVenda {
 
   @Prop({ type: [ItemDevolvidoSchema], default: [] })
   itens!: ItemDevolvido[];
+
+  /**
+   * Chave de idempotência do CANCELAMENTO (Etapa 10.13) — `null` para
+   * cancelamentos legados (sem chave) ou qualquer venda anterior a esta
+   * etapa. Permite reconhecer um retry da MESMA operação lógica (mesmo
+   * `vendaId` + mesma chave) e reconciliar efeitos faltantes (estoque/caixa)
+   * em vez de rejeitar com "venda já cancelada" ou, pior, tentar cancelar de
+   * novo.
+   */
+  @Prop({ type: String, default: null })
+  idempotencyKey!: string | null;
 }
 export const CancelamentoVendaSchema = SchemaFactory.createForClass(CancelamentoVenda);
 

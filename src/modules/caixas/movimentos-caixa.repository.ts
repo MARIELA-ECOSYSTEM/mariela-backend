@@ -28,19 +28,26 @@ export class MovimentosCaixaRepository {
   constructor(@InjectModel(MovimentoCaixa.name) private readonly movimentoModel: Model<MovimentoCaixaDocument>) {}
 
   /**
-   * Cria o movimento; se `idempotencyKey` já existir para este caixa (retry
-   * de uma requisição anterior), devolve o movimento JÁ CRIADO em vez de
-   * duplicar — nunca lança erro para esse caso (é o comportamento esperado
-   * de uma chave de idempotência, não uma falha).
+   * Cria o movimento; se `idempotencyKey` já existir (retry de uma
+   * requisição anterior), devolve o movimento JÁ CRIADO em vez de duplicar —
+   * nunca lança erro para esse caso (é o comportamento esperado de uma chave
+   * de idempotência, não uma falha).
    *
    * Tenta inserir diretamente (sem pré-checagem "existe? → insere", que tem
    * uma janela de corrida real: duas requisições concorrentes podem passar
    * pela checagem antes de qualquer uma terminar de escrever). O índice
-   * único parcial `{caixaId, idempotencyKey}` (`movimento-caixa.schema.ts`)
-   * garante que só uma gravação vence; a outra recebe erro Mongo `11000`,
-   * capturado aqui e traduzido no movimento que efetivamente venceu a
-   * corrida, em vez de propagar um 500 — mesmo padrão já usado por
-   * `VendasRepository.criar` para `idempotencyKey` de Venda.
+   * único parcial `{idempotencyKey}` (Etapa 10.13 — GLOBAL, não mais por
+   * caixa; ver `movimento-caixa.schema.ts`) garante que só uma gravação
+   * vence; a outra recebe erro Mongo `11000`, capturado aqui e traduzido no
+   * movimento que efetivamente venceu a corrida, em vez de propagar um 500 —
+   * mesmo padrão já usado por `VendasRepository.criar` para `idempotencyKey`
+   * de Venda.
+   *
+   * A busca do vencedor é SÓ por `idempotencyKey` (nunca mais filtrada por
+   * `caixaId`): o movimento original pode ter sido lançado num caixa que já
+   * fechou, diferente do `dados.caixaId` desta tentativa (o caixa atualmente
+   * aberto) — filtrar por `caixaId` aqui faria essa busca não encontrar nada
+   * e o erro 11000 vazaria como se fosse uma falha real.
    */
   async criar(dados: DadosCriarMovimento): Promise<ResultadoCriarMovimento> {
     try {
@@ -48,9 +55,7 @@ export class MovimentosCaixaRepository {
       return { movimento, duplicado: false };
     } catch (erro) {
       if (dados.idempotencyKey && this.ehErroDeIdempotencyKeyDuplicada(erro)) {
-        const existente = await this.movimentoModel
-          .findOne({ caixaId: dados.caixaId, idempotencyKey: dados.idempotencyKey })
-          .exec();
+        const existente = await this.movimentoModel.findOne({ idempotencyKey: dados.idempotencyKey }).exec();
         if (existente) return { movimento: existente, duplicado: true };
       }
       throw erro;
@@ -92,8 +97,9 @@ export class MovimentosCaixaRepository {
   }
 
   /**
-   * `MovimentoCaixa` tem um único índice único hoje: `{caixaId, idempotencyKey}`
-   * (parcial, só quando `idempotencyKey` é string — ver o schema). Só trata
+   * `MovimentoCaixa` tem um único índice único hoje: `{idempotencyKey}`
+   * (parcial/global desde a Etapa 10.13, só quando `idempotencyKey` é string
+   * — ver o schema). Só trata
    * como "conflito de idempotência recuperável" quando o índice em erro
    * INCLUI `idempotencyKey` — mesma técnica (e mesmo motivo) de
    * `VendasRepository.ehErroDeIdempotencyKeyDuplicada`: um 11000 em outro

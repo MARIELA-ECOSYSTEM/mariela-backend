@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import type { Connection } from "mongoose";
+import { Types, type Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { AdquirentesService } from "../adquirentes/adquirentes.service.js";
@@ -3354,7 +3354,10 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(segunda.pagamentos.filter((p) => p.idempotencyKey === chave)).toHaveLength(1);
 
       const movimentos = await movimentosDaVenda(venda.id);
-      const doRecebimento = movimentos.filter((m) => m["idempotencyKey"] === `${chave}:recebimento`);
+      // Etapa 10.13: a chave derivada agora é prefixada pela venda
+      // (`${vendaId}:recebimento:${chave}`) para sustentar a unicidade
+      // GLOBAL do índice de MovimentoCaixa (não mais por caixa).
+      const doRecebimento = movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`);
       expect(doRecebimento).toHaveLength(1); // também não duplicou no caixa
       await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
     });
@@ -3365,7 +3368,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const primeira = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 200, idempotencyKey: chave }, null);
       const movimentosOriginais = await movimentosDaVenda(primeira.id);
-      const doRecebimentoOriginal = movimentosOriginais.find((m) => m["idempotencyKey"] === `${chave}:recebimento`)!;
+      const doRecebimentoOriginal = movimentosOriginais.find((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`)!;
       expect(doRecebimentoOriginal).toBeDefined();
 
       // Simula "processo morreu depois de salvar a venda, antes de lançar o caixa".
@@ -3375,7 +3378,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(retry.valorPago).toBe(700); // não recontou
 
       const movimentosFinais = await movimentosDaVenda(retry.id);
-      const recriado = movimentosFinais.filter((m) => m["idempotencyKey"] === `${chave}:recebimento`);
+      const recriado = movimentosFinais.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`);
       expect(recriado).toHaveLength(1); // recriou o que faltava, sem duplicar
       await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
     });
@@ -4171,7 +4174,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(segunda.valorPago).toBe(300); // não dobrou
 
       const movimentos = await movimentosDaVenda(venda.id);
-      const doRecebimento = movimentos.filter((m) => m["idempotencyKey"] === `${chave}:recebimento`);
+      const doRecebimento = movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`);
       expect(doRecebimento).toHaveLength(1);
       await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
     });
@@ -4181,5 +4184,874 @@ describe("VendasService (integração — MongoDB real)", () => {
     // alterada por esta consolidação, apenas o ponto de resolução do caixa em
     // `receberPagamento`/`baixarParcela` (antes `venda.caixaId`, agora o
     // caixa atualmente aberto).
+  });
+
+  describe("cancelamento no caixa atual + baixa de parcela estruturada (Etapa 10.11)", () => {
+    async function movimentosDaVenda(vendaId: string) {
+      return connection.collection("movimentos_caixa").find({ vendaId }).toArray();
+    }
+
+    describe("cancelamento: caixa atual, nunca venda.caixaId", () => {
+      it("A. Caixa A fechado + Caixa B aberto: cancelamento lança o movimento no Caixa B, nenhum no Caixa A", async () => {
+        const produto = await criarProdutoComEstoque(200, 5);
+        const vendedor = await criarVendedor();
+        const caixaA = await abrirCaixa();
+
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixaA.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+          },
+          null,
+        );
+        expect(venda.caixaId).toBe(caixaA.id); // venda.caixaId continua sendo o caixa ORIGINAL
+
+        await caixasService.fechar(caixaA.id, { valorInformado: 1200 }, null);
+        const caixaB = await abrirCaixa();
+
+        const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste A" }, null);
+        expect(cancelada.status).toBe("cancelada");
+        expect(cancelada.caixaId).toBe(caixaA.id); // venda.caixaId NUNCA muda de significado
+
+        const movimentos = await movimentosDaVenda(venda.id);
+        const doCancelamento = movimentos.find((m) => m["tipo"] === "cancelamento");
+        expect(String(doCancelamento?.["caixaId"])).toBe(caixaB.id);
+        expect(String(doCancelamento?.["caixaId"])).not.toBe(caixaA.id);
+        await caixasService.fechar(caixaB.id, { valorInformado: 800 }, null); // 1000 - 200 devolvidos
+      });
+
+      it("B. nenhum caixa aberto: cancelamento rejeitado, venda e estoque intactos, nenhum movimento", async () => {
+        const produto = await criarProdutoComEstoque(150, 5);
+        const vendedor = await criarVendedor();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 150 }],
+          },
+          null,
+        );
+        await caixasService.fechar(caixa.id, { valorInformado: 1150 }, null); // nenhum caixa fica aberto
+
+        await expect(service.cancelar(venda.id, { tipo: "integral", motivo: "Teste B" }, null)).rejects.toThrow(ApiException);
+
+        const recarregada = await service.obterPorId(venda.id);
+        expect(recarregada.status).toBe("concluida"); // não mudou
+        const atualizado = await produtosService.obterPorId(produto.produtoId);
+        const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
+        expect(tamanho.quantidade).toBe(4); // estoque intacto (não devolvido)
+        const movimentos = await movimentosDaVenda(venda.id);
+        expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(0);
+
+        const caixaFinal = await abrirCaixa();
+        await caixasService.fechar(caixaFinal.id, { valorInformado: 1000 }, null);
+      });
+
+      it("C. cancelamento concorrente: estoque restaurado uma única vez (com caixa atual)", async () => {
+        const produto = await criarProdutoComEstoque(100, 3);
+        const vendedor = await criarVendedor();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 3 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 300 }],
+          },
+          null,
+        );
+
+        const resultados = await Promise.allSettled([
+          service.cancelar(venda.id, { tipo: "integral", motivo: "Concorrente 1" }, null),
+          service.cancelar(venda.id, { tipo: "integral", motivo: "Concorrente 2" }, null),
+        ]);
+        expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+        expect(resultados.filter((r) => r.status === "rejected")).toHaveLength(1);
+
+        const atualizado = await produtosService.obterPorId(produto.produtoId);
+        const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
+        expect(tamanho.quantidade).toBe(3); // nunca 6
+
+        const movimentos = await movimentosDaVenda(venda.id);
+        expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1);
+        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      });
+
+      it("D. cancelamento com descontoItem devolve o valor efetivo (subtotal), no caixa atual", async () => {
+        const produto = await criarProdutoComEstoque(100, 5);
+        const vendedor = await criarVendedor();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [
+              {
+                produtoId: produto.produtoId,
+                varianteId: produto.varianteId,
+                tamanhoId: produto.tamanhoId,
+                quantidade: 1,
+                desconto: { tipo: "valor", valor: 20 },
+              },
+            ],
+            pagamentos: [{ forma: "Dinheiro", valor: 80 }],
+          },
+          null,
+        );
+        const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste D" }, null);
+        expect(cancelada.valorDevolvido).toBe(80); // nunca 100
+        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      });
+
+      it("E. cancelamento com descontoVenda preserva o rateio proporcional (Etapa 10.9), no caixa atual", async () => {
+        const produtoA = await criarProdutoComEstoque(100, 5);
+        const produtoB = await criarProdutoComEstoque(200, 5);
+        const vendedor = await criarVendedor();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [
+              { produtoId: produtoA.produtoId, varianteId: produtoA.varianteId, tamanhoId: produtoA.tamanhoId, quantidade: 1 },
+              { produtoId: produtoB.produtoId, varianteId: produtoB.varianteId, tamanhoId: produtoB.tamanhoId, quantidade: 1 },
+            ],
+            descontoVenda: { tipo: "valor", valor: 30 },
+            pagamentos: [{ forma: "Dinheiro", valor: 270 }],
+          },
+          null,
+        );
+        const itemA = venda.itens.find((i) => i.produtoId === produtoA.produtoId)!;
+        const devolvida = await service.cancelar(
+          venda.id,
+          { tipo: "parcial", motivo: "Teste E", itens: [{ itemId: String(itemA._id), quantidade: 1 }] },
+          null,
+        );
+        expect(devolvida.cancelamento?.valorDevolvido).toBe(90); // 100 × (270/300)
+        await caixasService.fechar(caixa.id, { valorInformado: 1180 }, null); // 1000 + 270 - 90
+      });
+
+      it("F. tarifa de adquirente nunca reduz o valor devolvido, no caixa atual", async () => {
+        const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 10 }] });
+        const produto = await criarProdutoComEstoque(1000, 5);
+        const vendedor = await criarVendedor();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 1000 }],
+          },
+          null,
+        );
+        const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste F" }, null);
+        expect(cancelada.valorDevolvido).toBe(1000); // bruto, nunca 900 (líquido)
+        const detalhe = await caixasService.obterDetalhe(caixa.id);
+        expect(detalhe.resumo.devolucoes).toBe(1000);
+        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      });
+    });
+
+    describe("baixarParcela: pagamento estruturado + tarifa + caixa atual", () => {
+      async function venderComUmaParcela(valorItem: number, valorPagoNaCriacao: number) {
+        const produto = await criarProdutoComEstoque(valorItem, 5);
+        const vendedor = await criarVendedor();
+        const cliente = await criarCliente();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            clienteId: cliente.id,
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: valorPagoNaCriacao }],
+          },
+          null,
+        );
+        const parcelaId = String(venda.parcelas[0]!._id);
+        return { venda, parcelaId, caixa };
+      }
+
+      it("G. contrato legado { valor } continua funcionando — tarifaAplicada null", async () => {
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(300, 100); // parcela = 200
+        const atualizada = await service.baixarParcela(venda.id, parcelaId, { valor: 200 }, null);
+        expect(atualizada.status).toBe("concluida");
+        expect(atualizada.pagamentos[atualizada.pagamentos.length - 1]?.tarifaAplicada).toBeNull();
+        expect(atualizada.pagamentos[atualizada.pagamentos.length - 1]?.modalidade).toBeNull();
+        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      });
+
+      it("H. dinheiro: funciona, tarifaAplicada null", async () => {
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(300, 100);
+        const atualizada = await service.baixarParcela(venda.id, parcelaId, { modalidade: "dinheiro" }, null);
+        expect(atualizada.status).toBe("concluida");
+        expect(atualizada.pagamentos[atualizada.pagamentos.length - 1]?.tarifaAplicada).toBeNull();
+        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      });
+
+      it("I. PIX: funciona, tarifaAplicada null", async () => {
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(300, 100);
+        const atualizada = await service.baixarParcela(venda.id, parcelaId, { modalidade: "pix" }, null);
+        expect(atualizada.status).toBe("concluida");
+        expect(atualizada.pagamentos[atualizada.pagamentos.length - 1]?.tarifaAplicada).toBeNull();
+        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      });
+
+      it("J. débito + adquirente: tarifa calculada corretamente", async () => {
+        const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "debito", parcelas: 1, percentual: 1.99 }] });
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(500, 300); // parcela = 200
+        const atualizada = await service.baixarParcela(venda.id, parcelaId, { modalidade: "debito", adquirenteId: adquirente.id }, null);
+        const pagamento = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
+        expect(pagamento.tarifaAplicada?.valorTarifa).toBe(3.98); // 200 × 1,99%
+        expect(pagamento.tarifaAplicada?.valorLiquido).toBe(196.02);
+        await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+      });
+
+      it("K. crédito 6x + adquirente: usa a tarifa da configuração 6x", async () => {
+        const adquirente = await criarAdquirente({
+          tabelaTarifas: [
+            { modalidade: "credito", parcelas: 1, percentual: 3.49 },
+            { modalidade: "credito", parcelas: 6, percentual: 5 },
+          ],
+        });
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(1200, 600); // parcela = 600
+        const atualizada = await service.baixarParcela(
+          venda.id,
+          parcelaId,
+          { modalidade: "credito", adquirenteId: adquirente.id, parcelas: 6 },
+          null,
+        );
+        const pagamento = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
+        expect(pagamento.tarifaAplicada?.percentual).toBe(5);
+        expect(pagamento.tarifaAplicada?.valorTarifa).toBe(30); // 600 × 5%, nunca a de 1x (3,49%)
+        await caixasService.fechar(caixa.id, { valorInformado: 2200 }, null);
+      });
+
+      it("L. crédito sem adquirente é rejeitado (VALIDATION_ERROR)", async () => {
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(300, 100);
+        await expect(service.baixarParcela(venda.id, parcelaId, { modalidade: "credito", parcelas: 1 }, null)).rejects.toThrow(ApiException);
+        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null); // parcela não foi baixada, nada mudou
+      });
+
+      it("M. crédito com parcelamento NÃO configurado é rejeitado", async () => {
+        const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 3.49 }] });
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(300, 100);
+        await expect(
+          service.baixarParcela(venda.id, parcelaId, { modalidade: "credito", adquirenteId: adquirente.id, parcelas: 3 }, null),
+        ).rejects.toThrow(ApiException);
+        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      });
+
+      it("N. adquirente inativa é rejeitada", async () => {
+        const adquirente = await criarAdquirente({ ativo: false, tabelaTarifas: [{ modalidade: "debito", parcelas: 1, percentual: 1.99 }] });
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(300, 100);
+        await expect(service.baixarParcela(venda.id, parcelaId, { modalidade: "debito", adquirenteId: adquirente.id }, null)).rejects.toThrow(
+          ApiException,
+        );
+        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      });
+
+      it("O. adquirente inexistente retorna NOT_FOUND", async () => {
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(300, 100);
+        let erro: unknown = null;
+        try {
+          await service.baixarParcela(venda.id, parcelaId, { modalidade: "debito", adquirenteId: "65f1a2b3c4d5e6f7a8b9c0d1" }, null);
+        } catch (capturado) {
+          erro = capturado;
+        }
+        expect(erro).toBeInstanceOf(ApiException);
+        expect((erro as ApiException).code).toBe("NOT_FOUND");
+        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      });
+
+      it("P. valor informado maior que o valor da parcela é rejeitado", async () => {
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(300, 100); // parcela = 200
+        await expect(service.baixarParcela(venda.id, parcelaId, { valor: 201 }, null)).rejects.toThrow(ApiException);
+        const recarregada = await service.obterPorId(venda.id);
+        expect(recarregada.parcelas[0]?.pagoEm).toBeNull(); // não baixou nada
+        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      });
+
+      it("Q. duas baixas concorrentes da mesma parcela: só uma consome o saldo", async () => {
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(300, 100);
+        const resultados = await Promise.allSettled([
+          service.baixarParcela(venda.id, parcelaId, { formaPagamento: "PIX" }, null),
+          service.baixarParcela(venda.id, parcelaId, { formaPagamento: "Dinheiro" }, null),
+        ]);
+        expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+        expect(resultados.filter((r) => r.status === "rejected")).toHaveLength(1);
+
+        const final = await service.obterPorId(venda.id);
+        expect(final.valorPago).toBe(300); // 100 + 200, nunca 100+400
+        expect(final.valorPendente).toBe(0);
+        expect(final.status).toBe("concluida");
+        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      });
+
+      it("R. retry idempotente: não duplica pagamento nem movimento de caixa", async () => {
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(300, 100);
+        const chave = `baixa-parcela-retry-${Date.now()}`;
+
+        const primeira = await service.baixarParcela(venda.id, parcelaId, { formaPagamento: "PIX", idempotencyKey: chave }, null);
+        const segunda = await service.baixarParcela(venda.id, parcelaId, { formaPagamento: "PIX", idempotencyKey: chave }, null);
+        expect(primeira.valorPago).toBe(300);
+        expect(segunda.valorPago).toBe(300); // não dobrou
+        expect(segunda.pagamentos.filter((p) => p.idempotencyKey === chave)).toHaveLength(1);
+
+        const movimentos = await movimentosDaVenda(venda.id);
+        const daBaixa = movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave}`);
+        expect(daBaixa).toHaveLength(1);
+        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      });
+
+      it("S. caixa original fechado + caixa atual aberto: movimento lançado no caixa atual", async () => {
+        const { venda, parcelaId, caixa: caixaOriginal } = await venderComUmaParcela(300, 100);
+        await caixasService.fechar(caixaOriginal.id, { valorInformado: 1100 }, null);
+        const caixaAtual = await abrirCaixa();
+
+        const atualizada = await service.baixarParcela(venda.id, parcelaId, {}, null);
+        expect(atualizada.status).toBe("concluida");
+
+        const movimentos = await movimentosDaVenda(venda.id);
+        const daBaixa = movimentos.find((m) => m["tipo"] === "recebimento_parcela");
+        expect(String(daBaixa?.["caixaId"])).toBe(caixaAtual.id);
+        expect(String(daBaixa?.["caixaId"])).not.toBe(caixaOriginal.id);
+        await caixasService.fechar(caixaAtual.id, { valorInformado: 1200 }, null);
+      });
+
+      it("T. nenhum caixa aberto: rejeição sem mutação", async () => {
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(300, 100);
+        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null); // nenhum caixa fica aberto
+
+        await expect(service.baixarParcela(venda.id, parcelaId, {}, null)).rejects.toThrow(ApiException);
+
+        const recarregada = await service.obterPorId(venda.id);
+        expect(recarregada.parcelas[0]?.pagoEm).toBeNull();
+        expect(recarregada.status).toBe("em_pagamento");
+
+        const caixaFinal = await abrirCaixa();
+        await caixasService.fechar(caixaFinal.id, { valorInformado: 1000 }, null);
+      });
+
+      it("U. tarifa não altera valorPago, valorPendente, valorFinal nem o valor do movimento de caixa", async () => {
+        const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 10 }] });
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(1000, 600); // parcela = 400
+        const atualizada = await service.baixarParcela(venda.id, parcelaId, { modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1 }, null);
+
+        expect(atualizada.valorPago).toBe(1000); // bruto, nunca 960
+        expect(atualizada.valorPendente).toBe(0);
+        expect(atualizada.valorFinal).toBe(1000);
+
+        const movimentos = await movimentosDaVenda(venda.id);
+        const daBaixa = movimentos.find((m) => m["tipo"] === "recebimento_parcela");
+        expect(daBaixa?.["valor"]).toBe(400); // bruto, nunca 360 (líquido)
+        await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      });
+
+      it("V. snapshot da tarifa permanece histórico mesmo após alterar a tabela do adquirente", async () => {
+        const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 5 }] });
+        const { venda, parcelaId, caixa } = await venderComUmaParcela(500, 300); // parcela = 200
+        await service.baixarParcela(venda.id, parcelaId, { modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1 }, null);
+
+        await adquirentesService.atualizar(adquirente.id, { tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 9 }] }, null);
+
+        const recarregada = await service.obterPorId(venda.id);
+        const pagamento = recarregada.pagamentos[recarregada.pagamentos.length - 1]!;
+        expect(pagamento.tarifaAplicada?.percentual).toBe(5); // continua 5%, nunca 9%
+        expect(pagamento.tarifaAplicada?.valorTarifa).toBe(10); // continua R$10, nunca R$18
+        await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+      });
+    });
+  });
+
+  describe("auditoria de consistência financeira: receberPagamento × baixarParcela (Etapa 10.12)", () => {
+    async function movimentosDaVenda(vendaId: string) {
+      return connection.collection("movimentos_caixa").find({ vendaId }).toArray();
+    }
+
+    it("CRÍTICO: receberPagamento quitando o saldo não permite que uma baixa de parcela ainda aberta ultrapasse valorFinal", async () => {
+      // Cenário exato da auditoria: venda com 2 parcelas de 500 cada
+      // (valorFinal=1000, valorPago=0 na criação). receberPagamento(500)
+      // reduz o saldo geral mas NÃO toca em `parcelas[]` (separação de
+      // responsabilidades aprovada) — a parcela 1 continua com `pagoEm: null`
+      // mesmo que metade da dívida já tenha sido paga por outro caminho.
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+          totalParcelas: 2,
+        },
+        null,
+      );
+      expect(venda.valorFinal).toBe(1000);
+      expect(venda.valorPago).toBe(0);
+      expect(venda.parcelas).toHaveLength(2);
+      expect(venda.parcelas[0]?.valor).toBe(500);
+      expect(venda.parcelas[1]?.valor).toBe(500);
+      const parcela1Id = String(venda.parcelas[0]!._id);
+
+      const aposRecebimento = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 500 }, null);
+      expect(aposRecebimento.valorPago).toBe(500);
+      expect(aposRecebimento.valorPendente).toBe(500);
+      // A parcela 1 continua "aberta" no snapshot — receberPagamento nunca a toca.
+      expect(aposRecebimento.parcelas[0]?.pagoEm).toBeNull();
+
+      // Baixar a parcela 1 (500) AGORA é legítimo: o saldo pendente (500)
+      // ainda comporta exatamente esse valor.
+      const aposPrimeiraBaixa = await service.baixarParcela(venda.id, parcela1Id, {}, null);
+      expect(aposPrimeiraBaixa.valorPago).toBe(1000);
+      expect(aposPrimeiraBaixa.valorPendente).toBe(0);
+      expect(aposPrimeiraBaixa.status).toBe("concluida");
+
+      // A parcela 2 (também 500) NÃO pode mais ser baixada — o saldo
+      // pendente já é zero. Antes da correção da Etapa 10.12, isso era
+      // aceito e resultava em valorPago=1500 > valorFinal=1000.
+      const parcela2Id = String(venda.parcelas[1]!._id);
+      await expect(service.baixarParcela(venda.id, parcela2Id, {}, null)).rejects.toThrow(ApiException);
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.valorPago).toBe(1000); // nunca 1500
+      expect(final.valorPago).toBeLessThanOrEqual(final.valorFinal); // invariante fundamental
+      expect(final.valorPendente).toBe(0); // nunca negativo
+      expect(final.parcelas[1]?.pagoEm).toBeNull(); // não foi baixada
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    it("CRÍTICO: receberPagamento parcial reduz o quanto uma parcela subsequente pode cobrir", async () => {
+      // valorFinal=1000, 2 parcelas de 500. receberPagamento(300) deixa
+      // pendente=700 — a parcela de 500 ainda cabe (500<=700), mas depois de
+      // baixá-la o pendente vira 200, e a SEGUNDA parcela de 500 não cabe mais.
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+          totalParcelas: 2,
+        },
+        null,
+      );
+      await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300 }, null);
+
+      const parcela1Id = String(venda.parcelas[0]!._id);
+      const parcela2Id = String(venda.parcelas[1]!._id);
+      const aposBaixa1 = await service.baixarParcela(venda.id, parcela1Id, {}, null);
+      expect(aposBaixa1.valorPago).toBe(800); // 300 + 500
+      expect(aposBaixa1.valorPendente).toBe(200);
+
+      await expect(service.baixarParcela(venda.id, parcela2Id, {}, null)).rejects.toThrow(ApiException);
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.valorPago).toBe(800); // nunca 1300
+      expect(final.valorPago).toBeLessThanOrEqual(final.valorFinal);
+      await caixasService.fechar(caixa.id, { valorInformado: 1800 }, null);
+    });
+
+    it("valorPago nunca excede valorFinal mesmo sob concorrência entre receberPagamento e baixarParcela", async () => {
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+          totalParcelas: 2, // 2 parcelas de 500
+        },
+        null,
+      );
+      const parcela1Id = String(venda.parcelas[0]!._id);
+
+      // Concorrência: um recebimento livre de 500 e a baixa da parcela 1
+      // (também 500) disputando o MESMO saldo de 1000 (2×500).
+      const resultados = await Promise.allSettled([
+        service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 500 }, null),
+        service.baixarParcela(venda.id, parcela1Id, {}, null),
+      ]);
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.valorPago).toBeLessThanOrEqual(final.valorFinal); // invariante fundamental — nunca 1000+500=1500
+      expect(final.valorPendente).toBeGreaterThanOrEqual(0); // nunca negativo
+
+      // Como ambas operações pagam exatamente 500 (a soma bate exatamente com
+      // valorFinal=1000), as duas PODEM coexistir legitimamente se
+      // intercalarem corretamente — o que a correção garante é o invariante
+      // acima, não necessariamente que as duas sempre sejam aceitas.
+      const sucesso = resultados.filter((r) => r.status === "fulfilled");
+      expect(sucesso.length).toBeGreaterThanOrEqual(1);
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    it("movimentos de caixa refletem exatamente o valorPago final, sem sobra nem falta", async () => {
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+          totalParcelas: 2,
+        },
+        null,
+      );
+      const parcela1Id = String(venda.parcelas[0]!._id);
+
+      await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 500 }, null);
+      const final = await service.baixarParcela(venda.id, parcela1Id, {}, null);
+      expect(final.valorPago).toBe(1000);
+
+      const movimentos = await movimentosDaVenda(venda.id);
+      const somaMovimentos = movimentos.reduce((total, m) => total + (m["valor"] as number), 0);
+      expect(somaMovimentos).toBe(final.valorPago); // caixa reflete exatamente o pago, sem duplicar
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+  });
+
+  describe("idempotência financeira global e recuperação de cancelamento (Etapa 10.13)", () => {
+    async function movimentosDaVenda(vendaId: string) {
+      return connection.collection("movimentos_caixa").find({ vendaId }).toArray();
+    }
+
+    describe("idempotência cross-caixa", () => {
+      it("receberPagamento: retry após troca de caixa não cria um segundo movimento", async () => {
+        const produto = await criarProdutoComEstoque(1000, 5);
+        const vendedor = await criarVendedor();
+        const cliente = await criarCliente();
+        const caixaA = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            clienteId: cliente.id,
+            vendedorId: vendedor.id,
+            caixaId: caixaA.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 400 }],
+          },
+          null,
+        );
+        const chave = `cross-caixa-recebimento-${Date.now()}`;
+
+        const primeira = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300, idempotencyKey: chave }, null);
+        expect(primeira.valorPago).toBe(700);
+        const movimentosAntes = await movimentosDaVenda(venda.id);
+        const doRecebimento = movimentosAntes.find((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`);
+        expect(String(doRecebimento?.["caixaId"])).toBe(caixaA.id);
+
+        await caixasService.fechar(caixaA.id, { valorInformado: 1700 }, null);
+        const caixaB = await abrirCaixa();
+
+        const retry = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300, idempotencyKey: chave }, null);
+        expect(retry.valorPago).toBe(700); // não dobrou
+
+        const movimentosDepois = await movimentosDaVenda(venda.id);
+        const doRecebimentoTodos = movimentosDepois.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`);
+        expect(doRecebimentoTodos).toHaveLength(1); // exatamente 1 movimento no total
+        expect(String(doRecebimentoTodos[0]?.["caixaId"])).toBe(caixaA.id); // continua no Caixa A
+        expect(movimentosDepois.some((m) => String(m["caixaId"]) === caixaB.id)).toBe(false); // nada criado no Caixa B
+        await caixasService.fechar(caixaB.id, { valorInformado: 1000 }, null);
+      });
+
+      it("baixarParcela: retry após troca de caixa não cria um segundo movimento", async () => {
+        const produto = await criarProdutoComEstoque(300, 5);
+        const vendedor = await criarVendedor();
+        const cliente = await criarCliente();
+        const caixaA = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            clienteId: cliente.id,
+            vendedorId: vendedor.id,
+            caixaId: caixaA.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+          },
+          null,
+        );
+        const parcelaId = String(venda.parcelas[0]!._id);
+        const chave = `cross-caixa-parcela-${Date.now()}`;
+
+        const primeira = await service.baixarParcela(venda.id, parcelaId, { idempotencyKey: chave }, null);
+        expect(primeira.status).toBe("concluida");
+
+        await caixasService.fechar(caixaA.id, { valorInformado: 1300 }, null);
+        const caixaB = await abrirCaixa();
+
+        const retry = await service.baixarParcela(venda.id, parcelaId, { idempotencyKey: chave }, null);
+        expect(retry.valorPago).toBe(300); // não dobrou
+
+        const movimentos = await movimentosDaVenda(venda.id);
+        const daBaixa = movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave}`);
+        expect(daBaixa).toHaveLength(1);
+        expect(String(daBaixa[0]?.["caixaId"])).toBe(caixaA.id);
+        expect(movimentos.some((m) => String(m["caixaId"]) === caixaB.id)).toBe(false);
+        await caixasService.fechar(caixaB.id, { valorInformado: 1000 }, null);
+      });
+
+      it("cancelamento: retry após troca de caixa não cria um segundo movimento (estoque já restaurado permanece intacto)", async () => {
+        const produto = await criarProdutoComEstoque(200, 5);
+        const vendedor = await criarVendedor();
+        const caixaA = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixaA.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+          },
+          null,
+        );
+        const chave = `cross-caixa-cancelamento-${Date.now()}`;
+
+        const primeira = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste cross-caixa", idempotencyKey: chave }, null);
+        expect(primeira.status).toBe("cancelada");
+
+        await caixasService.fechar(caixaA.id, { valorInformado: 1000 }, null);
+        const caixaB = await abrirCaixa();
+
+        const retry = await service.cancelar(venda.id, { tipo: "integral", motivo: "Retry", idempotencyKey: chave }, null);
+        expect(retry.status).toBe("cancelada");
+
+        const movimentos = await movimentosDaVenda(venda.id);
+        const doCancelamento = movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:cancelamento:${chave}`);
+        expect(doCancelamento).toHaveLength(1);
+        expect(String(doCancelamento[0]?.["caixaId"])).toBe(caixaA.id);
+        expect(movimentos.some((m) => String(m["caixaId"]) === caixaB.id)).toBe(false);
+
+        const atualizado = await produtosService.obterPorId(produto.produtoId);
+        const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
+        expect(tamanho.quantidade).toBe(5); // restaurado uma única vez
+        await caixasService.fechar(caixaB.id, { valorInformado: 1000 }, null);
+      });
+    });
+
+    describe("cancelamento: idempotência e recuperação de crash", () => {
+      it("A. dois cancelamentos concorrentes com a MESMA chave: ambos convergem, 1 movimento, estoque restaurado uma vez", async () => {
+        const produto = await criarProdutoComEstoque(150, 4);
+        const vendedor = await criarVendedor();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 300 }],
+          },
+          null,
+        );
+        const chave = `cancelamento-concorrente-mesma-chave-${Date.now()}`;
+
+        const resultados = await Promise.allSettled([
+          service.cancelar(venda.id, { tipo: "integral", motivo: "Concorrente A", idempotencyKey: chave }, null),
+          service.cancelar(venda.id, { tipo: "integral", motivo: "Concorrente B", idempotencyKey: chave }, null),
+        ]);
+        // Mesma chave = mesma operação: NENHUMA das duas é rejeitada.
+        expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);
+
+        const atualizado = await produtosService.obterPorId(produto.produtoId);
+        const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
+        expect(tamanho.quantidade).toBe(4); // nunca 6 (restaurado só uma vez)
+
+        const movimentos = await movimentosDaVenda(venda.id);
+        expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1);
+
+        const final = await service.obterPorId(venda.id);
+        expect(final.status).toBe("cancelada");
+        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      });
+
+      it("B. dois cancelamentos concorrentes com chaves DIFERENTES: só um vence, o outro é rejeitado", async () => {
+        const produto = await criarProdutoComEstoque(150, 4);
+        const vendedor = await criarVendedor();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 300 }],
+          },
+          null,
+        );
+
+        const resultados = await Promise.allSettled([
+          service.cancelar(venda.id, { tipo: "integral", motivo: "Chave A", idempotencyKey: "chave-A" }, null),
+          service.cancelar(venda.id, { tipo: "integral", motivo: "Chave B", idempotencyKey: "chave-B" }, null),
+        ]);
+        expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+        expect(resultados.filter((r) => r.status === "rejected")).toHaveLength(1);
+
+        const atualizado = await produtosService.obterPorId(produto.produtoId);
+        const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
+        expect(tamanho.quantidade).toBe(4); // restaurado só uma vez
+
+        const movimentos = await movimentosDaVenda(venda.id);
+        expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1);
+        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      });
+
+      it("C./E./F. retry recupera cancelamento cujo estoque/movimento ainda não haviam sido concluídos (crash simulado)", async () => {
+        const produto = await criarProdutoComEstoque(150, 4);
+        const vendedor = await criarVendedor();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 300 }],
+          },
+          null,
+        );
+        const chave = `cancelamento-crash-${Date.now()}`;
+
+        const primeira = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste crash", idempotencyKey: chave }, null);
+        expect(primeira.status).toBe("cancelada");
+        const antesDoCrash = await produtosService.obterPorId(produto.produtoId);
+        expect(antesDoCrash.variantes[0]!.tamanhos[0]!.quantidade).toBe(4); // já restaurado normalmente
+
+        // Simula "processo morreu ENTRE persistir a venda cancelada e
+        // restaurar o estoque/lançar o caixa": desfaz manualmente os efeitos
+        // (como se eles nunca tivessem acontecido), mas preserva o registro
+        // `cancelamento` já persistido — exatamente o estado que um crash
+        // real deixaria para trás.
+        await connection
+          .collection("produtos")
+          .updateOne({ _id: new Types.ObjectId(produto.produtoId) }, { $inc: { "variantes.0.tamanhos.0.quantidade": -2 } });
+        const movimentosAntes = await movimentosDaVenda(venda.id);
+        await connection.collection("movimentos_caixa").deleteMany({ vendaId: venda.id, tipo: "cancelamento" });
+        await connection
+          .collection("vendas")
+          .updateOne({ _id: new Types.ObjectId(venda.id) }, { $set: { "cancelamento.itens.$[].restaurado": false } });
+
+        const meioDoCrash = await produtosService.obterPorId(produto.produtoId);
+        expect(meioDoCrash.variantes[0]!.tamanhos[0]!.quantidade).toBe(2); // "desfeito" — simula que nunca restaurou
+        const semMovimento = await movimentosDaVenda(venda.id);
+        expect(semMovimento.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(0);
+        expect(movimentosAntes.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1); // só para referência do que existia antes de apagar
+
+        // Retry com a MESMA chave: reconhecido como replay, reconcilia o que falta.
+        const retry = await service.cancelar(venda.id, { tipo: "integral", motivo: "Retry pós-crash", idempotencyKey: chave }, null);
+        expect(retry.status).toBe("cancelada");
+
+        const depoisDoRetry = await produtosService.obterPorId(produto.produtoId);
+        expect(depoisDoRetry.variantes[0]!.tamanhos[0]!.quantidade).toBe(4); // restaurado de novo — nunca 6 (dobrado)
+
+        const movimentosFinais = await movimentosDaVenda(venda.id);
+        expect(movimentosFinais.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1); // recriado, nunca duplicado
+        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      });
+
+      it("D. retry após cancelamento já 100% concluído (mesma chave) apenas reconhece o replay, sem efeito adicional", async () => {
+        const produto = await criarProdutoComEstoque(150, 4);
+        const vendedor = await criarVendedor();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 300 }],
+          },
+          null,
+        );
+        const chave = `cancelamento-retry-simples-${Date.now()}`;
+
+        await service.cancelar(venda.id, { tipo: "integral", motivo: "Primeira", idempotencyKey: chave }, null);
+        const retry = await service.cancelar(venda.id, { tipo: "integral", motivo: "Retry", idempotencyKey: chave }, null);
+        expect(retry.status).toBe("cancelada");
+        expect(retry.cancelamento?.valorDevolvido).toBe(300); // H. consistência do valor devolvido
+
+        const atualizado = await produtosService.obterPorId(produto.produtoId);
+        expect(atualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(4);
+        const movimentos = await movimentosDaVenda(venda.id);
+        expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1);
+        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      });
+
+      it("venda cancelada por chave diferente/ausente continua rejeitando um segundo cancelamento (compatibilidade legada)", async () => {
+        const produto = await criarProdutoComEstoque(100, 5);
+        const vendedor = await criarVendedor();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+          },
+          null,
+        );
+        // Primeiro cancelamento SEM chave (payload legado).
+        await service.cancelar(venda.id, { tipo: "integral", motivo: "Legado, sem chave" }, null);
+
+        // Um segundo cancelamento, mesmo COM chave, nunca é tratado como
+        // replay de uma operação que não tinha chave nenhuma.
+        await expect(
+          service.cancelar(venda.id, { tipo: "integral", motivo: "Retry com chave nova", idempotencyKey: "chave-nova" }, null),
+        ).rejects.toThrow(ApiException);
+
+        // E um cancelamento legado (sem chave) sobre uma venda JÁ cancelada
+        // (mesmo que originalmente cancelada COM chave) também sempre rejeita.
+        const produto2 = await criarProdutoComEstoque(100, 5);
+        const venda2 = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto2.produtoId, varianteId: produto2.varianteId, tamanhoId: produto2.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+          },
+          null,
+        );
+        await service.cancelar(venda2.id, { tipo: "integral", motivo: "Com chave", idempotencyKey: "alguma-chave" }, null);
+        await expect(service.cancelar(venda2.id, { tipo: "integral", motivo: "Retry sem chave" }, null)).rejects.toThrow(ApiException);
+        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      });
+    });
+
+    describe("regressão", () => {
+      it("vendas e cancelamentos sem idempotencyKey continuam funcionando exatamente como antes", async () => {
+        const produto = await criarProdutoComEstoque(200, 5);
+        const vendedor = await criarVendedor();
+        const caixa = await abrirCaixa();
+        const venda = await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+          },
+          null,
+        );
+        const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Sem chave" }, null);
+        expect(cancelada.status).toBe("cancelada");
+        expect(cancelada.valorDevolvido).toBe(200);
+
+        const atualizado = await produtosService.obterPorId(produto.produtoId);
+        expect(atualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(5);
+        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      });
+    });
   });
 });

@@ -3,7 +3,15 @@ import { Type } from "class-transformer";
 import { ArrayMinSize, IsArray, IsIn, IsNotEmpty, IsOptional, IsString, MaxLength, ValidateNested } from "class-validator";
 import { DevolucaoItemDto } from "./devolucao-item.dto.js";
 
-/** Espelha `CancelamentoPayload` (`src/types/venda.ts`). */
+/**
+ * Espelha `CancelamentoPayload` (`src/types/venda.ts`).
+ *
+ * `idempotencyKey` (Etapa 10.13) é OPCIONAL e ADITIVA — payloads legados sem
+ * ela continuam funcionando exatamente como antes (retry sem chave nunca é
+ * reconhecido como a mesma operação; uma venda já cancelada sempre rejeita).
+ * Quando informada, protege contra retry/crash: ver
+ * `VendasService.cancelar`.
+ */
 export class CancelamentoDto {
   @ApiProperty({ enum: ["integral", "parcial"] })
   @IsIn(["integral", "parcial"])
@@ -22,4 +30,10 @@ export class CancelamentoDto {
   @ValidateNested({ each: true })
   @Type(() => DevolucaoItemDto)
   itens?: DevolucaoItemDto[];
+
+  @ApiPropertyOptional({ description: "Protege contra retry duplicado — opcional, mas recomendada." })
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty({ message: "idempotencyKey não pode ser vazia quando informada." })
+  idempotencyKey?: string;
 }

@@ -396,34 +396,133 @@ export class VendasService {
     };
   }
 
+  /**
+   * Baixa de uma parcela pré-calculada em `montarParcelas` — SEMPRE quitada
+   * por inteiro (nunca parcialmente; ver "regra de domínio" no relatório da
+   * Etapa 10.11 sobre por que não existe baixa parcial de uma parcela
+   * individual — isso é papel de `receberPagamento`, que opera sobre
+   * `valorPendente` da venda inteira, não sobre uma parcela específica).
+   *
+   * Etapa 10.11 — PAGAMENTO ESTRUTURADO: `modalidade`/`adquirenteId`/
+   * `parcelas` (opcionais, aditivos) são validados e a tarifa é calculada
+   * reaproveitando `validarPagamentoEstruturado` — a MESMA função usada por
+   * `criar()`/`receberPagamento()`, sem nenhuma regra duplicada. Sem
+   * `modalidade` (contrato legado, ex.: `{ formaPagamento: "PIX" }` ou `{}`),
+   * o comportamento é idêntico ao de antes desta etapa: `tarifaAplicada`
+   * fica `null`.
+   *
+   * Etapa 10.10/10.11 — CAIXA ATUAL: resolvido uma única vez no início (fail
+   * fast), nunca `venda.caixaId` (ver `cancelar`/`receberPagamento`).
+   *
+   * Idempotência (Etapa 10.11, NOVA): `dto.idempotencyKey`, opcional,
+   * fornecida pelo chamador (nunca gerada aqui). Cobre o cenário "processo
+   * morreu entre salvar a venda e lançar o movimento de caixa": sem chave,
+   * uma segunda tentativa encontraria `parcela.pagoEm` já setado e seria
+   * rejeitada como "já baixada" — mesmo que o movimento de caixa nunca
+   * tivesse sido criado, deixando a baixa presa sem receita registrada. Com
+   * a chave, o replay é detectado ANTES dessa checagem (mesmo padrão de
+   * `receberPagamento`) e apenas garante o movimento, sem reaplicar a baixa.
+   *
+   * Concorrência: preservada — a checagem `parcela.pagoEm` é reavaliada
+   * DENTRO do callback de `salvarComRetentativa`, contra o documento
+   * recém-lido a cada tentativa; duas baixas concorrentes da MESMA parcela
+   * nunca resultam em dois pagamentos (a segunda encontra `pagoEm` já
+   * setado e é rejeitada).
+   */
   async baixarParcela(vendaId: string, parcelaId: string, dto: BaixarParcelaDto, usuarioId: string | null): Promise<VendaDocument> {
     const vendaAtual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
     if (vendaAtual.status === "cancelada") throw ApiException.validation("Venda cancelada não aceita novas baixas.");
 
-    // Etapa 10.10: o recebimento é lançado no caixa ATUALMENTE aberto — nunca
-    // em `venda.caixaId` (ver `receberPagamento` para a explicação completa
-    // do porquê: o caixa original quase certamente já está fechado quando uma
-    // parcela é paga dias/semanas depois, e `registrarMovimentoDeVenda`
-    // rejeita lançamento em caixa fechado). Resolvido ANTES de qualquer
-    // mutação da venda para falhar cedo, sem deixar a parcela baixada sem o
-    // movimento de caixa correspondente.
     const caixaAtual = await this.caixasService.obterAtual();
     if (!caixaAtual) {
       throw ApiException.validation("Nenhum caixa aberto. Abra o caixa antes de registrar a baixa.");
     }
 
-    let formaUsada = "";
-    let valorParcela = 0;
-    let numeroParcela = 0;
-    let totalParcelas = 0;
+    const parcelaAtual = vendaAtual.parcelas.find((item) => String(item._id) === parcelaId);
+    if (!parcelaAtual) throw ApiException.notFound("Parcela não encontrada.");
+
+    // Replay: já processado antes (crash entre salvar a venda e lançar o
+    // caixa) — só garante o movimento, nunca reaplica a baixa nem recalcula tarifa.
+    if (dto.idempotencyKey) {
+      const existente = vendaAtual.pagamentos.find((pagamento) => pagamento.idempotencyKey === dto.idempotencyKey);
+      if (existente) {
+        await this.garantirMovimentoDeBaixaParcela(caixaAtual.id, vendaAtual, dto.idempotencyKey, existente, parcelaAtual.numero, parcelaAtual.total);
+        return vendaAtual;
+      }
+    }
+
+    if (parcelaAtual.pagoEm) throw ApiException.validation("Esta parcela já está baixada.");
+
+    // Etapa 10.12 — AUDITORIA: `baixarParcela` só verificava se a PRÓPRIA
+    // parcela já estava paga, nunca se a VENDA ainda tinha saldo suficiente
+    // para cobri-la. Como `receberPagamento` reduz `valorPendente` sem tocar
+    // em `parcelas[]` (separação de responsabilidades aprovada — Etapa
+    // 10.11), uma venda podia ter seu saldo quitado via `receberPagamento` e,
+    // em seguida, uma parcela ainda marcada como aberta (`pagoEm: null`) podia
+    // ser baixada por cima, empurrando `valorPago` para além de `valorFinal`
+    // — violação direta do invariante `valorPago <= valorFinal`. Checado aqui
+    // (fail fast) e de novo dentro do retry contra o documento fresco.
+    if (parcelaAtual.valor > vendaAtual.valorPendente) {
+      throw ApiException.validation("Dados inválidos.", [
+        {
+          field: "valor",
+          message: `O valor da parcela (${parcelaAtual.valor.toFixed(2)}) excede o saldo pendente da venda (${vendaAtual.valorPendente.toFixed(2)}).`,
+        },
+      ]);
+    }
+
+    // Uma parcela é quitada por inteiro — `valor`, quando informado, é só uma
+    // confirmação defensiva do valor esperado (protege contra um bug de UI
+    // enviando a quantia errada), nunca um valor livre/parcial.
+    if (dto.valor !== undefined) {
+      const valorInformado = arredondar(dto.valor);
+      if (valorInformado !== parcelaAtual.valor) {
+        throw ApiException.validation("Dados inválidos.", [
+          {
+            field: "valor",
+            message: `O valor informado (${valorInformado.toFixed(2)}) não corresponde ao valor da parcela (${parcelaAtual.valor.toFixed(2)}).`,
+          },
+        ]);
+      }
+    }
+
+    const forma = dto.formaPagamento?.trim() || vendaAtual.formaPagamento;
+    // Reaproveita EXATAMENTE a mesma validação de modalidade/adquirente/tarifa
+    // de `criar()`/`receberPagamento()` — sem `modalidade`, devolve os nulls
+    // legados (mesmo contrato de sempre), sem nenhuma lógica duplicada aqui.
+    const adquirentesCache = new Map<string, AdquirenteRespostaPublica>();
+    const estruturado = await this.validarPagamentoEstruturado(
+      { forma, valor: parcelaAtual.valor, modalidade: dto.modalidade, adquirenteId: dto.adquirenteId, parcelas: dto.parcelas, observacao: dto.observacao },
+      adquirentesCache,
+    );
+
+    let pagamentoAplicado: PagamentoVenda | null = null;
 
     const venda = await this.vendasRepository.salvarComRetentativa(vendaId, (documento) => {
       if (documento.status === "cancelada") throw ApiException.validation("Venda cancelada não aceita novas baixas.");
+      if (dto.idempotencyKey) {
+        const existentePagamento = documento.pagamentos.find((pagamento) => pagamento.idempotencyKey === dto.idempotencyKey);
+        if (existentePagamento) {
+          pagamentoAplicado = existentePagamento;
+          return;
+        }
+      }
       const parcela = documento.parcelas.find((item) => String(item._id) === parcelaId);
       if (!parcela) throw ApiException.notFound("Parcela não encontrada.");
       if (parcela.pagoEm) throw ApiException.validation("Esta parcela já está baixada.");
+      // Reavaliado contra o documento FRESCO a cada tentativa (Etapa 10.12) —
+      // mesma proteção do fail-fast acima, mas agora segura sob concorrência
+      // real (ex.: um `receberPagamento` concorrente reduzindo o saldo entre
+      // a checagem inicial e esta tentativa).
+      if (parcela.valor > documento.valorPendente) {
+        throw ApiException.validation("Dados inválidos.", [
+          {
+            field: "valor",
+            message: `O valor da parcela (${parcela.valor.toFixed(2)}) excede o saldo pendente da venda (${documento.valorPendente.toFixed(2)}).`,
+          },
+        ]);
+      }
 
-      const forma = dto.formaPagamento?.trim() || documento.formaPagamento;
       const agora = new Date();
       parcela.pagoEm = agora;
       parcela.formaPagamento = forma;
@@ -432,8 +531,12 @@ export class VendasService {
         forma,
         valor: parcela.valor,
         dataPagamento: agora,
-        parcelas: parcela.total,
-        observacao: `Parcela ${parcela.numero}/${parcela.total} (baixa no backoffice)`,
+        parcelas: estruturado.parcelas,
+        observacao: dto.observacao?.trim() || `Parcela ${parcela.numero}/${parcela.total} (baixa no backoffice)`,
+        modalidade: estruturado.modalidade,
+        adquirenteId: estruturado.adquirenteId,
+        tarifaAplicada: estruturado.tarifaAplicada,
+        idempotencyKey: dto.idempotencyKey ?? null,
       } as PagamentoVenda);
       documento.valorPago = arredondar(documento.pagamentos.reduce((total, item) => total + item.valor, 0));
       documento.valorPendente = arredondar(Math.max(0, documento.valorFinal - documento.valorPago));
@@ -446,27 +549,14 @@ export class VendasService {
         autor: "Backoffice",
       });
 
-      formaUsada = forma;
-      valorParcela = parcela.valor;
-      numeroParcela = parcela.numero;
-      totalParcelas = parcela.total;
+      pagamentoAplicado = documento.pagamentos[documento.pagamentos.length - 1]!;
     });
 
-    await this.caixasService.registrarMovimentoDeVenda({
-      caixaId: caixaAtual.id,
-      tipo: "recebimento_parcela",
-      descricao: `Recebimento da parcela ${numeroParcela}/${totalParcelas} · ${venda.clienteNome}`,
-      referencia: venda.codigo,
-      vendaId: venda.id,
-      vendaCodigo: venda.codigo,
-      formaPagamento: formaUsada,
-      valor: valorParcela,
-      responsavelId: null,
-      responsavelNome: "Backoffice",
-      observacao: "Baixa registrada no backoffice",
-    });
+    if (pagamentoAplicado) {
+      await this.garantirMovimentoDeBaixaParcela(caixaAtual.id, venda, dto.idempotencyKey, pagamentoAplicado, parcelaAtual.numero, parcelaAtual.total);
+    }
 
-    await this.registrarEvento(venda.id, "venda.parcela_baixada", usuarioId, { parcelaId, valor: valorParcela });
+    await this.registrarEvento(venda.id, "venda.parcela_baixada", usuarioId, { parcelaId, valor: parcelaAtual.valor });
     return venda;
   }
 
@@ -618,38 +708,64 @@ export class VendasService {
   }
 
   /**
-   * Cancelamento/devolução (Etapa 10.9) — CORRIGIDO em relação à versão
-   * anterior em dois pontos:
+   * Cancelamento/devolução — ver histórico de correções nas Etapas 10.9
+   * (valor devolvido correto) e 10.11 (caixa atual, nunca `venda.caixaId`).
    *
-   * 1. VALOR DEVOLVIDO por item agora usa `calcularValorDevolucaoItem`
-   *    (snapshot: `item.subtotal` já líquido de `descontoItem`, mais o rateio
-   *    de `descontoVenda`) em vez de `item.precoPraticado × quantidade`, que
-   *    ignorava qualquer desconto de item e o desconto da venda — devolvia
-   *    MAIS do que o cliente efetivamente pagou por aquela unidade. Ver
-   *    "regra final de cálculo de devolução" no relatório.
+   * Etapa 10.13 — IDEMPOTÊNCIA E RECUPERAÇÃO:
    *
-   * 2. CONCORRÊNCIA/IDEMPOTÊNCIA: a decisão de QUAIS itens/quantidades devolver
-   *    (e seu valor) é tomada DENTRO do callback de `salvarComRetentativa`,
-   *    contra o documento recém-lido a CADA tentativa — nunca contra uma
-   *    cópia capturada antes do loop (bug da versão anterior: `devolverAoEstoque`
-   *    rodava ANTES do retry, usando uma leitura ficando obsoleta sob
-   *    concorrência real, podendo restaurar o MESMO estoque duas vezes se
-   *    duas chamadas concorrentes computassem a mesma quantidade "restante" a
-   *    partir do mesmo snapshot). Agora `devolverAoEstoque` só roda DEPOIS que
-   *    o `salvarComRetentativa` retorna, usando exclusivamente a lista
-   *    capturada pela tentativa que efetivamente venceu a gravação — a mesma
-   *    quantidade nunca é devolvida ao estoque mais de uma vez, mesmo sob
-   *    duas requisições disputando a mesma venda/item.
+   * 1. REPLAY: se `dto.idempotencyKey` for informada e a venda já estiver
+   *    cancelada com essa MESMA chave (`venda.cancelamento.idempotencyKey`),
+   *    a chamada é a MESMA operação lógica repetida — em vez de rejeitar com
+   *    "já cancelada", RECONCILIA efeitos ainda faltantes (estoque/caixa, ver
+   *    `reconciliarCancelamento`) e devolve a venda. Uma venda cancelada por
+   *    OUTRA chave (ou sem chave) continua rejeitando normalmente — nunca
+   *    permite dois cancelamentos DIFERENTES. Sem `idempotencyKey` (contrato
+   *    legado), o comportamento é IDÊNTICO ao de antes: sempre rejeita.
+   *
+   * 2. RECUPERAÇÃO GRANULAR DE ESTOQUE: fecha a janela "venda salva como
+   *    cancelada → processo cai → estoque nunca restaurado → retry rejeitado
+   *    antes de terminar". Cada linha de `cancelamento.itens` carrega seu
+   *    próprio `restaurado: boolean`, `false` na gravação inicial e só vira
+   *    `true` depois que `ProdutosService.ajustarQuantidadeTamanho` roda de
+   *    fato para aquela linha (nunca junto com a gravação do cancelamento em
+   *    si) — ver `restaurarEstoquePendente`. A "reivindicação" de cada item é
+   *    atômica (`VendasRepository.marcarItemDevolvidoRestaurado`), então a
+   *    mesma unidade nunca é devolvida duas vezes mesmo sob duas chamadas
+   *    (replay + concorrência) rodando ao mesmo tempo.
+   *
+   * 3. MOVIMENTO DE CAIXA: sempre re-garantido via
+   *    `garantirMovimentoDeCancelamento` — idempotente por chave GLOBAL
+   *    derivada `${vendaId}:cancelamento:${idempotencyKey}` (não mais
+   *    escopada por caixa, ver `movimento-caixa.schema.ts`) — chamar de novo
+   *    (replay/reconciliação) nunca duplica, mesmo que o caixa atualmente
+   *    aberto seja outro.
+   *
+   * 4. CONCORRÊNCIA: a decisão de "o que devolver" continua tomada DENTRO do
+   *    `salvarComRetentativa`, contra o documento fresco a cada tentativa
+   *    (Etapa 10.9, preservada). Uma tentativa que perde a corrida de escrita
+   *    para OUTRA com a MESMA `idempotencyKey` reconhece isso como replay
+   *    dentro do próprio callback (`eraReplayConcorrente`), em vez de lançar
+   *    "já cancelada" para uma operação que, na prática, é a sua própria.
    *
    * Atomicidade: mesma limitação já aceita em `criarInterno`/`receberPagamento`
-   * — a Venda é salva primeiro (protegida por versionamento otimista); a
-   * baixa de estoque e o movimento de caixa acontecem DEPOIS, sem transação
-   * multi-documento (Venda e Produto são coleções diferentes). Ver "Riscos"
-   * no relatório.
+   * — sem transação multi-documento (Venda e Produto são coleções
+   * diferentes); a idempotência acima é o que torna essa limitação segura de
+   * conviver com um crash, não uma transação.
    */
   async cancelar(vendaId: string, dto: CancelamentoDto, usuarioId: string | null): Promise<VendaDocument> {
     const vendaAtual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
-    if (vendaAtual.status === "cancelada") throw ApiException.validation("Esta venda já está cancelada.");
+
+    if (vendaAtual.status === "cancelada") {
+      if (dto.idempotencyKey && vendaAtual.cancelamento?.idempotencyKey === dto.idempotencyKey) {
+        return this.reconciliarCancelamento(vendaAtual, dto.idempotencyKey);
+      }
+      throw ApiException.validation("Esta venda já está cancelada.");
+    }
+
+    const caixaAtual = await this.caixasService.obterAtual();
+    if (!caixaAtual) {
+      throw ApiException.validation("Nenhum caixa aberto. Abra o caixa antes de registrar o cancelamento.");
+    }
 
     if (dto.tipo === "parcial" && !(dto.itens ?? []).length) {
       throw ApiException.validation("Dados inválidos.", [{ field: "itens", message: "Selecione ao menos um item para devolver." }]);
@@ -657,11 +773,20 @@ export class VendasService {
 
     const motivo = dto.motivo.trim();
     const agora = new Date();
-    let devolvidos: ItemDevolvido[] = [];
-    let valorDevolvido = 0;
+    let eraReplayConcorrente = false;
 
     const venda = await this.vendasRepository.salvarComRetentativa(vendaId, (documento) => {
-      if (documento.status === "cancelada") throw ApiException.validation("Esta venda já está cancelada.");
+      if (documento.status === "cancelada") {
+        if (dto.idempotencyKey && documento.cancelamento?.idempotencyKey === dto.idempotencyKey) {
+          // Concorrência: outra chamada com a MESMA chave venceu a corrida
+          // de escrita enquanto esta rodava — é a MESMA operação, não "venda
+          // já cancelada por outra coisa". Não muta de novo; a reconciliação
+          // abaixo, fora deste callback, cuida do resto.
+          eraReplayConcorrente = true;
+          return;
+        }
+        throw ApiException.validation("Esta venda já está cancelada.");
+      }
 
       const devolvidosDaTentativa: ItemDevolvido[] = [];
       if (dto.tipo === "integral") {
@@ -674,7 +799,8 @@ export class VendasService {
             nome: item.nome,
             quantidade: restante,
             valor: this.calcularValorDevolucaoItem(documento, item, restante),
-          });
+            restaurado: false,
+          } as ItemDevolvido);
         }
       } else {
         for (const solicitado of dto.itens ?? []) {
@@ -689,7 +815,8 @@ export class VendasService {
             nome: item.nome,
             quantidade,
             valor: this.calcularValorDevolucaoItem(documento, item, quantidade),
-          });
+            restaurado: false,
+          } as ItemDevolvido);
         }
         if (!devolvidosDaTentativa.length) throw ApiException.validation("Nenhuma quantidade disponível para devolução.");
       }
@@ -708,6 +835,7 @@ export class VendasService {
         autor: "Backoffice",
         valorDevolvido: valorDevolvidoDaTentativa,
         itens: devolvidosDaTentativa,
+        idempotencyKey: dto.idempotencyKey ?? null,
       } as never;
       documento.historico.push({
         dataHora: agora,
@@ -724,46 +852,100 @@ export class VendasService {
         documento.status = "cancelada";
         documento.valorPendente = 0;
       }
-
-      // Capturado da tentativa que efetivamente for salva (sobrescrito a cada
-      // retry) — nunca da leitura inicial, feita fora deste callback.
-      devolvidos = devolvidosDaTentativa;
-      valorDevolvido = valorDevolvidoDaTentativa;
     });
 
-    // Estoque restaurado SÓ AGORA, com a lista da tentativa vencedora — nunca
-    // antes do `salvarComRetentativa` (ver nota de concorrência acima).
-    for (const devolvido of devolvidos) {
-      const item = venda.itens.find((registro) => String(registro._id) === devolvido.itemId);
-      if (item) await this.devolverAoEstoque(item, devolvido.quantidade);
-    }
-
-    const valorParaCaixa = Math.min(valorDevolvido, venda.valorPago);
-    if (valorParaCaixa > 0 && venda.caixaId) {
-      await this.caixasService.registrarMovimentoDeVenda({
-        caixaId: venda.caixaId,
-        tipo: dto.tipo === "integral" ? "cancelamento" : "devolucao",
-        descricao: dto.tipo === "integral" ? `Cancelamento da venda ${venda.codigo} · ${venda.clienteNome}` : `Devolução parcial da venda ${venda.codigo} · ${venda.clienteNome}`,
-        referencia: venda.codigo,
-        vendaId: venda.id,
-        vendaCodigo: venda.codigo,
-        formaPagamento: venda.formaPagamento,
-        valor: valorParaCaixa,
-        responsavelId: null,
-        responsavelNome: "Backoffice",
-        observacao: motivo,
-      });
-    }
+    // Estoque e movimento de caixa passam SEMPRE pela mesma via de
+    // reconciliação (idempotente item a item / por chave global) usada num
+    // replay explícito — cobre também a corrida "perdi a gravação, mas a
+    // operação é minha" (`eraReplayConcorrente`) sem nenhum código duplicado.
+    await this.restaurarEstoquePendente(venda);
+    await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, dto.idempotencyKey);
 
     // `vendaAtual` já não podia estar cancelada aqui (a checagem no início da
-    // função teria lançado antes) — se `venda.status` virou "cancelada" agora,
-    // é esta chamada que fez a transição, e só então os agregados revertem.
-    if (venda.status === "cancelada") {
+    // função teria lançado ou reconciliado antes) — os agregados revertem só
+    // na tentativa que efetivamente fez a transição, nunca num replay.
+    if (!eraReplayConcorrente && venda.status === "cancelada") {
       await this.reverterAgregados(venda);
     }
 
-    await this.registrarEvento(venda.id, dto.tipo === "integral" ? "venda.cancelada" : "venda.devolvida", usuarioId, { valorDevolvido });
+    await this.registrarEvento(venda.id, dto.tipo === "integral" ? "venda.cancelada" : "venda.devolvida", usuarioId, {
+      valorDevolvido: venda.cancelamento?.valorDevolvido ?? 0,
+    });
     return venda;
+  }
+
+  /**
+   * Reconcilia uma venda JÁ cancelada pela MESMA `idempotencyKey` (Etapa
+   * 10.13) — chamado quando `cancelar()` detecta, ANTES de qualquer
+   * mutação, que a operação já foi persistida (crash ou retry de rede
+   * depois do `salvarComRetentativa` original). Só completa o que faltar
+   * (estoque/caixa); nunca reaplica o cancelamento em si — o snapshot em
+   * `venda.cancelamento` já existe e é imutável a partir daqui.
+   */
+  private async reconciliarCancelamento(venda: VendaDocument, idempotencyKey: string): Promise<VendaDocument> {
+    const caixaAtual = await this.caixasService.obterAtual();
+    if (!caixaAtual) {
+      throw ApiException.validation("Nenhum caixa aberto. Abra o caixa antes de concluir o cancelamento.");
+    }
+    await this.restaurarEstoquePendente(venda);
+    await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, idempotencyKey);
+    return this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
+  }
+
+  /**
+   * Restaura o estoque de cada linha de `cancelamento.itens` que AINDA não
+   * tiver sido restaurada (Etapa 10.13) — sempre relê a venda antes de
+   * decidir (nunca confia num snapshot potencialmente desatualizado sob
+   * concorrência) e usa `VendasRepository.marcarItemDevolvidoRestaurado`
+   * como uma reivindicação ATÔMICA por item: só quem GANHA a reivindicação
+   * chama `devolverAoEstoque` para aquela linha — a mesma unidade nunca é
+   * devolvida duas vezes, mesmo com replay e concorrência reais disputando a
+   * MESMA venda cancelada ao mesmo tempo.
+   */
+  private async restaurarEstoquePendente(venda: VendaDocument): Promise<void> {
+    const atual = await this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
+    if (!atual.cancelamento) return;
+    for (const devolvido of atual.cancelamento.itens) {
+      if (devolvido.restaurado) continue;
+      const reivindicado = await this.vendasRepository.marcarItemDevolvidoRestaurado(venda.id, devolvido.itemId);
+      if (!reivindicado) continue; // outra chamada já reivindicou (ou já concluiu) este item.
+      const item = atual.itens.find((registro) => String(registro._id) === devolvido.itemId);
+      if (item) await this.devolverAoEstoque(item, devolvido.quantidade);
+    }
+  }
+
+  /**
+   * Garante o movimento de caixa do cancelamento/devolução — sempre a partir
+   * do snapshot JÁ PERSISTIDO em `venda.cancelamento` (nunca de um valor
+   * calculado ad-hoc pelo chamador), para que chamar isto de novo
+   * (replay/reconciliação) seja idempotente por construção. Chave DERIVADA
+   * GLOBAL (Etapa 10.13) `${vendaId}:cancelamento:${idempotencyKey}` — nunca
+   * duplica mesmo que o caixa atualmente aberto seja outro (ver
+   * `movimento-caixa.schema.ts`). Sem `idempotencyKey`, nenhuma deduplicação
+   * (mesmo padrão do resto do projeto).
+   */
+  private async garantirMovimentoDeCancelamento(caixaId: string, venda: VendaDocument, idempotencyKey: string | undefined): Promise<void> {
+    const atual = await this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
+    if (!atual.cancelamento) return;
+    const valorParaCaixa = arredondar(Math.min(atual.cancelamento.valorDevolvido, atual.valorPago));
+    if (valorParaCaixa <= 0) return;
+    await this.caixasService.registrarMovimentoDeVenda({
+      caixaId,
+      tipo: atual.cancelamento.tipo === "integral" ? "cancelamento" : "devolucao",
+      descricao:
+        atual.cancelamento.tipo === "integral"
+          ? `Cancelamento da venda ${atual.codigo} · ${atual.clienteNome}`
+          : `Devolução parcial da venda ${atual.codigo} · ${atual.clienteNome}`,
+      referencia: atual.codigo,
+      vendaId: atual.id,
+      vendaCodigo: atual.codigo,
+      formaPagamento: atual.formaPagamento,
+      valor: valorParaCaixa,
+      responsavelId: null,
+      responsavelNome: "Backoffice",
+      observacao: atual.cancelamento.motivo,
+      idempotencyKey: idempotencyKey ? `${venda.id}:cancelamento:${idempotencyKey}` : null,
+    });
   }
 
   /**
@@ -1020,9 +1202,14 @@ export class VendasService {
    * ATUALMENTE aberto (resolvido pelo chamador antes de qualquer mutação da
    * venda), nunca `venda.caixaId` (ver comentário completo em
    * `receberPagamento`). Idempotente por chave DERIVADA
-   * (`${idempotencyKey}:recebimento`) quando o chamador informou uma — sem
-   * chave, nenhuma deduplicação (mesmo padrão do resto do projeto). Sempre o
-   * valor BRUTO do pagamento, nunca o líquido pós-tarifa (seção 10 do pedido).
+   * (`${venda.id}:recebimento:${idempotencyKey}`) quando o chamador informou
+   * uma — sem chave, nenhuma deduplicação (mesmo padrão do resto do
+   * projeto). Prefixar com `venda.id` (Etapa 10.13) é o que sustenta a
+   * unicidade GLOBAL do índice de `MovimentoCaixa` (não mais por caixa — ver
+   * `movimento-caixa.schema.ts`): sem isso, a mesma `idempotencyKey` bruta
+   * usada por engano em duas vendas diferentes colidiria uma com a outra.
+   * Sempre o valor BRUTO do pagamento, nunca o líquido pós-tarifa (seção 10
+   * do pedido).
    */
   private async garantirMovimentoDeRecebimento(caixaId: string, venda: VendaDocument, idempotencyKey: string | undefined, pagamento: PagamentoVenda): Promise<void> {
     if (pagamento.valor <= 0) return;
@@ -1038,7 +1225,43 @@ export class VendasService {
       responsavelId: null,
       responsavelNome: "Backoffice",
       observacao: pagamento.observacao ?? "",
-      idempotencyKey: idempotencyKey ? `${idempotencyKey}:recebimento` : null,
+      idempotencyKey: idempotencyKey ? `${venda.id}:recebimento:${idempotencyKey}` : null,
+    });
+  }
+
+  /**
+   * Lança no Caixa o movimento de uma BAIXA DE PARCELA (`baixarParcela`) —
+   * mesmo `tipo: "recebimento_parcela"` de sempre, agora no caixa
+   * ATUALMENTE aberto (Etapa 10.10/10.11), nunca `venda.caixaId`. Idempotente
+   * por chave DERIVADA (`${venda.id}:parcela:${idempotencyKey}`, prefixada
+   * pela venda desde a Etapa 10.13 para sustentar a unicidade GLOBAL do
+   * índice — ver `garantirMovimentoDeRecebimento`) quando o chamador
+   * informou uma — cobre "processo morreu entre salvar a venda e lançar o
+   * caixa" sem duplicar o movimento num retry. Sempre o valor BRUTO do
+   * pagamento (nunca o líquido pós-tarifa).
+   */
+  private async garantirMovimentoDeBaixaParcela(
+    caixaId: string,
+    venda: VendaDocument,
+    idempotencyKey: string | undefined,
+    pagamento: PagamentoVenda,
+    numeroParcela: number,
+    totalParcelas: number,
+  ): Promise<void> {
+    if (pagamento.valor <= 0) return;
+    await this.caixasService.registrarMovimentoDeVenda({
+      caixaId,
+      tipo: "recebimento_parcela",
+      descricao: `Recebimento da parcela ${numeroParcela}/${totalParcelas} · ${venda.clienteNome}`,
+      referencia: venda.codigo,
+      vendaId: venda.id,
+      vendaCodigo: venda.codigo,
+      formaPagamento: pagamento.forma,
+      valor: pagamento.valor,
+      responsavelId: null,
+      responsavelNome: "Backoffice",
+      observacao: pagamento.observacao ?? "Baixa registrada no backoffice",
+      idempotencyKey: idempotencyKey ? `${venda.id}:parcela:${idempotencyKey}` : null,
     });
   }
 

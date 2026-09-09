@@ -341,6 +341,55 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       });
       expect(recebimento.status).toBe(400);
     });
+
+    describe("idempotencyKey (Etapa 10.13)", () => {
+      it("retry com a mesma idempotencyKey devolve sucesso nas duas vezes, sem duplicar o movimento de caixa", async () => {
+        const { venda } = await criarVendaFiadaViaHttpSetup(300, 300);
+        const chave = `cancelamento-http-idem-${Date.now()}`;
+        const payload = JSON.stringify({ tipo: "integral", motivo: "Teste HTTP idempotência", idempotencyKey: chave });
+
+        const primeira = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, { method: "POST", headers: authHeaders(), body: payload });
+        const segunda = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, { method: "POST", headers: authHeaders(), body: payload });
+        expect(primeira.status).toBe(201);
+        expect(segunda.status).toBe(201); // replay reconhecido, nunca 400
+
+        const corpoSegunda = (await segunda.json()) as { data: { status: string } };
+        expect(corpoSegunda.data.status).toBe("cancelada");
+
+        const movimentos = await connection.collection("movimentos_caixa").find({ vendaId: venda.id, tipo: "cancelamento" }).toArray();
+        expect(movimentos).toHaveLength(1); // nunca duplicado
+      });
+
+      it("uma chave DIFERENTE numa venda já cancelada retorna 400 (nunca um segundo cancelamento)", async () => {
+        const { venda } = await criarVendaFiadaViaHttpSetup(300, 300);
+
+        const primeira = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ tipo: "integral", motivo: "Original", idempotencyKey: "chave-original" }),
+        });
+        expect(primeira.status).toBe(201);
+
+        const segunda = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ tipo: "integral", motivo: "Chave diferente", idempotencyKey: "chave-conflitante" }),
+        });
+        expect(segunda.status).toBe(400);
+      });
+
+      it("payload legado sem idempotencyKey continua funcionando normalmente", async () => {
+        const { venda } = await criarVendaFiadaViaHttpSetup(200, 200);
+        const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ tipo: "integral", motivo: "Sem chave" }),
+        });
+        expect(resposta.status).toBe(201);
+        const corpo = (await resposta.json()) as { data: { status: string } };
+        expect(corpo.data.status).toBe("cancelada");
+      });
+    });
   });
 
   describe("POST /api/v1/vendas/:id/recebimentos (Etapa 10.8)", () => {

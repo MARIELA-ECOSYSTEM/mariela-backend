@@ -104,6 +104,33 @@ export class VendasRepository {
     throw ApiException.conflict("Não foi possível salvar as alterações: a venda foi modificada por outra operação simultânea. Tente novamente.");
   }
 
+  /**
+   * "Reivindica" atomicamente o direito de restaurar o estoque de UMA linha
+   * de `cancelamento.itens` (Etapa 10.13) — `updateOne` com `arrayFilters`,
+   * fora de `salvarComRetentativa`/versionamento otimista de propósito: é uma
+   * escrita condicional autocontida (`WHERE restaurado = false`), do tipo
+   * "compare-and-swap" — o mesmo padrão de idempotência por índice único já
+   * usado em `VendasRepository.criar`/`MovimentosCaixaRepository.criar`,
+   * aplicado aqui a um campo em vez de um índice.
+   *
+   * Devolve `true` só para quem GANHOU a reivindicação (deve prosseguir e
+   * chamar `ProdutosService.ajustarQuantidadeTamanho`); `false` quando o item
+   * já estava `restaurado` (outra chamada já tratou, ou é uma reconciliação
+   * repetida) — o chamador NUNCA deve restaurar estoque quando isto devolve
+   * `false`. Sob duas chamadas concorrentes tentando reconciliar o MESMO
+   * item, o Mongo garante que só uma delas terá `modifiedCount === 1`.
+   */
+  async marcarItemDevolvidoRestaurado(vendaId: string, itemId: string): Promise<boolean> {
+    const resultado = await this.vendaModel
+      .updateOne(
+        { _id: vendaId, "cancelamento.itens": { $elemMatch: { itemId, restaurado: false } } },
+        { $set: { "cancelamento.itens.$[item].restaurado": true } },
+        { arrayFilters: [{ "item.itemId": itemId, "item.restaurado": false }] },
+      )
+      .exec();
+    return resultado.modifiedCount === 1;
+  }
+
   async listarComFacetas(params: ListarVendasParams): Promise<ListaVendasResultado> {
     const base = filtroSempreAtivo(params.busca);
     const filtroCompleto = combinarFiltros(base, params.selecao);

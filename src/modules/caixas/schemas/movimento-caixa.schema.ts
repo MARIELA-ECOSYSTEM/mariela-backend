@@ -16,9 +16,25 @@ import {
  * nova movimentação (ver regra de negócio no relatório).
  *
  * `idempotencyKey` é opcional (só quem envia se beneficia da proteção) e
- * único por caixa via índice parcial esparso abaixo — uma repetição da mesma
- * chave devolve o movimento já existente em vez de duplicá-lo (ver
- * `CaixasService.registrarMovimento`).
+ * único GLOBALMENTE (não mais por caixa — Etapa 10.13) via índice parcial
+ * esparso abaixo: uma repetição da mesma chave devolve o movimento já
+ * existente em vez de duplicá-lo, mesmo que o caixa ATUALMENTE aberto seja
+ * diferente do caixa onde o movimento original foi lançado (ver
+ * `CaixasService.registrarMovimento`/`registrarMovimentoDeVenda`).
+ *
+ * ANTES desta etapa o índice era `{caixaId, idempotencyKey}`: como
+ * `receberPagamento`/`baixarParcela`/`cancelar` (Etapas 10.10-10.13) resolvem
+ * o caixa de lançamento DINAMICAMENTE (`caixasService.obterAtual()`), um
+ * retry chegando depois de o caixa original fechar e outro abrir recalculava
+ * um `caixaId` diferente — a chave antiga não colidia com o índice antigo
+ * (caixaId mudou) e um SEGUNDO movimento era criado, duplicando o valor nos
+ * relatórios do caixa novo. A identidade da operação financeira nunca pode
+ * depender de qual caixa está aberto no momento do retry; só o VALOR
+ * lançado (`caixaId` no documento) continua refletindo isso. As chaves
+ * derivadas em `VendasService` (`${vendaId}:pagamento:N`,
+ * `${vendaId}:recebimento:X`, `${vendaId}:parcela:X`,
+ * `${vendaId}:cancelamento:X`) já incorporam o id da venda especificamente
+ * para sustentar essa unicidade global sem colidir entre vendas diferentes.
  */
 @Schema({ collection: "movimentos_caixa", versionKey: false, timestamps: { createdAt: "criadoEm", updatedAt: false } })
 export class MovimentoCaixa {
@@ -86,8 +102,7 @@ MovimentoCaixaSchema.index({ caixaId: 1, dataHora: -1 });
 MovimentoCaixaSchema.index({ caixaId: 1, tipo: 1 });
 // Estatísticas do dia, somando todos os caixas.
 MovimentoCaixaSchema.index({ dataHora: 1 });
-// Deduplicação de retries: única por caixa quando informada (esparsa — nem todo movimento manda idempotencyKey).
-MovimentoCaixaSchema.index(
-  { caixaId: 1, idempotencyKey: 1 },
-  { unique: true, partialFilterExpression: { idempotencyKey: { $type: "string" } } },
-);
+// Deduplicação de retries: única GLOBALMENTE quando informada (esparsa — nem
+// todo movimento manda idempotencyKey) — Etapa 10.13, nunca mais escopada
+// por caixa (ver comentário da classe acima).
+MovimentoCaixaSchema.index({ idempotencyKey: 1 }, { unique: true, partialFilterExpression: { idempotencyKey: { $type: "string" } } });
