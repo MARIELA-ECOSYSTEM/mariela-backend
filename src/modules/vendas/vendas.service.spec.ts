@@ -5327,4 +5327,133 @@ describe("VendasService (integração — MongoDB real)", () => {
       await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
     });
   });
+
+  describe("auditoria de pagamentos, parcelas e idempotência (Etapa 10.15)", () => {
+    async function movimentosDaVenda(vendaId: string) {
+      return connection.collection("movimentos_caixa").find({ vendaId }).toArray();
+    }
+
+    it("receberPagamento: retry recupera um movimento de caixa ausente (crash simulado) sem duplicar o pagamento", async () => {
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 400 }],
+        },
+        null,
+      );
+      const chave = `crash-recebimento-${Date.now()}`;
+
+      const primeira = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300, idempotencyKey: chave }, null);
+      expect(primeira.valorPago).toBe(700);
+      const antesDoCrash = await movimentosDaVenda(venda.id);
+      expect(antesDoCrash.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`)).toHaveLength(1);
+
+      // Simula "processo morreu ENTRE salvar a venda e lançar o movimento de
+      // caixa": apaga só o movimento do RECEBIMENTO, preservando o pagamento
+      // já persistido na venda e o movimento original da criação (tipo
+      // "venda") — exatamente o estado que um crash real deixaria.
+      await connection.collection("movimentos_caixa").deleteMany({ vendaId: venda.id, tipo: "recebimento_parcela" });
+      const semMovimento = await movimentosDaVenda(venda.id);
+      expect(semMovimento.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`)).toHaveLength(0);
+
+      // Retry com a MESMA chave e o MESMO valor: reconhecido como replay do
+      // pagamento (nunca reaplica), mas RECRIA o movimento que faltava.
+      const retry = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300, idempotencyKey: chave }, null);
+      expect(retry.valorPago).toBe(700); // nunca 1000 (nunca reaplicado)
+      expect(retry.pagamentos.filter((p) => p.idempotencyKey === chave)).toHaveLength(1); // 1 pagamento, nunca 2
+
+      const depoisDoRetry = await movimentosDaVenda(venda.id);
+      expect(depoisDoRetry.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`)).toHaveLength(1); // recriado, nunca duplicado
+      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+    });
+
+    it("baixarParcela: retry recupera um movimento de caixa ausente (crash simulado) sem duplicar o pagamento", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+        },
+        null,
+      );
+      const parcelaId = String(venda.parcelas[0]!._id);
+      const chave = `crash-parcela-${Date.now()}`;
+
+      const primeira = await service.baixarParcela(venda.id, parcelaId, { idempotencyKey: chave }, null);
+      expect(primeira.status).toBe("concluida");
+      expect(primeira.parcelas[0]?.pagoEm).not.toBeNull();
+
+      await connection.collection("movimentos_caixa").deleteMany({ vendaId: venda.id, tipo: "recebimento_parcela" });
+      const semMovimento = await movimentosDaVenda(venda.id);
+      expect(semMovimento.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave}`)).toHaveLength(0);
+
+      const retry = await service.baixarParcela(venda.id, parcelaId, { idempotencyKey: chave }, null);
+      expect(retry.valorPago).toBe(300); // nunca 400 (nunca rebaixada)
+      expect(retry.parcelasPagas).toBe(1);
+
+      const depoisDoRetry = await movimentosDaVenda(venda.id);
+      expect(depoisDoRetry.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave}`)).toHaveLength(1);
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("baixarParcela: mesma chave reaproveitada para uma parcela DIFERENTE já paga por outro meio é rejeitada por conflito, nunca confunde as duas baixas", async () => {
+      // 3 parcelas de valores não-uniformes (100 dividido em 3 não fecha
+      // exato) — necessário para que a checagem por VALOR (proxy usado por
+      // não existir vínculo explícito parcela↔pagamento em `PagamentoVenda`)
+      // consiga distinguir uma parcela da outra neste teste.
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+          totalParcelas: 3,
+        },
+        null,
+      );
+      const [parcela1, parcela2, parcela3] = venda.parcelas;
+      expect(parcela1!.valor).not.toBe(parcela3!.valor); // confirma o arredondamento desigual usado pelo teste
+
+      const chave1 = `parcela-1-${Date.now()}`;
+      await service.baixarParcela(venda.id, String(parcela1!._id), { idempotencyKey: chave1 }, null);
+
+      const chave3 = `parcela-3-${Date.now()}`;
+      await service.baixarParcela(venda.id, String(parcela3!._id), { idempotencyKey: chave3 }, null);
+
+      // Reaproveita a chave da parcela 1 (valor diferente) pedindo a baixa da
+      // parcela 3 — que JÁ está paga (por `chave3`, não por `chave1`). Nunca
+      // pode devolver silenciosamente "sucesso" como se `chave1` tivesse sido
+      // a responsável por baixar a parcela 3.
+      await expect(
+        service.baixarParcela(venda.id, String(parcela3!._id), { idempotencyKey: chave1 }, null),
+      ).rejects.toThrow(ApiException);
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.parcelasPagas).toBe(2); // só 1 e 3, nada adicional
+      expect(final.valorPago).toBe(final.parcelas.filter((p) => p.pagoEm).reduce((total, p) => total + p.valor, 0));
+
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave1}`)).toHaveLength(1); // continua só o da parcela 1
+      expect(movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave3}`)).toHaveLength(1); // continua só o da parcela 3
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 + final.valorPago }, null);
+    });
+  });
 });

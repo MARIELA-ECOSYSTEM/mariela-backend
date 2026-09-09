@@ -488,9 +488,21 @@ export class VendasService {
     // existe, mas a PARCELA pedida agora continua em aberto (`pagoEm: null`)
     // — a chave pertence à baixa de OUTRA parcela desta mesma venda, nunca
     // um replay desta. Nunca reconcilia a parcela errada.
+    //
+    // Etapa 10.15 — AUDITORIA: `parcelaAtual.pagoEm` truthy sozinho não prova
+    // que foi ESTE pagamento que a quitou — a parcela pedida agora pode já
+    // ter sido baixada por OUTRO meio (chave diferente) enquanto a chave
+    // informada pertence à baixa de uma parcela DIFERENTE desta mesma venda
+    // (ex.: caller reaproveita por engano uma `idempotencyKey` já usada numa
+    // parcela anterior). `PagamentoVenda` não guarda qual parcela originou o
+    // pagamento, então `existente.valor === parcelaAtual.valor` é o proxy
+    // mais forte disponível para confirmar que o pagamento encontrado é
+    // realmente desta parcela — sem essa checagem, o caller receberia uma
+    // resposta "de sucesso" (o estado atual da venda, já pago por outro
+    // meio) para uma chave que, na verdade, nunca baixou ESTA parcela.
     if (dto.idempotencyKey) {
       const existente = vendaAtual.pagamentos.find((pagamento) => pagamento.idempotencyKey === dto.idempotencyKey);
-      if (existente && parcelaAtual.pagoEm) {
+      if (existente && parcelaAtual.pagoEm && existente.valor === parcelaAtual.valor) {
         await this.garantirMovimentoDeBaixaParcela(caixaAtual.id, vendaAtual, dto.idempotencyKey, existente, parcelaAtual.numero, parcelaAtual.total);
         return vendaAtual;
       }
@@ -552,7 +564,11 @@ export class VendasService {
       if (!parcela) throw ApiException.notFound("Parcela não encontrada.");
       if (dto.idempotencyKey) {
         const existentePagamento = documento.pagamentos.find((pagamento) => pagamento.idempotencyKey === dto.idempotencyKey);
-        if (existentePagamento && parcela.pagoEm) {
+        // Etapa 10.15 — mesmo raciocínio do fail-fast acima: só reconhece
+        // como replay se o VALOR do pagamento encontrado bater com o desta
+        // parcela (proxy de que é realmente o pagamento DELA, não de outra
+        // parcela desta venda que coincidentemente também já está paga).
+        if (existentePagamento && parcela.pagoEm && existentePagamento.valor === parcela.valor) {
           // Concorrência: outra tentativa com a MESMA chave já baixou ESTA
           // parcela enquanto esta rodava — reconhece como replay.
           pagamentoAplicado = existentePagamento;
