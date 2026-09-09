@@ -9,7 +9,7 @@ import { CaixasService } from "../caixas/caixas.service.js";
 import { ClientesRepository } from "../clientes/clientes.repository.js";
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
-import { arredondarMoeda, precoEfetivo } from "../produtos/utils/precos.util.js";
+import { precoEfetivo } from "../produtos/utils/precos.util.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
 import { VendedoresRepository } from "../vendedores/vendedores.repository.js";
 import {
@@ -400,6 +400,18 @@ export class VendasService {
     const vendaAtual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
     if (vendaAtual.status === "cancelada") throw ApiException.validation("Venda cancelada não aceita novas baixas.");
 
+    // Etapa 10.10: o recebimento é lançado no caixa ATUALMENTE aberto — nunca
+    // em `venda.caixaId` (ver `receberPagamento` para a explicação completa
+    // do porquê: o caixa original quase certamente já está fechado quando uma
+    // parcela é paga dias/semanas depois, e `registrarMovimentoDeVenda`
+    // rejeita lançamento em caixa fechado). Resolvido ANTES de qualquer
+    // mutação da venda para falhar cedo, sem deixar a parcela baixada sem o
+    // movimento de caixa correspondente.
+    const caixaAtual = await this.caixasService.obterAtual();
+    if (!caixaAtual) {
+      throw ApiException.validation("Nenhum caixa aberto. Abra o caixa antes de registrar a baixa.");
+    }
+
     let formaUsada = "";
     let valorParcela = 0;
     let numeroParcela = 0;
@@ -440,21 +452,19 @@ export class VendasService {
       totalParcelas = parcela.total;
     });
 
-    if (venda.caixaId) {
-      await this.caixasService.registrarMovimentoDeVenda({
-        caixaId: venda.caixaId,
-        tipo: "recebimento_parcela",
-        descricao: `Recebimento da parcela ${numeroParcela}/${totalParcelas} · ${venda.clienteNome}`,
-        referencia: venda.codigo,
-        vendaId: venda.id,
-        vendaCodigo: venda.codigo,
-        formaPagamento: formaUsada,
-        valor: valorParcela,
-        responsavelId: null,
-        responsavelNome: "Backoffice",
-        observacao: "Baixa registrada no backoffice",
-      });
-    }
+    await this.caixasService.registrarMovimentoDeVenda({
+      caixaId: caixaAtual.id,
+      tipo: "recebimento_parcela",
+      descricao: `Recebimento da parcela ${numeroParcela}/${totalParcelas} · ${venda.clienteNome}`,
+      referencia: venda.codigo,
+      vendaId: venda.id,
+      vendaCodigo: venda.codigo,
+      formaPagamento: formaUsada,
+      valor: valorParcela,
+      responsavelId: null,
+      responsavelNome: "Backoffice",
+      observacao: "Baixa registrada no backoffice",
+    });
 
     await this.registrarEvento(venda.id, "venda.parcela_baixada", usuarioId, { parcelaId, valor: valorParcela });
     return venda;
@@ -501,6 +511,22 @@ export class VendasService {
    * Atomicidade: a venda é salva PRIMEIRO; o movimento de caixa é lançado
    * DEPOIS — mesma ordem e mesma limitação já aceitas em `criarInterno` (sem
    * transação multi-documento nesta etapa; ver "Riscos" no relatório).
+   *
+   * Etapa 10.10 — CAIXA ATUAL, nunca `venda.caixaId`: o recebimento é lançado
+   * no caixa ATUALMENTE aberto, resolvido uma única vez logo no início (antes
+   * de qualquer mutação da venda). Motivo: `registrarMovimentoDeVenda` rejeita
+   * lançamento num caixa fechado (`exigirAberto`), e o caixa em que a venda
+   * original foi criada quase certamente já está fechado quando o cliente
+   * volta, dias ou semanas depois, para pagar o saldo — usar `venda.caixaId`
+   * (como a Etapa 10.8 fazia) tornava essa chamada permanentemente impossível
+   * de completar assim que esse caixa fechasse (o erro só aconteceria DEPOIS
+   * de `valorPago` já ter sido incrementado e salvo, deixando a venda com o
+   * pagamento aplicado mas sem o movimento correspondente). Resolver o caixa
+   * ANTES da mutação evita esse estado parcial no caminho comum; a única
+   * janela residual (caixa fecha entre esta checagem e o lançamento do
+   * movimento, alguns milissegundos depois) é recuperável por retry com a
+   * mesma `idempotencyKey` — mesma classe de limitação já aceita em toda
+   * operação financeira deste serviço sem transação multi-documento.
    */
   async receberPagamento(vendaId: string, dados: DadosReceberPagamento, usuarioId: string | null): Promise<VendaDocument> {
     const vendaAtual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
@@ -508,10 +534,15 @@ export class VendasService {
       throw ApiException.validation("Venda cancelada não aceita novos recebimentos.");
     }
 
+    const caixaAtual = await this.caixasService.obterAtual();
+    if (!caixaAtual) {
+      throw ApiException.validation("Nenhum caixa aberto. Abra o caixa antes de registrar o recebimento.");
+    }
+
     if (dados.idempotencyKey) {
       const existente = vendaAtual.pagamentos.find((pagamento) => pagamento.idempotencyKey === dados.idempotencyKey);
       if (existente) {
-        await this.garantirMovimentoDeRecebimento(vendaAtual, dados.idempotencyKey, existente);
+        await this.garantirMovimentoDeRecebimento(caixaAtual.id, vendaAtual, dados.idempotencyKey, existente);
         return vendaAtual;
       }
     }
@@ -579,61 +610,112 @@ export class VendasService {
     });
 
     if (pagamentoAplicado) {
-      await this.garantirMovimentoDeRecebimento(venda, dados.idempotencyKey, pagamentoAplicado);
+      await this.garantirMovimentoDeRecebimento(caixaAtual.id, venda, dados.idempotencyKey, pagamentoAplicado);
     }
 
     await this.registrarEvento(venda.id, "venda.recebimento_registrado", usuarioId, { valor, idempotencyKey: dados.idempotencyKey ?? null });
     return venda;
   }
 
+  /**
+   * Cancelamento/devolução (Etapa 10.9) — CORRIGIDO em relação à versão
+   * anterior em dois pontos:
+   *
+   * 1. VALOR DEVOLVIDO por item agora usa `calcularValorDevolucaoItem`
+   *    (snapshot: `item.subtotal` já líquido de `descontoItem`, mais o rateio
+   *    de `descontoVenda`) em vez de `item.precoPraticado × quantidade`, que
+   *    ignorava qualquer desconto de item e o desconto da venda — devolvia
+   *    MAIS do que o cliente efetivamente pagou por aquela unidade. Ver
+   *    "regra final de cálculo de devolução" no relatório.
+   *
+   * 2. CONCORRÊNCIA/IDEMPOTÊNCIA: a decisão de QUAIS itens/quantidades devolver
+   *    (e seu valor) é tomada DENTRO do callback de `salvarComRetentativa`,
+   *    contra o documento recém-lido a CADA tentativa — nunca contra uma
+   *    cópia capturada antes do loop (bug da versão anterior: `devolverAoEstoque`
+   *    rodava ANTES do retry, usando uma leitura ficando obsoleta sob
+   *    concorrência real, podendo restaurar o MESMO estoque duas vezes se
+   *    duas chamadas concorrentes computassem a mesma quantidade "restante" a
+   *    partir do mesmo snapshot). Agora `devolverAoEstoque` só roda DEPOIS que
+   *    o `salvarComRetentativa` retorna, usando exclusivamente a lista
+   *    capturada pela tentativa que efetivamente venceu a gravação — a mesma
+   *    quantidade nunca é devolvida ao estoque mais de uma vez, mesmo sob
+   *    duas requisições disputando a mesma venda/item.
+   *
+   * Atomicidade: mesma limitação já aceita em `criarInterno`/`receberPagamento`
+   * — a Venda é salva primeiro (protegida por versionamento otimista); a
+   * baixa de estoque e o movimento de caixa acontecem DEPOIS, sem transação
+   * multi-documento (Venda e Produto são coleções diferentes). Ver "Riscos"
+   * no relatório.
+   */
   async cancelar(vendaId: string, dto: CancelamentoDto, usuarioId: string | null): Promise<VendaDocument> {
     const vendaAtual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
     if (vendaAtual.status === "cancelada") throw ApiException.validation("Esta venda já está cancelada.");
 
-    const devolvidos: ItemDevolvido[] = [];
-    if (dto.tipo === "integral") {
-      for (const item of vendaAtual.itens) {
-        const restante = item.quantidade - item.quantidadeDevolvida;
-        if (restante <= 0) continue;
-        await this.devolverAoEstoque(item, restante);
-        devolvidos.push({ itemId: String(item._id), codProduto: item.codProduto, nome: item.nome, quantidade: restante, valor: arredondarMoeda(item.precoPraticado * restante) });
-      }
-    } else {
-      const solicitados = dto.itens ?? [];
-      if (!solicitados.length) {
-        throw ApiException.validation("Dados inválidos.", [{ field: "itens", message: "Selecione ao menos um item para devolver." }]);
-      }
-      for (const solicitado of solicitados) {
-        const item = vendaAtual.itens.find((registro) => String(registro._id) === solicitado.itemId);
-        if (!item) throw ApiException.notFound("Item da venda não encontrado.");
-        const restante = item.quantidade - item.quantidadeDevolvida;
-        const quantidade = Math.min(Math.max(0, Math.floor(solicitado.quantidade)), restante);
-        if (quantidade <= 0) continue;
-        await this.devolverAoEstoque(item, quantidade);
-        devolvidos.push({ itemId: String(item._id), codProduto: item.codProduto, nome: item.nome, quantidade, valor: arredondarMoeda(item.precoPraticado * quantidade) });
-      }
-      if (!devolvidos.length) throw ApiException.validation("Nenhuma quantidade disponível para devolução.");
+    if (dto.tipo === "parcial" && !(dto.itens ?? []).length) {
+      throw ApiException.validation("Dados inválidos.", [{ field: "itens", message: "Selecione ao menos um item para devolver." }]);
     }
 
-    const valorDevolvido = arredondar(devolvidos.reduce((total, item) => total + item.valor, 0));
     const motivo = dto.motivo.trim();
     const agora = new Date();
+    let devolvidos: ItemDevolvido[] = [];
+    let valorDevolvido = 0;
 
     const venda = await this.vendasRepository.salvarComRetentativa(vendaId, (documento) => {
       if (documento.status === "cancelada") throw ApiException.validation("Esta venda já está cancelada.");
 
-      for (const devolvido of devolvidos) {
+      const devolvidosDaTentativa: ItemDevolvido[] = [];
+      if (dto.tipo === "integral") {
+        for (const item of documento.itens) {
+          const restante = item.quantidade - item.quantidadeDevolvida;
+          if (restante <= 0) continue;
+          devolvidosDaTentativa.push({
+            itemId: String(item._id),
+            codProduto: item.codProduto,
+            nome: item.nome,
+            quantidade: restante,
+            valor: this.calcularValorDevolucaoItem(documento, item, restante),
+          });
+        }
+      } else {
+        for (const solicitado of dto.itens ?? []) {
+          const item = documento.itens.find((registro) => String(registro._id) === solicitado.itemId);
+          if (!item) throw ApiException.notFound("Item da venda não encontrado.");
+          const restante = item.quantidade - item.quantidadeDevolvida;
+          const quantidade = Math.min(Math.max(0, Math.floor(solicitado.quantidade)), restante);
+          if (quantidade <= 0) continue;
+          devolvidosDaTentativa.push({
+            itemId: String(item._id),
+            codProduto: item.codProduto,
+            nome: item.nome,
+            quantidade,
+            valor: this.calcularValorDevolucaoItem(documento, item, quantidade),
+          });
+        }
+        if (!devolvidosDaTentativa.length) throw ApiException.validation("Nenhuma quantidade disponível para devolução.");
+      }
+
+      for (const devolvido of devolvidosDaTentativa) {
         const item = documento.itens.find((registro) => String(registro._id) === devolvido.itemId);
         if (item) item.quantidadeDevolvida += devolvido.quantidade;
       }
 
-      documento.valorDevolvido = arredondar(documento.valorDevolvido + valorDevolvido);
-      documento.cancelamento = { tipo: dto.tipo, motivo, dataHora: agora, autor: "Backoffice", valorDevolvido, itens: devolvidos } as never;
+      const valorDevolvidoDaTentativa = arredondar(devolvidosDaTentativa.reduce((total, item) => total + item.valor, 0));
+      documento.valorDevolvido = arredondar(documento.valorDevolvido + valorDevolvidoDaTentativa);
+      documento.cancelamento = {
+        tipo: dto.tipo,
+        motivo,
+        dataHora: agora,
+        autor: "Backoffice",
+        valorDevolvido: valorDevolvidoDaTentativa,
+        itens: devolvidosDaTentativa,
+      } as never;
       documento.historico.push({
         dataHora: agora,
         tipo: dto.tipo === "integral" ? "cancelamento" : "devolucao",
         descricao:
-          dto.tipo === "integral" ? `Venda cancelada integralmente · ${motivo}` : `Devolução parcial de ${devolvidos.length} item(ns) · ${motivo}`,
+          dto.tipo === "integral"
+            ? `Venda cancelada integralmente · ${motivo}`
+            : `Devolução parcial de ${devolvidosDaTentativa.length} item(ns) · ${motivo}`,
         autor: "Backoffice",
       });
 
@@ -642,7 +724,19 @@ export class VendasService {
         documento.status = "cancelada";
         documento.valorPendente = 0;
       }
+
+      // Capturado da tentativa que efetivamente for salva (sobrescrito a cada
+      // retry) — nunca da leitura inicial, feita fora deste callback.
+      devolvidos = devolvidosDaTentativa;
+      valorDevolvido = valorDevolvidoDaTentativa;
     });
+
+    // Estoque restaurado SÓ AGORA, com a lista da tentativa vencedora — nunca
+    // antes do `salvarComRetentativa` (ver nota de concorrência acima).
+    for (const devolvido of devolvidos) {
+      const item = venda.itens.find((registro) => String(registro._id) === devolvido.itemId);
+      if (item) await this.devolverAoEstoque(item, devolvido.quantidade);
+    }
 
     const valorParaCaixa = Math.min(valorDevolvido, venda.valorPago);
     if (valorParaCaixa > 0 && venda.caixaId) {
@@ -670,6 +764,39 @@ export class VendasService {
 
     await this.registrarEvento(venda.id, dto.tipo === "integral" ? "venda.cancelada" : "venda.devolvida", usuarioId, { valorDevolvido });
     return venda;
+  }
+
+  /**
+   * Valor econômico devolvido para `quantidade` unidades de um item (Etapa
+   * 10.9) — SEMPRE a partir do snapshot já persistido, nunca do preço/
+   * promoção/tarifa atuais (seção 3 do pedido):
+   *
+   * 1. Valor unitário EFETIVO = `item.subtotal / item.quantidade` — `subtotal`
+   *    já é `precoPraticado × quantidade − descontoItem` (resolvido na
+   *    criação, ver `criarInterno`), então dividir pela quantidade ORIGINAL
+   *    da linha (nunca a quantidade sendo devolvida agora) dá o valor por
+   *    unidade já líquido de `descontoItem` e de promoção — sem recalcular
+   *    percentual nenhum, só usando o campo que já existe.
+   * 2. Rateio de `descontoVenda` (seção 6 do pedido — nenhuma regra de rateio
+   *    existia antes desta etapa): proporcional ao peso de CADA item no
+   *    subtotal da venda (soma de `item.subtotal`, recomputada aqui a partir
+   *    dos itens persistidos — nunca um campo `subtotalVenda` armazenado, que
+   *    não existe no schema). Com `descontoVenda = 0` (o caso comum, todas as
+   *    vendas de todas as etapas anteriores), o fator é exatamente 1 e o
+   *    valor não muda em nada — retrocompatível por construção.
+   *
+   * Tarifa de adquirente (Etapa 10.5) NUNCA entra aqui (seção 9 do pedido): a
+   * tarifa é custo de operação sobre o PAGAMENTO, não sobre o item vendido —
+   * o valor devolvido ao cliente é sempre bruto, nunca `valorLiquido`.
+   */
+  private calcularValorDevolucaoItem(documento: VendaDocument, item: ItemVenda, quantidade: number): number {
+    const valorUnitarioEfetivo = item.quantidade > 0 ? item.subtotal / item.quantidade : 0;
+    const valorBrutoDevolucao = valorUnitarioEfetivo * quantidade;
+
+    const subtotalVenda = documento.itens.reduce((total, atual) => total + atual.subtotal, 0);
+    const fatorDescontoVenda = subtotalVenda > 0 ? (subtotalVenda - documento.descontoVenda) / subtotalVenda : 1;
+
+    return arredondar(valorBrutoDevolucao * fatorDescontoVenda);
   }
 
   /**
@@ -888,19 +1015,19 @@ export class VendasService {
    * Lança no Caixa o movimento de um RECEBIMENTO POSTERIOR (Etapa 10.8) —
    * reaproveita `tipo: "recebimento_parcela"` (mesma faixa já usada por
    * `baixarParcela` e já somada no resumo do caixa como "recebimentos": não
-   * inventa um tipo novo para o mesmo tipo de evento financeiro). Usa
-   * `venda.caixaId` (o caixa da venda original, mesma decisão já tomada por
-   * `baixarParcela` — ver "Riscos" no relatório sobre a limitação de um
-   * recebimento não poder ser lançado se esse caixa específico já tiver sido
-   * fechado). Idempotente por chave DERIVADA (`${idempotencyKey}:recebimento`)
-   * quando o chamador informou uma — sem chave, nenhuma deduplicação (mesmo
-   * padrão do resto do projeto). Sempre o valor BRUTO do pagamento, nunca o
-   * líquido pós-tarifa (seção 10 do pedido).
+   * inventa um tipo novo para o mesmo tipo de evento financeiro). Recebe
+   * `caixaId` explicitamente — desde a Etapa 10.10, é sempre o caixa
+   * ATUALMENTE aberto (resolvido pelo chamador antes de qualquer mutação da
+   * venda), nunca `venda.caixaId` (ver comentário completo em
+   * `receberPagamento`). Idempotente por chave DERIVADA
+   * (`${idempotencyKey}:recebimento`) quando o chamador informou uma — sem
+   * chave, nenhuma deduplicação (mesmo padrão do resto do projeto). Sempre o
+   * valor BRUTO do pagamento, nunca o líquido pós-tarifa (seção 10 do pedido).
    */
-  private async garantirMovimentoDeRecebimento(venda: VendaDocument, idempotencyKey: string | undefined, pagamento: PagamentoVenda): Promise<void> {
-    if (!venda.caixaId || pagamento.valor <= 0) return;
+  private async garantirMovimentoDeRecebimento(caixaId: string, venda: VendaDocument, idempotencyKey: string | undefined, pagamento: PagamentoVenda): Promise<void> {
+    if (pagamento.valor <= 0) return;
     await this.caixasService.registrarMovimentoDeVenda({
-      caixaId: venda.caixaId,
+      caixaId,
       tipo: "recebimento_parcela",
       descricao: `Recebimento posterior da venda ${venda.codigo} · ${venda.clienteNome} · ${pagamento.forma}`,
       referencia: venda.codigo,

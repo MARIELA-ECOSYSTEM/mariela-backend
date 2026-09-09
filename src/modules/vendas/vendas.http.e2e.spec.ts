@@ -250,6 +250,99 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     expect(corpo.data.cancelamento?.tipo).toBe("integral");
   });
 
+  describe("POST /api/v1/vendas/:id/cancelamento (Etapa 10.9)", () => {
+    it("devolução com descontoItem usa o valor efetivo (subtotal), nunca o preço praticado bruto", async () => {
+      const produto = await produtosService.criar({ nome: `Produto Cancelamento HTTP ${Date.now()}`, categoria: "Vestidos", precoCusto: 50, precoVenda: 100, ehNovidade: false }, null);
+      const variante = await produtosService.adicionarVariante(produto.id, { cor: "Rosa" }, null);
+      const { tamanhoId } = await produtosService.ajustarQuantidadeTamanho(produto.id, String(variante._id), { tamanho: "P", delta: 5, exigirExistente: false });
+      const vendedor = await vendedoresService.criar({ nome: "Vendedora Cancelamento HTTP", telefone: telefoneUnico(), ativo: true, senha: "senha123" }, null);
+      const caixaAtual = await caixasService.obterAtual();
+      if (!caixaAtual) throw new Error("Nenhum caixa aberto.");
+
+      const venda = await vendasService.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixaAtual.id,
+          itens: [
+            {
+              produtoId: produto.id,
+              varianteId: String(variante._id),
+              tamanhoId,
+              quantidade: 1,
+              desconto: { tipo: "valor", valor: 20 },
+            },
+          ],
+          pagamentos: [{ forma: "Dinheiro", valor: 80 }],
+        },
+        null,
+      );
+      expect(venda.itens[0]?.subtotal).toBe(80);
+
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ tipo: "integral", motivo: "Teste HTTP descontoItem" }),
+      });
+      expect(resposta.status).toBe(201);
+      const corpo = (await resposta.json()) as { data: { valorDevolvido: number } };
+      expect(corpo.data.valorDevolvido).toBe(80); // nunca 100
+    });
+
+    it("cancelamento de venda EM_PAGAMENTO devolve só o valor efetivamente pago no caixa", async () => {
+      const { venda, caixa } = await criarVendaFiadaViaHttpSetup(1000, 400);
+      const antes = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+      const corpoAntes = (await antes.json()) as { data: { resumo: { devolucoes: number } } };
+
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ tipo: "integral", motivo: "Teste HTTP EM_PAGAMENTO" }),
+      });
+      expect(resposta.status).toBe(201);
+      const corpo = (await resposta.json()) as { data: { status: string; valorDevolvido: number } };
+      expect(corpo.data.status).toBe("cancelada");
+      expect(corpo.data.valorDevolvido).toBe(1000); // valor econômico do item inteiro
+
+      const depois = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+      const corpoDepois = (await depois.json()) as { data: { resumo: { devolucoes: number } } };
+      expect(corpoDepois.data.resumo.devolucoes - corpoAntes.data.resumo.devolucoes).toBe(400); // nunca 1000, nunca 600 (pendente)
+    });
+
+    it("venda já CANCELADA rejeita novo cancelamento (400)", async () => {
+      const { venda } = await criarVendaFiadaViaHttpSetup(500, 500);
+      const primeira = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ tipo: "integral", motivo: "Primeiro cancelamento" }),
+      });
+      expect(primeira.status).toBe(201);
+
+      const segunda = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ tipo: "integral", motivo: "Segundo cancelamento" }),
+      });
+      expect(segunda.status).toBe(400);
+    });
+
+    it("recebimento posterior após cancelamento continua rejeitado via HTTP (regressão Etapa 10.8)", async () => {
+      const { venda } = await criarVendaFiadaViaHttpSetup(500, 300);
+      const cancelamento = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ tipo: "integral", motivo: "Teste HTTP recebimento pós-cancelamento" }),
+      });
+      expect(cancelamento.status).toBe(201);
+
+      const recebimento = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ forma: "Dinheiro", valor: 50 }),
+      });
+      expect(recebimento.status).toBe(400);
+    });
+  });
+
   describe("POST /api/v1/vendas/:id/recebimentos (Etapa 10.8)", () => {
     it("SEM token retorna 401", async () => {
       const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/recebimentos`, {
