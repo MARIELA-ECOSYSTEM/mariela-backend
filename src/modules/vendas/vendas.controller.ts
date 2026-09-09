@@ -8,6 +8,7 @@ import { VendasService } from "./vendas.service.js";
 import { BaixarParcelaDto } from "./dto/baixar-parcela.dto.js";
 import { CancelamentoDto } from "./dto/cancelamento.dto.js";
 import { ListarVendasQueryDto } from "./dto/listar-vendas-query.dto.js";
+import { RegistrarRecebimentoDto } from "./dto/registrar-recebimento.dto.js";
 
 /**
  * Controller fino, SOMENTE CONSULTA + as duas ações administrativas já
@@ -52,6 +53,12 @@ export class VendasController {
     @CurrentUser("sub") usuarioId: string,
   ) {
     return { data: await this.vendasService.baixarParcela(id, parcelaId, dto, usuarioId) };
+  }
+
+  @Post(":id/recebimentos")
+  @ApiOperation({ summary: "Registra um recebimento posterior contra o saldo pendente de uma venda EM_PAGAMENTO." })
+  async receberPagamento(@Param("id") id: string, @Body() dto: RegistrarRecebimentoDto, @CurrentUser("sub") usuarioId: string) {
+    return { data: await this.vendasService.receberPagamento(id, dto, usuarioId) };
   }
 
   @Post(":id/cancelamento")

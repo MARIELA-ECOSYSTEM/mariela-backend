@@ -64,6 +64,18 @@ export interface PagamentoSolicitado {
 }
 
 /**
+ * Entrada de `VendasService.receberPagamento` (Etapa 10.8) — um RECEBIMENTO
+ * POSTERIOR contra o saldo pendente (`valorPendente`) de uma venda já criada.
+ * Estende `PagamentoSolicitado` exatamente (mesmos campos, mesma validação de
+ * modalidade/adquirente/tarifa via `validarPagamentoEstruturado` — nenhuma
+ * duplicação), acrescida só de `idempotencyKey`, opcional, para proteger o
+ * recebimento contra retry (mesmo padrão de `DadosCriarVenda.idempotencyKey`).
+ */
+export interface DadosReceberPagamento extends PagamentoSolicitado {
+  idempotencyKey?: string;
+}
+
+/**
  * Entrada do único ponto de criação de venda (`VendasService.criar`) — NÃO
  * exposto por nenhuma rota HTTP nesta etapa (ver relatório): a criação
  * pertence ao futuro MARIELA PDV. Usado hoje apenas pelos testes de

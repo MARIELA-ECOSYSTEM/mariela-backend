@@ -12,6 +12,7 @@ import { ResponseInterceptor } from "../../common/interceptors/response.intercep
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
+import { AdquirentesService } from "../adquirentes/adquirentes.service.js";
 import { CaixasService } from "../caixas/caixas.service.js";
 import { ClientesService } from "../clientes/clientes.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
@@ -36,6 +37,12 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
   let parcelaId: string;
   let caixaId: string;
   let contadorTelefone = 0;
+  let produtosService: ProdutosService;
+  let vendedoresService: VendedoresService;
+  let clientesService: ClientesService;
+  let caixasService: CaixasService;
+  let vendasService: VendasService;
+  let adquirentesService: AdquirentesService;
 
   function telefoneUnico(): string {
     contadorTelefone += 1;
@@ -44,6 +51,34 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
 
   function authHeaders(): Record<string, string> {
     return { authorization: `Bearer ${accessToken}`, "content-type": "application/json" };
+  }
+
+  /**
+   * Cria, fora do HTTP (mesmo padrão do seed em `beforeAll`), uma venda
+   * EM_PAGAMENTO para os testes de recebimento posterior. Reutiliza o ÚNICO
+   * caixa aberto do arquivo inteiro (`CaixasRepository` só permite um caixa
+   * aberto por vez, sistema afora — nenhum teste deste arquivo fecha o caixa
+   * seedado em `beforeAll`) em vez de abrir um novo, que causaria 409.
+   */
+  async function criarVendaFiadaViaHttpSetup(valorItem: number, valorPagoNaCriacao: number) {
+    const produto = await produtosService.criar({ nome: `Produto Recebimento HTTP ${Date.now()}`, categoria: "Vestidos", precoCusto: valorItem / 2, precoVenda: valorItem, ehNovidade: false }, null);
+    const variante = await produtosService.adicionarVariante(produto.id, { cor: "Preto" }, null);
+    const { tamanhoId } = await produtosService.ajustarQuantidadeTamanho(produto.id, String(variante._id), { tamanho: "M", delta: 5, exigirExistente: false });
+    const vendedor = await vendedoresService.criar({ nome: "Vendedora Recebimento HTTP", telefone: telefoneUnico(), ativo: true, senha: "senha123" }, null);
+    const cliente = await clientesService.criar({ nome: "Cliente Recebimento HTTP", telefone: telefoneUnico() }, null);
+    const caixaAtual = await caixasService.obterAtual();
+    if (!caixaAtual) throw new Error("Nenhum caixa aberto — o seed de beforeAll deveria manter um aberto.");
+    const venda = await vendasService.criar(
+      {
+        clienteId: cliente.id,
+        vendedorId: vendedor.id,
+        caixaId: caixaAtual.id,
+        itens: [{ produtoId: produto.id, varianteId: String(variante._id), tamanhoId, quantidade: 1 }],
+        pagamentos: valorPagoNaCriacao > 0 ? [{ forma: "Dinheiro", valor: valorPagoNaCriacao }] : [],
+      },
+      null,
+    );
+    return { venda, caixa: caixaAtual };
   }
 
   beforeAll(async () => {
@@ -78,11 +113,12 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     accessToken = login.accessToken;
 
     // Seed via mecanismo interno — nunca via HTTP (não existe rota de criação).
-    const produtosService = app.get(ProdutosService);
-    const vendedoresService = app.get(VendedoresService);
-    const clientesService = app.get(ClientesService);
-    const caixasService = app.get(CaixasService);
-    const vendasService = app.get(VendasService);
+    produtosService = app.get(ProdutosService);
+    vendedoresService = app.get(VendedoresService);
+    clientesService = app.get(ClientesService);
+    caixasService = app.get(CaixasService);
+    vendasService = app.get(VendasService);
+    adquirentesService = app.get(AdquirentesService);
 
     const produto = await produtosService.criar({ nome: "Produto HTTP Vendas", categoria: "Vestidos", precoCusto: 100, precoVenda: 200, ehNovidade: false }, null);
     const variante = await produtosService.adicionarVariante(produto.id, { cor: "Verde" }, null);
@@ -214,6 +250,134 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     expect(corpo.data.cancelamento?.tipo).toBe("integral");
   });
 
+  describe("POST /api/v1/vendas/:id/recebimentos (Etapa 10.8)", () => {
+    it("SEM token retorna 401", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/recebimentos`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ forma: "Dinheiro", valor: 10 }),
+      });
+      expect(resposta.status).toBe(401);
+    });
+
+    it("recebimento parcial reduz o pendente e reflete no caixa como recebimento", async () => {
+      const { venda, caixa } = await criarVendaFiadaViaHttpSetup(1000, 400);
+      const antes = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+      const corpoAntes = (await antes.json()) as { data: { resumo: { recebimentos: number } } };
+
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ forma: "Dinheiro", valor: 250 }),
+      });
+      expect(resposta.status).toBe(201);
+      const corpo = (await resposta.json()) as { data: { valorPago: number; valorPendente: number; status: string } };
+      expect(corpo.data.valorPago).toBe(650);
+      expect(corpo.data.valorPendente).toBe(350);
+      expect(corpo.data.status).toBe("em_pagamento");
+
+      const depois = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+      const corpoDepois = (await depois.json()) as { data: { resumo: { recebimentos: number } } };
+      expect(corpoDepois.data.resumo.recebimentos - corpoAntes.data.resumo.recebimentos).toBe(250);
+    });
+
+    it("recebimento que quita exatamente o saldo conclui a venda", async () => {
+      const { venda } = await criarVendaFiadaViaHttpSetup(500, 300);
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ forma: "PIX", valor: 200 }),
+      });
+      expect(resposta.status).toBe(201);
+      const corpo = (await resposta.json()) as { data: { status: string; valorPendente: number } };
+      expect(corpo.data.status).toBe("concluida");
+      expect(corpo.data.valorPendente).toBe(0);
+    });
+
+    it("recebimento acima do saldo pendente retorna 400 sem alterar a venda", async () => {
+      const { venda } = await criarVendaFiadaViaHttpSetup(500, 300);
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ forma: "Dinheiro", valor: 201 }),
+      });
+      const corpo = (await resposta.json()) as { code: string };
+      expect(resposta.status).toBe(400);
+      expect(corpo.code).toBe("VALIDATION_ERROR");
+
+      const detalhe = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}`, { headers: authHeaders() });
+      const corpoDetalhe = (await detalhe.json()) as { data: { valorPago: number; valorPendente: number } };
+      expect(corpoDetalhe.data.valorPago).toBe(300);
+      expect(corpoDetalhe.data.valorPendente).toBe(200);
+    });
+
+    it("recebimento em crédito com adquirente calcula tarifa e usa o valor bruto no caixa", async () => {
+      const adquirente = await adquirentesService.criar({ nome: `Adquirente Recebimento HTTP ${Date.now()}`, tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 4 }] }, null);
+      const { venda, caixa } = await criarVendaFiadaViaHttpSetup(500, 300);
+      const antes = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+      const corpoAntes = (await antes.json()) as { data: { resumo: { recebimentos: number } } };
+
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 200 }),
+      });
+      expect(resposta.status).toBe(201);
+      const corpo = (await resposta.json()) as {
+        data: { valorPago: number; pagamentos: { valor: number; tarifaAplicada: { valorTarifa: number; valorBruto: number } | null }[] };
+      };
+      const recebido = corpo.data.pagamentos[corpo.data.pagamentos.length - 1]!;
+      expect(recebido.tarifaAplicada?.valorBruto).toBe(200);
+      expect(recebido.tarifaAplicada?.valorTarifa).toBe(8);
+      expect(corpo.data.valorPago).toBe(500); // bruto, nunca 300+192
+
+      const depois = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+      const corpoDepois = (await depois.json()) as { data: { resumo: { recebimentos: number } } };
+      expect(corpoDepois.data.resumo.recebimentos - corpoAntes.data.resumo.recebimentos).toBe(200); // bruto, nunca 192
+    });
+
+    it("retry com a mesma idempotencyKey não duplica o recebimento nem o movimento de caixa", async () => {
+      const { venda, caixa } = await criarVendaFiadaViaHttpSetup(500, 300);
+      const chave = `recebimento-http-idem-${Date.now()}`;
+      const payload = JSON.stringify({ forma: "Dinheiro", valor: 100, idempotencyKey: chave });
+      const antes = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+      const corpoAntes = (await antes.json()) as { data: { resumo: { recebimentos: number } } };
+
+      const primeira = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, { method: "POST", headers: authHeaders(), body: payload });
+      const segunda = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, { method: "POST", headers: authHeaders(), body: payload });
+      expect(primeira.status).toBe(201);
+      expect(segunda.status).toBe(201);
+      const corpoSegunda = (await segunda.json()) as { data: { valorPago: number } };
+      expect(corpoSegunda.data.valorPago).toBe(400); // não virou 500
+
+      const depois = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+      const corpoDepois = (await depois.json()) as { data: { resumo: { recebimentos: number } } };
+      expect(corpoDepois.data.resumo.recebimentos - corpoAntes.data.resumo.recebimentos).toBe(100); // não duplicou no caixa
+    });
+
+    it("recebimento em venda CANCELADA retorna 400", async () => {
+      const { venda } = await criarVendaFiadaViaHttpSetup(500, 300);
+      await vendasService.cancelar(venda.id, { tipo: "integral", motivo: "Teste HTTP 10.8" }, null);
+
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ forma: "Dinheiro", valor: 50 }),
+      });
+      expect(resposta.status).toBe(400);
+    });
+
+    it("payload sem forma/valor é rejeitado pelo ValidationPipe (400)", async () => {
+      const { venda } = await criarVendaFiadaViaHttpSetup(500, 300);
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({}),
+      });
+      expect(resposta.status).toBe(400);
+    });
+  });
+
   it("não existe POST /api/v1/vendas (criação é exclusiva do mecanismo interno/futuro PDV)", async () => {
     const resposta = await fetch(`${baseUrl}/api/v1/vendas`, {
       method: "POST",
@@ -227,7 +391,14 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     const resposta = await fetch(`${baseUrl}/docs-json`);
     const documento = (await resposta.json()) as { paths: Record<string, Record<string, unknown>> };
     expect(Object.keys(documento.paths)).toEqual(
-      expect.arrayContaining(["/api/v1/vendas", "/api/v1/vendas/estatisticas", "/api/v1/vendas/{id}", "/api/v1/vendas/{id}/parcelas/{parcelaId}/baixa", "/api/v1/vendas/{id}/cancelamento"]),
+      expect.arrayContaining([
+        "/api/v1/vendas",
+        "/api/v1/vendas/estatisticas",
+        "/api/v1/vendas/{id}",
+        "/api/v1/vendas/{id}/parcelas/{parcelaId}/baixa",
+        "/api/v1/vendas/{id}/recebimentos",
+        "/api/v1/vendas/{id}/cancelamento",
+      ]),
     );
     expect(documento.paths["/api/v1/vendas"]?.["post"]).toBeUndefined();
   });

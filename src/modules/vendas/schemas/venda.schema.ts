@@ -145,6 +145,17 @@ export class PagamentoVenda {
    */
   @Prop({ type: TarifaAplicadaSchema, default: null })
   tarifaAplicada!: TarifaAplicada | null;
+
+  /**
+   * Chave de idempotência do RECEBIMENTO POSTERIOR que originou este
+   * pagamento (Etapa 10.8, `VendasService.receberPagamento`) — `null` para
+   * todo pagamento registrado na CRIAÇÃO da venda (que já tem sua própria
+   * idempotência por Venda inteira) e para qualquer venda anterior a esta
+   * etapa. Permite detectar retry de um mesmo recebimento sem duplicar o
+   * pagamento nem recontar `valorPago`.
+   */
+  @Prop({ type: String, default: null })
+  idempotencyKey!: string | null;
 }
 export const PagamentoVendaSchema = SchemaFactory.createForClass(PagamentoVenda);
 aplicarSerializacaoPadrao(PagamentoVendaSchema);

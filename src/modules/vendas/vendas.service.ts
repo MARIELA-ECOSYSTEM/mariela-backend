@@ -27,7 +27,7 @@ import type { CancelamentoDto } from "./dto/cancelamento.dto.js";
 import type { ListarVendasQueryDto } from "./dto/listar-vendas-query.dto.js";
 import { EventoVenda, type EventoVendaDocument } from "./schemas/evento-venda.schema.js";
 import type { ItemDevolvido, ItemVenda, PagamentoVenda, VendaDocument } from "./schemas/venda.schema.js";
-import type { DadosCriarVenda, DadosPersistirVenda, Desconto, PagamentoSolicitado, TarifaAplicada } from "./vendas.types.js";
+import type { DadosCriarVenda, DadosPersistirVenda, DadosReceberPagamento, Desconto, PagamentoSolicitado, TarifaAplicada } from "./vendas.types.js";
 
 export interface ResultadoListaVendas {
   data: VendaDocument[];
@@ -460,6 +460,132 @@ export class VendasService {
     return venda;
   }
 
+  /**
+   * Registra um RECEBIMENTO POSTERIOR contra o saldo pendente de uma venda já
+   * criada (Etapa 10.8) — mecanismo isolado e ADICIONAL a `baixarParcela`
+   * (que só quita o valor FIXO de uma parcela pré-calculada em
+   * `montarParcelas`): aqui o valor é livre — qualquer quantia, desde que não
+   * ultrapasse `valorPendente` — com suporte completo a modalidade/
+   * adquirente/tarifa, reaproveitando `validarPagamentoEstruturado` sem
+   * duplicar NENHUMA das regras das Etapas 10.4/10.5.
+   *
+   * Ordem de validação (seção 21 do pedido — nenhum efeito colateral antes de
+   * qualquer rejeição): venda existe → não cancelada → (replay de
+   * idempotência, se houver) → valor > 0 → modalidade/adquirente/tarifa
+   * válidos → dentro do retry de concorrência: não cancelada (de novo, contra
+   * o documento fresco) → ainda há saldo pendente → valor não excede o saldo
+   * → só then persiste. Não baixa estoque (já baixado na criação — seção 14)
+   * nem recalcula desconto/preço praticado (seção 15): o valor devido já
+   * pertence ao snapshot da venda.
+   *
+   * Concorrência: mesmo padrão de `baixarParcela`/`cancelar` — a validação
+   * "valor não excede o saldo" é reavaliada DENTRO do callback de
+   * `salvarComRetentativa`, contra o documento recém-lido a cada tentativa
+   * (nunca contra uma cópia capturada antes do loop). Sob duas requisições
+   * concorrentes disputando o mesmo saldo, a que perder a corrida de escrita
+   * relê o saldo já reduzido pela vencedora e rejeita corretamente se o seu
+   * valor não couber mais — nunca ultrapassa `valorFinal` nem deixa
+   * `valorPendente` negativo.
+   *
+   * Idempotência: chave DETERMINÍSTICA fornecida pelo chamador
+   * (`dados.idempotencyKey`, mesmo padrão de `DadosCriarVenda` — nunca um
+   * UUID gerado aqui). Se um pagamento com essa chave já existe na venda, a
+   * operação é um NO-OP para o valorPago/valorPendente (nunca reaplicada) —
+   * mas o movimento de caixa correspondente é sempre RE-GARANTIDO (chave
+   * derivada `${idempotencyKey}:recebimento`, idempotente por construção via
+   * `MovimentosCaixaRepository`), cobrindo o mesmo cenário "processo morreu
+   * entre salvar a venda e lançar o caixa" já tratado em
+   * `garantirMovimentosDeCaixa`. Sem `idempotencyKey`, nenhuma deduplicação é
+   * aplicada (mesmo comportamento de sempre para chamadas sem chave).
+   *
+   * Atomicidade: a venda é salva PRIMEIRO; o movimento de caixa é lançado
+   * DEPOIS — mesma ordem e mesma limitação já aceitas em `criarInterno` (sem
+   * transação multi-documento nesta etapa; ver "Riscos" no relatório).
+   */
+  async receberPagamento(vendaId: string, dados: DadosReceberPagamento, usuarioId: string | null): Promise<VendaDocument> {
+    const vendaAtual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
+    if (vendaAtual.status === "cancelada") {
+      throw ApiException.validation("Venda cancelada não aceita novos recebimentos.");
+    }
+
+    if (dados.idempotencyKey) {
+      const existente = vendaAtual.pagamentos.find((pagamento) => pagamento.idempotencyKey === dados.idempotencyKey);
+      if (existente) {
+        await this.garantirMovimentoDeRecebimento(vendaAtual, dados.idempotencyKey, existente);
+        return vendaAtual;
+      }
+    }
+
+    const valor = arredondar(dados.valor);
+    if (!Number.isFinite(valor) || valor <= 0) {
+      throw ApiException.validation("Dados inválidos.", [{ field: "valor", message: "O valor recebido deve ser maior que zero." }]);
+    }
+
+    // Reaproveita EXATAMENTE a mesma validação de modalidade/adquirente/tarifa
+    // da criação (Etapas 10.4/10.5) — não depende de nada específico da
+    // criação da venda, por isso é seguro chamar aqui sem duplicar a regra.
+    const adquirentesCache = new Map<string, AdquirenteRespostaPublica>();
+    const estruturado = await this.validarPagamentoEstruturado(dados, adquirentesCache);
+
+    const dataRecebimento = new Date();
+    let pagamentoAplicado: PagamentoVenda | null = null;
+
+    const venda = await this.vendasRepository.salvarComRetentativa(vendaId, (documento) => {
+      if (documento.status === "cancelada") {
+        throw ApiException.validation("Venda cancelada não aceita novos recebimentos.");
+      }
+      if (dados.idempotencyKey) {
+        const existente = documento.pagamentos.find((pagamento) => pagamento.idempotencyKey === dados.idempotencyKey);
+        if (existente) {
+          pagamentoAplicado = existente;
+          return;
+        }
+      }
+      if (documento.valorPendente <= 0) {
+        throw ApiException.validation("Dados inválidos.", [
+          { field: "valor", message: "Esta venda já está quitada; nenhum recebimento é necessário." },
+        ]);
+      }
+      if (valor > documento.valorPendente) {
+        throw ApiException.validation("Dados inválidos.", [
+          { field: "valor", message: `Recebimento maior que o saldo pendente (${documento.valorPendente.toFixed(2)}).` },
+        ]);
+      }
+
+      documento.pagamentos.push({
+        forma: dados.forma,
+        valor,
+        dataPagamento: dataRecebimento,
+        parcelas: estruturado.parcelas,
+        observacao: dados.observacao ?? null,
+        modalidade: estruturado.modalidade,
+        adquirenteId: estruturado.adquirenteId,
+        tarifaAplicada: estruturado.tarifaAplicada,
+        idempotencyKey: dados.idempotencyKey ?? null,
+      } as PagamentoVenda);
+      // Sempre sobre o valor BRUTO (seções 1/4/17 do pedido) — a tarifa
+      // (`estruturado.tarifaAplicada`) nunca entra nesta soma.
+      documento.valorPago = arredondar(documento.valorPago + valor);
+      documento.valorPendente = arredondar(Math.max(0, documento.valorFinal - documento.valorPago));
+      if (documento.valorPendente === 0) documento.status = "concluida";
+      documento.historico.push({
+        dataHora: dataRecebimento,
+        tipo: "pagamento",
+        descricao: `Recebimento posterior de ${valor.toFixed(2)} em ${dados.forma}`,
+        autor: "Backoffice",
+      });
+
+      pagamentoAplicado = documento.pagamentos[documento.pagamentos.length - 1]!;
+    });
+
+    if (pagamentoAplicado) {
+      await this.garantirMovimentoDeRecebimento(venda, dados.idempotencyKey, pagamentoAplicado);
+    }
+
+    await this.registrarEvento(venda.id, "venda.recebimento_registrado", usuarioId, { valor, idempotencyKey: dados.idempotencyKey ?? null });
+    return venda;
+  }
+
   async cancelar(vendaId: string, dto: CancelamentoDto, usuarioId: string | null): Promise<VendaDocument> {
     const vendaAtual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
     if (vendaAtual.status === "cancelada") throw ApiException.validation("Esta venda já está cancelada.");
@@ -756,6 +882,37 @@ export class VendasService {
         idempotencyKey: `${chaveBase}:pagamento:${indice}`,
       });
     }
+  }
+
+  /**
+   * Lança no Caixa o movimento de um RECEBIMENTO POSTERIOR (Etapa 10.8) —
+   * reaproveita `tipo: "recebimento_parcela"` (mesma faixa já usada por
+   * `baixarParcela` e já somada no resumo do caixa como "recebimentos": não
+   * inventa um tipo novo para o mesmo tipo de evento financeiro). Usa
+   * `venda.caixaId` (o caixa da venda original, mesma decisão já tomada por
+   * `baixarParcela` — ver "Riscos" no relatório sobre a limitação de um
+   * recebimento não poder ser lançado se esse caixa específico já tiver sido
+   * fechado). Idempotente por chave DERIVADA (`${idempotencyKey}:recebimento`)
+   * quando o chamador informou uma — sem chave, nenhuma deduplicação (mesmo
+   * padrão do resto do projeto). Sempre o valor BRUTO do pagamento, nunca o
+   * líquido pós-tarifa (seção 10 do pedido).
+   */
+  private async garantirMovimentoDeRecebimento(venda: VendaDocument, idempotencyKey: string | undefined, pagamento: PagamentoVenda): Promise<void> {
+    if (!venda.caixaId || pagamento.valor <= 0) return;
+    await this.caixasService.registrarMovimentoDeVenda({
+      caixaId: venda.caixaId,
+      tipo: "recebimento_parcela",
+      descricao: `Recebimento posterior da venda ${venda.codigo} · ${venda.clienteNome} · ${pagamento.forma}`,
+      referencia: venda.codigo,
+      vendaId: venda.id,
+      vendaCodigo: venda.codigo,
+      formaPagamento: pagamento.forma,
+      valor: pagamento.valor,
+      responsavelId: null,
+      responsavelNome: "Backoffice",
+      observacao: pagamento.observacao ?? "",
+      idempotencyKey: idempotencyKey ? `${idempotencyKey}:recebimento` : null,
+    });
   }
 
   private async devolverAoEstoque(item: ItemVenda, quantidade: number): Promise<void> {

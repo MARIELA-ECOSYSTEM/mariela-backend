@@ -3117,4 +3117,367 @@ describe("VendasService (integração — MongoDB real)", () => {
     // juntos sem nenhuma exclusão/alteração de expectativa fora do escopo
     // desta regra.
   });
+
+  describe("recebimento posterior de venda EM_PAGAMENTO (Etapa 10.8)", () => {
+    async function movimentosDaVenda(vendaId: string) {
+      return connection.collection("movimentos_caixa").find({ vendaId }).toArray();
+    }
+
+    async function venderFiado(valorItem: number, valorPagoNaCriacao: number) {
+      const produto = await criarProdutoComEstoque(valorItem, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: valorPagoNaCriacao > 0 ? [{ forma: "Dinheiro", valor: valorPagoNaCriacao }] : [],
+        },
+        null,
+      );
+      return { venda, produto, vendedor, cliente, caixa };
+    }
+
+    it("A. venda criada com saldo pendente fica EM_PAGAMENTO com valorPendente correto", async () => {
+      const { venda, caixa } = await venderFiado(1000, 500);
+      expect(venda.status).toBe("em_pagamento");
+      expect(venda.valorPago).toBe(500);
+      expect(venda.valorPendente).toBe(500);
+      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+    });
+
+    it("B. recebimento parcial reduz o pendente e mantém EM_PAGAMENTO", async () => {
+      const { venda, caixa } = await venderFiado(1000, 500);
+      const atualizada = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 250 }, null);
+      expect(atualizada.valorPago).toBe(750);
+      expect(atualizada.valorPendente).toBe(250);
+      expect(atualizada.status).toBe("em_pagamento");
+      await caixasService.fechar(caixa.id, { valorInformado: 1750 }, null);
+    });
+
+    it("C. segundo recebimento continua reduzindo o pendente corretamente", async () => {
+      const { venda, caixa } = await venderFiado(1000, 500);
+      await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 250 }, null);
+      const depoisDoSegundo = await service.receberPagamento(venda.id, { forma: "PIX", valor: 150 }, null);
+      expect(depoisDoSegundo.valorPago).toBe(900);
+      expect(depoisDoSegundo.valorPendente).toBe(100);
+      expect(depoisDoSegundo.status).toBe("em_pagamento");
+      await caixasService.fechar(caixa.id, { valorInformado: 1900 }, null);
+    });
+
+    it("D. recebimento que quita exatamente o saldo conclui a venda", async () => {
+      const { venda, caixa } = await venderFiado(1000, 600);
+      const quitada = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 400 }, null);
+      expect(quitada.valorPago).toBe(1000);
+      expect(quitada.valorPendente).toBe(0);
+      expect(quitada.status).toBe("concluida");
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    it("E. recebimento acima do saldo é rejeitado sem alterar venda/estoque/caixa/pagamentos", async () => {
+      const { venda, caixa, produto } = await venderFiado(1000, 700);
+      const pagamentosAntes = venda.pagamentos.length;
+      const movimentosAntes = await movimentosDaVenda(venda.id);
+
+      await expect(service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 301 }, null)).rejects.toThrow(ApiException);
+
+      const recarregada = await service.obterPorId(venda.id);
+      expect(recarregada.valorPago).toBe(700);
+      expect(recarregada.valorPendente).toBe(300);
+      expect(recarregada.pagamentos).toHaveLength(pagamentosAntes);
+
+      const atualizadoProduto = await produtosService.obterPorId(produto.produtoId);
+      const tamanho = atualizadoProduto.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
+      expect(tamanho.quantidade).toBe(4); // estoque intacto (já baixado 1 na criação, não baixa de novo nem desfaz)
+
+      const movimentosDepois = await movimentosDaVenda(venda.id);
+      expect(movimentosDepois).toHaveLength(movimentosAntes.length); // nenhum movimento novo
+      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+    });
+
+    it("F. recebimento em venda já CONCLUIDA é rejeitado, sem novo movimento de caixa", async () => {
+      const { venda, caixa } = await venderFiado(500, 500); // já nasce quitada
+      expect(venda.status).toBe("concluida");
+      const movimentosAntes = await movimentosDaVenda(venda.id);
+
+      await expect(service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 10 }, null)).rejects.toThrow(ApiException);
+
+      const movimentosDepois = await movimentosDaVenda(venda.id);
+      expect(movimentosDepois).toHaveLength(movimentosAntes.length);
+      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+    });
+
+    it("G. recebimento em venda CANCELADA é rejeitado", async () => {
+      const { venda, caixa } = await venderFiado(1000, 500);
+      await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste 10.8" }, null);
+
+      await expect(service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 100 }, null)).rejects.toThrow(ApiException);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("H. recebimento em dinheiro não exige adquirente e tarifaAplicada é null", async () => {
+      const { venda, caixa } = await venderFiado(1000, 500);
+      const atualizada = await service.receberPagamento(venda.id, { forma: "Dinheiro", modalidade: "dinheiro", valor: 200 }, null);
+      const recebido = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
+      expect(recebido.tarifaAplicada).toBeNull();
+      expect(recebido.modalidade).toBe("dinheiro");
+      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+    });
+
+    it("I. recebimento em PIX não exige adquirente e tarifaAplicada é null", async () => {
+      const { venda, caixa } = await venderFiado(1000, 500);
+      const atualizada = await service.receberPagamento(venda.id, { forma: "PIX", modalidade: "pix", valor: 200 }, null);
+      const recebido = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
+      expect(recebido.tarifaAplicada).toBeNull();
+      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+    });
+
+    it("J. recebimento em débito com adquirente calcula a tarifa corretamente", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "debito", parcelas: 1, percentual: 1.99 }] });
+      const { venda, caixa } = await venderFiado(1000, 500);
+      const atualizada = await service.receberPagamento(
+        venda.id,
+        { forma: "Débito", modalidade: "debito", adquirenteId: adquirente.id, valor: 500 },
+        null,
+      );
+      const recebido = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
+      expect(recebido.tarifaAplicada?.valorTarifa).toBe(9.95);
+      expect(recebido.tarifaAplicada?.valorLiquido).toBe(490.05);
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    it("K. recebimento em crédito com adquirente exige parcelas e calcula a tarifa", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 3, percentual: 5 }] });
+      const { venda, caixa } = await venderFiado(1000, 500);
+      const atualizada = await service.receberPagamento(
+        venda.id,
+        { forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 3, valor: 500 },
+        null,
+      );
+      const recebido = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
+      expect(recebido.tarifaAplicada?.parcelas).toBe(3);
+      expect(recebido.tarifaAplicada?.valorTarifa).toBe(25);
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    it("L. tarifa é calculada sobre o valor BRUTO deste recebimento (nunca sobre o total da venda)", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 10 }] });
+      const { venda, caixa } = await venderFiado(1000, 600);
+      const atualizada = await service.receberPagamento(
+        venda.id,
+        { forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 400 },
+        null,
+      );
+      const recebido = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
+      expect(recebido.tarifaAplicada?.valorBruto).toBe(400); // nunca 1000
+      expect(recebido.tarifaAplicada?.valorTarifa).toBe(40); // 10% de 400, nunca de 1000
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    it("M. tarifa nunca reduz valorPago — o recebimento soma sempre o BRUTO", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 10 }] });
+      const { venda, caixa } = await venderFiado(1000, 600);
+      const atualizada = await service.receberPagamento(
+        venda.id,
+        { forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 400 },
+        null,
+      );
+      expect(atualizada.valorPago).toBe(1000); // 600 + 400 (bruto), nunca 600 + 360
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    it("N. tarifa nunca reduz valorPendente — pendente calculado contra o bruto", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 10 }] });
+      const { venda, caixa } = await venderFiado(1000, 300);
+      const atualizada = await service.receberPagamento(
+        venda.id,
+        { forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 400 },
+        null,
+      );
+      // pago = 300 + 400 = 700 (bruto); pendente = 1000 - 700 = 300, nunca 1000 - (300+360)=340.
+      expect(atualizada.valorPago).toBe(700);
+      expect(atualizada.valorPendente).toBe(300);
+      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+    });
+
+    it("O. o movimento de Caixa do recebimento usa o valor BRUTO, nunca o líquido pós-tarifa", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 3.49 }] });
+      const { venda, caixa } = await venderFiado(1000, 900);
+      await service.receberPagamento(venda.id, { forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 100 }, null);
+
+      const movimentos = await movimentosDaVenda(venda.id);
+      const doRecebimento = movimentos.find((m) => m["tipo"] === "recebimento_parcela");
+      expect(doRecebimento?.["valor"]).toBe(100); // nunca 96.51
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    it("P. múltiplos recebimentos sucessivos convergem corretamente para a quitação", async () => {
+      const { venda, caixa } = await venderFiado(1000, 100);
+      await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300 }, null);
+      await service.receberPagamento(venda.id, { forma: "PIX", valor: 300 }, null);
+      const final = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300 }, null);
+      expect(final.valorPago).toBe(1000);
+      expect(final.valorPendente).toBe(0);
+      expect(final.status).toBe("concluida");
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    it("Q. histórico preserva cada recebimento individualmente identificável (nunca agregado em um só)", async () => {
+      const { venda, caixa } = await venderFiado(1000, 100);
+      await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300 }, null);
+      const final = await service.receberPagamento(venda.id, { forma: "PIX", valor: 600 }, null);
+
+      expect(final.pagamentos).toHaveLength(3); // criação + 2 recebimentos
+      expect(final.pagamentos[0]?.valor).toBe(100);
+      expect(final.pagamentos[1]?.valor).toBe(300);
+      expect(final.pagamentos[1]?.forma).toBe("Dinheiro");
+      expect(final.pagamentos[2]?.valor).toBe(600);
+      expect(final.pagamentos[2]?.forma).toBe("PIX");
+      // Cada um com sua própria data — não uma data única compartilhada por engano.
+      expect(final.pagamentos[0]?.dataPagamento).toBeInstanceOf(Date);
+      expect(final.pagamentos[1]?.dataPagamento).toBeInstanceOf(Date);
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    it("R. idempotência: retry com a mesma idempotencyKey não duplica o pagamento nem recontabiliza valorPago", async () => {
+      const { venda, caixa } = await venderFiado(1000, 500);
+      const chave = `recebimento-idem-${Date.now()}`;
+
+      const primeira = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 200, idempotencyKey: chave }, null);
+      const segunda = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 200, idempotencyKey: chave }, null);
+
+      expect(primeira.valorPago).toBe(700);
+      expect(segunda.valorPago).toBe(700); // não virou 900
+      expect(segunda.pagamentos.filter((p) => p.idempotencyKey === chave)).toHaveLength(1);
+
+      const movimentos = await movimentosDaVenda(venda.id);
+      const doRecebimento = movimentos.filter((m) => m["idempotencyKey"] === `${chave}:recebimento`);
+      expect(doRecebimento).toHaveLength(1); // também não duplicou no caixa
+      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+    });
+
+    it("S. retry recupera um movimento de caixa faltante sem duplicar o pagamento já persistido", async () => {
+      const { venda, caixa } = await venderFiado(1000, 500);
+      const chave = `recebimento-retry-${Date.now()}`;
+
+      const primeira = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 200, idempotencyKey: chave }, null);
+      const movimentosOriginais = await movimentosDaVenda(primeira.id);
+      const doRecebimentoOriginal = movimentosOriginais.find((m) => m["idempotencyKey"] === `${chave}:recebimento`)!;
+      expect(doRecebimentoOriginal).toBeDefined();
+
+      // Simula "processo morreu depois de salvar a venda, antes de lançar o caixa".
+      await connection.collection("movimentos_caixa").deleteOne({ _id: doRecebimentoOriginal["_id"] });
+
+      const retry = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 200, idempotencyKey: chave }, null);
+      expect(retry.valorPago).toBe(700); // não recontou
+
+      const movimentosFinais = await movimentosDaVenda(retry.id);
+      const recriado = movimentosFinais.filter((m) => m["idempotencyKey"] === `${chave}:recebimento`);
+      expect(recriado).toHaveLength(1); // recriou o que faltava, sem duplicar
+      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+    });
+
+    it("T. concorrência: duas requisições disputando o mesmo saldo nunca resultam em valorPendente negativo nem excedem valorFinal", async () => {
+      const { venda, caixa } = await venderFiado(1000, 500); // pendente = 500
+
+      const resultados = await Promise.allSettled([
+        service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300 }, null),
+        service.receberPagamento(venda.id, { forma: "PIX", valor: 300 }, null),
+      ]);
+
+      const sucesso = resultados.filter((r) => r.status === "fulfilled");
+      const falha = resultados.filter((r) => r.status === "rejected");
+      expect(sucesso).toHaveLength(1); // só um dos dois cabia no saldo de 500
+      expect(falha).toHaveLength(1);
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.valorPago).toBe(800); // 500 + 300, nunca 500+600=1100
+      expect(final.valorPendente).toBe(200); // nunca negativo
+      expect(final.valorPago).toBeLessThanOrEqual(final.valorFinal);
+      await caixasService.fechar(caixa.id, { valorInformado: 1800 }, null);
+    });
+
+    it("U. recebimento posterior não baixa estoque novamente", async () => {
+      const { venda, caixa, produto } = await venderFiado(1000, 500);
+      const antes = await produtosService.obterPorId(produto.produtoId);
+      const tamanhoAntes = antes.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!.quantidade;
+
+      await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 500 }, null);
+
+      const depois = await produtosService.obterPorId(produto.produtoId);
+      const tamanhoDepois = depois.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!.quantidade;
+      expect(tamanhoDepois).toBe(tamanhoAntes); // estoque inalterado pelo recebimento
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    it("V. recebimento posterior não recalcula desconto/valorFinal da venda (snapshot preservado)", async () => {
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          descontoVenda: { tipo: "percentual", valor: 10 }, // valorFinal = 900
+          pagamentos: [{ forma: "Dinheiro", valor: 500 }],
+        },
+        null,
+      );
+      expect(venda.valorFinal).toBe(900);
+      expect(venda.descontoVenda).toBe(100);
+
+      const atualizada = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 400 }, null);
+      expect(atualizada.valorFinal).toBe(900); // inalterado
+      expect(atualizada.descontoVenda).toBe(100); // inalterado
+      expect(atualizada.itens[0]?.precoPraticado).toBe(1000); // snapshot do item inalterado
+      expect(atualizada.status).toBe("concluida");
+      await caixasService.fechar(caixa.id, { valorInformado: 1900 }, null);
+    });
+
+    it("W. tarifa de um pagamento anterior nunca é recalculada por um recebimento posterior diferente", async () => {
+      const adquirenteOriginal = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 3.49 }] });
+      const adquirenteNovo = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 1.99 }] });
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId: adquirenteOriginal.id, parcelas: 1, valor: 600 }],
+        },
+        null,
+      );
+      const tarifaOriginalAntes = venda.pagamentos[0]!.tarifaAplicada!.valorTarifa;
+      expect(tarifaOriginalAntes).toBe(20.94); // 600 × 3,49%
+
+      const final = await service.receberPagamento(
+        venda.id,
+        { forma: "Crédito", modalidade: "credito", adquirenteId: adquirenteNovo.id, parcelas: 1, valor: 400 },
+        null,
+      );
+      // O pagamento ORIGINAL continua com sua própria tarifa, intocada.
+      expect(final.pagamentos[0]?.tarifaAplicada?.valorTarifa).toBe(20.94);
+      expect(final.pagamentos[0]?.tarifaAplicada?.percentual).toBe(3.49);
+      // O NOVO recebimento tem sua própria tarifa, independente.
+      expect(final.pagamentos[1]?.tarifaAplicada?.valorTarifa).toBe(7.96); // 400 × 1,99%
+      expect(final.pagamentos[1]?.tarifaAplicada?.percentual).toBe(1.99);
+      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+    });
+
+    // X. Regressão completa: verificada rodando este arquivo inteiro (testes
+    // A–W acima somados a toda a suíte pré-existente das Etapas 10.1–10.7),
+    // todos passando juntos, sem nenhuma alteração de expectativa fora do
+    // escopo desta etapa.
+  });
 });
