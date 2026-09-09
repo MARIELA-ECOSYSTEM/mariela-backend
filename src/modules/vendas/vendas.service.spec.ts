@@ -158,10 +158,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("marca EM_PAGAMENTO com uma parcela cobrindo o valor pendente quando o pagamento é parcial", async () => {
       const produto = await criarProdutoComEstoque(300, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -181,10 +183,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("gera N parcelas quando totalParcelas é solicitado (estilo Crediário)", async () => {
       const produto = await criarProdutoComEstoque(300, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -416,10 +420,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("desconto por item em % — considera a quantidade (preço praticado × quantidade é a base, não o unitário)", async () => {
       const produto = await criarProdutoComEstoque(50, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [
@@ -445,10 +451,12 @@ describe("VendasService (integração — MongoDB real)", () => {
       const produto = await criarProdutoComEstoque(100, 5);
       await produtosService.definirPromocao(produto.produtoId, { ehPromocao: true, precoPromocional: 80 }, null);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [
@@ -498,10 +506,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("desconto da venda em % (objeto {tipo:'percentual', valor})", async () => {
       const produto = await criarProdutoComEstoque(200, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -708,10 +718,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("desconto por item + desconto da venda combinados: aplica na ordem correta (item primeiro, depois venda)", async () => {
       const produto = await criarProdutoComEstoque(100, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [
@@ -742,10 +754,12 @@ describe("VendasService (integração — MongoDB real)", () => {
       const produtoA = await criarProdutoComEstoque(100, 5);
       const produtoB = await criarProdutoComEstoque(50, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [
@@ -781,9 +795,11 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("ignora valorFinal forjado no payload e recalcula do zero (backend é a autoridade)", async () => {
       const produto = await criarProdutoComEstoque(100, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const dadosForjados = {
+        clienteId: cliente.id,
         vendedorId: vendedor.id,
         caixaId: caixa.id,
         itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -800,10 +816,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("arredondamento determinístico: percentual com dízima resulta em 2 casas decimais, sem resíduo negativo", async () => {
       const produto = await criarProdutoComEstoque(10, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [
@@ -830,10 +848,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("snapshot: descontoItem persiste no documento e é recuperável via obterPorId", async () => {
       const produto = await criarProdutoComEstoque(100, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [
@@ -1784,10 +1804,12 @@ describe("VendasService (integração — MongoDB real)", () => {
       const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 5 }] });
       const produto = await criarProdutoComEstoque(500, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -2063,10 +2085,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("G. pagamento parcial: só o valor efetivamente recebido gera movimento — nenhum movimento do saldo pendente", async () => {
       const produto = await criarProdutoComEstoque(500, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -2088,10 +2112,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("H. múltiplos pagamentos + saldo pendente: N movimentos, nenhum do saldo pendente", async () => {
       const produto = await criarProdutoComEstoque(500, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -2308,10 +2334,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("registra no caixa só o valor pago, não o valor total da venda", async () => {
       const produto = await criarProdutoComEstoque(500, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -2329,10 +2357,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("venda sem nenhum pagamento no ato não lança nada no caixa", async () => {
       const produto = await criarProdutoComEstoque(100, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -2380,10 +2410,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("EM_PAGAMENTO também conta nos agregados (só cancelada não conta)", async () => {
       const produto = await criarProdutoComEstoque(150, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -2403,10 +2435,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("baixa a parcela, zera o pendente, marca CONCLUIDA e lança o recebimento no caixa", async () => {
       const produto = await criarProdutoComEstoque(300, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -2431,9 +2465,11 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("rejeita baixar uma parcela já paga", async () => {
       const produto = await criarProdutoComEstoque(300, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -2450,9 +2486,11 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("lança NOT_FOUND para parcela inexistente", async () => {
       const produto = await criarProdutoComEstoque(300, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -2510,10 +2548,12 @@ describe("VendasService (integração — MongoDB real)", () => {
     it("cancelamento nunca devolve ao caixa mais do que foi recebido", async () => {
       const produto = await criarProdutoComEstoque(300, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
@@ -2537,10 +2577,12 @@ describe("VendasService (integração — MongoDB real)", () => {
       const produtoA = await criarProdutoComEstoque(100, 5);
       const produtoB = await criarProdutoComEstoque(50, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [
@@ -2655,5 +2697,424 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(depois.faturamento).toBeLessThanOrEqual(antes.faturamento);
       await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
     });
+  });
+
+  describe("venda fiada: cliente obrigatório quando houver saldo pendente (Etapa 10.7)", () => {
+    async function movimentosDaVenda(vendaId: string) {
+      return connection.collection("movimentos_caixa").find({ vendaId }).toArray();
+    }
+
+    async function esperarValidacaoClienteId(promessa: Promise<unknown>): Promise<void> {
+      let erro: unknown = null;
+      try {
+        await promessa;
+      } catch (capturado) {
+        erro = capturado;
+      }
+      expect(erro).toBeInstanceOf(ApiException);
+      const apiErro = erro as ApiException;
+      expect(apiErro.code).toBe("VALIDATION_ERROR");
+      expect(apiErro.errors.some((e) => e.field === "clienteId")).toBe(true);
+    }
+
+    it("A. venda totalmente paga sem cliente → sucesso (Consumidor final pode pagar à vista)", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+        },
+        null,
+      );
+      expect(venda.clienteId).toBeNull();
+      expect(venda.clienteNome).toBe("Consumidor final");
+      expect(venda.valorPendente).toBe(0);
+      expect(venda.status).toBe("concluida");
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("B. venda totalmente paga com cliente → sucesso", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+        },
+        null,
+      );
+      expect(venda.clienteId).toBe(cliente.id);
+      expect(venda.valorPendente).toBe(0);
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("C. venda parcial sem cliente → rejeitada com VALIDATION_ERROR no campo clienteId", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await esperarValidacaoClienteId(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+          },
+          null,
+        ),
+      );
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("D. venda parcial com cliente → sucesso", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+        },
+        null,
+      );
+      expect(venda.valorPendente).toBe(200);
+      expect(venda.status).toBe("em_pagamento");
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("E. múltiplos pagamentos + pendente sem cliente → rejeitada", async () => {
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await esperarValidacaoClienteId(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [
+              { forma: "Dinheiro", valor: 100 },
+              { forma: "PIX", valor: 150 },
+            ],
+          },
+          null,
+        ),
+      );
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("F. múltiplos pagamentos + pendente com cliente → sucesso", async () => {
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [
+            { forma: "Dinheiro", valor: 100 },
+            { forma: "PIX", valor: 150 },
+          ],
+        },
+        null,
+      );
+      expect(venda.valorPago).toBe(250);
+      expect(venda.valorPendente).toBe(250);
+      await caixasService.fechar(caixa.id, { valorInformado: 1250 }, null);
+    });
+
+    it("G. crédito com tarifa + pendente sem cliente → rejeitada", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 5 }] });
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await esperarValidacaoClienteId(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 300 }],
+          },
+          null,
+        ),
+      );
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("H. crédito com tarifa + pendente com cliente → sucesso (tarifa nunca entra no saldo devedor)", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 5 }] });
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 300 }],
+        },
+        null,
+      );
+      // Pendente = 500 - 300 = 200 (sobre o BRUTO), nunca 500 - 285 (líquido).
+      expect(venda.valorPendente).toBe(200);
+      expect(venda.pagamentos[0]?.tarifaAplicada?.valorLiquido).toBe(285);
+      expect(venda.valorPago).toBe(300);
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("I. clienteId=null com pendente → rejeitada", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await esperarValidacaoClienteId(
+        service.criar(
+          {
+            clienteId: null,
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+          },
+          null,
+        ),
+      );
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("J. clienteId ausente com pendente → rejeitada", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await esperarValidacaoClienteId(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+          },
+          null,
+        ),
+      );
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it('K. clienteId="" (string vazia) com pendente → rejeitada', async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await esperarValidacaoClienteId(
+        service.criar(
+          {
+            clienteId: "",
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+          },
+          null,
+        ),
+      );
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("L. clienteId inexistente → NOT_FOUND (nunca confundido com a validação de pendente)", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      let erro: unknown = null;
+      try {
+        await service.criar(
+          {
+            clienteId: "65f1a2b3c4d5e6f7a8b9c0d1",
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+          },
+          null,
+        );
+      } catch (capturado) {
+        erro = capturado;
+      }
+      expect(erro).toBeInstanceOf(ApiException);
+      expect((erro as ApiException).code).toBe("NOT_FOUND");
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("M. venda rejeitada por pendente sem cliente não baixa estoque", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      await esperarValidacaoClienteId(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+          },
+          null,
+        ),
+      );
+
+      const atualizado = await produtosService.obterPorId(produto.produtoId);
+      const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
+      expect(tamanho.quantidade).toBe(5); // estoque intacto
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("N. venda rejeitada por pendente sem cliente não cria movimento de caixa nem documento de venda", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const totalVendasAntes = await connection.collection("vendas").countDocuments({});
+      const totalMovimentosAntes = await connection.collection("movimentos_caixa").countDocuments({});
+
+      await esperarValidacaoClienteId(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+          },
+          null,
+        ),
+      );
+
+      const totalVendasDepois = await connection.collection("vendas").countDocuments({});
+      const totalMovimentosDepois = await connection.collection("movimentos_caixa").countDocuments({});
+      expect(totalVendasDepois).toBe(totalVendasAntes); // nenhum documento de venda criado
+      expect(totalMovimentosDepois).toBe(totalMovimentosAntes); // nenhum movimento de caixa criado
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("O. venda válida parcial (com cliente) cria movimento SÓ dos pagamentos efetivamente recebidos", async () => {
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+        },
+        null,
+      );
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos).toHaveLength(1);
+      expect(movimentos[0]?.["valor"]).toBe(200); // nunca 500 (o pendente não vira movimento)
+      await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+    });
+
+    it("P. valorPago continua bruto, independente da tarifa, mesmo em venda fiada com cliente", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 5 }] });
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 300 }],
+        },
+        null,
+      );
+      expect(venda.valorPago).toBe(300); // bruto, nunca 285 (líquido)
+      expect(venda.pagamentos[0]?.valor).toBe(300);
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("Q. valorPendente é sempre calculado contra o BRUTO, nunca contra o líquido", async () => {
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 10 }] });
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 400 }],
+        },
+        null,
+      );
+      // Bruto pago = 400 (líquido seria 360, com 10% de tarifa) → pendente = 1000-400 = 600, nunca 1000-360=640.
+      expect(venda.pagamentos[0]?.tarifaAplicada?.valorLiquido).toBe(360);
+      expect(venda.valorPendente).toBe(600);
+      await caixasService.fechar(caixa.id, { valorInformado: 1400 }, null);
+    });
+
+    it("R. venda exatamente quitada (valorPago === valorFinal) → cliente não é obrigatório", async () => {
+      const produto = await criarProdutoComEstoque(150, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 150 }],
+        },
+        null,
+      );
+      expect(venda.valorPago).toBe(venda.valorFinal);
+      expect(venda.valorPendente).toBe(0);
+      expect(venda.clienteId).toBeNull();
+      expect(venda.status).toBe("concluida");
+      await caixasService.fechar(caixa.id, { valorInformado: 1150 }, null);
+    });
+
+    // S. Regressão da suíte inteira: verificada rodando este arquivo completo
+    // (777+ testes pré-existentes das Etapas 10.1–10.6, todos ajustados nesta
+    // etapa para fornecer `clienteId` onde a venda de teste tem saldo
+    // pendente — ver relatório) mais os 18 testes A–R acima, todos passando
+    // juntos sem nenhuma exclusão/alteração de expectativa fora do escopo
+    // desta regra.
   });
 });

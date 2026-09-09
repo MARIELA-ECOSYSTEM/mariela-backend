@@ -347,11 +347,16 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
     it("pagamento parcial: status em_pagamento, caixa recebe só o valor pago, pendente correto", async () => {
       const produto = await criarProdutoComEstoque(500, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const caixa = await abrirCaixa();
 
       const venda = await service.criar(
         vendedor.id,
-        payloadPadrao({ itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }], pagamentos: [{ forma: "Dinheiro", valor: 200 }] }),
+        payloadPadrao({
+          clienteId: cliente.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+        }),
       );
       expect(venda.status).toBe("em_pagamento");
       expect(venda.valorFinal).toBe(500);

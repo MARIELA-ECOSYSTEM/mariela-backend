@@ -14,6 +14,7 @@ import { validationExceptionFactory } from "../../common/pipes/validation-except
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { CaixasService } from "../caixas/caixas.service.js";
+import { ClientesService } from "../clientes/clientes.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 
@@ -78,6 +79,8 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     await connection.collection("eventos_produto").deleteMany({});
     await connection.collection("vendedores").deleteMany({});
     await connection.collection("eventos_vendedor").deleteMany({});
+    await connection.collection("clientes").deleteMany({});
+    await connection.collection("eventos_cliente").deleteMany({});
     await connection.collection("vendedor_refresh_tokens").deleteMany({});
     await connection.collection("eventos_pdv_auth").deleteMany({});
     await connection.collection("caixas").deleteMany({});
@@ -85,7 +88,7 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     await connection.collection("eventos_caixa").deleteMany({});
     await connection.collection("adquirentes").deleteMany({});
     await connection.collection("eventos_adquirente").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "caixa", "usuario"] } });
+    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "caixa", "usuario"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});
@@ -109,6 +112,12 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     const corpo = (await respostaLogin.json()) as { data: { accessToken: string } };
     if (!ativo) await vendedoresService.alterarStatus(vendedor.id, { ativo: false }, null);
     return { id: vendedor.id, codigo: vendedor.codigo, accessToken: corpo.data.accessToken };
+  }
+
+  async function criarCliente(): Promise<{ id: string }> {
+    const clientesService = app.get(ClientesService);
+    const cliente = await clientesService.criar({ nome: `Cliente HTTP PDV Vendas ${Date.now()}`, telefone: telefoneUnico() }, null);
+    return { id: cliente.id };
   }
 
   async function criarProdutoComEstoque(precoVenda: number, quantidade: number) {
@@ -366,12 +375,14 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     const vendedor = await criarELogarVendedor();
     await abrirCaixaViaPdv(vendedor.accessToken);
     const produto = await criarProdutoComEstoque(100, 5);
+    const cliente = await criarCliente();
 
     const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
       method: "POST",
       headers: jsonHeaders(vendedor.accessToken),
       body: JSON.stringify({
         idempotencyKey: randomUUID(),
+        clienteId: cliente.id,
         itens: [
           {
             produtoId: produto.produtoId,
@@ -404,12 +415,14 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     const vendedor = await criarELogarVendedor();
     await abrirCaixaViaPdv(vendedor.accessToken);
     const produto = await criarProdutoComEstoque(100, 5);
+    const cliente = await criarCliente();
 
     const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
       method: "POST",
       headers: jsonHeaders(vendedor.accessToken),
       body: JSON.stringify({
         idempotencyKey: randomUUID(),
+        clienteId: cliente.id,
         itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
         descontoVenda: 25,
         pagamentos: [],

@@ -13,6 +13,7 @@ import { validationExceptionFactory } from "../../common/pipes/validation-except
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { CaixasService } from "../caixas/caixas.service.js";
+import { ClientesService } from "../clientes/clientes.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 import { VendasService } from "./vendas.service.js";
@@ -79,6 +80,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     // Seed via mecanismo interno — nunca via HTTP (não existe rota de criação).
     const produtosService = app.get(ProdutosService);
     const vendedoresService = app.get(VendedoresService);
+    const clientesService = app.get(ClientesService);
     const caixasService = app.get(CaixasService);
     const vendasService = app.get(VendasService);
 
@@ -86,11 +88,15 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     const variante = await produtosService.adicionarVariante(produto.id, { cor: "Verde" }, null);
     const { tamanhoId } = await produtosService.ajustarQuantidadeTamanho(produto.id, String(variante._id), { tamanho: "G", delta: 10, exigirExistente: false });
     const vendedor = await vendedoresService.criar({ nome: "Vendedora HTTP", telefone: telefoneUnico(), ativo: true, senha: "senha123" }, null);
+    // Venda seedada fica com saldo pendente (pagamento 100 < valorFinal 200) —
+    // exige clienteId desde a Etapa 10.7 (venda fiada nunca para Consumidor final).
+    const cliente = await clientesService.criar({ nome: "Cliente HTTP Vendas", telefone: telefoneUnico() }, null);
     const caixa = await caixasService.abrir({ valorInicial: 500, observacao: "" }, null);
     caixaId = caixa.id;
 
     const venda = await vendasService.criar(
       {
+        clienteId: cliente.id,
         vendedorId: vendedor.id,
         caixaId: caixa.id,
         itens: [{ produtoId: produto.id, varianteId: String(variante._id), tamanhoId, quantidade: 1 }],
@@ -110,10 +116,12 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     await connection.collection("eventos_produto").deleteMany({});
     await connection.collection("vendedores").deleteMany({});
     await connection.collection("eventos_vendedor").deleteMany({});
+    await connection.collection("clientes").deleteMany({});
+    await connection.collection("eventos_cliente").deleteMany({});
     await connection.collection("caixas").deleteMany({});
     await connection.collection("movimentos_caixa").deleteMany({});
     await connection.collection("eventos_caixa").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "caixa", "usuario"] } });
+    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "caixa", "usuario"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});

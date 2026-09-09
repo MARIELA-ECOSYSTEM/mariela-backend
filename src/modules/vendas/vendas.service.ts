@@ -221,6 +221,20 @@ export class VendasService {
     }
     const valorPendente = arredondar(Math.max(0, valorFinal - valorPago));
 
+    // Etapa 10.7: venda fiada exige um cliente identificável — nunca uma
+    // dívida lançada para "Consumidor final", que não é rastreável. Checado
+    // ANTES de baixar estoque/persistir (nenhuma escrita ainda ocorreu neste
+    // ponto — nem venda, nem movimento de caixa, nem estoque). `!dados.clienteId`
+    // cobre ausente/`null`/`""` uniformemente (mesmo critério de truthiness
+    // já usado para resolver `clienteNome` acima); a tarifa (Etapa 10.5)
+    // nunca entra nesta conta — `valorPendente` já é calculado sobre o valor
+    // BRUTO pago, exatamente como antes desta etapa.
+    if (valorPendente > 0 && !dados.clienteId) {
+      throw ApiException.validation("Dados inválidos.", [
+        { field: "clienteId", message: "Cliente é obrigatório para vendas com saldo pendente (venda fiada)." },
+      ]);
+    }
+
     const parcelas = valorPendente > 0 ? this.montarParcelas(valorPendente, dados.totalParcelas ?? 1, dataVenda) : [];
 
     // Baixa o estoque item a item; se algum falhar (corrida entre a

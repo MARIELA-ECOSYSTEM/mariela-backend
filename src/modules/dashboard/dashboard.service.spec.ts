@@ -172,10 +172,12 @@ describe("DashboardService (integração — MongoDB real)", () => {
       const antes = await dashboardService.resumo();
       const produto = await criarProdutoComEstoque(100, 300, 5);
       const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
       const { caixa, fechar } = await abrirEFecharCaixa();
 
       const venda = await vendasService.criar(
         {
+          clienteId: cliente.id,
           vendedorId: vendedor.id,
           caixaId: caixa.id,
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
