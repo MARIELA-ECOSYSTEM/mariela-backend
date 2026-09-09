@@ -5456,4 +5456,87 @@ describe("VendasService (integração — MongoDB real)", () => {
       await caixasService.fechar(caixa.id, { valorInformado: 1000 + final.valorPago }, null);
     });
   });
+
+  describe("concorrência entre cancelamento e pagamento/recebimento (Etapa 10.19)", () => {
+    it("cancelar × receberPagamento concorrentes: invariantes financeiros seguros em qualquer ordem de corrida", async () => {
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+        },
+        null,
+      );
+      expect(venda.valorPendente).toBe(500);
+
+      const resultados = await Promise.allSettled([
+        service.cancelar(venda.id, { tipo: "integral", motivo: "Concorrente com recebimento" }, null),
+        service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300 }, null),
+      ]);
+
+      // O cancelamento nunca é bloqueado por um recebimento concorrente — só
+      // outro cancelamento poderia impedi-lo, e não há nenhum aqui.
+      expect(resultados[0]!.status).toBe("fulfilled");
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.status).toBe("cancelada");
+      expect(final.valorPago).toBeLessThanOrEqual(final.valorFinal); // nunca ultrapassa, em nenhuma ordem de corrida
+      expect(final.valorPendente).toBe(0); // cancelamento sempre zera
+
+      // Se o recebimento venceu a corrida ANTES do cancelamento consolidar,
+      // o caixa reflete só o que foi de fato recebido (nunca o valor cheio do
+      // item, regra da Etapa 10.9); se o recebimento foi rejeitado (viu a
+      // venda já cancelada no retry), valorPago permanece 0.
+      expect([0, 300]).toContain(final.valorPago);
+      // `garantirMovimentoDeCancelamento` só lança movimento quando há algo a
+      // devolver (`valorParaCaixa > 0`) — se o recebimento foi rejeitado
+      // (valorPago=0), não há devolução nenhuma a registrar.
+      const movimentoCancelamento = await connection.collection("movimentos_caixa").find({ vendaId: venda.id, tipo: "cancelamento" }).toArray();
+      expect(movimentoCancelamento).toHaveLength(final.valorPago > 0 ? 1 : 0);
+      if (final.valorPago > 0) expect(movimentoCancelamento[0]!["valor"]).toBe(final.valorPago); // devolução nunca excede o que foi recebido
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("cancelar × baixarParcela concorrentes: invariantes financeiros seguros em qualquer ordem de corrida", async () => {
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+        },
+        null,
+      );
+      const parcelaId = String(venda.parcelas[0]!._id);
+
+      const resultados = await Promise.allSettled([
+        service.cancelar(venda.id, { tipo: "integral", motivo: "Concorrente com baixa de parcela" }, null),
+        service.baixarParcela(venda.id, parcelaId, {}, null),
+      ]);
+
+      expect(resultados[0]!.status).toBe("fulfilled"); // cancelamento nunca é bloqueado pela baixa concorrente
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.status).toBe("cancelada");
+      expect(final.valorPago).toBeLessThanOrEqual(final.valorFinal);
+      expect(final.valorPendente).toBe(0);
+      expect([0, 500]).toContain(final.valorPago); // ou a parcela baixou antes do cancelamento, ou foi rejeitada (venda já cancelada)
+
+      const movimentoCancelamento = await connection.collection("movimentos_caixa").find({ vendaId: venda.id, tipo: "cancelamento" }).toArray();
+      expect(movimentoCancelamento).toHaveLength(final.valorPago > 0 ? 1 : 0);
+      if (final.valorPago > 0) expect(movimentoCancelamento[0]!["valor"]).toBe(final.valorPago);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+  });
 });
