@@ -12,6 +12,11 @@ import { ResponseInterceptor } from "../../common/interceptors/response.intercep
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
+import { CaixasService } from "../caixas/caixas.service.js";
+import { ProdutosService } from "../produtos/produtos.service.js";
+import { VendasService } from "../vendas/vendas.service.js";
+import type { CriarVendedorDto } from "../vendedores/dto/criar-vendedor.dto.js";
+import { VendedoresService } from "../vendedores/vendedores.service.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE (mesmos guards, mesmo pipeline de
@@ -69,12 +74,50 @@ describe("HTTP — Clientes (integração — servidor real)", () => {
   afterAll(async () => {
     await connection.collection("clientes").deleteMany({});
     await connection.collection("eventos_cliente").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["cliente", "usuario"] } });
+    await connection.collection("vendas").deleteMany({});
+    await connection.collection("eventos_venda").deleteMany({});
+    await connection.collection("produtos").deleteMany({});
+    await connection.collection("eventos_produto").deleteMany({});
+    await connection.collection("vendedores").deleteMany({});
+    await connection.collection("eventos_vendedor").deleteMany({});
+    await connection.collection("caixas").deleteMany({});
+    await connection.collection("movimentos_caixa").deleteMany({});
+    await connection.collection("eventos_caixa").deleteMany({});
+    await connection.collection("sequencias").deleteMany({ _id: { $in: ["cliente", "usuario", "venda", "produto", "vendedor", "caixa"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});
+    await connection.collection("vendedor_refresh_tokens").deleteMany({});
+    await connection.collection("eventos_pdv_auth").deleteMany({});
     await app.close();
   });
+
+  async function criarVendaParaCliente(clienteId: string) {
+    const produtosService = app.get(ProdutosService);
+    const vendedoresService = app.get(VendedoresService);
+    const caixasService = app.get(CaixasService);
+    const vendasService = app.get(VendasService);
+
+    const produto = await produtosService.criar({ nome: `Produto HTTP Histórico ${Date.now()}`, categoria: "Vestidos", precoCusto: 50, precoVenda: 100, ehNovidade: false }, null);
+    const variante = await produtosService.adicionarVariante(produto.id, { cor: "Azul" }, null);
+    const { tamanhoId } = await produtosService.ajustarQuantidadeTamanho(produto.id, String(variante._id), { tamanho: "M", delta: 5, exigirExistente: false });
+    const vendedorDto: CriarVendedorDto = { nome: "Vendedora HTTP Histórico", telefone: telefoneUnico(), ativo: true, senha: "senha123" };
+    const vendedor = await vendedoresService.criar(vendedorDto, null);
+
+    let caixaAtual = await caixasService.obterAtual();
+    if (!caixaAtual) caixaAtual = await caixasService.abrir({ valorInicial: 1000, observacao: "" }, null);
+
+    return vendasService.criar(
+      {
+        clienteId,
+        vendedorId: vendedor.id,
+        caixaId: caixaAtual.id,
+        itens: [{ produtoId: produto.id, varianteId: String(variante._id), tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+      },
+      null,
+    );
+  }
 
   it("GET /api/v1/clientes SEM token retorna 401", async () => {
     const resposta = await fetch(`${baseUrl}/api/v1/clientes`);
@@ -146,6 +189,123 @@ describe("HTTP — Clientes (integração — servidor real)", () => {
     const listaApos = await fetch(`${baseUrl}/api/v1/clientes?busca=${encodeURIComponent(nome)}`, { headers: authHeaders() });
     const corpoListaApos = (await listaApos.json()) as { data: unknown[] };
     expect(corpoListaApos.data).toHaveLength(0);
+  });
+
+  describe("GET /clientes: contrato duplo retrocompatível (Etapa 13.2)", () => {
+    it("SEM nenhum query param: devolve o array COMPLETO de clientes ativos, sem meta/facets (contrato legado do Backoffice)", async () => {
+      const nome = `Legado ${Date.now()}`;
+      const criacao = await fetch(`${baseUrl}/api/v1/clientes`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, telefone: telefoneUnico() }),
+      });
+      const clienteId = ((await criacao.json()) as { data: { id: string } }).data.id;
+
+      const resposta = await fetch(`${baseUrl}/api/v1/clientes`, { headers: authHeaders() });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as { data: { id: string; nome: string }[]; meta?: unknown; facets?: unknown };
+      expect(Array.isArray(corpo.data)).toBe(true);
+      expect(corpo.meta).toBeUndefined();
+      expect(corpo.facets).toBeUndefined();
+      expect(corpo.data.some((cliente) => cliente.id === clienteId)).toBe(true);
+    });
+
+    it("COM page/limit: preserva o contrato paginado/facetado já existente", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/clientes?page=1&limit=1`, { headers: authHeaders() });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as { data: unknown[]; meta: { total: number; page: number; limit: number }; facets: Record<string, unknown> };
+      expect(corpo.data.length).toBeLessThanOrEqual(1);
+      expect(corpo.meta).toBeTruthy();
+      expect(corpo.meta.page).toBe(1);
+      expect(corpo.meta.limit).toBe(1);
+      expect(corpo.facets).toBeTruthy();
+    });
+
+    it("COM apenas busca (sem page/limit explícitos): continua no contrato paginado/facetado, nunca no legado", async () => {
+      const nome = `SoBusca ${Date.now()}`;
+      await fetch(`${baseUrl}/api/v1/clientes`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, telefone: telefoneUnico() }),
+      });
+      const resposta = await fetch(`${baseUrl}/api/v1/clientes?busca=${encodeURIComponent(nome)}`, { headers: authHeaders() });
+      const corpo = (await resposta.json()) as { data: { nome: string }[]; meta: { total: number } };
+      expect(corpo.meta).toBeTruthy(); // presença de QUALQUER param já ativa o contrato paginado
+      expect(corpo.data).toHaveLength(1);
+    });
+
+    it("clientes soft-deleted continuam excluídos tanto no modo legado quanto no paginado", async () => {
+      const nome = `SoftDel ${Date.now()}`;
+      const criacao = await fetch(`${baseUrl}/api/v1/clientes`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, telefone: telefoneUnico() }),
+      });
+      const clienteId = ((await criacao.json()) as { data: { id: string } }).data.id;
+      await fetch(`${baseUrl}/api/v1/clientes/${clienteId}`, { method: "DELETE", headers: authHeaders() });
+
+      const legado = await fetch(`${baseUrl}/api/v1/clientes`, { headers: authHeaders() });
+      const corpoLegado = (await legado.json()) as { data: { id: string }[] };
+      expect(corpoLegado.data.some((cliente) => cliente.id === clienteId)).toBe(false);
+
+      const paginado = await fetch(`${baseUrl}/api/v1/clientes?busca=${encodeURIComponent(nome)}`, { headers: authHeaders() });
+      const corpoPaginado = (await paginado.json()) as { data: { id: string }[] };
+      expect(corpoPaginado.data.some((cliente) => cliente.id === clienteId)).toBe(false);
+    });
+
+    it("PDV (/pdv/clientes) continua funcionando com paginação real, sem nenhuma interferência do contrato legado do Backoffice", async () => {
+      const vendedoresService = app.get(VendedoresService);
+      const vendedor = await vendedoresService.criar({ nome: "Vendedora HTTP Clientes PDV", telefone: telefoneUnico(), ativo: true, senha: "senha123" }, null);
+      const loginPdv = await fetch(`${baseUrl}/api/v1/pdv/auth/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ codigo: vendedor.codigo, senha: "senha123" }),
+      });
+      const tokenPdv = ((await loginPdv.json()) as { data: { accessToken: string } }).data.accessToken;
+
+      const resposta = await fetch(`${baseUrl}/api/v1/pdv/clientes?page=1&limit=5`, {
+        headers: { authorization: `Bearer ${tokenPdv}`, "content-type": "application/json" },
+      });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as { data: unknown[]; meta: { page: number; limit: number } };
+      expect(corpo.meta.page).toBe(1);
+      expect(corpo.meta.limit).toBe(5);
+    });
+  });
+
+  describe("GET /clientes/:id/vendas: histórico real (Etapa 13.2)", () => {
+    it("SEM token retorna 401", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/clientes/65f1a2b3c4d5e6f7a8b9c0d1/vendas`);
+      expect(resposta.status).toBe(401);
+    });
+
+    it("estrutura da resposta é exatamente compatível com VendaResumo — sem campos internos vazados", async () => {
+      const criacao = await fetch(`${baseUrl}/api/v1/clientes`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome: `Cliente Histórico HTTP ${Date.now()}`, telefone: telefoneUnico() }),
+      });
+      const clienteId = ((await criacao.json()) as { data: { id: string } }).data.id;
+      await criarVendaParaCliente(clienteId);
+
+      const resposta = await fetch(`${baseUrl}/api/v1/clientes/${clienteId}/vendas`, { headers: authHeaders() });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as { data: Record<string, unknown>[]; meta: { total: number } };
+      expect(corpo.data).toHaveLength(1);
+      expect(corpo.meta.total).toBe(1);
+
+      const CAMPOS_ESPERADOS = [
+        "id", "codigo", "numero", "dataVenda", "clienteId", "clienteNome", "vendedorId", "vendedorNome",
+        "caixaId", "caixaCodigo", "totalItens", "valorBruto", "descontoPromocional", "descontoVenda",
+        "descontoTotal", "valorFinal", "valorPago", "valorPendente", "valorDevolvido", "temPromocao",
+        "temDesconto", "formaPagamento", "totalParcelas", "parcelasPagas", "status",
+      ].sort();
+      expect(Object.keys(corpo.data[0]!).sort()).toEqual(CAMPOS_ESPERADOS);
+      // Nunca expõe detalhe pesado nem campos internos.
+      for (const campoProibido of ["itens", "pagamentos", "parcelas", "historico", "cancelamento", "observacao", "idempotencyKey", "criadoEm", "atualizadoEm", "_id", "__v"]) {
+        expect(corpo.data[0]![campoProibido]).toBeUndefined();
+      }
+    });
   });
 
   it("POST /api/v1/clientes com telefone duplicado retorna 409", async () => {

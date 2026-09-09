@@ -51,10 +51,10 @@ export class Cliente {
   observacao!: string;
 
   /**
-   * Agregados de compras — SEMPRE calculados e escritos pelo futuro módulo de
-   * Vendas (fora do escopo desta etapa), nunca por Clientes. Nascem zerados;
-   * só existem aqui porque já fazem parte do contrato consumido pelo
-   * Backoffice (`Cliente.compras/totalComprado/ultimaCompra`).
+   * Agregados de compras — SEMPRE calculados e escritos por `VendasService`
+   * (`atualizarAgregadosNaCriacao`/`reverterAgregados`), nunca por Clientes.
+   * Nascem zerados; existem aqui porque fazem parte do contrato consumido
+   * pelo Backoffice (`Cliente.compras/totalComprado/ultimaCompra`).
    */
   @Prop({ type: Number, default: 0 })
   compras!: number;
