@@ -5539,4 +5539,79 @@ describe("VendasService (integração — MongoDB real)", () => {
       await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
     });
   });
+
+  describe("retry CONCORRENTE (Promise.all) da mesma operação com a mesma chave (Etapa 10.20)", () => {
+    async function movimentosDaVenda(vendaId: string) {
+      return connection.collection("movimentos_caixa").find({ vendaId }).toArray();
+    }
+
+    it("receberPagamento: duas chamadas concorrentes com a MESMA chave e o MESMO valor nunca duplicam o pagamento", async () => {
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+        },
+        null,
+      );
+      const chave = `recebimento-concorrente-${Date.now()}`;
+
+      const resultados = await Promise.allSettled([
+        service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300, idempotencyKey: chave }, null),
+        service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300, idempotencyKey: chave }, null),
+      ]);
+      // Mesma chave + mesmo valor = mesma operação: nenhuma das duas é rejeitada.
+      expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.valorPago).toBe(300); // nunca 600
+      expect(final.valorPendente).toBe(200);
+      expect(final.pagamentos.filter((p) => p.idempotencyKey === chave)).toHaveLength(1);
+
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`)).toHaveLength(1);
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("baixarParcela: duas chamadas concorrentes com a MESMA chave nunca duplicam a baixa", async () => {
+      const produto = await criarProdutoComEstoque(500, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+        },
+        null,
+      );
+      const parcelaId = String(venda.parcelas[0]!._id);
+      const chave = `parcela-concorrente-${Date.now()}`;
+
+      const resultados = await Promise.allSettled([
+        service.baixarParcela(venda.id, parcelaId, { idempotencyKey: chave }, null),
+        service.baixarParcela(venda.id, parcelaId, { idempotencyKey: chave }, null),
+      ]);
+      expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.valorPago).toBe(500); // nunca 1000
+      expect(final.valorPendente).toBe(0);
+      expect(final.parcelasPagas).toBe(1);
+      expect(final.pagamentos.filter((p) => p.idempotencyKey === chave)).toHaveLength(1);
+
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave}`)).toHaveLength(1);
+      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+    });
+  });
 });
