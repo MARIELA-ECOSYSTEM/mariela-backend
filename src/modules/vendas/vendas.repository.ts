@@ -249,6 +249,21 @@ export class VendasRepository {
   }
 
   /**
+   * TODAS as vendas de um vendedor, qualquer status — usado pelo histórico de
+   * vendas exibido em `GET /vendedores/:id/vendas` (Etapa 17.2). Mesmo
+   * princípio de `encontrarPorClienteId`: inclui vendas canceladas de
+   * propósito (histórico nunca é apagado/escondido, só a projeção do
+   * chamador decide como exibir), mesma projeção enxuta.
+   */
+  async encontrarPorVendedorId(vendedorId: string): Promise<VendaDocument[]> {
+    return this.vendaModel
+      .find({ vendedorId })
+      .select("-itens -pagamentos -parcelas -historico -cancelamento -observacao -idempotencyKey")
+      .sort({ dataVenda: -1 })
+      .exec();
+  }
+
+  /**
    * Vendas com `dataVenda` no intervalo semiaberto `[inicio, fim)` — usado
    * pelo Dashboard para os recortes hoje/semana/mês (cada chamador passa o
    * intervalo já calculado; nunca a coleção inteira). Projeção mínima: só os

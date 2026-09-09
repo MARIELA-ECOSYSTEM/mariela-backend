@@ -12,6 +12,9 @@ import { ResponseInterceptor } from "../../common/interceptors/response.intercep
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
+import { CaixasService } from "../caixas/caixas.service.js";
+import { ProdutosService } from "../produtos/produtos.service.js";
+import { VendasService } from "../vendas/vendas.service.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE (mesmos guards, mesmo pipeline de
@@ -69,12 +72,42 @@ describe("HTTP — Vendedores (integração — servidor real)", () => {
   afterAll(async () => {
     await connection.collection("vendedores").deleteMany({});
     await connection.collection("eventos_vendedor").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["vendedor", "usuario"] } });
+    await connection.collection("vendas").deleteMany({});
+    await connection.collection("eventos_venda").deleteMany({});
+    await connection.collection("produtos").deleteMany({});
+    await connection.collection("eventos_produto").deleteMany({});
+    await connection.collection("caixas").deleteMany({});
+    await connection.collection("movimentos_caixa").deleteMany({});
+    await connection.collection("eventos_caixa").deleteMany({});
+    await connection.collection("sequencias").deleteMany({ _id: { $in: ["vendedor", "usuario", "venda", "produto", "caixa"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});
     await app.close();
   });
+
+  async function criarVendaParaVendedor(vendedorId: string) {
+    const produtosService = app.get(ProdutosService);
+    const caixasService = app.get(CaixasService);
+    const vendasService = app.get(VendasService);
+
+    const produto = await produtosService.criar({ nome: `Produto HTTP Histórico Vendedor ${Date.now()}`, categoria: "Vestidos", precoCusto: 50, precoVenda: 100, ehNovidade: false }, null);
+    const variante = await produtosService.adicionarVariante(produto.id, { cor: "Azul" }, null);
+    const { tamanhoId } = await produtosService.ajustarQuantidadeTamanho(produto.id, String(variante._id), { tamanho: "M", delta: 5, exigirExistente: false });
+
+    let caixaAtual = await caixasService.obterAtual();
+    if (!caixaAtual) caixaAtual = await caixasService.abrir({ valorInicial: 1000, observacao: "" }, null);
+
+    return vendasService.criar(
+      {
+        vendedorId,
+        caixaId: caixaAtual.id,
+        itens: [{ produtoId: produto.id, varianteId: String(variante._id), tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+      },
+      null,
+    );
+  }
 
   it("GET /api/v1/vendedores SEM token retorna 401", async () => {
     const resposta = await fetch(`${baseUrl}/api/v1/vendedores`);
@@ -206,6 +239,124 @@ describe("HTTP — Vendedores (integração — servidor real)", () => {
   it("GET /api/v1/vendedores/:id inexistente retorna 404", async () => {
     const resposta = await fetch(`${baseUrl}/api/v1/vendedores/65f1a2b3c4d5e6f7a8b9c0d1`, { headers: authHeaders() });
     expect(resposta.status).toBe(404);
+  });
+
+  describe("GET /vendedores: contrato duplo retrocompatível (Etapa 17.2)", () => {
+    it("SEM nenhum query param: devolve o array COMPLETO de vendedores ativos, sem meta/facets, sem truncar em 20 (contrato legado do Backoffice)", async () => {
+      const prefixo = `Legado${Date.now()}`;
+      await Promise.all(
+        Array.from({ length: 21 }, (_, indice) =>
+          fetch(`${baseUrl}/api/v1/vendedores`, {
+            method: "POST",
+            headers: authHeaders(),
+            body: JSON.stringify({ nome: `${prefixo} ${indice}`, telefone: telefoneUnico(), ativo: true, senha: "senha123" }),
+          }),
+        ),
+      );
+
+      const resposta = await fetch(`${baseUrl}/api/v1/vendedores`, { headers: authHeaders() });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as { data: { nome: string }[]; meta?: unknown; facets?: unknown };
+      expect(Array.isArray(corpo.data)).toBe(true);
+      expect(corpo.meta).toBeUndefined();
+      expect(corpo.facets).toBeUndefined();
+      expect(corpo.data.filter((vendedor) => vendedor.nome.startsWith(prefixo))).toHaveLength(21); // nunca truncado em 20 (LIMITE_PADRAO)
+    });
+
+    it("COM page/limit: preserva o contrato paginado/facetado já existente", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/vendedores?page=1&limit=1`, { headers: authHeaders() });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as { data: unknown[]; meta: { total: number; page: number; limit: number }; facets: Record<string, unknown> };
+      expect(corpo.data.length).toBeLessThanOrEqual(1);
+      expect(corpo.meta).toBeTruthy();
+      expect(corpo.meta.page).toBe(1);
+      expect(corpo.meta.limit).toBe(1);
+      expect(corpo.facets).toBeTruthy();
+    });
+
+    it("COM apenas busca (sem page/limit explícitos): continua no contrato paginado/facetado, nunca no legado", async () => {
+      const nome = `SoBusca ${Date.now()}`;
+      await fetch(`${baseUrl}/api/v1/vendedores`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, telefone: telefoneUnico(), ativo: true, senha: "senha123" }),
+      });
+      const resposta = await fetch(`${baseUrl}/api/v1/vendedores?busca=${encodeURIComponent(nome)}`, { headers: authHeaders() });
+      const corpo = (await resposta.json()) as { data: { nome: string }[]; meta: { total: number } };
+      expect(corpo.meta).toBeTruthy(); // presença de QUALQUER param já ativa o contrato paginado
+      expect(corpo.data).toHaveLength(1);
+    });
+
+    it("vendedores soft-deleted continuam excluídos tanto no modo legado quanto no paginado", async () => {
+      const nome = `SoftDel ${Date.now()}`;
+      const criacao = await fetch(`${baseUrl}/api/v1/vendedores`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, telefone: telefoneUnico(), ativo: true, senha: "senha123" }),
+      });
+      const vendedorId = ((await criacao.json()) as { data: { id: string } }).data.id;
+      await fetch(`${baseUrl}/api/v1/vendedores/${vendedorId}`, { method: "DELETE", headers: authHeaders() });
+
+      const legado = await fetch(`${baseUrl}/api/v1/vendedores`, { headers: authHeaders() });
+      const corpoLegado = (await legado.json()) as { data: { id: string }[] };
+      expect(corpoLegado.data.some((vendedor) => vendedor.id === vendedorId)).toBe(false);
+
+      const paginado = await fetch(`${baseUrl}/api/v1/vendedores?busca=${encodeURIComponent(nome)}`, { headers: authHeaders() });
+      const corpoPaginado = (await paginado.json()) as { data: { id: string }[] };
+      expect(corpoPaginado.data.some((vendedor) => vendedor.id === vendedorId)).toBe(false);
+    });
+
+    it("array completo continua compatível com o formato consumido por vendedoresApi.listar() (sem senha/senhaHash)", async () => {
+      const nome = `Compat ${Date.now()}`;
+      await fetch(`${baseUrl}/api/v1/vendedores`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, telefone: telefoneUnico(), ativo: true, senha: "senha123" }),
+      });
+
+      const resposta = await fetch(`${baseUrl}/api/v1/vendedores`, { headers: authHeaders() });
+      const corpo = (await resposta.json()) as { data: Record<string, unknown>[] };
+      const encontrado = corpo.data.find((vendedor) => vendedor["nome"] === nome)!;
+      expect(encontrado["senha"]).toBeUndefined();
+      expect(encontrado["senhaHash"]).toBeUndefined();
+      expect(encontrado["telefoneNormalizado"]).toBeUndefined();
+    });
+  });
+
+  describe("GET /vendedores/:id/vendas: histórico real (Etapa 17.2)", () => {
+    it("SEM token retorna 401", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/vendedores/65f1a2b3c4d5e6f7a8b9c0d1/vendas`);
+      expect(resposta.status).toBe(401);
+    });
+
+    it("estrutura da resposta é exatamente compatível com VendaResumo — sem campos internos vazados", async () => {
+      const criacao = await fetch(`${baseUrl}/api/v1/vendedores`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome: `Vendedor Histórico HTTP ${Date.now()}`, telefone: telefoneUnico(), ativo: true, senha: "senha123" }),
+      });
+      const vendedorId = ((await criacao.json()) as { data: { id: string } }).data.id;
+      await criarVendaParaVendedor(vendedorId);
+
+      const resposta = await fetch(`${baseUrl}/api/v1/vendedores/${vendedorId}/vendas`, { headers: authHeaders() });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as { data: Record<string, unknown>[]; meta: { total: number } };
+      expect(corpo.data).toHaveLength(1);
+      expect(corpo.meta.total).toBe(1);
+
+      const CAMPOS_ESPERADOS = [
+        "id", "codigo", "numero", "dataVenda", "clienteId", "clienteNome", "vendedorId", "vendedorNome",
+        "caixaId", "caixaCodigo", "totalItens", "valorBruto", "descontoPromocional", "descontoVenda",
+        "descontoTotal", "valorFinal", "valorPago", "valorPendente", "valorDevolvido", "temPromocao",
+        "temDesconto", "formaPagamento", "totalParcelas", "parcelasPagas", "status",
+      ].sort();
+      expect(Object.keys(corpo.data[0]!).sort()).toEqual(CAMPOS_ESPERADOS);
+      expect(corpo.data[0]!["vendedorId"]).toBe(vendedorId);
+      // Nunca expõe detalhe pesado nem campos internos.
+      for (const campoProibido of ["itens", "pagamentos", "parcelas", "historico", "cancelamento", "observacao", "idempotencyKey", "criadoEm", "atualizadoEm", "_id", "__v"]) {
+        expect(corpo.data[0]![campoProibido]).toBeUndefined();
+      }
+    });
   });
 
   it("GET /api/v1/vendedores com token malformado/inválido retorna 401", async () => {

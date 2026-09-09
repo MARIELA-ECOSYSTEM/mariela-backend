@@ -5,6 +5,8 @@ import type { Model, Types } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
+import type { VendaDocument } from "../vendas/schemas/venda.schema.js";
+import { VendasRepository } from "../vendas/vendas.repository.js";
 import {
   ARGON2_MEMORY_COST,
   ARGON2_TIME_COST,
@@ -22,6 +24,7 @@ import type { ListarVendedoresQueryDto } from "./dto/listar-vendedores-query.dto
 import type { RedefinirSenhaVendedorDto } from "./dto/redefinir-senha-vendedor.dto.js";
 import { EventoVendedor, type EventoVendedorDocument } from "./schemas/evento-vendedor.schema.js";
 import type { VendedorDocument } from "./schemas/vendedor.schema.js";
+import type { VendaResumoDoVendedor } from "./vendedores.types.js";
 import { normalizarTelefone } from "./utils/normalizacao.util.js";
 
 export interface ResultadoListaVendedores {
@@ -49,6 +52,7 @@ export class VendedoresService {
   constructor(
     private readonly vendedoresRepository: VendedoresRepository,
     private readonly sequenciasService: SequenciasService,
+    private readonly vendasRepository: VendasRepository,
     @InjectModel(EventoVendedor.name) private readonly eventoModel: Model<EventoVendedorDocument>,
   ) {}
 
@@ -87,6 +91,21 @@ export class VendedoresService {
 
     await this.registrarEvento(vendedor.id, "vendedor.criado", usuarioId, { codigo });
     return vendedor;
+  }
+
+  /**
+   * Contrato LEGADO do Backoffice (Etapa 17.2, mesmo padrão de
+   * `ClientesService.listarTodosAtivos`/`FornecedoresService.listarTodosAtivos`/
+   * `ColecoesService.listarTodosAtivos`/`CampanhasService.listarTodosAtivos`)
+   * — `GET /vendedores` sem NENHUM parâmetro de paginação/busca/faceta espera
+   * de volta a base INTEIRA de vendedores ativos, num array simples, nunca
+   * truncada por um `limit` padrão. Reusa `encontrarTodosAtivos()` (já
+   * existente, já usado pelo Dashboard) — nenhuma consulta nova, nenhuma
+   * regra duplicada de `listar()`. Ver `VendedoresController.listar` para a
+   * decisão de QUANDO usar este caminho vs. o paginado/facetado abaixo.
+   */
+  async listarTodosAtivos(): Promise<VendedorDocument[]> {
+    return this.vendedoresRepository.encontrarTodosAtivos();
   }
 
   async listar(query: ListarVendedoresQueryDto): Promise<ResultadoListaVendedores> {
@@ -176,14 +195,59 @@ export class VendedoresService {
   }
 
   /**
-   * Histórico de vendas do vendedor. O módulo de Vendas ainda não existe
-   * nesta etapa — por isso sempre devolve uma lista vazia (nunca inventa
-   * dados de venda). Continua validando que o vendedor existe, para preservar
-   * o 404 já esperado pelo Backoffice quando o id é inválido ou excluído.
+   * Histórico de vendas do vendedor (Etapa 17.2) — consulta real via
+   * `VendasRepository.encontrarPorVendedorId` (Vendas não é alterado; só
+   * consultado, mesmo padrão já usado pelo Dashboard e por
+   * `ClientesService.listarVendas`). Inclui vendas CANCELADAS de propósito:
+   * histórico nunca é apagado, a UI decide como exibir usando `status` —
+   * mesma regra exata do histórico de compras do Cliente. `encontrarPorIdOuFalhar`
+   * preserva o 404 já esperado pelo Backoffice quando o id é inválido ou o
+   * vendedor está excluído (soft delete) — mesma checagem de sempre,
+   * comportamento inalterado.
    */
-  async listarVendas(id: string): Promise<{ data: never[]; meta: ApiMeta }> {
+  async listarVendas(id: string): Promise<{ data: VendaResumoDoVendedor[]; meta: ApiMeta }> {
     await this.vendedoresRepository.encontrarPorIdOuFalhar(id);
-    return { data: [], meta: { total: 0 } };
+    const vendas = await this.vendasRepository.encontrarPorVendedorId(id);
+    const data = vendas.map((venda) => this.paraResumoVenda(venda));
+    return { data, meta: { total: data.length } };
+  }
+
+  /**
+   * Projeta uma `Venda` para o formato `VendaResumo` do Backoffice — só os
+   * campos que já fazem parte desse contrato (ver `vendedores.types.ts`).
+   * Nunca inclui itens/pagamentos/parcelas/histórico/cancelamento (detalhe
+   * pesado, fora do escopo de um resumo) nem campos internos do backend
+   * (`idempotencyKey`, `criadoEm`, `atualizadoEm`) — mesmo mapeamento de
+   * `ClientesService.paraResumoVenda`.
+   */
+  private paraResumoVenda(venda: VendaDocument): VendaResumoDoVendedor {
+    return {
+      id: venda.id,
+      codigo: venda.codigo,
+      numero: venda.numero,
+      dataVenda: venda.dataVenda,
+      clienteId: venda.clienteId,
+      clienteNome: venda.clienteNome,
+      vendedorId: venda.vendedorId,
+      vendedorNome: venda.vendedorNome,
+      caixaId: venda.caixaId,
+      caixaCodigo: venda.caixaCodigo,
+      totalItens: venda.totalItens,
+      valorBruto: venda.valorBruto,
+      descontoPromocional: venda.descontoPromocional,
+      descontoVenda: venda.descontoVenda,
+      descontoTotal: venda.descontoTotal,
+      valorFinal: venda.valorFinal,
+      valorPago: venda.valorPago,
+      valorPendente: venda.valorPendente,
+      valorDevolvido: venda.valorDevolvido,
+      temPromocao: venda.temPromocao,
+      temDesconto: venda.temDesconto,
+      formaPagamento: venda.formaPagamento,
+      totalParcelas: venda.totalParcelas,
+      parcelasPagas: venda.parcelasPagas,
+      status: venda.status,
+    };
   }
 
   /**

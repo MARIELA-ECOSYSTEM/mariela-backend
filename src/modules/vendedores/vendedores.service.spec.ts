@@ -5,6 +5,10 @@ import { Test, type TestingModule } from "@nestjs/testing";
 import type { Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
+import { CaixasService } from "../caixas/caixas.service.js";
+import { ProdutosService } from "../produtos/produtos.service.js";
+import { VendasModule } from "../vendas/vendas.module.js";
+import { VendasService } from "../vendas/vendas.service.js";
 import type { CriarVendedorDto } from "./dto/criar-vendedor.dto.js";
 import type { ListarVendedoresQueryDto } from "./dto/listar-vendedores-query.dto.js";
 import { VendedoresModule } from "./vendedores.module.js";
@@ -248,14 +252,14 @@ describe("VendedoresService (integração — MongoDB real)", () => {
       expect(inativos.data[0]?.ativo).toBe(false);
     });
 
-    it("filtro vendas=sem retorna todos, pois o módulo de Vendas ainda não existe", async () => {
+    it("filtro vendas=sem retorna vendedores recém-criados (agregado vendas=0 até a primeira venda real)", async () => {
       const prefixo = `Vendas${Date.now()}`;
       await service.criar(payloadVendedor("v1", { nome: prefixo }), null);
       const resultado = await service.listar(queryPadrao({ busca: prefixo, vendas: ["sem"] }));
       expect(resultado.data).toHaveLength(1);
     });
 
-    it("filtro vendas=21+ não retorna ninguém enquanto não existir módulo de Vendas", async () => {
+    it("filtro vendas=21+ não retorna vendedores com o agregado `vendas` abaixo da faixa", async () => {
       const prefixo = `Vendas21${Date.now()}`;
       await service.criar(payloadVendedor("v2", { nome: prefixo }), null);
       const resultado = await service.listar(queryPadrao({ busca: prefixo, vendas: ["21+"] }));
@@ -314,8 +318,8 @@ describe("VendedoresService (integração — MongoDB real)", () => {
     });
   });
 
-  describe("histórico de vendas (Vendas ainda não implementado)", () => {
-    it("devolve lista vazia para um vendedor existente", async () => {
+  describe("histórico de vendas: vendedor sem nenhuma venda", () => {
+    it("devolve lista vazia para um vendedor existente sem vendas", async () => {
       const vendedor = await service.criar(payloadVendedor("T"), null);
       const vendas = await service.listarVendas(vendedor.id);
       expect(vendas.data).toEqual([]);
@@ -325,5 +329,216 @@ describe("VendedoresService (integração — MongoDB real)", () => {
     it("lança NOT_FOUND para um vendedor inexistente", async () => {
       await expect(service.listarVendas("65f1a2b3c4d5e6f7a8b9c0d1")).rejects.toThrow(ApiException);
     });
+
+    it("lança NOT_FOUND para um vendedor soft-deleted (mesma regra de obterPorId)", async () => {
+      const vendedor = await service.criar(payloadVendedor("T2"), null);
+      await service.excluir(vendedor.id, null);
+      await expect(service.listarVendas(vendedor.id)).rejects.toThrow(ApiException);
+    });
+  });
+
+  describe("listagem completa sem paginação (contrato legado do Backoffice — Etapa 17.2)", () => {
+    it("listarTodosAtivos() devolve todos os vendedores ativos, sem truncar por um limite padrão", async () => {
+      const prefixo = `Full${Date.now()}`;
+      await Promise.all(
+        Array.from({ length: 25 }, (_, indice) => service.criar(payloadVendedor(`${prefixo}-${indice}`, { nome: `${prefixo} ${indice}` }), null)),
+      );
+      const todos = await service.listarTodosAtivos();
+      const doPrefixo = todos.filter((vendedor) => vendedor.nome.startsWith(prefixo));
+      expect(doPrefixo).toHaveLength(25); // nunca truncado em 20 (LIMITE_PADRAO), ao contrário de listar()
+    });
+
+    it("listarTodosAtivos() nunca inclui vendedores excluídos (soft delete)", async () => {
+      const ativo = await service.criar(payloadVendedor("Vis"), null);
+      const excluido = await service.criar(payloadVendedor("Inv"), null);
+      await service.excluir(excluido.id, null);
+
+      const todos = await service.listarTodosAtivos();
+      const ids = todos.map((vendedor) => vendedor.id);
+      expect(ids).toContain(ativo.id);
+      expect(ids).not.toContain(excluido.id);
+    });
+  });
+
+  describe("concorrência na criação: colisão de telefone (Etapa 17.2)", () => {
+    it("duas criações concorrentes com o MESMO telefone: exatamente uma sucede, a outra é rejeitada por conflito, nunca dois vendedores ativos", async () => {
+      const telefone = telefoneUnico();
+      const resultados = await Promise.allSettled([
+        service.criar(payloadVendedor("Corr1", { telefone }), null),
+        service.criar(payloadVendedor("Corr2", { telefone }), null),
+      ]);
+
+      expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const rejeitado = resultados.find((r) => r.status === "rejected");
+      expect(rejeitado).toBeDefined();
+      expect((rejeitado as PromiseRejectedResult).reason).toBeInstanceOf(ApiException);
+
+      const total = await connection.collection("vendedores").countDocuments({ telefoneNormalizado: telefone, excluidoEm: null });
+      expect(total).toBe(1); // nunca dois vendedores ativos com o mesmo telefone
+    });
+  });
+});
+
+/**
+ * Suíte SEPARADA (módulo de teste próprio) porque este cenário precisa de
+ * vendas reais persistidas — traz `VendasModule` (que já importa
+ * `ProdutosModule`/`VendedoresModule`/`ClientesModule`/`CaixasModule`
+ * internamente) para o grafo de DI, mesmo padrão já usado por
+ * `clientes.service.spec.ts`/`dashboard.service.spec.ts` para testar a mesma
+ * combinação de módulos. `VendasService` NUNCA é alterado aqui — só usado
+ * para preparar o cenário (criar vendas reais) e então exercitar
+ * `VendedoresService.listarVendas`.
+ */
+describe("VendedoresService.listarVendas — histórico real (Etapa 17.2, integração — MongoDB real)", () => {
+  let moduleRef: TestingModule;
+  let vendedoresService: VendedoresService;
+  let vendasService: VendasService;
+  let produtosService: ProdutosService;
+  let caixasService: CaixasService;
+  let connection: Connection;
+  let contador = 0;
+
+  function sufixo(): string {
+    contador += 1;
+    return String(contador);
+  }
+
+  beforeAll(async () => {
+    moduleRef = await Test.createTestingModule({
+      imports: [
+        mongooseModuloDeTeste(),
+        JwtModule.register({ global: true, secret: "segredo-de-teste", signOptions: { expiresIn: "15m" } }),
+        VendasModule,
+        VendedoresModule,
+      ],
+    }).compile();
+    vendedoresService = moduleRef.get(VendedoresService);
+    vendasService = moduleRef.get(VendasService);
+    produtosService = moduleRef.get(ProdutosService);
+    caixasService = moduleRef.get(CaixasService);
+    connection = moduleRef.get(getConnectionToken());
+  });
+
+  afterAll(async () => {
+    await connection.collection("vendas").deleteMany({});
+    await connection.collection("eventos_venda").deleteMany({});
+    await connection.collection("produtos").deleteMany({});
+    await connection.collection("eventos_produto").deleteMany({});
+    await connection.collection("vendedores").deleteMany({});
+    await connection.collection("eventos_vendedor").deleteMany({});
+    await connection.collection("caixas").deleteMany({});
+    await connection.collection("movimentos_caixa").deleteMany({});
+    await connection.collection("eventos_caixa").deleteMany({});
+    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "caixa"] } });
+    await moduleRef.close();
+  });
+
+  async function criarProdutoComEstoque(quantidade: number) {
+    const s = sufixo();
+    const produto = await produtosService.criar({ nome: `Produto Histórico Vendedor ${s}`, categoria: "Vestidos", precoCusto: 50, precoVenda: 100, ehNovidade: false }, null);
+    const variante = await produtosService.adicionarVariante(produto.id, { cor: "Azul" }, null);
+    const { tamanhoId } = await produtosService.ajustarQuantidadeTamanho(produto.id, String(variante._id), { tamanho: "M", delta: quantidade, exigirExistente: false });
+    return { produtoId: produto.id, varianteId: String(variante._id), tamanhoId };
+  }
+
+  async function criarVendedor() {
+    const s = sufixo();
+    const dto: CriarVendedorDto = { nome: `Vendedor Histórico ${s}`, telefone: `1198${String(contador).padStart(6, "0")}`, ativo: true, senha: "senha123" };
+    return vendedoresService.criar(dto, null);
+  }
+
+  it("vendedor sem vendas: lista vazia", async () => {
+    const vendedor = await criarVendedor();
+    const resultado = await vendedoresService.listarVendas(vendedor.id);
+    expect(resultado.data).toEqual([]);
+    expect(resultado.meta.total).toBe(0);
+  });
+
+  it("vendedor com UMA venda: a venda aparece no histórico, com o formato de VendaResumo", async () => {
+    const vendedor = await criarVendedor();
+    const produto = await criarProdutoComEstoque(5);
+    const caixaAberto = await caixasService.abrir({ valorInicial: 1000, observacao: "" }, null);
+    const venda = await vendasService.criar(
+      {
+        vendedorId: vendedor.id,
+        caixaId: caixaAberto.id,
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+      },
+      null,
+    );
+    await caixasService.fechar(caixaAberto.id, { valorInformado: 1100 }, null);
+
+    const resultado = await vendedoresService.listarVendas(vendedor.id);
+    expect(resultado.data).toHaveLength(1);
+    expect(resultado.meta.total).toBe(1);
+    const resumo = resultado.data[0]!;
+    expect(resumo.id).toBe(venda.id);
+    expect(resumo.codigo).toBe(venda.codigo);
+    expect(resumo.vendedorId).toBe(vendedor.id);
+    expect(resumo.valorFinal).toBe(venda.valorFinal);
+    expect(resumo.status).toBe(venda.status);
+    // Nunca expõe detalhe pesado/interno no resumo.
+    expect((resumo as Record<string, unknown>)["itens"]).toBeUndefined();
+    expect((resumo as Record<string, unknown>)["pagamentos"]).toBeUndefined();
+    expect((resumo as Record<string, unknown>)["idempotencyKey"]).toBeUndefined();
+  });
+
+  it("vendedor com MÚLTIPLAS vendas: todas aparecem, e meta.total reflete a quantidade correta", async () => {
+    const vendedor = await criarVendedor();
+
+    for (let indice = 0; indice < 3; indice += 1) {
+      const produto = await criarProdutoComEstoque(5);
+      const caixa = await caixasService.abrir({ valorInicial: 1000, observacao: "" }, null);
+      await vendasService.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+        },
+        null,
+      );
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    }
+
+    const resultado = await vendedoresService.listarVendas(vendedor.id);
+    expect(resultado.data).toHaveLength(3);
+    expect(resultado.meta.total).toBe(3);
+  });
+
+  it("isolamento: só aparecem vendas DAQUELE vendedor, nunca de outro", async () => {
+    const vendedorA = await criarVendedor();
+    const vendedorB = await criarVendedor();
+
+    const produtoA = await criarProdutoComEstoque(5);
+    const caixaA = await caixasService.abrir({ valorInicial: 1000, observacao: "" }, null);
+    await vendasService.criar(
+      { vendedorId: vendedorA.id, caixaId: caixaA.id, itens: [{ produtoId: produtoA.produtoId, varianteId: produtoA.varianteId, tamanhoId: produtoA.tamanhoId, quantidade: 1 }], pagamentos: [{ forma: "Dinheiro", valor: 100 }] },
+      null,
+    );
+    await caixasService.fechar(caixaA.id, { valorInformado: 1100 }, null);
+
+    const resultadoA = await vendedoresService.listarVendas(vendedorA.id);
+    const resultadoB = await vendedoresService.listarVendas(vendedorB.id);
+    expect(resultadoA.data).toHaveLength(1);
+    expect(resultadoB.data).toHaveLength(0);
+    expect(resultadoA.data.every((venda) => venda.vendedorId === vendedorA.id)).toBe(true);
+  });
+
+  it("vendas CANCELADAS continuam aparecendo no histórico — nunca apaga histórico (mesma regra do Cliente)", async () => {
+    const vendedor = await criarVendedor();
+    const produto = await criarProdutoComEstoque(5);
+    const caixa = await caixasService.abrir({ valorInicial: 1000, observacao: "" }, null);
+    const venda = await vendasService.criar(
+      { vendedorId: vendedor.id, caixaId: caixa.id, itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }], pagamentos: [{ forma: "Dinheiro", valor: 100 }] },
+      null,
+    );
+    await vendasService.cancelar(venda.id, { tipo: "integral", motivo: "Teste histórico vendedor" }, null);
+    await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+
+    const resultado = await vendedoresService.listarVendas(vendedor.id);
+    expect(resultado.data).toHaveLength(1);
+    expect(resultado.data[0]?.status).toBe("cancelada");
   });
 });

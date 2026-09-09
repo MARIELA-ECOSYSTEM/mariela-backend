@@ -44,8 +44,37 @@ interface ResultadoAggregate {
 export class VendedoresRepository {
   constructor(@InjectModel(Vendedor.name) private readonly vendedorModel: Model<VendedorDocument>) {}
 
+  /**
+   * `VendedoresService.criar` já checa telefone duplicado ANTES de chamar
+   * isto (defesa primária, mensagem de erro melhor). Este `catch` é só a
+   * rede de segurança para a corrida rara entre essa checagem e a gravação
+   * (duas criações simultâneas com o mesmo telefone) — quem perde a corrida
+   * esbarra no índice único parcial de `telefoneNormalizado` (`erro 11000`)
+   * e, sem isto, receberia um 500 cru em vez do 409 já usado pelo resto do
+   * domínio para este mesmo caso (Etapa 17.2, mesmo padrão de
+   * `ClientesRepository.criar`/`FornecedoresRepository.criar`). Nunca
+   * mascara outro tipo de erro: só traduz especificamente a colisão desse
+   * índice.
+   */
   async criar(dados: DadosCriarVendedor): Promise<VendedorDocument> {
-    return this.vendedorModel.create(dados);
+    try {
+      return await this.vendedorModel.create(dados);
+    } catch (erro) {
+      if (this.ehErroDeTelefoneDuplicado(erro)) {
+        throw ApiException.conflict("Já existe um vendedor cadastrado com este telefone.");
+      }
+      throw erro;
+    }
+  }
+
+  private ehErroDeTelefoneDuplicado(erro: unknown): boolean {
+    if (typeof erro !== "object" || erro === null || !("code" in erro) || (erro as { code: unknown }).code !== 11000) {
+      return false;
+    }
+    const keyPattern = (erro as { keyPattern?: Record<string, unknown> }).keyPattern;
+    if (keyPattern) return "telefoneNormalizado" in keyPattern;
+    const mensagem = String((erro as { message?: unknown }).message ?? "");
+    return mensagem.includes("telefoneNormalizado");
   }
 
   async encontrarPorId(id: string): Promise<VendedorDocument | null> {
