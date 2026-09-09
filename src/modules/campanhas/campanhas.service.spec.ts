@@ -296,4 +296,46 @@ describe("CampanhasService (integração — MongoDB real)", () => {
       await expect(service.listarProdutos("65f1a2b3c4d5e6f7a8b9c0d1")).rejects.toThrow(ApiException);
     });
   });
+
+  describe("listarTodosAtivos() — contrato legado sem paginação (Etapa 16.2)", () => {
+    it("devolve todas as campanhas ativas, sem truncar por um limite padrão", async () => {
+      const prefixo = `Full${Date.now()}`;
+      await Promise.all(
+        Array.from({ length: 25 }, (_, indice) => service.criar(payloadCampanha(`${prefixo}-${indice}`, { nome: `${prefixo} ${indice}` }), null)),
+      );
+      const todas = await service.listarTodosAtivos();
+      const doPrefixo = todas.filter((campanha) => campanha.nome.startsWith(prefixo));
+      expect(doPrefixo).toHaveLength(25); // nunca truncado em 20 (LIMITE_PADRAO), ao contrário de listar()
+    });
+
+    it("nunca inclui campanhas excluídas (soft delete)", async () => {
+      const ativa = await service.criar(payloadCampanha("VisTodas"), null);
+      const excluida = await service.criar(payloadCampanha("InvTodas"), null);
+      await service.excluir(excluida.id, null);
+
+      const todas = await service.listarTodosAtivos();
+      const ids = todas.map((campanha) => campanha.id);
+      expect(ids).toContain(ativa.id);
+      expect(ids).not.toContain(excluida.id);
+    });
+
+    it("calcula produtosVinculados exatamente como listar()", async () => {
+      const campanha = await service.criar(payloadCampanha("AgrTodas"), null);
+      await produtosService.criar(payloadProduto("AgrTodas-1", { campanhaId: campanha.id }), null);
+      await produtosService.criar(payloadProduto("AgrTodas-2", { campanhaId: campanha.id }), null);
+
+      const todas = await service.listarTodosAtivos();
+      const encontrada = todas.find((item) => item.id === campanha.id)!;
+      expect(encontrada.produtosVinculados).toBe(2);
+    });
+
+    it("é estável sob execuções repetidas (mesmo resultado toda vez)", async () => {
+      const prefixo = `Estavel${Date.now()}`;
+      await service.criar(payloadCampanha("Estavel1", { nome: prefixo }), null);
+
+      const resultados = await Promise.all(Array.from({ length: 5 }, () => service.listarTodosAtivos()));
+      const contagens = resultados.map((todas) => todas.filter((campanha) => campanha.nome === prefixo).length);
+      expect(contagens).toEqual([1, 1, 1, 1, 1]);
+    });
+  });
 });

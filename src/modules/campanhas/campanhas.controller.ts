@@ -1,5 +1,6 @@
-import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Patch, Post, Put, Query, UseGuards } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Patch, Post, Put, Query, Req, UseGuards } from "@nestjs/common";
 import { ApiBearerAuth, ApiOperation, ApiTags } from "@nestjs/swagger";
+import type { Request } from "express";
 import { CurrentUser } from "../../common/decorators/current-user.decorator.js";
 import { Roles } from "../../common/decorators/roles.decorator.js";
 import { JwtAuthGuard } from "../../common/guards/jwt-auth.guard.js";
@@ -32,9 +33,29 @@ export class CampanhasController {
     return { data: await this.campanhasService.criar(dto, usuarioId) };
   }
 
+  /**
+   * Etapa 16.2 — contrato DUPLO retrocompatível, mesmo padrão exato já
+   * aprovado/implementado em `ClientesController.listar` (13.2),
+   * `FornecedoresController.listar` (14.2) e `ColecoesController.listar`
+   * (15.2): decidido pela presença de QUALQUER query param na requisição
+   * BRUTA (`request.query`, lido ANTES do `ValidationPipe` preencher os
+   * defaults do DTO — o DTO já transformado sempre tem
+   * `page`/`limit`/`ordenarPor`/`ordem` preenchidos, mesmo sem o chamador
+   * ter enviado nada, então não serve para decidir isto).
+   *
+   * - `GET /campanhas` (zero query params) → contrato LEGADO do Backoffice
+   *   (`campanhasApi.listar()`, que nunca envia parâmetro nenhum e espera o
+   *   array COMPLETO de campanhas ativas — a tela faz busca/filtro/
+   *   paginação inteiramente no cliente). Ver `CampanhasService.listarTodosAtivos`.
+   * - QUALQUER query param presente (`page`, `limit`, `busca`, facetas…) →
+   *   contrato paginado/facetado já existente, inalterado.
+   */
   @Get()
-  @ApiOperation({ summary: "Lista campanhas com busca, facetas e paginação." })
-  async listar(@Query() query: ListarCampanhasQueryDto) {
+  @ApiOperation({ summary: "Lista campanhas. Sem parâmetros: array completo (contrato legado do Backoffice). Com page/limit/busca/facetas: contrato paginado." })
+  async listar(@Query() query: ListarCampanhasQueryDto, @Req() request: Request) {
+    if (Object.keys(request.query).length === 0) {
+      return { data: await this.campanhasService.listarTodosAtivos() };
+    }
     return this.campanhasService.listar(query);
   }
 

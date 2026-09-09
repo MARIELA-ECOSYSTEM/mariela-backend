@@ -96,6 +96,27 @@ export class CampanhasService {
     return this.paraRespostaPublica(campanha, 0);
   }
 
+  /**
+   * Etapa 16.2 — mesmo padrão já aprovado em `ClientesService.listarTodosAtivos`/
+   * `FornecedoresService.listarTodosAtivos`/`ColecoesService.listarTodosAtivos`
+   * — `GET /campanhas` sem NENHUM parâmetro espera de volta a base INTEIRA de
+   * campanhas ativas, num array simples, nunca truncada pelo `limit` padrão
+   * de `listar()`. Reusa `CampanhasRepository.encontrarTodasAtivas()` e a
+   * MESMA função de agregação (`construirMapaDeContagem`) já usada por
+   * `listar()` — `produtosVinculados` continua calculado exatamente como
+   * hoje, nenhuma regra duplicada.
+   */
+  async listarTodosAtivos(): Promise<CampanhaRespostaPublica[]> {
+    const [campanhasAtivas, produtosAtivos] = await Promise.all([
+      this.campanhasRepository.encontrarTodasAtivas(),
+      this.produtosRepository.listarTodosAtivos(),
+    ]);
+    const contagemPorCampanha = construirMapaDeContagem(produtosAtivos);
+    return campanhasAtivas.map((documento) =>
+      this.paraRespostaPublica(documento, contagemPorCampanha.get(documento.id) ?? 0),
+    );
+  }
+
   async listar(query: ListarCampanhasQueryDto): Promise<ResultadoListaCampanhas> {
     const [campanhasAtivas, produtosAtivos] = await Promise.all([
       this.campanhasRepository.encontrarTodasAtivas(query.busca),
