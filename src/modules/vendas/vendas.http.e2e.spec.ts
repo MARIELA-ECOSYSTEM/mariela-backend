@@ -389,6 +389,80 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
         const corpo = (await resposta.json()) as { data: { status: string } };
         expect(corpo.data.status).toBe("cancelada");
       });
+
+      it("Etapa 10.14: mesma chave reaproveitada para uma operação de cancelamento DIFERENTE (tipo diferente) é rejeitada, nunca sobrescreve o cancelamento original", async () => {
+        const { venda } = await criarVendaFiadaViaHttpSetup(300, 300);
+        const chave = `cancelamento-http-conflito-${Date.now()}`;
+
+        const primeira = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ tipo: "integral", motivo: "Original", idempotencyKey: chave }),
+        });
+        expect(primeira.status).toBe(201);
+
+        const detalheItens = (await primeira.json()) as { data: { itens: { id: string }[] } };
+        const itemId = detalheItens.data.itens[0]!.id;
+
+        // Reusa a MESMA chave, mas agora pedindo uma devolução PARCIAL — operação diferente.
+        const segunda = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ tipo: "parcial", motivo: "Tentativa diferente", itens: [{ itemId, quantidade: 1 }], idempotencyKey: chave }),
+        });
+        expect(segunda.status).toBe(409); // conflito de idempotência, nunca 201/400 silencioso
+
+        const final = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}`, { headers: authHeaders() });
+        const corpoFinal = (await final.json()) as { data: { cancelamento: { tipo: string } | null } };
+        expect(corpoFinal.data.cancelamento?.tipo).toBe("integral"); // nunca sobrescrito pela tentativa diferente
+      });
+
+      it("Etapa 10.14: retry da mesma idempotencyKey após o caixa original fechar e outro abrir não duplica nem migra o movimento", async () => {
+        const { venda, caixa: caixaOriginal } = await criarVendaFiadaViaHttpSetup(150, 150);
+        const chave = `cancelamento-http-cross-caixa-${Date.now()}`;
+
+        const primeira = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ tipo: "integral", motivo: "Original", idempotencyKey: chave }),
+        });
+        expect(primeira.status).toBe(201);
+
+        // Fecha o caixa ORIGINAL usando o saldo esperado calculado pelo próprio
+        // backend (nunca um valor fixo — este caixa é compartilhado por todos os
+        // testes deste arquivo, então o total acumulado não é previsível aqui) e
+        // abre um caixa NOVO, que fica aberto ao final para não quebrar os
+        // demais testes do arquivo.
+        const detalheAntesDeFechar = await fetch(`${baseUrl}/api/v1/caixas/${caixaOriginal.id}`, { headers: authHeaders() });
+        const corpoAntesDeFechar = (await detalheAntesDeFechar.json()) as { data: { resumo: { saldoEsperado: number } } };
+        const fechamento = await fetch(`${baseUrl}/api/v1/caixas/${caixaOriginal.id}/fechamento`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ valorInformado: corpoAntesDeFechar.data.resumo.saldoEsperado }),
+        });
+        expect(fechamento.status).toBe(201);
+
+        const novoCaixa = await fetch(`${baseUrl}/api/v1/caixas`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ valorInicial: 500, observacao: "Caixa pós Etapa 10.14 cross-caixa" }),
+        });
+        expect(novoCaixa.status).toBe(201);
+        const corpoNovoCaixa = (await novoCaixa.json()) as { data: { id: string } };
+
+        // Retry da MESMA chave, agora com um caixa DIFERENTE aberto.
+        const segunda = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ tipo: "integral", motivo: "Retry pós-fechamento", idempotencyKey: chave }),
+        });
+        expect(segunda.status).toBe(201); // replay reconhecido, nunca 400/409
+
+        const movimentos = await connection.collection("movimentos_caixa").find({ vendaId: venda.id, tipo: "cancelamento" }).toArray();
+        expect(movimentos).toHaveLength(1); // nunca duplicado
+        expect(String(movimentos[0]!["caixaId"])).toBe(caixaOriginal.id); // continua no caixa ORIGINAL
+        expect(String(movimentos[0]!["caixaId"])).not.toBe(corpoNovoCaixa.data.id); // nunca migra para o novo caixa
+      });
     });
   });
 

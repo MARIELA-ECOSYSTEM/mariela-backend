@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { getConnectionToken, MongooseModule } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
 import { Types, type Connection } from "mongoose";
+import { ApiException } from "../../common/exceptions/api.exception.js";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import type { DadosCriarMovimento } from "./caixas.types.js";
 import { MovimentosCaixaRepository } from "./movimentos-caixa.repository.js";
@@ -94,6 +95,48 @@ describe("MovimentosCaixaRepository (integração — MongoDB real)", () => {
 
       const total = await connection.collection("movimentos_caixa").countDocuments({ caixaId: new Types.ObjectId(caixaId), idempotencyKey: chave });
       expect(total).toBe(1);
+    });
+  });
+
+  describe("conflito de chave reaproveitada para operação diferente (Etapa 10.14)", () => {
+    it("mesma chave, VALOR diferente: rejeitado por conflito, nunca devolve o movimento errado", async () => {
+      const caixaId = new Types.ObjectId().toString();
+      const chave = `chave-conflito-valor-${Date.now()}`;
+
+      const primeira = await repository.criar(payloadMovimento(caixaId, { idempotencyKey: chave, valor: 100 }));
+      expect(primeira.duplicado).toBe(false);
+
+      await expect(repository.criar(payloadMovimento(caixaId, { idempotencyKey: chave, valor: 250 }))).rejects.toThrow(ApiException);
+
+      const total = await connection.collection("movimentos_caixa").countDocuments({ idempotencyKey: chave });
+      expect(total).toBe(1); // nenhum segundo documento, nenhum dado alterado
+    });
+
+    it("mesma chave, TIPO/SENTIDO diferente (entrada manual vs saída manual): rejeitado por conflito", async () => {
+      const caixaId = new Types.ObjectId().toString();
+      const chave = `chave-conflito-tipo-${Date.now()}`;
+
+      const primeira = await repository.criar(payloadMovimento(caixaId, { idempotencyKey: chave, tipo: "entrada", sentido: "entrada" }));
+      expect(primeira.duplicado).toBe(false);
+
+      await expect(
+        repository.criar(payloadMovimento(caixaId, { idempotencyKey: chave, tipo: "saida", sentido: "saida" })),
+      ).rejects.toThrow(ApiException);
+
+      const total = await connection.collection("movimentos_caixa").countDocuments({ idempotencyKey: chave });
+      expect(total).toBe(1);
+    });
+
+    it("mesma chave, MESMA operação (tipo/sentido/valor/vendaId/formaPagamento iguais): continua funcionando como replay", async () => {
+      const caixaId = new Types.ObjectId().toString();
+      const chave = `chave-replay-genuino-${Date.now()}`;
+
+      const primeira = await repository.criar(payloadMovimento(caixaId, { idempotencyKey: chave, valor: 100, descricao: "Original" }));
+      const segunda = await repository.criar(payloadMovimento(caixaId, { idempotencyKey: chave, valor: 100, descricao: "Retry com texto diferente" }));
+
+      expect(primeira.duplicado).toBe(false);
+      expect(segunda.duplicado).toBe(true);
+      expect(String(segunda.movimento._id)).toBe(String(primeira.movimento._id));
     });
   });
 

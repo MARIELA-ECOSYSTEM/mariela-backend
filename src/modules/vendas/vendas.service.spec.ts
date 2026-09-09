@@ -8,6 +8,7 @@ import { ApiException } from "../../common/exceptions/api.exception.js";
 import { AdquirentesService } from "../adquirentes/adquirentes.service.js";
 import type { CriarAdquirenteDto } from "../adquirentes/dto/criar-adquirente.dto.js";
 import { CaixasService } from "../caixas/caixas.service.js";
+import { MovimentosCaixaRepository } from "../caixas/movimentos-caixa.repository.js";
 import { ClientesService } from "../clientes/clientes.service.js";
 import type { CriarClienteDto } from "../clientes/dto/criar-cliente.dto.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
@@ -17,6 +18,7 @@ import { VendedoresService } from "../vendedores/vendedores.service.js";
 import type { DadosCriarVenda } from "./vendas.types.js";
 import type { ListarVendasQueryDto } from "./dto/listar-vendas-query.dto.js";
 import { VendasModule } from "./vendas.module.js";
+import { VendasRepository } from "./vendas.repository.js";
 import { VendasService } from "./vendas.service.js";
 
 const JWT_MODULO_DE_TESTE = JwtModule.register({
@@ -5052,6 +5054,277 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(atualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(5);
         await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
       });
+    });
+  });
+
+  describe("conflito de chave e migração de índice (Etapa 10.14)", () => {
+    it("L. venda A e venda B com a mesma idempotencyKey: a segunda é rejeitada por conflito, nunca devolve a venda errada", async () => {
+      const produtoA = await criarProdutoComEstoque(100, 5);
+      const produtoB = await criarProdutoComEstoque(200, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const chave = `chave-reusada-entre-vendas-${Date.now()}`;
+
+      const vendaA = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produtoA.produtoId, varianteId: produtoA.varianteId, tamanhoId: produtoA.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+          idempotencyKey: chave,
+        },
+        null,
+      );
+      expect(vendaA.valorFinal).toBe(100);
+
+      // Venda B usa a MESMA chave, mas é um pedido genuinamente diferente
+      // (outro item, outro valor) — nunca deve ser confundida com a venda A.
+      await expect(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produtoB.produtoId, varianteId: produtoB.varianteId, tamanhoId: produtoB.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+            idempotencyKey: chave,
+          },
+          null,
+        ),
+      ).rejects.toThrow(ApiException);
+
+      // Nem o estoque do produto B foi baixado, nem uma segunda venda foi criada.
+      const produtoBAtualizado = await produtosService.obterPorId(produtoB.produtoId);
+      expect(produtoBAtualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(5);
+      const totalVendas = await connection.collection("vendas").countDocuments({ idempotencyKey: chave });
+      expect(totalVendas).toBe(1); // só a venda A
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("retry genuíno da MESMA venda (idênticos itens/vendedor/caixa) com a mesma chave continua funcionando como replay", async () => {
+      const produto = await criarProdutoComEstoque(150, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const chave = `retry-genuino-${Date.now()}`;
+      const dados: DadosCriarVenda = {
+        vendedorId: vendedor.id,
+        caixaId: caixa.id,
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Dinheiro", valor: 150 }],
+        idempotencyKey: chave,
+      };
+
+      const primeira = await service.criar(dados, null);
+      const segunda = await service.criar(dados, null);
+      expect(segunda.id).toBe(primeira.id);
+      await caixasService.fechar(caixa.id, { valorInformado: 1150 }, null);
+    });
+
+    it("F. receberPagamento: mesma chave com valor DIFERENTE é rejeitado por conflito", async () => {
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 400 }],
+        },
+        null,
+      );
+      const chave = `recebimento-chave-conflitante-${Date.now()}`;
+
+      const primeiro = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 200, idempotencyKey: chave }, null);
+      expect(primeiro.valorPago).toBe(600);
+
+      await expect(
+        service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300, idempotencyKey: chave }, null),
+      ).rejects.toThrow(ApiException);
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.valorPago).toBe(600); // nunca 900 (o segundo valor nunca foi aplicado)
+      await caixasService.fechar(caixa.id, { valorInformado: 1600 }, null);
+    });
+
+    it("G. baixarParcela: mesma chave usada para uma PARCELA DIFERENTE é rejeitada por conflito", async () => {
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          clienteId: cliente.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+          totalParcelas: 2,
+        },
+        null,
+      );
+      const parcela1Id = String(venda.parcelas[0]!._id);
+      const parcela2Id = String(venda.parcelas[1]!._id);
+      const chave = `parcela-chave-conflitante-${Date.now()}`;
+
+      const primeira = await service.baixarParcela(venda.id, parcela1Id, { idempotencyKey: chave }, null);
+      expect(primeira.parcelasPagas).toBe(1);
+
+      await expect(service.baixarParcela(venda.id, parcela2Id, { idempotencyKey: chave }, null)).rejects.toThrow(ApiException);
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.parcelasPagas).toBe(1); // a parcela 2 nunca foi baixada
+      expect(final.parcelas[1]?.pagoEm).toBeNull();
+      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+    });
+
+    it("H. cancelar: mesma chave com tipo/itens DIFERENTES é rejeitada por conflito", async () => {
+      const produtoA = await criarProdutoComEstoque(100, 5);
+      const produtoB = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          clienteId: cliente.id,
+          itens: [
+            { produtoId: produtoA.produtoId, varianteId: produtoA.varianteId, tamanhoId: produtoA.tamanhoId, quantidade: 1 },
+            { produtoId: produtoB.produtoId, varianteId: produtoB.varianteId, tamanhoId: produtoB.tamanhoId, quantidade: 1 },
+          ],
+          // Paga só metade (100 de 200) para que, mesmo após devolver o item A
+          // (também 100), ainda reste saldo pendente do item B — mantendo a
+          // venda em "em_pagamento" em vez de "concluida" pelo cancelamento
+          // parcial coincidentemente zerar o pendente.
+          pagamentos: [{ forma: "Dinheiro", valor: 50 }],
+        },
+        null,
+      );
+      const itemA = venda.itens.find((i) => i.produtoId === produtoA.produtoId)!;
+      const chave = `cancelamento-chave-conflitante-${Date.now()}`;
+
+      const primeira = await service.cancelar(
+        venda.id,
+        { tipo: "parcial", motivo: "Só o item A", itens: [{ itemId: String(itemA._id), quantidade: 1 }], idempotencyKey: chave },
+        null,
+      );
+      expect(primeira.status).toBe("em_pagamento"); // ainda restou o item B, com saldo pendente
+
+      // Reusa a MESMA chave, mas agora pedindo um cancelamento INTEGRAL — operação diferente.
+      await expect(
+        service.cancelar(venda.id, { tipo: "integral", motivo: "Tentativa diferente", idempotencyKey: chave }, null),
+      ).rejects.toThrow(ApiException);
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.status).toBe("em_pagamento"); // não foi cancelada integralmente por engano
+      // Caixa: 1000 inicial + 50 de entrada (pagamento parcial) - 50 de saída
+      // (devolução do item A, limitada ao valorPago já recebido) = 1000. A
+      // tentativa rejeitada de cancelamento integral nunca chega a mexer no caixa.
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("M./N. índice global do MovimentoCaixa: mesma chave em caixas diferentes nunca cria dois documentos", async () => {
+      const caixaId1 = new Types.ObjectId().toString();
+      const caixaId2 = new Types.ObjectId().toString();
+      const chave = `indice-global-${Date.now()}`;
+      const base = {
+        dataHora: new Date(),
+        tipo: "venda" as const,
+        origem: "venda" as const,
+        descricao: "Teste índice global",
+        referencia: null,
+        vendaId: null,
+        vendaCodigo: null,
+        formaPagamento: "Dinheiro",
+        valor: 100,
+        sentido: "entrada" as const,
+        responsavelId: null,
+        responsavelNome: "Backoffice",
+        observacao: "",
+        motivo: null,
+      };
+
+      // Acesso direto ao repository via o módulo de caixas já carregado pelo VendasModule.
+      const movimentosRepository = moduleRef.get(MovimentosCaixaRepository);
+      const primeiro = await movimentosRepository.criar({ ...base, caixaId: caixaId1, idempotencyKey: chave });
+      expect(primeiro.duplicado).toBe(false);
+
+      // MESMA chave, CAIXA DIFERENTE — o índice global deve impedir um segundo documento.
+      const segundo = await movimentosRepository.criar({ ...base, caixaId: caixaId2, idempotencyKey: chave });
+      expect(segundo.duplicado).toBe(true);
+      expect(String(segundo.movimento._id)).toBe(String(primeiro.movimento._id));
+      expect(String(segundo.movimento.caixaId)).toBe(caixaId1); // continua no caixa ORIGINAL, nunca migra para caixaId2
+
+      const total = await connection.collection("movimentos_caixa").countDocuments({ idempotencyKey: chave });
+      expect(total).toBe(1);
+    });
+  });
+
+  describe("estoque: reivindicação atômica de restauração (Etapa 10.14)", () => {
+    it("O. duas requisições concorrentes reivindicando o MESMO item: só uma restaura o estoque", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+        },
+        null,
+      );
+      const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste reivindicação" }, null);
+      const itemId = cancelada.cancelamento!.itens[0]!.itemId;
+
+      // Reabre a reivindicação manualmente (simula um cenário onde duas
+      // chamadas de reconciliação concorrentes disputam o MESMO item ainda
+      // não restaurado) e dispara duas reivindicações concorrentes de verdade.
+      await connection.collection("vendas").updateOne({ _id: new Types.ObjectId(venda.id) }, { $set: { "cancelamento.itens.$[].restaurado": false } });
+
+      const vendasRepository = moduleRef.get(VendasRepository);
+      const resultados = await Promise.all([
+        vendasRepository.marcarItemDevolvidoRestaurado(venda.id, itemId),
+        vendasRepository.marcarItemDevolvidoRestaurado(venda.id, itemId),
+      ]);
+      expect(resultados.filter(Boolean)).toHaveLength(1); // só uma reivindicação vence
+      // Caixa: 1000 inicial + 200 de entrada - 200 de saída (cancelamento integral) = 1000.
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("reivindicações de itens DIFERENTES nunca conflitam entre si", async () => {
+      const produtoA = await criarProdutoComEstoque(100, 5);
+      const produtoB = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            { produtoId: produtoA.produtoId, varianteId: produtoA.varianteId, tamanhoId: produtoA.tamanhoId, quantidade: 1 },
+            { produtoId: produtoB.produtoId, varianteId: produtoB.varianteId, tamanhoId: produtoB.tamanhoId, quantidade: 1 },
+          ],
+          pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+        },
+        null,
+      );
+      const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste itens diferentes" }, null);
+      const [itemId1, itemId2] = cancelada.cancelamento!.itens.map((i) => i.itemId);
+
+      await connection.collection("vendas").updateOne({ _id: new Types.ObjectId(venda.id) }, { $set: { "cancelamento.itens.$[].restaurado": false } });
+
+      const vendasRepository = moduleRef.get(VendasRepository);
+      const [resultado1, resultado2] = await Promise.all([
+        vendasRepository.marcarItemDevolvidoRestaurado(venda.id, itemId1!),
+        vendasRepository.marcarItemDevolvidoRestaurado(venda.id, itemId2!),
+      ]);
+      expect(resultado1).toBe(true);
+      expect(resultado2).toBe(true); // itens diferentes — ambas reivindicações vencem
+      // Caixa: 1000 inicial + 200 de entrada - 200 de saída (cancelamento integral) = 1000.
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
     });
   });
 });

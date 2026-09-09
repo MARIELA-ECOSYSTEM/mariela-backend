@@ -69,7 +69,18 @@ export class VendasRepository {
     } catch (erro) {
       if (dados.idempotencyKey && this.ehErroDeIdempotencyKeyDuplicada(erro)) {
         const existente = await this.encontrarPorIdempotencyKey(dados.idempotencyKey);
-        if (existente) return existente;
+        // Etapa 10.14: mesma cautela de `VendasService.verificarMesmaOperacaoDeCriacao`,
+        // aplicada aqui à corrida rara de duas gravações concorrentes com a
+        // MESMA chave — comparação leve (vendedor/caixa; a checagem completa,
+        // item a item, já aconteceu antes de chegar aqui via a chamada comum
+        // em `criarInterno`) só para nunca devolver silenciosamente a venda
+        // de outro vendedor/caixa como se fosse o resultado desta chamada.
+        if (existente && existente.vendedorId === dados.vendedorId && existente.caixaId === dados.caixaId) {
+          return existente;
+        }
+        if (existente) {
+          throw ApiException.conflict("Esta idempotencyKey já foi usada para registrar uma venda diferente. Gere uma nova chave para esta operação.");
+        }
       }
       throw erro;
     }

@@ -1,6 +1,7 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Logger, type OnModuleInit } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import { isValidObjectId, type Model } from "mongoose";
+import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { DadosCriarMovimento } from "./caixas.types.js";
 import { MovimentoCaixa, type MovimentoCaixaDocument } from "./schemas/movimento-caixa.schema.js";
 
@@ -24,8 +25,43 @@ export interface ResultadoCriarMovimento {
 }
 
 @Injectable()
-export class MovimentosCaixaRepository {
+export class MovimentosCaixaRepository implements OnModuleInit {
+  private readonly logger = new Logger(MovimentosCaixaRepository.name);
+
   constructor(@InjectModel(MovimentoCaixa.name) private readonly movimentoModel: Model<MovimentoCaixaDocument>) {}
+
+  /**
+   * Etapa 10.14 — auto-cura de índice: sincroniza os índices efetivamente
+   * criados no MongoDB com os declarados no schema atual a cada
+   * inicialização do módulo. Resolve especificamente a migração do índice
+   * de idempotência de `{caixaId, idempotencyKey}` (Etapa 10.10 e
+   * anteriores) para `{idempotencyKey}` GLOBAL (Etapa 10.13): por padrão o
+   * Mongoose só CRIA índices que faltam — nunca remove um índice antigo que
+   * deixou de existir no schema, então sem isto o índice antigo (redundante,
+   * mas inofensivo — é um subconjunto estritamente mais permissivo do novo)
+   * continuaria ocupando espaço/tempo de escrita indefinidamente em
+   * qualquer banco já em uso antes desta etapa (confirmado via auditoria:
+   * exatamente esse índice antigo ainda presente no banco de testes).
+   *
+   * `syncIndexes()` é idempotente — não faz nada se já estiver sincronizado
+   * — e seguro de rodar a cada boot. A auditoria da Etapa 10.14 confirmou o
+   * banco livre de qualquer `idempotencyKey` duplicada entre caixas
+   * diferentes, então este sync nunca falha por conflito de dados hoje; se
+   * algum ambiente tiver dados incompatíveis no futuro, `syncIndexes()`
+   * lançará ao tentar construir o índice único — capturado e logado aqui
+   * (nunca derruba a inicialização do módulo inteiro por um problema de
+   * manutenção de índice).
+   */
+  async onModuleInit(): Promise<void> {
+    try {
+      await this.movimentoModel.syncIndexes();
+    } catch (erro) {
+      this.logger.error(
+        "Falha ao sincronizar índices de movimentos_caixa — verifique manualmente se há idempotencyKey duplicada entre caixas diferentes antes de confiar na proteção de idempotência.",
+        erro instanceof Error ? erro.stack : String(erro),
+      );
+    }
+  }
 
   /**
    * Cria o movimento; se `idempotencyKey` já existir (retry de uma
@@ -48,6 +84,19 @@ export class MovimentosCaixaRepository {
    * fechou, diferente do `dados.caixaId` desta tentativa (o caixa atualmente
    * aberto) — filtrar por `caixaId` aqui faria essa busca não encontrar nada
    * e o erro 11000 vazaria como se fosse uma falha real.
+   *
+   * Etapa 10.14 — antes de devolver o vencedor como replay, confirma que ele
+   * representa a MESMA operação (`tipo`/`sentido`/`valor`/`vendaId`/
+   * `formaPagamento` batem — `caixaId` deliberadamente EXCLUÍDO da
+   * comparação, ver acima). As chaves derivadas por `VendasService`
+   * (prefixadas por `vendaId:operação:`) já não colidem entre operações
+   * diferentes por construção, mas `CaixasService.registrarMovimento`
+   * (entrada/saída MANUAL) aceita uma `idempotencyKey` bruta informada
+   * livremente pelo chamador, sem esse prefixo — sem esta checagem, reusar a
+   * mesma chave por engano em duas movimentações manuais diferentes faria a
+   * segunda "suceder" silenciosamente devolvendo o resultado da primeira, em
+   * vez de ser rejeitada. Reusa `ApiException.conflict` (mesmo código já
+   * usado para os demais conflitos de idempotência do domínio).
    */
   async criar(dados: DadosCriarMovimento): Promise<ResultadoCriarMovimento> {
     try {
@@ -56,10 +105,25 @@ export class MovimentosCaixaRepository {
     } catch (erro) {
       if (dados.idempotencyKey && this.ehErroDeIdempotencyKeyDuplicada(erro)) {
         const existente = await this.movimentoModel.findOne({ idempotencyKey: dados.idempotencyKey }).exec();
-        if (existente) return { movimento: existente, duplicado: true };
+        if (existente) {
+          if (!this.representaMesmaOperacao(existente, dados)) {
+            throw ApiException.conflict("Esta idempotencyKey já foi usada para um movimento de caixa diferente. Gere uma nova chave para esta operação.");
+          }
+          return { movimento: existente, duplicado: true };
+        }
       }
       throw erro;
     }
+  }
+
+  private representaMesmaOperacao(existente: MovimentoCaixaDocument, dados: DadosCriarMovimento): boolean {
+    return (
+      existente.tipo === dados.tipo &&
+      existente.sentido === dados.sentido &&
+      existente.valor === dados.valor &&
+      existente.vendaId === dados.vendaId &&
+      existente.formaPagamento === dados.formaPagamento
+    );
   }
 
   async listarTodosPorCaixa(caixaId: string): Promise<MovimentoCaixaDocument[]> {

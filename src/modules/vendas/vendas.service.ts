@@ -26,7 +26,7 @@ import type { BaixarParcelaDto } from "./dto/baixar-parcela.dto.js";
 import type { CancelamentoDto } from "./dto/cancelamento.dto.js";
 import type { ListarVendasQueryDto } from "./dto/listar-vendas-query.dto.js";
 import { EventoVenda, type EventoVendaDocument } from "./schemas/evento-venda.schema.js";
-import type { ItemDevolvido, ItemVenda, PagamentoVenda, VendaDocument } from "./schemas/venda.schema.js";
+import type { CancelamentoVenda, ItemDevolvido, ItemVenda, PagamentoVenda, VendaDocument } from "./schemas/venda.schema.js";
 import type { DadosCriarVenda, DadosPersistirVenda, DadosReceberPagamento, Desconto, PagamentoSolicitado, TarifaAplicada } from "./vendas.types.js";
 
 export interface ResultadoListaVendas {
@@ -103,7 +103,14 @@ export class VendasService {
       // determinística). Cobre o cenário "processo morreu entre persistir a
       // Venda e criar todos os movimentos": o retry cai aqui, encontra a
       // Venda pronta e só recria o que faltar — nunca duplica o que já existe.
+      //
+      // Etapa 10.14 — CONFLITO DE CHAVE: antes de tratar isto como replay,
+      // confirma que `existente` representa a MESMA operação lógica (mesmo
+      // vendedor/caixa/itens) — nunca devolve silenciosamente a venda de
+      // OUTRO pedido só porque a `idempotencyKey` (uma string arbitrária do
+      // chamador) coincidiu. Ver `verificarMesmaOperacaoDeCriacao`.
       if (existente) {
+        this.verificarMesmaOperacaoDeCriacao(dados, existente);
         await this.garantirMovimentosDeCaixa(existente);
         return existente;
       }
@@ -329,6 +336,40 @@ export class VendasService {
     return venda;
   }
 
+  /**
+   * Etapa 10.14 — verifica que uma venda encontrada por `idempotencyKey`
+   * (replay) representa de fato a MESMA operação solicitada agora, não uma
+   * OUTRA venda cujo chamador, por coincidência ou erro, reutilizou a mesma
+   * chave (`idempotencyKey` é uma string arbitrária do cliente — nada no
+   * banco impede reuso indevido). Comparação DELIBERADAMENTE leve
+   * (vendedor, caixa e o "formato" dos itens — produto/variante/quantidade,
+   * na mesma ordem) — o bastante para detectar com segurança um
+   * pedido genuinamente diferente, sem recalcular preço/desconto/tarifa
+   * (que já pertencem exclusivamente a `criarInterno`). Diferença encontrada
+   * → `ApiException.conflict` (código já existente, reaproveitado — nunca
+   * um código novo); nunca devolve silenciosamente o resultado da operação
+   * errada.
+   */
+  private verificarMesmaOperacaoDeCriacao(dados: DadosCriarVenda, existente: VendaDocument): void {
+    const itensBatem =
+      dados.itens.length === existente.itens.length &&
+      dados.itens.every((solicitado, indice) => {
+        const persistido = existente.itens[indice];
+        return (
+          persistido !== undefined &&
+          solicitado.produtoId === persistido.produtoId &&
+          solicitado.varianteId === persistido.varianteId &&
+          solicitado.quantidade === persistido.quantidade
+        );
+      });
+
+    if (existente.vendedorId !== dados.vendedorId || existente.caixaId !== dados.caixaId || !itensBatem) {
+      throw ApiException.conflict(
+        "Esta idempotencyKey já foi usada para registrar uma venda diferente. Gere uma nova chave para esta operação.",
+      );
+    }
+  }
+
   async listar(query: ListarVendasQueryDto): Promise<ResultadoListaVendas> {
     const selecao: SelecaoFacetas = {
       status: query.status,
@@ -442,12 +483,19 @@ export class VendasService {
     if (!parcelaAtual) throw ApiException.notFound("Parcela não encontrada.");
 
     // Replay: já processado antes (crash entre salvar a venda e lançar o
-    // caixa) — só garante o movimento, nunca reaplica a baixa nem recalcula tarifa.
+    // caixa) — só garante o movimento, nunca reaplica a baixa nem recalcula
+    // tarifa. Etapa 10.14 — CONFLITO DE CHAVE: um pagamento com esta chave
+    // existe, mas a PARCELA pedida agora continua em aberto (`pagoEm: null`)
+    // — a chave pertence à baixa de OUTRA parcela desta mesma venda, nunca
+    // um replay desta. Nunca reconcilia a parcela errada.
     if (dto.idempotencyKey) {
       const existente = vendaAtual.pagamentos.find((pagamento) => pagamento.idempotencyKey === dto.idempotencyKey);
-      if (existente) {
+      if (existente && parcelaAtual.pagoEm) {
         await this.garantirMovimentoDeBaixaParcela(caixaAtual.id, vendaAtual, dto.idempotencyKey, existente, parcelaAtual.numero, parcelaAtual.total);
         return vendaAtual;
+      }
+      if (existente) {
+        throw ApiException.conflict("Esta idempotencyKey já foi usada para baixar outra parcela desta venda. Gere uma nova chave para esta operação.");
       }
     }
 
@@ -500,15 +548,20 @@ export class VendasService {
 
     const venda = await this.vendasRepository.salvarComRetentativa(vendaId, (documento) => {
       if (documento.status === "cancelada") throw ApiException.validation("Venda cancelada não aceita novas baixas.");
+      const parcela = documento.parcelas.find((item) => String(item._id) === parcelaId);
+      if (!parcela) throw ApiException.notFound("Parcela não encontrada.");
       if (dto.idempotencyKey) {
         const existentePagamento = documento.pagamentos.find((pagamento) => pagamento.idempotencyKey === dto.idempotencyKey);
-        if (existentePagamento) {
+        if (existentePagamento && parcela.pagoEm) {
+          // Concorrência: outra tentativa com a MESMA chave já baixou ESTA
+          // parcela enquanto esta rodava — reconhece como replay.
           pagamentoAplicado = existentePagamento;
           return;
         }
+        if (existentePagamento) {
+          throw ApiException.conflict("Esta idempotencyKey já foi usada para baixar outra parcela desta venda. Gere uma nova chave para esta operação.");
+        }
       }
-      const parcela = documento.parcelas.find((item) => String(item._id) === parcelaId);
-      if (!parcela) throw ApiException.notFound("Parcela não encontrada.");
       if (parcela.pagoEm) throw ApiException.validation("Esta parcela já está baixada.");
       // Reavaliado contra o documento FRESCO a cada tentativa (Etapa 10.12) —
       // mesma proteção do fail-fast acima, mas agora segura sob concorrência
@@ -629,17 +682,24 @@ export class VendasService {
       throw ApiException.validation("Nenhum caixa aberto. Abra o caixa antes de registrar o recebimento.");
     }
 
-    if (dados.idempotencyKey) {
-      const existente = vendaAtual.pagamentos.find((pagamento) => pagamento.idempotencyKey === dados.idempotencyKey);
-      if (existente) {
-        await this.garantirMovimentoDeRecebimento(caixaAtual.id, vendaAtual, dados.idempotencyKey, existente);
-        return vendaAtual;
-      }
-    }
-
     const valor = arredondar(dados.valor);
     if (!Number.isFinite(valor) || valor <= 0) {
       throw ApiException.validation("Dados inválidos.", [{ field: "valor", message: "O valor recebido deve ser maior que zero." }]);
+    }
+
+    // Etapa 10.14 — CONFLITO DE CHAVE: um pagamento com esta chave já existe,
+    // mas com um valor DIFERENTE do pedido agora — a chave foi reaproveitada
+    // para um recebimento genuinamente diferente desta mesma venda. Nunca
+    // reconcilia como se fosse o mesmo pedido.
+    if (dados.idempotencyKey) {
+      const existente = vendaAtual.pagamentos.find((pagamento) => pagamento.idempotencyKey === dados.idempotencyKey);
+      if (existente && existente.valor === valor) {
+        await this.garantirMovimentoDeRecebimento(caixaAtual.id, vendaAtual, dados.idempotencyKey, existente);
+        return vendaAtual;
+      }
+      if (existente) {
+        throw ApiException.conflict("Esta idempotencyKey já foi usada para um recebimento com valor diferente. Gere uma nova chave para esta operação.");
+      }
     }
 
     // Reaproveita EXATAMENTE a mesma validação de modalidade/adquirente/tarifa
@@ -657,9 +717,14 @@ export class VendasService {
       }
       if (dados.idempotencyKey) {
         const existente = documento.pagamentos.find((pagamento) => pagamento.idempotencyKey === dados.idempotencyKey);
-        if (existente) {
+        if (existente && existente.valor === valor) {
+          // Concorrência: outra tentativa com a MESMA chave e o MESMO valor
+          // já aplicou este recebimento enquanto esta rodava — replay.
           pagamentoAplicado = existente;
           return;
+        }
+        if (existente) {
+          throw ApiException.conflict("Esta idempotencyKey já foi usada para um recebimento com valor diferente. Gere uma nova chave para esta operação.");
         }
       }
       if (documento.valorPendente <= 0) {
@@ -755,10 +820,17 @@ export class VendasService {
   async cancelar(vendaId: string, dto: CancelamentoDto, usuarioId: string | null): Promise<VendaDocument> {
     const vendaAtual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
 
+    // Etapa 10.14 — a checagem de replay/conflito por `idempotencyKey` roda
+    // ANTES de olhar `status`: uma devolução PARCIAL bem-sucedida deixa a
+    // venda em "em_pagamento" (nunca "cancelada"), então um retry dessa MESMA
+    // operação (ou um reaproveitamento indevido da chave para uma operação
+    // DIFERENTE) precisa ser reconhecido independentemente do status atual —
+    // não só quando o cancelamento anterior fechou a venda por completo.
+    if (dto.idempotencyKey && vendaAtual.cancelamento?.idempotencyKey === dto.idempotencyKey) {
+      this.verificarMesmaOperacaoDeCancelamento(vendaAtual.cancelamento, dto);
+      return this.reconciliarCancelamento(vendaAtual, dto.idempotencyKey);
+    }
     if (vendaAtual.status === "cancelada") {
-      if (dto.idempotencyKey && vendaAtual.cancelamento?.idempotencyKey === dto.idempotencyKey) {
-        return this.reconciliarCancelamento(vendaAtual, dto.idempotencyKey);
-      }
       throw ApiException.validation("Esta venda já está cancelada.");
     }
 
@@ -776,15 +848,19 @@ export class VendasService {
     let eraReplayConcorrente = false;
 
     const venda = await this.vendasRepository.salvarComRetentativa(vendaId, (documento) => {
+      // Mesma checagem de replay/conflito da entrada da função, agora contra
+      // o documento FRESCO desta tentativa — cobre a corrida onde outra
+      // chamada com a MESMA chave (replay concorrente genuíno, ou reuso
+      // indevido para operação diferente) venceu a escrita entre a leitura
+      // inicial e agora.
+      if (dto.idempotencyKey && documento.cancelamento?.idempotencyKey === dto.idempotencyKey) {
+        this.verificarMesmaOperacaoDeCancelamento(documento.cancelamento, dto);
+        // É a MESMA operação — não muta de novo; a reconciliação fora deste
+        // callback cuida do resto (estoque/caixa).
+        eraReplayConcorrente = true;
+        return;
+      }
       if (documento.status === "cancelada") {
-        if (dto.idempotencyKey && documento.cancelamento?.idempotencyKey === dto.idempotencyKey) {
-          // Concorrência: outra chamada com a MESMA chave venceu a corrida
-          // de escrita enquanto esta rodava — é a MESMA operação, não "venda
-          // já cancelada por outra coisa". Não muta de novo; a reconciliação
-          // abaixo, fora deste callback, cuida do resto.
-          eraReplayConcorrente = true;
-          return;
-        }
         throw ApiException.validation("Esta venda já está cancelada.");
       }
 
@@ -872,6 +948,37 @@ export class VendasService {
       valorDevolvido: venda.cancelamento?.valorDevolvido ?? 0,
     });
     return venda;
+  }
+
+  /**
+   * Etapa 10.14 — confirma que uma `idempotencyKey` reencontrada em
+   * `venda.cancelamento` representa a MESMA operação pedida agora, nunca
+   * apenas "a mesma chave". Um cancelamento PARCIAL bem-sucedido não fecha a
+   * venda (status continua "em_pagamento"), então nada além desta checagem
+   * impediria reaproveitar a chave para um `tipo`/conjunto de itens
+   * diferente enquanto a venda seguir aberta. `tipo` precisa bater sempre; um
+   * "parcial" também precisa pedir exatamente o mesmo conjunto
+   * itemId+quantidade já persistido — reusa `ApiException.conflict` (mesmo
+   * código de erro já usado para o conflito de criação/recebimento/parcela).
+   */
+  private verificarMesmaOperacaoDeCancelamento(existente: CancelamentoVenda, dto: CancelamentoDto): void {
+    const mensagem = "Esta idempotencyKey já foi usada para um cancelamento diferente. Gere uma nova chave para esta operação.";
+    if (existente.tipo !== dto.tipo) {
+      throw ApiException.conflict(mensagem);
+    }
+    if (dto.tipo === "parcial") {
+      const solicitados = [...(dto.itens ?? [])].sort((a, b) => a.itemId.localeCompare(b.itemId));
+      const persistidos = [...existente.itens].sort((a, b) => a.itemId.localeCompare(b.itemId));
+      const itensBatem =
+        solicitados.length === persistidos.length &&
+        solicitados.every((solicitado, indice) => {
+          const persistido = persistidos[indice];
+          return persistido !== undefined && solicitado.itemId === persistido.itemId && solicitado.quantidade === persistido.quantidade;
+        });
+      if (!itensBatem) {
+        throw ApiException.conflict(mensagem);
+      }
+    }
   }
 
   /**
