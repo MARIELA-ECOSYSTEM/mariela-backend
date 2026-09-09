@@ -649,6 +649,111 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     });
   });
 
+  describe("segurança e autorização do ciclo financeiro (Etapa 10.18)", () => {
+    it("SEM token: baixa de parcela e cancelamento retornam 401 (mesmo guard de classe já validado para recebimentos)", async () => {
+      const semTokenBaixa = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/parcelas/${parcelaId}/baixa`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(semTokenBaixa.status).toBe(401);
+
+      const semTokenCancelamento = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/cancelamento`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ tipo: "integral", motivo: "Teste" }),
+      });
+      expect(semTokenCancelamento.status).toBe(401);
+    });
+
+    it("venda já CANCELADA continua rejeitando baixa de parcela (400) — mesma proteção já confirmada para recebimentos/cancelamento", async () => {
+      // Reutiliza a venda seedada em beforeAll: já foi baixada (linha ~207) e
+      // depois cancelada (linha ~296) mais cedo neste arquivo — permanece
+      // "cancelada" pelo resto da suíte.
+      const detalhe = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}`, { headers: authHeaders() });
+      const corpoDetalhe = (await detalhe.json()) as { data: { status: string } };
+      expect(corpoDetalhe.data.status).toBe("cancelada");
+
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/parcelas/${parcelaId}/baixa`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({}),
+      });
+      expect(resposta.status).toBe(400);
+    });
+
+    it("payload com caixaId/vendedorId extra em recebimentos é rejeitado (400) pelo whitelist global — nunca usado como autoridade", async () => {
+      const { venda } = await criarVendaFiadaViaHttpSetup(500, 300);
+
+      const comCaixaId = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ forma: "Dinheiro", valor: 100, caixaId: "65f1a2b3c4d5e6f7a8b9c0d1" }),
+      });
+      expect(comCaixaId.status).toBe(400);
+
+      const comVendedorId = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ forma: "Dinheiro", valor: 100, vendedorId: "65f1a2b3c4d5e6f7a8b9c0d1" }),
+      });
+      expect(comVendedorId.status).toBe(400);
+
+      // Nenhuma das duas tentativas alterou a venda.
+      const final = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}`, { headers: authHeaders() });
+      const corpoFinal = (await final.json()) as { data: { valorPago: number } };
+      expect(corpoFinal.data.valorPago).toBe(300);
+    });
+
+    it("parcelaId de OUTRA venda retorna 404 — nunca baixa a parcela errada nem vaza dados de uma venda diferente", async () => {
+      const { venda: vendaA } = await criarVendaFiadaViaHttpSetup(300, 100);
+      const { venda: vendaB } = await criarVendaFiadaViaHttpSetup(300, 100);
+      const parcelaDeB = String(vendaB.parcelas[0]!._id);
+
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaA.id}/parcelas/${parcelaDeB}/baixa`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({}),
+      });
+      expect(resposta.status).toBe(404);
+
+      // Nem a venda A nem a venda B foram afetadas pela tentativa cruzada.
+      const detalheA = await fetch(`${baseUrl}/api/v1/vendas/${vendaA.id}`, { headers: authHeaders() });
+      const corpoA = (await detalheA.json()) as { data: { valorPago: number; parcelas: { pagoEm: string | null }[] } };
+      expect(corpoA.data.valorPago).toBe(100);
+      expect(corpoA.data.parcelas[0]?.pagoEm).toBeNull();
+
+      const detalheB = await fetch(`${baseUrl}/api/v1/vendas/${vendaB.id}`, { headers: authHeaders() });
+      const corpoB = (await detalheB.json()) as { data: { valorPago: number; parcelas: { pagoEm: string | null }[] } };
+      expect(corpoB.data.valorPago).toBe(100);
+      expect(corpoB.data.parcelas[0]?.pagoEm).toBeNull();
+    });
+
+    it("a mesma idempotencyKey (raw) usada em recebimentos de DUAS vendas diferentes nunca as confunde — ambas processam independentemente", async () => {
+      const { venda: vendaA } = await criarVendaFiadaViaHttpSetup(500, 300);
+      const { venda: vendaB } = await criarVendaFiadaViaHttpSetup(500, 300);
+      const chave = `chave-cross-venda-${Date.now()}`;
+      const payload = JSON.stringify({ forma: "Dinheiro", valor: 100, idempotencyKey: chave });
+
+      const respostaA = await fetch(`${baseUrl}/api/v1/vendas/${vendaA.id}/recebimentos`, { method: "POST", headers: authHeaders(), body: payload });
+      const respostaB = await fetch(`${baseUrl}/api/v1/vendas/${vendaB.id}/recebimentos`, { method: "POST", headers: authHeaders(), body: payload });
+      expect(respostaA.status).toBe(201); // a mesma chave "crua" é independente por venda — nunca um conflito global aqui
+      expect(respostaB.status).toBe(201);
+
+      const corpoA = (await respostaA.json()) as { data: { valorPago: number } };
+      const corpoB = (await respostaB.json()) as { data: { valorPago: number } };
+      expect(corpoA.data.valorPago).toBe(400);
+      expect(corpoB.data.valorPago).toBe(400);
+
+      // Os movimentos de caixa derivados (prefixados por vendaId — Etapa
+      // 10.13) nunca colidem entre si, mesmo com a chave crua idêntica.
+      const movimentosA = await connection.collection("movimentos_caixa").find({ idempotencyKey: `${vendaA.id}:recebimento:${chave}` }).toArray();
+      const movimentosB = await connection.collection("movimentos_caixa").find({ idempotencyKey: `${vendaB.id}:recebimento:${chave}` }).toArray();
+      expect(movimentosA).toHaveLength(1);
+      expect(movimentosB).toHaveLength(1);
+    });
+  });
+
   it("não existe POST /api/v1/vendas (criação é exclusiva do mecanismo interno/futuro PDV)", async () => {
     const resposta = await fetch(`${baseUrl}/api/v1/vendas`, {
       method: "POST",
