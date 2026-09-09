@@ -10,6 +10,7 @@ import { CaixasModule } from "./modules/caixas/caixas.module.js";
 import { CampanhasModule } from "./modules/campanhas/campanhas.module.js";
 import { ClientesModule } from "./modules/clientes/clientes.module.js";
 import { ColecoesModule } from "./modules/colecoes/colecoes.module.js";
+import { ConfiguracoesModule } from "./modules/configuracoes/configuracoes.module.js";
 import { DashboardModule } from "./modules/dashboard/dashboard.module.js";
 import { EstoqueModule } from "./modules/estoque/estoque.module.js";
 import { FornecedoresModule } from "./modules/fornecedores/fornecedores.module.js";
@@ -51,6 +52,7 @@ import { VendedoresModule } from "./modules/vendedores/vendedores.module.js";
     ClientesModule,
     FornecedoresModule,
     ColecoesModule,
+    ConfiguracoesModule,
     CampanhasModule,
     VendedoresModule,
     CaixasModule,
