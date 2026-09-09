@@ -296,4 +296,46 @@ describe("ColecoesService (integração — MongoDB real)", () => {
       await expect(service.listarProdutos("65f1a2b3c4d5e6f7a8b9c0d1")).rejects.toThrow(ApiException);
     });
   });
+
+  describe("listarTodosAtivos() — contrato legado sem paginação (Etapa 15.2)", () => {
+    it("devolve todas as coleções ativas, sem truncar por um limite padrão", async () => {
+      const prefixo = `Full${Date.now()}`;
+      await Promise.all(
+        Array.from({ length: 25 }, (_, indice) => service.criar(payloadColecao(`${prefixo}-${indice}`, { nome: `${prefixo} ${indice}` }), null)),
+      );
+      const todas = await service.listarTodosAtivos();
+      const doPrefixo = todas.filter((colecao) => colecao.nome.startsWith(prefixo));
+      expect(doPrefixo).toHaveLength(25); // nunca truncado em 20 (LIMITE_PADRAO), ao contrário de listar()
+    });
+
+    it("nunca inclui coleções excluídas (soft delete)", async () => {
+      const ativa = await service.criar(payloadColecao("VisTodas"), null);
+      const excluida = await service.criar(payloadColecao("InvTodas"), null);
+      await service.excluir(excluida.id, null);
+
+      const todas = await service.listarTodosAtivos();
+      const ids = todas.map((colecao) => colecao.id);
+      expect(ids).toContain(ativa.id);
+      expect(ids).not.toContain(excluida.id);
+    });
+
+    it("calcula produtosVinculados exatamente como listar()", async () => {
+      const colecao = await service.criar(payloadColecao("AgrTodas"), null);
+      await produtosService.criar(payloadProduto("AgrTodas-1", { colecaoId: colecao.id }), null);
+      await produtosService.criar(payloadProduto("AgrTodas-2", { colecaoId: colecao.id }), null);
+
+      const todas = await service.listarTodosAtivos();
+      const encontrada = todas.find((item) => item.id === colecao.id)!;
+      expect(encontrada.produtosVinculados).toBe(2);
+    });
+
+    it("é estável sob execuções repetidas (mesmo resultado toda vez)", async () => {
+      const prefixo = `Estavel${Date.now()}`;
+      await service.criar(payloadColecao("Estavel1", { nome: prefixo }), null);
+
+      const resultados = await Promise.all(Array.from({ length: 5 }, () => service.listarTodosAtivos()));
+      const contagens = resultados.map((todas) => todas.filter((colecao) => colecao.nome === prefixo).length);
+      expect(contagens).toEqual([1, 1, 1, 1, 1]);
+    });
+  });
 });

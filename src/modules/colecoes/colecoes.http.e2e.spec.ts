@@ -194,6 +194,93 @@ describe("HTTP — Coleções (integração — servidor real)", () => {
     expect(resposta.status).toBe(404);
   });
 
+  describe("GET /colecoes: contrato duplo retrocompatível (Etapa 15.2)", () => {
+    it("SEM nenhum query param: devolve o array COMPLETO de coleções ativas, sem meta/facets, sem truncar em 20 (contrato legado do Backoffice)", async () => {
+      const prefixo = `Legado${Date.now()}`;
+      await Promise.all(
+        Array.from({ length: 21 }, (_, indice) =>
+          fetch(`${baseUrl}/api/v1/colecoes`, {
+            method: "POST",
+            headers: authHeaders(),
+            body: JSON.stringify({ nome: `${prefixo} ${indice}`, inicio: "2026-01-01", fim: "2026-03-31" }),
+          }),
+        ),
+      );
+
+      const resposta = await fetch(`${baseUrl}/api/v1/colecoes`, { headers: authHeaders() });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as { data: { nome: string }[]; meta?: unknown; facets?: unknown };
+      expect(Array.isArray(corpo.data)).toBe(true);
+      expect(corpo.meta).toBeUndefined();
+      expect(corpo.facets).toBeUndefined();
+      expect(corpo.data.filter((colecao) => colecao.nome.startsWith(prefixo))).toHaveLength(21); // nunca truncado em 20 (LIMITE_PADRAO)
+    });
+
+    it("COM page/limit: preserva o contrato paginado/facetado já existente", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/colecoes?page=1&limit=1`, { headers: authHeaders() });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as { data: unknown[]; meta: { total: number; page: number; limit: number }; facets: Record<string, unknown> };
+      expect(corpo.data.length).toBeLessThanOrEqual(1);
+      expect(corpo.meta).toBeTruthy();
+      expect(corpo.meta.page).toBe(1);
+      expect(corpo.meta.limit).toBe(1);
+      expect(corpo.facets).toBeTruthy();
+    });
+
+    it("COM apenas busca (sem page/limit explícitos): continua no contrato paginado/facetado, nunca no legado", async () => {
+      const nome = `SoBusca ${Date.now()}`;
+      await fetch(`${baseUrl}/api/v1/colecoes`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, inicio: "2026-01-01", fim: "2026-03-31" }),
+      });
+      const resposta = await fetch(`${baseUrl}/api/v1/colecoes?busca=${encodeURIComponent(nome)}`, { headers: authHeaders() });
+      const corpo = (await resposta.json()) as { data: { nome: string }[]; meta: { total: number } };
+      expect(corpo.meta).toBeTruthy(); // presença de QUALQUER param já ativa o contrato paginado
+      expect(corpo.data).toHaveLength(1);
+    });
+
+    it("coleções soft-deleted continuam excluídas tanto no modo legado quanto no paginado", async () => {
+      const nome = `SoftDel ${Date.now()}`;
+      const criacao = await fetch(`${baseUrl}/api/v1/colecoes`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, inicio: "2026-01-01", fim: "2026-03-31" }),
+      });
+      const colecaoId = ((await criacao.json()) as { data: { id: string } }).data.id;
+      await fetch(`${baseUrl}/api/v1/colecoes/${colecaoId}`, { method: "DELETE", headers: authHeaders() });
+
+      const legado = await fetch(`${baseUrl}/api/v1/colecoes`, { headers: authHeaders() });
+      const corpoLegado = (await legado.json()) as { data: { id: string }[] };
+      expect(corpoLegado.data.some((colecao) => colecao.id === colecaoId)).toBe(false);
+
+      const paginado = await fetch(`${baseUrl}/api/v1/colecoes?busca=${encodeURIComponent(nome)}`, { headers: authHeaders() });
+      const corpoPaginado = (await paginado.json()) as { data: { id: string }[] };
+      expect(corpoPaginado.data.some((colecao) => colecao.id === colecaoId)).toBe(false);
+    });
+
+    it("array completo continua trazendo produtosVinculados calculado normalmente", async () => {
+      const nome = `Agregados ${Date.now()}`;
+      const criacao = await fetch(`${baseUrl}/api/v1/colecoes`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, inicio: "2026-01-01", fim: "2026-03-31" }),
+      });
+      const colecaoId = ((await criacao.json()) as { data: { id: string } }).data.id;
+
+      await fetch(`${baseUrl}/api/v1/produtos`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome: `Produto Agregado ${Date.now()}`, categoria: "Vestidos", precoCusto: 50, precoVenda: 100, colecaoId }),
+      });
+
+      const resposta = await fetch(`${baseUrl}/api/v1/colecoes`, { headers: authHeaders() });
+      const corpo = (await resposta.json()) as { data: { id: string; produtosVinculados: number }[] };
+      const encontrada = corpo.data.find((colecao) => colecao.id === colecaoId)!;
+      expect(encontrada.produtosVinculados).toBe(1);
+    });
+  });
+
   it("GET /docs-json documenta as rotas de Coleções com BearerAuth", async () => {
     const resposta = await fetch(`${baseUrl}/docs-json`);
     const documento = (await resposta.json()) as { paths: Record<string, unknown> };

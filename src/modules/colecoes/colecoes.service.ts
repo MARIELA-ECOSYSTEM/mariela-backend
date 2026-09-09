@@ -96,6 +96,27 @@ export class ColecoesService {
     return this.paraRespostaPublica(colecao, 0);
   }
 
+  /**
+   * Etapa 15.2 — mesmo padrão já aprovado em `ClientesService.listarTodosAtivos`/
+   * `FornecedoresService.listarTodosAtivos` — `GET /colecoes` sem NENHUM
+   * parâmetro espera de volta a base INTEIRA de coleções ativas, num array
+   * simples, nunca truncada pelo `limit` padrão de `listar()`. Reusa
+   * `ColecoesRepository.encontrarTodasAtivas()` e a MESMA função de
+   * agregação (`construirMapaDeContagem`) já usada por `listar()` —
+   * `produtosVinculados` continua calculado exatamente como hoje, nenhuma
+   * regra duplicada.
+   */
+  async listarTodosAtivos(): Promise<ColecaoRespostaPublica[]> {
+    const [colecoesAtivas, produtosAtivos] = await Promise.all([
+      this.colecoesRepository.encontrarTodasAtivas(),
+      this.produtosRepository.listarTodosAtivos(),
+    ]);
+    const contagemPorColecao = construirMapaDeContagem(produtosAtivos);
+    return colecoesAtivas.map((documento) =>
+      this.paraRespostaPublica(documento, contagemPorColecao.get(documento.id) ?? 0),
+    );
+  }
+
   async listar(query: ListarColecoesQueryDto): Promise<ResultadoListaColecoes> {
     const [colecoesAtivas, produtosAtivos] = await Promise.all([
       this.colecoesRepository.encontrarTodasAtivas(query.busca),

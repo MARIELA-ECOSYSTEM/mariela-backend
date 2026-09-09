@@ -1,5 +1,6 @@
-import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Patch, Post, Put, Query, UseGuards } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Patch, Post, Put, Query, Req, UseGuards } from "@nestjs/common";
 import { ApiBearerAuth, ApiOperation, ApiTags } from "@nestjs/swagger";
+import type { Request } from "express";
 import { CurrentUser } from "../../common/decorators/current-user.decorator.js";
 import { Roles } from "../../common/decorators/roles.decorator.js";
 import { JwtAuthGuard } from "../../common/guards/jwt-auth.guard.js";
@@ -32,9 +33,29 @@ export class ColecoesController {
     return { data: await this.colecoesService.criar(dto, usuarioId) };
   }
 
+  /**
+   * Etapa 15.2 — contrato DUPLO retrocompatível, mesmo padrão exato já
+   * aprovado/implementado em `ClientesController.listar` (13.2) e
+   * `FornecedoresController.listar` (14.2): decidido pela presença de
+   * QUALQUER query param na requisição BRUTA (`request.query`, lido ANTES
+   * do `ValidationPipe` preencher os defaults do DTO — o DTO já
+   * transformado sempre tem `page`/`limit`/`ordenarPor`/`ordem`
+   * preenchidos, mesmo sem o chamador ter enviado nada, então não serve
+   * para decidir isto).
+   *
+   * - `GET /colecoes` (zero query params) → contrato LEGADO do Backoffice
+   *   (`colecoesApi.listar()`, que nunca envia parâmetro nenhum e espera o
+   *   array COMPLETO de coleções ativas — a tela faz busca/filtro/
+   *   paginação inteiramente no cliente). Ver `ColecoesService.listarTodosAtivos`.
+   * - QUALQUER query param presente (`page`, `limit`, `busca`, facetas…) →
+   *   contrato paginado/facetado já existente, inalterado.
+   */
   @Get()
-  @ApiOperation({ summary: "Lista coleções com busca, facetas e paginação." })
-  async listar(@Query() query: ListarColecoesQueryDto) {
+  @ApiOperation({ summary: "Lista coleções. Sem parâmetros: array completo (contrato legado do Backoffice). Com page/limit/busca/facetas: contrato paginado." })
+  async listar(@Query() query: ListarColecoesQueryDto, @Req() request: Request) {
+    if (Object.keys(request.query).length === 0) {
+      return { data: await this.colecoesService.listarTodosAtivos() };
+    }
     return this.colecoesService.listar(query);
   }
 
