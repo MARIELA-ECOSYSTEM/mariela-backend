@@ -111,6 +111,27 @@ export class FornecedoresService {
     return this.paraRespostaPublica(fornecedor, { produtosVinculados: 0, valorEmCusto: 0, ultimaEntrada: null });
   }
 
+  /**
+   * Contrato LEGADO do Backoffice (Etapa 14.2, mesmo padrão de
+   * `ClientesService.listarTodosAtivos`) — `GET /fornecedores` sem NENHUM
+   * parâmetro espera de volta a base INTEIRA de fornecedores ativos, num
+   * array simples, nunca truncada pelo `limit` padrão de `listar()`. Reusa
+   * `FornecedoresRepository.encontrarTodosAtivos()` e a MESMA função de
+   * agregação (`construirMapaDeAgregados`) já usada por `listar()` — os
+   * agregados públicos (`produtosVinculados`/`valorEmCusto`/`ultimaEntrada`)
+   * continuam calculados exatamente como hoje, nenhuma regra duplicada.
+   */
+  async listarTodosAtivos(): Promise<FornecedorRespostaPublica[]> {
+    const [fornecedoresAtivos, produtosAtivos] = await Promise.all([
+      this.fornecedoresRepository.encontrarTodosAtivos(),
+      this.produtosRepository.listarTodosAtivos(),
+    ]);
+    const agregadosPorFornecedor = construirMapaDeAgregados(produtosAtivos);
+    return fornecedoresAtivos.map((documento) =>
+      this.paraRespostaPublica(documento, agregadosPorFornecedor.get(documento.id) ?? { produtosVinculados: 0, valorEmCusto: 0, ultimaEntrada: null }),
+    );
+  }
+
   async listar(query: ListarFornecedoresQueryDto): Promise<ResultadoListaFornecedores> {
     const [fornecedoresAtivos, produtosAtivos] = await Promise.all([
       this.fornecedoresRepository.encontrarTodosAtivos(query.busca),

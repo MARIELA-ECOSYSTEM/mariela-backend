@@ -302,4 +302,68 @@ describe("FornecedoresService (integração — MongoDB real)", () => {
       await expect(service.listarHistorico("65f1a2b3c4d5e6f7a8b9c0d1")).rejects.toThrow(ApiException);
     });
   });
+
+  describe("listagem completa sem paginação (contrato legado do Backoffice — Etapa 14.2)", () => {
+    it("listarTodosAtivos() devolve todos os fornecedores ativos, sem truncar por um limite padrão", async () => {
+      const prefixo = `Full${Date.now()}`;
+      await Promise.all(
+        Array.from({ length: 25 }, (_, indice) => service.criar(payloadFornecedor(`${prefixo}-${indice}`, { nome: `${prefixo} ${indice}` }), null)),
+      );
+      const todos = await service.listarTodosAtivos();
+      const doPrefixo = todos.filter((fornecedor) => fornecedor.nome.startsWith(prefixo));
+      expect(doPrefixo).toHaveLength(25); // nunca truncado em 20 (LIMITE_PADRAO), ao contrário de listar()
+    });
+
+    it("listarTodosAtivos() nunca inclui fornecedores excluídos (soft delete)", async () => {
+      const ativo = await service.criar(payloadFornecedor("Vis"), null);
+      const excluido = await service.criar(payloadFornecedor("Inv"), null);
+      await service.excluir(excluido.id, null);
+
+      const todos = await service.listarTodosAtivos();
+      const ids = todos.map((fornecedor) => fornecedor.id);
+      expect(ids).toContain(ativo.id);
+      expect(ids).not.toContain(excluido.id);
+    });
+
+    it("listarTodosAtivos() calcula os agregados públicos exatamente como listar()", async () => {
+      const fornecedor = await service.criar(payloadFornecedor("Agr"), null);
+      await produtosService.criar(payloadProduto("AgrProd", { fornecedorId: fornecedor.id }), null);
+
+      const todos = await service.listarTodosAtivos();
+      const encontrado = todos.find((item) => item.id === fornecedor.id)!;
+      expect(encontrado.produtosVinculados).toBe(1);
+      expect(encontrado.valorEmCusto).toBe(0); // sem estoque ainda
+      expect(encontrado.ultimaEntrada).not.toBeNull();
+    });
+  });
+
+  describe("concorrência na criação: colisão de telefone (Etapa 14.2)", () => {
+    it("duas criações concorrentes com o MESMO telefone: exatamente uma sucede, a outra é rejeitada por conflito, nunca dois fornecedores ativos", async () => {
+      const telefone = telefoneUnico();
+      const resultados = await Promise.allSettled([
+        service.criar(payloadFornecedor("Corr1", { telefone }), null),
+        service.criar(payloadFornecedor("Corr2", { telefone }), null),
+      ]);
+
+      expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const rejeitado = resultados.find((r) => r.status === "rejected");
+      expect(rejeitado).toBeDefined();
+      expect((rejeitado as PromiseRejectedResult).reason).toBeInstanceOf(ApiException);
+
+      const total = await connection.collection("fornecedores").countDocuments({ telefoneNormalizado: telefone.replace(/\D/g, ""), excluidoEm: null });
+      expect(total).toBe(1); // nunca dois fornecedores ativos com o mesmo telefone
+    });
+
+    it("é estável em múltiplas execuções (5 corridas seguidas, mesma garantia toda vez)", async () => {
+      for (let execucao = 0; execucao < 5; execucao += 1) {
+        const telefone = telefoneUnico();
+        const resultados = await Promise.allSettled([
+          service.criar(payloadFornecedor(`Est${execucao}A`, { telefone }), null),
+          service.criar(payloadFornecedor(`Est${execucao}B`, { telefone }), null),
+        ]);
+        expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+        expect(resultados.filter((r) => r.status === "rejected")).toHaveLength(1);
+      }
+    });
+  });
 });

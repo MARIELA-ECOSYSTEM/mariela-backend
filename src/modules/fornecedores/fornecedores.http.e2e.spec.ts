@@ -149,6 +149,123 @@ describe("HTTP — Fornecedores (integração — servidor real)", () => {
     expect(corpoListaApos.data).toHaveLength(0);
   });
 
+  describe("GET /fornecedores: contrato duplo retrocompatível (Etapa 14.2)", () => {
+    it("SEM nenhum query param: devolve o array COMPLETO de fornecedores ativos, sem meta/facets (contrato legado do Backoffice)", async () => {
+      const nome = `Legado ${Date.now()}`;
+      const criacao = await fetch(`${baseUrl}/api/v1/fornecedores`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, telefone: telefoneUnico() }),
+      });
+      const fornecedorId = ((await criacao.json()) as { data: { id: string } }).data.id;
+
+      const resposta = await fetch(`${baseUrl}/api/v1/fornecedores`, { headers: authHeaders() });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as { data: { id: string; nome: string }[]; meta?: unknown; facets?: unknown };
+      expect(Array.isArray(corpo.data)).toBe(true);
+      expect(corpo.meta).toBeUndefined();
+      expect(corpo.facets).toBeUndefined();
+      expect(corpo.data.some((fornecedor) => fornecedor.id === fornecedorId)).toBe(true);
+    });
+
+    it("COM page/limit: preserva o contrato paginado/facetado já existente", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/fornecedores?page=1&limit=1`, { headers: authHeaders() });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as { data: unknown[]; meta: { total: number; page: number; limit: number }; facets: Record<string, unknown> };
+      expect(corpo.data.length).toBeLessThanOrEqual(1);
+      expect(corpo.meta).toBeTruthy();
+      expect(corpo.meta.page).toBe(1);
+      expect(corpo.meta.limit).toBe(1);
+      expect(corpo.facets).toBeTruthy();
+    });
+
+    it("COM apenas busca (sem page/limit explícitos): continua no contrato paginado/facetado, nunca no legado", async () => {
+      const nome = `SoBusca ${Date.now()}`;
+      await fetch(`${baseUrl}/api/v1/fornecedores`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, telefone: telefoneUnico() }),
+      });
+      const resposta = await fetch(`${baseUrl}/api/v1/fornecedores?busca=${encodeURIComponent(nome)}`, { headers: authHeaders() });
+      const corpo = (await resposta.json()) as { data: { nome: string }[]; meta: { total: number } };
+      expect(corpo.meta).toBeTruthy(); // presença de QUALQUER param já ativa o contrato paginado
+      expect(corpo.data).toHaveLength(1);
+    });
+
+    it("fornecedores soft-deleted continuam excluídos tanto no modo legado quanto no paginado", async () => {
+      const nome = `SoftDel ${Date.now()}`;
+      const criacao = await fetch(`${baseUrl}/api/v1/fornecedores`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, telefone: telefoneUnico() }),
+      });
+      const fornecedorId = ((await criacao.json()) as { data: { id: string } }).data.id;
+      await fetch(`${baseUrl}/api/v1/fornecedores/${fornecedorId}`, { method: "DELETE", headers: authHeaders() });
+
+      const legado = await fetch(`${baseUrl}/api/v1/fornecedores`, { headers: authHeaders() });
+      const corpoLegado = (await legado.json()) as { data: { id: string }[] };
+      expect(corpoLegado.data.some((fornecedor) => fornecedor.id === fornecedorId)).toBe(false);
+
+      const paginado = await fetch(`${baseUrl}/api/v1/fornecedores?busca=${encodeURIComponent(nome)}`, { headers: authHeaders() });
+      const corpoPaginado = (await paginado.json()) as { data: { id: string }[] };
+      expect(corpoPaginado.data.some((fornecedor) => fornecedor.id === fornecedorId)).toBe(false);
+    });
+
+    it("array completo continua trazendo os agregados públicos (produtosVinculados/valorEmCusto/ultimaEntrada) calculados normalmente", async () => {
+      const nome = `Agregados ${Date.now()}`;
+      const criacao = await fetch(`${baseUrl}/api/v1/fornecedores`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, telefone: telefoneUnico() }),
+      });
+      const fornecedorId = ((await criacao.json()) as { data: { id: string } }).data.id;
+
+      await fetch(`${baseUrl}/api/v1/produtos`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome: `Produto Agregado ${Date.now()}`, categoria: "Vestidos", precoCusto: 50, precoVenda: 100, ehNovidade: false, fornecedorId }),
+      });
+
+      const resposta = await fetch(`${baseUrl}/api/v1/fornecedores`, { headers: authHeaders() });
+      const corpo = (await resposta.json()) as { data: { id: string; produtosVinculados: number; valorEmCusto: number; ultimaEntrada: string | null }[] };
+      const encontrado = corpo.data.find((fornecedor) => fornecedor.id === fornecedorId)!;
+      expect(encontrado.produtosVinculados).toBe(1);
+      expect(encontrado.valorEmCusto).toBe(0); // produto recém-criado, sem estoque ainda (0 × precoCusto)
+      expect(encontrado.ultimaEntrada).not.toBeNull();
+    });
+
+    it("não quebra criação/atualização/exclusão/histórico/facetas já existentes (regressão)", async () => {
+      const nome = `Regressão ${Date.now()}`;
+      const telefone = telefoneUnico();
+
+      const criacao = await fetch(`${baseUrl}/api/v1/fornecedores`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome, telefone }),
+      });
+      expect(criacao.status).toBe(201);
+      const fornecedorId = ((await criacao.json()) as { data: { id: string } }).data.id;
+
+      const atualizacao = await fetch(`${baseUrl}/api/v1/fornecedores/${fornecedorId}`, {
+        method: "PUT",
+        headers: authHeaders(),
+        body: JSON.stringify({ nome: `${nome} Atualizado`, telefone }),
+      });
+      expect(atualizacao.status).toBe(200);
+
+      const historico = await fetch(`${baseUrl}/api/v1/fornecedores/${fornecedorId}/historico`, { headers: authHeaders() });
+      expect(historico.status).toBe(200);
+
+      const paginado = await fetch(`${baseUrl}/api/v1/fornecedores?page=1&limit=20&produtos=sem`, { headers: authHeaders() });
+      expect(paginado.status).toBe(200);
+      const corpoPaginado = (await paginado.json()) as { facets: Record<string, unknown> };
+      expect(corpoPaginado.facets["produtos"]).toBeTruthy();
+
+      const exclusao = await fetch(`${baseUrl}/api/v1/fornecedores/${fornecedorId}`, { method: "DELETE", headers: authHeaders() });
+      expect(exclusao.status).toBe(200);
+    });
+  });
+
   it("POST /api/v1/fornecedores com telefone duplicado retorna 409", async () => {
     const telefone = telefoneUnico();
     await fetch(`${baseUrl}/api/v1/fornecedores`, {
