@@ -5614,4 +5614,95 @@ describe("VendasService (integração — MongoDB real)", () => {
       await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
     });
   });
+
+  describe("cenários cross-flow sequenciais: recebimento/baixa seguidos de cancelamento (Etapa 10.21)", () => {
+    async function movimentosDaVenda(vendaId: string) {
+      return connection.collection("movimentos_caixa").find({ vendaId }).toArray();
+    }
+
+    it("cenário E: receberPagamento (operação separada) seguido de cancelar — devolução capada ao que foi de fato recebido", async () => {
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+        },
+        null,
+      );
+
+      const aposRecebimento = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 400 }, null);
+      expect(aposRecebimento.valorPago).toBe(400);
+
+      const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste cross-flow E" }, null);
+      expect(cancelada.status).toBe("cancelada");
+      expect(cancelada.valorPago).toBe(400); // cancelar nunca mexe em valorPago
+      expect(cancelada.valorPendente).toBe(0);
+      expect(cancelada.valorDevolvido).toBe(1000); // valor econômico do item inteiro
+
+      // Duas movimentações distintas e corretas: entrada do recebimento (400)
+      // e saída do cancelamento CAPADA ao que foi de fato recebido (400,
+      // nunca 1000) — mesma regra já aprovada na Etapa 10.9 para vendas
+      // pagas na criação, agora confirmada quando o pagamento veio de uma
+      // chamada SEPARADA de receberPagamento.
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos.filter((m) => m["tipo"] === "recebimento_parcela")).toHaveLength(1);
+      expect(movimentos.find((m) => m["tipo"] === "recebimento_parcela")?.["valor"]).toBe(400);
+      expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1);
+      expect(movimentos.find((m) => m["tipo"] === "cancelamento")?.["valor"]).toBe(400);
+
+      const produtoAtualizado = await produtosService.obterPorId(produto.produtoId);
+      expect(produtoAtualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(5); // estoque restaurado integralmente
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("cenário F: baixarParcela (operação separada) seguido de cancelar — histórico da parcela preservado, devolução integral", async () => {
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [],
+        },
+        null,
+      );
+      const parcelaId = String(venda.parcelas[0]!._id);
+
+      const aposBaixa = await service.baixarParcela(venda.id, parcelaId, {}, null);
+      expect(aposBaixa.status).toBe("concluida");
+      expect(aposBaixa.valorPago).toBe(1000);
+
+      const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste cross-flow F" }, null);
+      expect(cancelada.status).toBe("cancelada"); // transita de CONCLUIDA para cancelada normalmente
+      expect(cancelada.valorPago).toBe(1000);
+      expect(cancelada.valorDevolvido).toBe(1000);
+
+      // O cancelamento nunca reescreve `parcelas[]` (separação de
+      // responsabilidades já aprovada — mesmo princípio da Etapa 10.11 para
+      // receberPagamento): o registro histórico de que a parcela foi paga
+      // continua íntegro mesmo após a venda ser cancelada.
+      expect(cancelada.parcelas[0]?.pagoEm).not.toBeNull();
+      expect(cancelada.parcelasPagas).toBe(1);
+
+      const movimentos = await movimentosDaVenda(venda.id);
+      expect(movimentos.filter((m) => m["tipo"] === "recebimento_parcela")).toHaveLength(1);
+      expect(movimentos.find((m) => m["tipo"] === "recebimento_parcela")?.["valor"]).toBe(1000);
+      expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1);
+      expect(movimentos.find((m) => m["tipo"] === "cancelamento")?.["valor"]).toBe(1000); // devolução integral, venda estava totalmente paga
+
+      const produtoAtualizado = await produtosService.obterPorId(produto.produtoId);
+      expect(produtoAtualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(5);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+  });
 });
