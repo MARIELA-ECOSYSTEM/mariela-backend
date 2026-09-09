@@ -19,6 +19,18 @@ describe("BaixarParcelaDto", () => {
     const erros = await validate(dto);
     expect(erros).toHaveLength(0);
   });
+
+  it("aceita idempotencyKey opcional", async () => {
+    const dto = plainToInstance(BaixarParcelaDto, { idempotencyKey: "chave-123" });
+    const erros = await validate(dto);
+    expect(erros).toHaveLength(0);
+  });
+
+  it("rejeita idempotencyKey vazia quando informada (Etapa 10.17)", async () => {
+    const dto = plainToInstance(BaixarParcelaDto, { idempotencyKey: "" });
+    const erros = await validate(dto);
+    expect(erros.some((erro) => erro.property === "idempotencyKey")).toBe(true);
+  });
 });
 
 describe("CancelamentoDto", () => {

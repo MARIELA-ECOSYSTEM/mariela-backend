@@ -229,6 +229,61 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     expect(resposta.status).toBe(400);
   });
 
+  it("Etapa 10.17: POST .../parcelas/:parcelaId/baixa com modalidade crédito + adquirente calcula tarifa e usa o valor bruto no caixa", async () => {
+    const adquirente = await adquirentesService.criar({ nome: `Adquirente Parcela HTTP ${Date.now()}`, tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 5 }] }, null);
+    const { venda, caixa } = await criarVendaFiadaViaHttpSetup(500, 300); // parcela = 200
+    const parcela = venda.parcelas[0]!;
+    const antes = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+    const corpoAntes = (await antes.json()) as { data: { resumo: { recebimentos: number } } };
+
+    const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/parcelas/${String(parcela._id)}/baixa`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1 }),
+    });
+    expect(resposta.status).toBe(201);
+    const corpo = (await resposta.json()) as {
+      data: { valorPago: number; pagamentos: { valor: number; tarifaAplicada: { valorTarifa: number; valorBruto: number; valorLiquido: number } | null }[] };
+    };
+    const pago = corpo.data.pagamentos[corpo.data.pagamentos.length - 1]!;
+    expect(pago.tarifaAplicada?.valorBruto).toBe(200);
+    expect(pago.tarifaAplicada?.valorTarifa).toBe(10);
+    expect(pago.tarifaAplicada?.valorLiquido).toBe(190);
+    expect(corpo.data.valorPago).toBe(500); // bruto, nunca 490 (líquido pós-tarifa)
+
+    const depois = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+    const corpoDepois = (await depois.json()) as { data: { resumo: { recebimentos: number } } };
+    expect(corpoDepois.data.resumo.recebimentos - corpoAntes.data.resumo.recebimentos).toBe(200); // bruto, nunca 190 (líquido)
+  });
+
+  it("Etapa 10.17: retry com a mesma idempotencyKey em .../parcelas/:parcelaId/baixa não duplica o pagamento nem o movimento de caixa", async () => {
+    const { venda, caixa } = await criarVendaFiadaViaHttpSetup(500, 300); // parcela = 200
+    const parcela = venda.parcelas[0]!;
+    const chave = `parcela-http-idem-${Date.now()}`;
+    const payload = JSON.stringify({ idempotencyKey: chave });
+    const antes = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+    const corpoAntes = (await antes.json()) as { data: { resumo: { recebimentos: number } } };
+
+    const primeira = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/parcelas/${String(parcela._id)}/baixa`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: payload,
+    });
+    const segunda = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/parcelas/${String(parcela._id)}/baixa`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: payload,
+    });
+    expect(primeira.status).toBe(201);
+    expect(segunda.status).toBe(201); // replay reconhecido, nunca 400
+    const corpoSegunda = (await segunda.json()) as { data: { valorPago: number } };
+    expect(corpoSegunda.data.valorPago).toBe(500); // não dobrou (300 + 200, nunca 300 + 400)
+
+    const depois = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+    const corpoDepois = (await depois.json()) as { data: { resumo: { recebimentos: number } } };
+    expect(corpoDepois.data.resumo.recebimentos - corpoAntes.data.resumo.recebimentos).toBe(200); // não duplicou no caixa
+  });
+
   it("POST /api/v1/vendas/:id/cancelamento com motivo vazio retorna 400", async () => {
     const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/cancelamento`, {
       method: "POST",

@@ -1,6 +1,6 @@
 import { ApiPropertyOptional } from "@nestjs/swagger";
 import { Type } from "class-transformer";
-import { IsIn, IsInt, IsNumber, IsOptional, IsPositive, IsString, Max, MaxLength, Min } from "class-validator";
+import { IsIn, IsInt, IsNotEmpty, IsNumber, IsOptional, IsPositive, IsString, Max, MaxLength, Min } from "class-validator";
 import { MODALIDADES_PAGAMENTO, type ModalidadePagamento } from "../vendas.constants.js";
 
 /**
@@ -60,5 +60,6 @@ export class BaixarParcelaDto {
   @ApiPropertyOptional({ description: "Protege contra retry duplicado — opcional, mas recomendada." })
   @IsOptional()
   @IsString()
+  @IsNotEmpty({ message: "idempotencyKey não pode ser vazia quando informada." })
   idempotencyKey?: string;
 }
