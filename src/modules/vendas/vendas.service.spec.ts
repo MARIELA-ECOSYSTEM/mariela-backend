@@ -847,6 +847,38 @@ describe("VendasService (integração — MongoDB real)", () => {
       await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
     });
 
+    it("Etapa 18.17 — arredondamento de meio-centavo exato usa Math.round (arredondarMoeda), nunca Number(toFixed(2))", async () => {
+      // base = 100 (preço × quantidade); 0,015% de 100 = 0,015 exatamente —
+      // Number((0.015).toFixed(2)) daria 0.01, divergindo de arredondarMoeda
+      // (produtos/utils/precos.util.ts), que dá 0.02. Mesma classe de bug já
+      // corrigida em caixas/dinheiro.util.ts na Etapa 18.16.
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            {
+              produtoId: produto.produtoId,
+              varianteId: produto.varianteId,
+              tamanhoId: produto.tamanhoId,
+              quantidade: 1,
+              desconto: { tipo: "percentual", valor: 0.015 },
+            },
+          ],
+          pagamentos: [],
+        },
+        null,
+      );
+      expect(venda.itens[0]?.descontoItem).toBe(0.02);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
     it("snapshot: descontoItem persiste no documento e é recuperável via obterPorId", async () => {
       const produto = await criarProdutoComEstoque(100, 5);
       const vendedor = await criarVendedor();

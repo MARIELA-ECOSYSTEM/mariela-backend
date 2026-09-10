@@ -35,8 +35,20 @@ export interface ResultadoListaVendas {
   facets: ApiFacets;
 }
 
+/**
+ * Etapa 18.17 — usa `Math.round`, NUNCA `Number(valor.toFixed(2))`: as duas
+ * estratégias divergem em valores de meio-centavo exato (ex.: `0.015` vira
+ * `0.01` com `toFixed` mas `0.02` com `Math.round`, comprovado empiricamente
+ * na Etapa 18.16 para o mesmo problema em `caixas/dinheiro.util.ts`). Aqui o
+ * risco é maior que em Caixa: `resolverDesconto` calcula `(base * percentual) / 100`
+ * — uma divisão que frequentemente produz um resultado intermediário de
+ * mais de 2 casas decimais antes de arredondar — e é exatamente esse tipo de
+ * conta que pode pousar num meio-centavo exato. `Math.round` é o mesmo
+ * algoritmo de `produtos/utils/precos.util.ts#arredondarMoeda`, a fonte de
+ * verdade de arredondamento monetário do projeto.
+ */
 function arredondar(valor: number): number {
-  return Number(valor.toFixed(2));
+  return Math.round(valor * 100) / 100;
 }
 
 @Injectable()
