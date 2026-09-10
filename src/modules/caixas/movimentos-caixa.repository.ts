@@ -7,7 +7,6 @@ import { MovimentoCaixa, type MovimentoCaixaDocument } from "./schemas/movimento
 
 export interface ListarMovimentosParams {
   tipo: string[];
-  responsavelId?: string;
   ordem: "asc" | "desc";
   page: number;
   limit: number;
@@ -126,6 +125,23 @@ export class MovimentosCaixaRepository implements OnModuleInit {
     );
   }
 
+  /**
+   * Etapa 18.3 — remoção de COMPENSAÇÃO, nunca de negócio: usada
+   * EXCLUSIVAMENTE por `CaixasService` para desfazer um movimento que acabou
+   * de ser inserido por ESTA MESMA requisição quando, no instante seguinte,
+   * se descobre que o caixa já havia fechado (corrida rara entre
+   * `criar()` e `CaixasRepository.fecharAtomico`, ver `CaixasService`). Não
+   * existe rota HTTP nem caso de uso de negócio que apague um movimento —
+   * histórico financeiro continua append-only do ponto de vista da API. Do
+   * ponto de vista de quem chamou a operação que perdeu a corrida, o efeito
+   * observável é sempre "nenhum movimento foi registrado" (a exceção é
+   * lançada ANTES de qualquer resposta de sucesso) — nunca um "sucesso"
+   * seguido de um desaparecimento.
+   */
+  async removerPorId(id: string): Promise<void> {
+    await this.movimentoModel.deleteOne({ _id: id }).exec();
+  }
+
   async listarTodosPorCaixa(caixaId: string): Promise<MovimentoCaixaDocument[]> {
     if (!isValidObjectId(caixaId)) return [];
     return this.movimentoModel.find({ caixaId }).exec();
@@ -143,7 +159,6 @@ export class MovimentosCaixaRepository implements OnModuleInit {
   async listarPaginadoPorCaixa(caixaId: string, params: ListarMovimentosParams): Promise<ListaMovimentosResultado> {
     const filtro: Record<string, unknown> = { caixaId };
     if (params.tipo.length > 0) filtro["tipo"] = { $in: params.tipo };
-    if (params.responsavelId) filtro["responsavelId"] = params.responsavelId;
 
     const direcao = params.ordem === "asc" ? 1 : -1;
     const skip = (params.page - 1) * params.limit;

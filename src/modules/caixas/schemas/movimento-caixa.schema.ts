@@ -13,28 +13,20 @@ import {
 /**
  * Contrato alinhado a `MovimentacaoCaixa` (`src/types/caixa.ts`) — registro
  * IMUTÁVEL: não existe endpoint de edição/exclusão. Correções nascem de uma
- * nova movimentação (ver regra de negócio no relatório).
+ * nova movimentação (ver regra de negócio no relatório da Etapa 18.2).
+ *
+ * Etapa 18.2 — CAIXA GERAL DA LOJA: `responsavelId`/`responsavelNome` foram
+ * REMOVIDOS do domínio (o Caixa não tem mais vínculo de vendedor). Quando o
+ * Backoffice quiser saber QUEM vendeu (`tipo: "venda"`/`"cancelamento"`),
+ * consulta a Venda via `vendaId` — o vendedor vem de lá, nunca de um
+ * snapshot duplicado aqui (ver `CaixasService`, camada de consulta).
  *
  * `idempotencyKey` é opcional (só quem envia se beneficia da proteção) e
- * único GLOBALMENTE (não mais por caixa — Etapa 10.13) via índice parcial
+ * único GLOBALMENTE (não por caixa — Etapa 10.13) via índice parcial
  * esparso abaixo: uma repetição da mesma chave devolve o movimento já
  * existente em vez de duplicá-lo, mesmo que o caixa ATUALMENTE aberto seja
  * diferente do caixa onde o movimento original foi lançado (ver
  * `CaixasService.registrarMovimento`/`registrarMovimentoDeVenda`).
- *
- * ANTES desta etapa o índice era `{caixaId, idempotencyKey}`: como
- * `receberPagamento`/`baixarParcela`/`cancelar` (Etapas 10.10-10.13) resolvem
- * o caixa de lançamento DINAMICAMENTE (`caixasService.obterAtual()`), um
- * retry chegando depois de o caixa original fechar e outro abrir recalculava
- * um `caixaId` diferente — a chave antiga não colidia com o índice antigo
- * (caixaId mudou) e um SEGUNDO movimento era criado, duplicando o valor nos
- * relatórios do caixa novo. A identidade da operação financeira nunca pode
- * depender de qual caixa está aberto no momento do retry; só o VALOR
- * lançado (`caixaId` no documento) continua refletindo isso. As chaves
- * derivadas em `VendasService` (`${vendaId}:pagamento:N`,
- * `${vendaId}:recebimento:X`, `${vendaId}:parcela:X`,
- * `${vendaId}:cancelamento:X`) já incorporam o id da venda especificamente
- * para sustentar essa unicidade global sem colidir entre vendas diferentes.
  */
 @Schema({ collection: "movimentos_caixa", versionKey: false, timestamps: { createdAt: "criadoEm", updatedAt: false } })
 export class MovimentoCaixa {
@@ -56,7 +48,7 @@ export class MovimentoCaixa {
   @Prop({ type: String, default: null })
   referencia!: string | null;
 
-  /** Referência livre a uma venda futura — sem validação de existência (Vendas ainda não existe). */
+  /** Obrigatório para `venda`/`cancelamento`; sempre `null` para `injecao`/`sangria` — nunca validado quanto à existência aqui (a Venda já foi validada por quem chamou, ver `VendasService`). */
   @Prop({ type: String, default: null })
   vendaId!: string | null;
 
@@ -70,15 +62,9 @@ export class MovimentoCaixa {
   @Prop({ type: Number, required: true, min: 0 })
   valor!: number;
 
+  /** Derivado deterministicamente de `tipo` (`SENTIDO_POR_TIPO`) — nunca escolhido pelo chamador. */
   @Prop({ type: String, required: true, enum: SENTIDOS_MOVIMENTACAO })
   sentido!: SentidoMovimentacao;
-
-  /** Referência livre a um Vendedor — snapshot em `responsavelNome`, nunca usado como autoridade. */
-  @Prop({ type: String, default: null })
-  responsavelId!: string | null;
-
-  @Prop({ type: String, required: true })
-  responsavelNome!: string;
 
   @Prop({ type: String, trim: true, maxlength: 400, default: "" })
   observacao!: string;
@@ -98,11 +84,12 @@ aplicarSerializacaoPadrao(MovimentoCaixaSchema);
 
 // Histórico paginado de um caixa, mais recente primeiro.
 MovimentoCaixaSchema.index({ caixaId: 1, dataHora: -1 });
-// Filtro por tipo dentro de um caixa (ex.: só "venda" para calcular resumo).
+// Filtro por tipo dentro de um caixa.
 MovimentoCaixaSchema.index({ caixaId: 1, tipo: 1 });
 // Estatísticas do dia, somando todos os caixas.
 MovimentoCaixaSchema.index({ dataHora: 1 });
 // Deduplicação de retries: única GLOBALMENTE quando informada (esparsa — nem
 // todo movimento manda idempotencyKey) — Etapa 10.13, nunca mais escopada
-// por caixa (ver comentário da classe acima).
+// por caixa (ver comentário da classe acima e `MovimentosCaixaRepository.onModuleInit`
+// para a rotina de auto-cura que migra bancos com o índice antigo).
 MovimentoCaixaSchema.index({ idempotencyKey: 1 }, { unique: true, partialFilterExpression: { idempotencyKey: { $type: "string" } } });

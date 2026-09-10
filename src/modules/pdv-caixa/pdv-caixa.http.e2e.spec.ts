@@ -5,7 +5,7 @@ import { getConnectionToken } from "@nestjs/mongoose";
 import type { NestExpressApplication } from "@nestjs/platform-express";
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
 import type { AddressInfo } from "node:net";
-import type { Connection } from "mongoose";
+import { Types, type Connection } from "mongoose";
 import { AppModule } from "../../app.module.js";
 import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.js";
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
@@ -136,16 +136,23 @@ describe("HTTP — PDV Caixa (integração — servidor real)", () => {
     });
     expect(respostaAbertura.status).toBe(201);
     const corpoAbertura = (await respostaAbertura.json()) as {
-      data: { id: string; codigo: string; abertura: { responsavelId: string; responsavelNome: string; valorInicial: number } };
+      data: { id: string; codigo: string; abertura: { responsavelId: string | null; responsavelNome: string; valorInicial: number } };
     };
-    expect(corpoAbertura.data.abertura.responsavelId).toBe(vendedorA.id);
-    expect(corpoAbertura.data.abertura.responsavelNome).toBe(vendedorA.nome);
+    // Etapa 18.2 — o Caixa não tem mais vínculo de vendedor: o vendedor
+    // autenticado (vendedorA) NUNCA aparece no documento do Caixa, só no
+    // evento de auditoria (ver asserção abaixo).
+    expect(corpoAbertura.data.abertura.responsavelId).toBeNull();
+    expect(corpoAbertura.data.abertura.responsavelNome).toBe("Loja");
     expect(corpoAbertura.data.abertura.valorInicial).toBe(200);
 
-    // Confirma no banco: o responsável é o vendedor A de verdade.
+    // Confirma no banco: o documento persistido não guarda nenhum vínculo de vendedor.
     const documento = await connection.collection("caixas").findOne({ codigo: corpoAbertura.data.codigo });
-    expect(documento?.["abertura"].responsavelId).toBe(vendedorA.id);
-    expect(documento?.["abertura"].responsavelNome).toBe(vendedorA.nome);
+    expect(documento?.["responsavelId"]).toBeUndefined();
+    expect(documento?.["responsavelNome"]).toBeUndefined();
+
+    // O vendedor autenticado só aparece como autor do evento de auditoria.
+    const evento = await connection.collection("eventos_caixa").findOne({ caixaId: new Types.ObjectId(corpoAbertura.data.id), tipo: "caixa.aberto" });
+    expect(evento?.["usuarioId"]).toBe(vendedorA.id);
 
     // Vendedor B, autenticado de forma completamente independente, enxerga o MESMO caixa.
     const respostaAtualB = await fetch(`${baseUrl}/api/v1/pdv/caixa/atual`, { headers: jsonHeaders(vendedorB.accessToken) });

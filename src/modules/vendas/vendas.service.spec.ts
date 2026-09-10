@@ -2459,8 +2459,11 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(atualizada.parcelasPagas).toBe(1);
 
       const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
-      expect(detalheCaixa.resumo.totalVendas).toBe(100);
-      expect(detalheCaixa.resumo.recebimentos).toBe(200);
+      // Etapa 18.2 — o Caixa não distingue mais "venda à vista" de "recebimento
+      // de parcela": os 100 do ato + os 200 da baixa da parcela são ambos
+      // `tipo: "venda"`, somados em `totalVendas`. `recebimentos` é sempre 0.
+      expect(detalheCaixa.resumo.totalVendas).toBe(300);
+      expect(detalheCaixa.resumo.recebimentos).toBe(0);
       await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
     });
 
@@ -3311,7 +3314,10 @@ describe("VendasService (integração — MongoDB real)", () => {
       await service.receberPagamento(venda.id, { forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 100 }, null);
 
       const movimentos = await movimentosDaVenda(venda.id);
-      const doRecebimento = movimentos.find((m) => m["tipo"] === "recebimento_parcela");
+      // Etapa 18.2 — o movimento do recebimento posterior é `tipo: "venda"`
+      // (mesmo tipo do pagamento inicial); distinguido aqui pelo valor (100),
+      // já que os 900 do ato geraram um movimento `tipo: "venda"` separado.
+      const doRecebimento = movimentos.find((m) => m["tipo"] === "venda" && m["valor"] === 100);
       expect(doRecebimento?.["valor"]).toBe(100); // nunca 96.51
       await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
     });
@@ -4057,13 +4063,19 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(atualizada.status).toBe("concluida");
 
       // O movimento vai para o caixa ATUAL — nunca para o original (já fechado).
+      // Etapa 18.2 — o movimento gerado por `receberPagamento` é `tipo: "venda"`
+      // (não existe mais `"recebimento_parcela"` como tipo distinto); como o
+      // caixa original só teve os 400 do ato, filtramos pelo caixaId atual
+      // para achar especificamente o movimento dos 600 recebidos depois.
       const movimentos = await movimentosDaVenda(venda.id);
-      const doRecebimento = movimentos.find((m) => m["tipo"] === "recebimento_parcela");
-      expect(String(doRecebimento?.["caixaId"])).toBe(caixaAtual.id);
+      const doRecebimento = movimentos.find((m) => m["tipo"] === "venda" && String(m["caixaId"]) === caixaAtual.id);
+      expect(doRecebimento).toBeTruthy();
+      expect(doRecebimento?.["valor"]).toBe(600);
       expect(String(doRecebimento?.["caixaId"])).not.toBe(caixaOriginal.id);
 
       const detalheAtual = await caixasService.obterDetalhe(caixaAtual.id);
-      expect(detalheAtual.resumo.recebimentos).toBe(600);
+      expect(detalheAtual.resumo.totalVendas).toBe(600);
+      expect(detalheAtual.resumo.recebimentos).toBe(0);
       await caixasService.fechar(caixaAtual.id, { valorInformado: 1600 }, null);
     });
 
@@ -4119,8 +4131,12 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizada = await service.baixarParcela(venda.id, parcelaId, { formaPagamento: "PIX" }, null);
       expect(atualizada.status).toBe("concluida");
 
+      // Etapa 18.2 — `tipo: "venda"` para os dois movimentos agora (o do ato e
+      // o da baixa); distinguido pelo caixaId, que é exatamente o que este
+      // teste verifica (a baixa vai para o caixa ATUAL, nunca o original).
       const movimentos = await movimentosDaVenda(venda.id);
-      const daBaixa = movimentos.find((m) => m["tipo"] === "recebimento_parcela");
+      const daBaixa = movimentos.find((m) => m["tipo"] === "venda" && String(m["caixaId"]) === caixaAtual.id);
+      expect(daBaixa).toBeTruthy();
       expect(String(daBaixa?.["caixaId"])).toBe(caixaAtual.id);
       expect(String(daBaixa?.["caixaId"])).not.toBe(caixaOriginal.id);
       await caixasService.fechar(caixaAtual.id, { valorInformado: 1200 }, null);
@@ -4519,8 +4535,10 @@ describe("VendasService (integração — MongoDB real)", () => {
         const atualizada = await service.baixarParcela(venda.id, parcelaId, {}, null);
         expect(atualizada.status).toBe("concluida");
 
+        // Etapa 18.2 — os dois movimentos agora são `tipo: "venda"`; distinguido pelo caixaId.
         const movimentos = await movimentosDaVenda(venda.id);
-        const daBaixa = movimentos.find((m) => m["tipo"] === "recebimento_parcela");
+        const daBaixa = movimentos.find((m) => m["tipo"] === "venda" && String(m["caixaId"]) === caixaAtual.id);
+        expect(daBaixa).toBeTruthy();
         expect(String(daBaixa?.["caixaId"])).toBe(caixaAtual.id);
         expect(String(daBaixa?.["caixaId"])).not.toBe(caixaOriginal.id);
         await caixasService.fechar(caixaAtual.id, { valorInformado: 1200 }, null);
@@ -4549,8 +4567,9 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(atualizada.valorPendente).toBe(0);
         expect(atualizada.valorFinal).toBe(1000);
 
+        // Etapa 18.2 — distinguido pelo valor (400), já que o pagamento inicial (600) também é `tipo: "venda"`.
         const movimentos = await movimentosDaVenda(venda.id);
-        const daBaixa = movimentos.find((m) => m["tipo"] === "recebimento_parcela");
+        const daBaixa = movimentos.find((m) => m["tipo"] === "venda" && m["valor"] === 400);
         expect(daBaixa?.["valor"]).toBe(400); // bruto, nunca 360 (líquido)
         await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
       });
@@ -5357,9 +5376,10 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       // Simula "processo morreu ENTRE salvar a venda e lançar o movimento de
       // caixa": apaga só o movimento do RECEBIMENTO, preservando o pagamento
-      // já persistido na venda e o movimento original da criação (tipo
-      // "venda") — exatamente o estado que um crash real deixaria.
-      await connection.collection("movimentos_caixa").deleteMany({ vendaId: venda.id, tipo: "recebimento_parcela" });
+      // já persistido na venda e o movimento original da criação. Etapa 18.2
+      // — os dois são `tipo: "venda"` agora, então isola pelo idempotencyKey
+      // (identifica exatamente o movimento do recebimento, nunca o original).
+      await connection.collection("movimentos_caixa").deleteMany({ vendaId: venda.id, idempotencyKey: `${venda.id}:recebimento:${chave}` });
       const semMovimento = await movimentosDaVenda(venda.id);
       expect(semMovimento.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`)).toHaveLength(0);
 
@@ -5396,7 +5416,8 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(primeira.status).toBe("concluida");
       expect(primeira.parcelas[0]?.pagoEm).not.toBeNull();
 
-      await connection.collection("movimentos_caixa").deleteMany({ vendaId: venda.id, tipo: "recebimento_parcela" });
+      // Etapa 18.2 — isola pelo idempotencyKey (ver justificativa no teste de `receberPagamento` acima).
+      await connection.collection("movimentos_caixa").deleteMany({ vendaId: venda.id, idempotencyKey: `${venda.id}:parcela:${chave}` });
       const semMovimento = await movimentosDaVenda(venda.id);
       expect(semMovimento.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave}`)).toHaveLength(0);
 
@@ -5651,8 +5672,8 @@ describe("VendasService (integração — MongoDB real)", () => {
       // pagas na criação, agora confirmada quando o pagamento veio de uma
       // chamada SEPARADA de receberPagamento.
       const movimentos = await movimentosDaVenda(venda.id);
-      expect(movimentos.filter((m) => m["tipo"] === "recebimento_parcela")).toHaveLength(1);
-      expect(movimentos.find((m) => m["tipo"] === "recebimento_parcela")?.["valor"]).toBe(400);
+      expect(movimentos.filter((m) => m["tipo"] === "venda")).toHaveLength(1);
+      expect(movimentos.find((m) => m["tipo"] === "venda")?.["valor"]).toBe(400);
       expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1);
       expect(movimentos.find((m) => m["tipo"] === "cancelamento")?.["valor"]).toBe(400);
 
@@ -5695,8 +5716,8 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(cancelada.parcelasPagas).toBe(1);
 
       const movimentos = await movimentosDaVenda(venda.id);
-      expect(movimentos.filter((m) => m["tipo"] === "recebimento_parcela")).toHaveLength(1);
-      expect(movimentos.find((m) => m["tipo"] === "recebimento_parcela")?.["valor"]).toBe(1000);
+      expect(movimentos.filter((m) => m["tipo"] === "venda")).toHaveLength(1);
+      expect(movimentos.find((m) => m["tipo"] === "venda")?.["valor"]).toBe(1000);
       expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1);
       expect(movimentos.find((m) => m["tipo"] === "cancelamento")?.["valor"]).toBe(1000); // devolução integral, venda estava totalmente paga
 

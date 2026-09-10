@@ -15,7 +15,9 @@ import { MovimentoCaixa, MovimentoCaixaSchema } from "./schemas/movimento-caixa.
  * `pdv-vendas.service.spec.ts`, aplicado ao repository de movimentos de
  * caixa (aqui não é preciso subir `CaixasModule` inteiro — só o schema sob
  * teste — porque a garantia é inteiramente do repository, sem regra de
- * negócio de `CaixasService` envolvida).
+ * negócio de `CaixasService` envolvida). Payload adaptado para o domínio
+ * simplificado da Etapa 18.2: 4 tipos (`injecao`/`sangria`/`venda`/
+ * `cancelamento`), sem `responsavelId`/`responsavelNome`.
  */
 describe("MovimentosCaixaRepository (integração — MongoDB real)", () => {
   let moduleRef: TestingModule;
@@ -49,8 +51,6 @@ describe("MovimentosCaixaRepository (integração — MongoDB real)", () => {
       formaPagamento: "Dinheiro",
       valor: 100,
       sentido: "entrada",
-      responsavelId: null,
-      responsavelNome: "Backoffice",
       observacao: "",
       motivo: null,
       idempotencyKey: null,
@@ -112,15 +112,15 @@ describe("MovimentosCaixaRepository (integração — MongoDB real)", () => {
       expect(total).toBe(1); // nenhum segundo documento, nenhum dado alterado
     });
 
-    it("mesma chave, TIPO/SENTIDO diferente (entrada manual vs saída manual): rejeitado por conflito", async () => {
+    it("mesma chave, TIPO/SENTIDO diferente (injeção vs sangria): rejeitado por conflito", async () => {
       const caixaId = new Types.ObjectId().toString();
       const chave = `chave-conflito-tipo-${Date.now()}`;
 
-      const primeira = await repository.criar(payloadMovimento(caixaId, { idempotencyKey: chave, tipo: "entrada", sentido: "entrada" }));
+      const primeira = await repository.criar(payloadMovimento(caixaId, { idempotencyKey: chave, tipo: "injecao", origem: "manual", sentido: "entrada" }));
       expect(primeira.duplicado).toBe(false);
 
       await expect(
-        repository.criar(payloadMovimento(caixaId, { idempotencyKey: chave, tipo: "saida", sentido: "saida" })),
+        repository.criar(payloadMovimento(caixaId, { idempotencyKey: chave, tipo: "sangria", origem: "manual", sentido: "saida" })),
       ).rejects.toThrow(ApiException);
 
       const total = await connection.collection("movimentos_caixa").countDocuments({ idempotencyKey: chave });

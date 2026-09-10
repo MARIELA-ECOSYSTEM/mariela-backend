@@ -1054,7 +1054,11 @@ export class VendasService {
     if (valorParaCaixa <= 0) return;
     await this.caixasService.registrarMovimentoDeVenda({
       caixaId,
-      tipo: atual.cancelamento.tipo === "integral" ? "cancelamento" : "devolucao",
+      // Etapa 18.2 — o Caixa não distingue mais cancelamento total de
+      // devolução parcial (ambos são `tipo: "cancelamento"`, sentido saída);
+      // essa distinção continua existindo aqui, só em `atual.cancelamento.tipo`
+      // (autoridade comercial de Vendas), refletida na descrição do lançamento.
+      tipo: "cancelamento",
       descricao:
         atual.cancelamento.tipo === "integral"
           ? `Cancelamento da venda ${atual.codigo} · ${atual.clienteNome}`
@@ -1064,8 +1068,6 @@ export class VendasService {
       vendaCodigo: atual.codigo,
       formaPagamento: atual.formaPagamento,
       valor: valorParaCaixa,
-      responsavelId: null,
-      responsavelNome: "Backoffice",
       observacao: atual.cancelamento.motivo,
       idempotencyKey: idempotencyKey ? `${venda.id}:cancelamento:${idempotencyKey}` : null,
     });
@@ -1308,8 +1310,6 @@ export class VendasService {
         vendaCodigo: venda.codigo,
         formaPagamento: pagamento.forma,
         valor: pagamento.valor,
-        responsavelId: null,
-        responsavelNome: venda.vendedorNome,
         observacao: "",
         idempotencyKey: `${chaveBase}:pagamento:${indice}`,
       });
@@ -1318,35 +1318,32 @@ export class VendasService {
 
   /**
    * Lança no Caixa o movimento de um RECEBIMENTO POSTERIOR (Etapa 10.8) —
-   * reaproveita `tipo: "recebimento_parcela"` (mesma faixa já usada por
-   * `baixarParcela` e já somada no resumo do caixa como "recebimentos": não
-   * inventa um tipo novo para o mesmo tipo de evento financeiro). Recebe
-   * `caixaId` explicitamente — desde a Etapa 10.10, é sempre o caixa
-   * ATUALMENTE aberto (resolvido pelo chamador antes de qualquer mutação da
-   * venda), nunca `venda.caixaId` (ver comentário completo em
-   * `receberPagamento`). Idempotente por chave DERIVADA
-   * (`${venda.id}:recebimento:${idempotencyKey}`) quando o chamador informou
-   * uma — sem chave, nenhuma deduplicação (mesmo padrão do resto do
-   * projeto). Prefixar com `venda.id` (Etapa 10.13) é o que sustenta a
-   * unicidade GLOBAL do índice de `MovimentoCaixa` (não mais por caixa — ver
-   * `movimento-caixa.schema.ts`): sem isso, a mesma `idempotencyKey` bruta
-   * usada por engano em duas vendas diferentes colidiria uma com a outra.
-   * Sempre o valor BRUTO do pagamento, nunca o líquido pós-tarifa (seção 10
-   * do pedido).
+   * Etapa 18.2: usa `tipo: "venda"` (o Caixa não distingue mais "venda à
+   * vista" de "recebimento de parcela" — qualquer entrada de dinheiro de uma
+   * venda é só "venda", ver `caixas.constants.ts`). Recebe `caixaId`
+   * explicitamente — desde a Etapa 10.10, é sempre o caixa ATUALMENTE aberto
+   * (resolvido pelo chamador antes de qualquer mutação da venda), nunca
+   * `venda.caixaId` (ver comentário completo em `receberPagamento`).
+   * Idempotente por chave DERIVADA (`${venda.id}:recebimento:${idempotencyKey}`)
+   * quando o chamador informou uma — sem chave, nenhuma deduplicação (mesmo
+   * padrão do resto do projeto). Prefixar com `venda.id` (Etapa 10.13) é o
+   * que sustenta a unicidade GLOBAL do índice de `MovimentoCaixa` (não mais
+   * por caixa — ver `movimento-caixa.schema.ts`): sem isso, a mesma
+   * `idempotencyKey` bruta usada por engano em duas vendas diferentes
+   * colidiria uma com a outra. Sempre o valor BRUTO do pagamento, nunca o
+   * líquido pós-tarifa (seção 10 do pedido).
    */
   private async garantirMovimentoDeRecebimento(caixaId: string, venda: VendaDocument, idempotencyKey: string | undefined, pagamento: PagamentoVenda): Promise<void> {
     if (pagamento.valor <= 0) return;
     await this.caixasService.registrarMovimentoDeVenda({
       caixaId,
-      tipo: "recebimento_parcela",
+      tipo: "venda",
       descricao: `Recebimento posterior da venda ${venda.codigo} · ${venda.clienteNome} · ${pagamento.forma}`,
       referencia: venda.codigo,
       vendaId: venda.id,
       vendaCodigo: venda.codigo,
       formaPagamento: pagamento.forma,
       valor: pagamento.valor,
-      responsavelId: null,
-      responsavelNome: "Backoffice",
       observacao: pagamento.observacao ?? "",
       idempotencyKey: idempotencyKey ? `${venda.id}:recebimento:${idempotencyKey}` : null,
     });
@@ -1354,14 +1351,14 @@ export class VendasService {
 
   /**
    * Lança no Caixa o movimento de uma BAIXA DE PARCELA (`baixarParcela`) —
-   * mesmo `tipo: "recebimento_parcela"` de sempre, agora no caixa
-   * ATUALMENTE aberto (Etapa 10.10/10.11), nunca `venda.caixaId`. Idempotente
-   * por chave DERIVADA (`${venda.id}:parcela:${idempotencyKey}`, prefixada
-   * pela venda desde a Etapa 10.13 para sustentar a unicidade GLOBAL do
-   * índice — ver `garantirMovimentoDeRecebimento`) quando o chamador
-   * informou uma — cobre "processo morreu entre salvar a venda e lançar o
-   * caixa" sem duplicar o movimento num retry. Sempre o valor BRUTO do
-   * pagamento (nunca o líquido pós-tarifa).
+   * Etapa 18.2: `tipo: "venda"` (mesma unificação de `garantirMovimentoDeRecebimento`),
+   * agora no caixa ATUALMENTE aberto (Etapa 10.10/10.11), nunca `venda.caixaId`.
+   * Idempotente por chave DERIVADA (`${venda.id}:parcela:${idempotencyKey}`,
+   * prefixada pela venda desde a Etapa 10.13 para sustentar a unicidade
+   * GLOBAL do índice — ver `garantirMovimentoDeRecebimento`) quando o
+   * chamador informou uma — cobre "processo morreu entre salvar a venda e
+   * lançar o caixa" sem duplicar o movimento num retry. Sempre o valor
+   * BRUTO do pagamento (nunca o líquido pós-tarifa).
    */
   private async garantirMovimentoDeBaixaParcela(
     caixaId: string,
@@ -1374,15 +1371,13 @@ export class VendasService {
     if (pagamento.valor <= 0) return;
     await this.caixasService.registrarMovimentoDeVenda({
       caixaId,
-      tipo: "recebimento_parcela",
+      tipo: "venda",
       descricao: `Recebimento da parcela ${numeroParcela}/${totalParcelas} · ${venda.clienteNome}`,
       referencia: venda.codigo,
       vendaId: venda.id,
       vendaCodigo: venda.codigo,
       formaPagamento: pagamento.forma,
       valor: pagamento.valor,
-      responsavelId: null,
-      responsavelNome: "Backoffice",
       observacao: pagamento.observacao ?? "Baixa registrada no backoffice",
       idempotencyKey: idempotencyKey ? `${venda.id}:parcela:${idempotencyKey}` : null,
     });

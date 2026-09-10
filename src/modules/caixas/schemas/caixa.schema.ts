@@ -3,31 +3,18 @@ import type { HydratedDocument } from "mongoose";
 import { aplicarSerializacaoPadrao } from "../../../database/mongoose-json.util.js";
 import { STATUS_CAIXA, type CaixaStatus } from "../caixas.constants.js";
 
-export interface AberturaCaixaSub {
-  dataHora: Date;
-  responsavelId: string | null;
-  responsavelNome: string;
-  valorInicial: number;
-  observacao: string;
-}
-
-export interface FechamentoCaixaSub {
-  dataHora: Date;
-  responsavelId: string | null;
-  responsavelNome: string;
-  valorInformado: number;
-  valorEsperado: number;
-  diferenca: number;
-  observacao: string;
-}
-
 /**
- * Contrato alinhado ao tipo `Caixa` já consumido pelo Backoffice
- * (`src/types/caixa.ts`). `resumo` NÃO é um campo deste schema: é SEMPRE
- * calculado em tempo de leitura a partir de `movimentos_caixa` (ver
- * `CaixasService`/`caixas.lancamentos.ts` no frontend, que já documenta essa
- * mesma regra) — nunca persistido aqui, para nunca dessincronizar do
- * histórico real de movimentações.
+ * Etapa 18.2 — CAIXA GERAL DA LOJA: modelo simplificado, sem nenhum vínculo
+ * de vendedor/responsável (removidos `abertura.responsavelId`/
+ * `responsavelNome`, `fechamento.responsavelId`/`responsavelNome` do
+ * domínio persistido — ver `CaixasService.paraRespostaPublica` para como a
+ * resposta pública reconstrói o formato aninhado `abertura`/`fechamento`
+ * ainda esperado pelo Backoffice, preservando compatibilidade de contrato
+ * sem reintroduzir o conceito no domínio). Existe NO MÁXIMO um Caixa aberto
+ * em toda a loja — nunca por vendedor, nunca por usuário, nunca por PDV.
+ *
+ * `resumo`/saldo continuam NUNCA persistidos aqui: sempre calculados em
+ * tempo de leitura a partir de `movimentos_caixa` (ver `CaixasService`).
  */
 @Schema({
   collection: "caixas",
@@ -46,33 +33,32 @@ export class Caixa {
   @Prop({ type: String, required: true, enum: STATUS_CAIXA, default: "aberto" })
   status!: CaixaStatus;
 
-  @Prop({
-    type: {
-      dataHora: { type: Date, required: true },
-      responsavelId: { type: String, default: null },
-      responsavelNome: { type: String, required: true },
-      valorInicial: { type: Number, required: true },
-      observacao: { type: String, default: "" },
-    },
-    required: true,
-    _id: false,
-  })
-  abertura!: AberturaCaixaSub;
+  @Prop({ type: Number, required: true })
+  valorInicial!: number;
 
-  @Prop({
-    type: {
-      dataHora: { type: Date, required: true },
-      responsavelId: { type: String, default: null },
-      responsavelNome: { type: String, required: true },
-      valorInformado: { type: Number, required: true },
-      valorEsperado: { type: Number, required: true },
-      diferenca: { type: Number, required: true },
-      observacao: { type: String, default: "" },
-    },
-    default: null,
-    _id: false,
-  })
-  fechamento!: FechamentoCaixaSub | null;
+  @Prop({ type: Date, required: true })
+  dataAbertura!: Date;
+
+  @Prop({ type: String, trim: true, maxlength: 400, default: "" })
+  observacaoAbertura!: string;
+
+  @Prop({ type: Date, default: null })
+  dataFechamento!: Date | null;
+
+  /** Valor contado fisicamente na gaveta no fechamento — `null` enquanto aberto. */
+  @Prop({ type: Number, default: null })
+  valorInformado!: number | null;
+
+  /** Sempre recalculado pelo backend a partir de `movimentos_caixa` no momento do fechamento — nunca aceito do cliente. */
+  @Prop({ type: Number, default: null })
+  valorEsperado!: number | null;
+
+  /** `valorInformado - valorEsperado`: pode ser negativo (falta) ou positivo (sobra). */
+  @Prop({ type: Number, default: null })
+  diferenca!: number | null;
+
+  @Prop({ type: String, trim: true, maxlength: 400, default: "" })
+  observacaoFechamento!: string;
 
   criadoEm!: Date;
   atualizadoEm!: Date;
@@ -88,4 +74,4 @@ aplicarSerializacaoPadrao(CaixaSchema);
 // a segunda recebe erro de chave duplicada, traduzido pelo service em 409.
 CaixaSchema.index({ status: 1 }, { unique: true, partialFilterExpression: { status: "aberto" } });
 // Ordenação/filtro por período de abertura.
-CaixaSchema.index({ "abertura.dataHora": 1 });
+CaixaSchema.index({ dataAbertura: 1 });

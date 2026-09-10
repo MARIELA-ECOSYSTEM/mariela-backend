@@ -14,18 +14,17 @@ export class PdvCaixaService {
   constructor(private readonly caixasService: CaixasService) {}
 
   /**
-   * Abre o caixa com o VENDEDOR AUTENTICADO como responsável — `vendedorId`
-   * vem sempre do token (`PdvJwtAuthGuard`/`@VendedorPdv()`), nunca do corpo
-   * da requisição. `CaixasService.abrir` já valida o vendedor
-   * (`resolverResponsavel` → `VendedoresRepository.encontrarPorIdOuFalhar`),
-   * já garante "só um caixa aberto" via o índice único parcial do MongoDB, e
-   * já registra o evento de auditoria `caixa.aberto` — nada disso é repetido
-   * aqui. `usuarioId: null` porque nenhum `Usuario` (ADMIN) administrou esta
-   * abertura — mesmo padrão já usado por `VendasService.criar` para
-   * operações originadas fora do Backoffice.
+   * Abre o Caixa Geral da Loja — `vendedorId` vem sempre do token
+   * (`PdvJwtAuthGuard`/`@VendedorPdv()`), nunca do corpo da requisição.
+   * Etapa 18.2: o Caixa NÃO tem mais vínculo de vendedor no seu domínio
+   * (`CaixasService.abrir` ignora `responsavelId` por completo) — o
+   * vendedor autenticado só identifica o AUTOR do evento de auditoria
+   * `caixa.aberto` (nunca persistido no documento financeiro). `CaixasService.abrir`
+   * já garante "só um caixa aberto" via o índice único parcial do MongoDB —
+   * nada disso é repetido aqui.
    */
   async abrir(vendedorId: string, dto: AbrirCaixaPdvDto): Promise<CaixaDetalheResposta> {
-    return this.caixasService.abrir({ responsavelId: vendedorId, valorInicial: dto.valorInicial, observacao: dto.observacao }, null);
+    return this.caixasService.abrir({ valorInicial: dto.valorInicial, observacao: dto.observacao }, vendedorId);
   }
 
   /** Caixa aberto atual (compartilhado por todos os vendedores) — `null` quando nenhum está aberto, nunca 404. */

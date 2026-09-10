@@ -264,6 +264,25 @@ export class VendasRepository {
   }
 
   /**
+   * Lote de vendas por id — usado por `CaixasService` (Etapa 18.2) para
+   * enriquecer a consulta `GET /caixas/:id` com as vendas reais referenciadas
+   * pelos movimentos `venda`/`cancelamento` daquele caixa (o Caixa NUNCA
+   * duplica dados de Venda no seu próprio documento — só consulta, ver
+   * princípio arquitetural "Vendas = autoridade comercial" no relatório da
+   * 18.2). Mesma projeção enxuta de `encontrarPorClienteId`. Array vazio
+   * devolve array vazio (sem round-trip ao Mongo).
+   */
+  async encontrarPorIds(ids: string[]): Promise<VendaDocument[]> {
+    const validos = ids.filter((id) => isValidObjectId(id));
+    if (validos.length === 0) return [];
+    return this.vendaModel
+      .find({ _id: { $in: validos } })
+      .select("-itens -pagamentos -parcelas -historico -cancelamento -observacao -idempotencyKey")
+      .sort({ dataVenda: -1 })
+      .exec();
+  }
+
+  /**
    * Vendas com `dataVenda` no intervalo semiaberto `[inicio, fim)` — usado
    * pelo Dashboard para os recortes hoje/semana/mês (cada chamador passa o
    * intervalo já calculado; nunca a coleção inteira). Projeção mínima: só os

@@ -4,14 +4,16 @@ import type { Model, Types } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
-import { VendedoresRepository } from "../vendedores/vendedores.repository.js";
+import type { VendaDocument } from "../vendas/schemas/venda.schema.js";
+import { VendasRepository } from "../vendas/vendas.repository.js";
 import {
   CHAVE_SEQUENCIA_CAIXA,
-  DIGITOS_CODIGO_CAIXA,
   DIFERENCA_TOLERANCIA,
+  DIGITOS_CODIGO_CAIXA,
   FACETAS_CAIXA,
   FAIXAS_SALDO,
   PREFIXO_CODIGO_CAIXA,
+  SENTIDO_POR_TIPO,
   STATUS_CAIXA,
   VALORES_DIFERENCA,
   VALORES_PERIODO,
@@ -40,21 +42,61 @@ import type { ListarMovimentosQueryDto } from "./dto/listar-movimentos-query.dto
 import { EventoCaixa, type EventoCaixaDocument } from "./schemas/evento-caixa.schema.js";
 import type { CaixaDocument } from "./schemas/caixa.schema.js";
 import type { MovimentoCaixaDocument } from "./schemas/movimento-caixa.schema.js";
-import type { ResumoCaixaCalculado } from "./caixas.types.js";
+import type { ResumoCaixaCalculado, VendaResumoDoCaixa } from "./caixas.types.js";
 import { MOVIMENTOS_RECENTES_NO_DETALHE } from "./caixas.constants.js";
+
+/**
+ * Etapa 18.2 — formato de resposta `abertura`/`fechamento` PRESERVADO
+ * (aninhado, com `responsavelId`/`responsavelNome`) por compatibilidade com
+ * o Backoffice (`caixa.index.tsx`/`caixa.$id.tsx` leem
+ * `caixa.abertura.responsavelNome` diretamente). O domínio persistido
+ * (`schemas/caixa.schema.ts`) NÃO tem mais esse conceito — `responsavelNome`
+ * aqui é sempre a string fixa `"Loja"`, nunca um vendedor real, nunca
+ * validado, nunca usado para filtrar/particionar caixas. Esta é a camada de
+ * LEITURA reconstruindo um formato de tela a partir de um domínio mais
+ * simples — não uma reintrodução do vínculo de vendedor.
+ */
+export interface AberturaCaixaResposta {
+  dataHora: Date;
+  responsavelId: null;
+  responsavelNome: string;
+  valorInicial: number;
+  observacao: string;
+}
+
+export interface FechamentoCaixaResposta {
+  dataHora: Date;
+  responsavelId: null;
+  responsavelNome: string;
+  valorInformado: number;
+  valorEsperado: number;
+  diferenca: number;
+  observacao: string;
+}
 
 export interface CaixaRespostaPublica {
   id: string;
   codigo: string;
   status: string;
-  abertura: unknown;
-  fechamento: unknown;
+  abertura: AberturaCaixaResposta;
+  fechamento: FechamentoCaixaResposta | null;
   resumo: ResumoCaixaCalculado;
 }
 
 export interface CaixaDetalheResposta extends CaixaRespostaPublica {
   movimentacoes: MovimentoCaixaDocument[];
-  vendas: never[];
+  vendas: VendaResumoDoCaixa[];
+  /**
+   * Etapa 18.2 — o conceito de "recebimento" (baixa de parcela como
+   * movimento distinto de "venda") foi RETIRADO do domínio Caixa: toda
+   * entrada de venda, à vista ou parcelada, agora é só `tipo: "venda"` (ver
+   * `caixas.constants.ts`). Este campo permanece SEMPRE `[]`,
+   * deliberadamente — não é um bug a corrigir, é a ausência intencional de
+   * um conceito que não existe mais. Mantido só para não quebrar
+   * `caixa.$id.tsx`, que ainda lê `caixa.recebimentos.length`; a remoção
+   * dessa seção da UI é trabalho de uma futura etapa Lovable, fora do
+   * escopo desta refatoração de backend.
+   */
   recebimentos: never[];
 }
 
@@ -69,29 +111,35 @@ export class CaixasService {
   constructor(
     private readonly caixasRepository: CaixasRepository,
     private readonly movimentosRepository: MovimentosCaixaRepository,
-    private readonly vendedoresRepository: VendedoresRepository,
+    private readonly vendasRepository: VendasRepository,
     private readonly sequenciasService: SequenciasService,
     @InjectModel(EventoCaixa.name) private readonly eventoModel: Model<EventoCaixaDocument>,
   ) {}
 
-  async abrir(dto: AbrirCaixaDto, usuarioId: string | null): Promise<CaixaDetalheResposta> {
-    const autor = await this.resolverResponsavel(dto.responsavelId);
+  /**
+   * `dto.responsavelId` é aceito (nunca rejeitado por `forbidNonWhitelisted`,
+   * preservando o payload atual do Backoffice) mas inteiramente IGNORADO: o
+   * Caixa Geral da Loja não tem vínculo de vendedor/responsável (Etapa 18.2).
+   * `autorId` só alimenta o evento de auditoria (`caixa.aberto`), nunca o
+   * documento financeiro.
+   */
+  async abrir(dto: AbrirCaixaDto, autorId: string | null): Promise<CaixaDetalheResposta> {
     const codigo = await this.sequenciasService.proximoCodigo(CHAVE_SEQUENCIA_CAIXA, PREFIXO_CODIGO_CAIXA, DIGITOS_CODIGO_CAIXA);
 
     const caixa = await this.caixasRepository.criar({
       codigo,
       status: "aberto",
-      abertura: {
-        dataHora: new Date(),
-        responsavelId: autor.id,
-        responsavelNome: autor.nome,
-        valorInicial: arredondar(dto.valorInicial),
-        observacao: dto.observacao?.trim() ?? "",
-      },
-      fechamento: null,
+      valorInicial: arredondar(dto.valorInicial),
+      dataAbertura: new Date(),
+      observacaoAbertura: dto.observacao?.trim() ?? "",
+      dataFechamento: null,
+      valorInformado: null,
+      valorEsperado: null,
+      diferenca: null,
+      observacaoFechamento: "",
     });
 
-    await this.registrarEvento(caixa.id, "caixa.aberto", usuarioId, { codigo });
+    await this.registrarEvento(caixa.id, "caixa.aberto", autorId, { codigo });
     return this.obterDetalhe(caixa.id);
   }
 
@@ -111,13 +159,12 @@ export class CaixasService {
 
     const itens: CaixaComResumo[] = caixas.map((documento) => ({
       documento: documento as CaixaDocument & { id: string },
-      resumo: this.calcularResumo(movimentosPorCaixa.get(documento.id) ?? [], documento.abertura.valorInicial),
+      resumo: this.calcularResumo(movimentosPorCaixa.get(documento.id) ?? [], documento.valorInicial),
     }));
 
     const selecao: SelecaoFacetas = {
       status: query.status,
       periodo: query.periodo,
-      responsavel: query.responsavel,
       diferenca: query.diferenca,
       saldo: query.saldo,
     };
@@ -143,18 +190,45 @@ export class CaixasService {
     };
   }
 
+  /**
+   * Etapa 18.2 — contrato LEGADO do Backoffice, mesmo padrão já aprovado em
+   * Clientes/Fornecedores/Coleções/Campanhas/Vendedores: `GET /caixas` sem
+   * NENHUM parâmetro espera de volta a base INTEIRA de caixas (histórico
+   * completo, não só os ativos — Caixa não tem soft delete), num array
+   * simples, nunca truncada pelo `limit` padrão de `listar()`.
+   */
+  async listarTodos(): Promise<CaixaRespostaPublica[]> {
+    const [caixas, movimentos] = await Promise.all([
+      this.caixasRepository.listarTodos(),
+      this.movimentosRepository.listarTodos(),
+    ]);
+
+    const movimentosPorCaixa = new Map<string, MovimentoCaixaDocument[]>();
+    for (const movimento of movimentos) {
+      const chave = String(movimento.caixaId);
+      const lista = movimentosPorCaixa.get(chave) ?? [];
+      lista.push(movimento);
+      movimentosPorCaixa.set(chave, lista);
+    }
+
+    return caixas.map((documento) =>
+      this.paraRespostaPublica(documento as CaixaDocument & { id: string }, this.calcularResumo(movimentosPorCaixa.get(documento.id) ?? [], documento.valorInicial)),
+    );
+  }
+
   async obterDetalhe(id: string): Promise<CaixaDetalheResposta> {
     const caixa = await this.caixasRepository.encontrarPorIdOuFalhar(id);
     const [movimentosTodos, recentes] = await Promise.all([
       this.movimentosRepository.listarTodosPorCaixa(id),
       this.movimentosRepository.recentesPorCaixa(id, MOVIMENTOS_RECENTES_NO_DETALHE),
     ]);
-    const resumo = this.calcularResumo(movimentosTodos, caixa.abertura.valorInicial);
+    const resumo = this.calcularResumo(movimentosTodos, caixa.valorInicial);
+    const vendas = await this.buscarVendasDoCaixa(movimentosTodos);
 
     return {
       ...this.paraRespostaPublica(caixa, resumo),
       movimentacoes: recentes,
-      vendas: [],
+      vendas,
       recebimentos: [],
     };
   }
@@ -169,7 +243,6 @@ export class CaixasService {
     await this.caixasRepository.encontrarPorIdOuFalhar(caixaId);
     const { itens, total } = await this.movimentosRepository.listarPaginadoPorCaixa(caixaId, {
       tipo: query.tipo,
-      responsavelId: query.responsavelId,
       ordem: query.ordem,
       page: query.page,
       limit: query.limit,
@@ -178,22 +251,6 @@ export class CaixasService {
       data: itens,
       meta: { total, page: query.page, limit: query.limit, totalPages: Math.max(1, Math.ceil(total / query.limit)) },
     };
-  }
-
-  /**
-   * Histórico de vendas do caixa. O módulo de Vendas ainda não existe nesta
-   * etapa — por isso sempre devolve uma lista vazia (nunca inventa dados de
-   * venda). Continua validando que o caixa existe, para preservar o 404 já
-   * esperado pelo Backoffice quando o id é inválido.
-   */
-  async listarVendas(id: string): Promise<{ data: never[]; meta: ApiMeta }> {
-    await this.caixasRepository.encontrarPorIdOuFalhar(id);
-    return { data: [], meta: { total: 0 } };
-  }
-
-  async listarRecebimentos(id: string): Promise<{ data: never[]; meta: ApiMeta }> {
-    await this.caixasRepository.encontrarPorIdOuFalhar(id);
-    return { data: [], meta: { total: 0 } };
   }
 
   async estatisticas(): Promise<{
@@ -226,7 +283,7 @@ export class CaixasService {
     let saldoEsperadoAtual = 0;
     if (caixaAberto) {
       const movimentos = await this.movimentosRepository.listarTodosPorCaixa(caixaAberto.id);
-      saldoEsperadoAtual = this.calcularResumo(movimentos, caixaAberto.abertura.valorInicial).saldoEsperado;
+      saldoEsperadoAtual = this.calcularResumo(movimentos, caixaAberto.valorInicial).saldoEsperado;
     }
 
     return {
@@ -235,84 +292,84 @@ export class CaixasService {
       entradasHoje: somar((item) => item.sentido === "entrada"),
       saidasHoje: somar((item) => item.sentido === "saida"),
       vendasHoje: somar((item) => item.tipo === "venda"),
-      recebimentosHoje: somar((item) => item.tipo === "recebimento_parcela"),
-      devolucoesHoje: somar((item) => item.tipo === "devolucao" || item.tipo === "cancelamento"),
+      // Etapa 18.2 — "recebimento" não é mais um tipo distinto (ver `caixas.constants.ts`); sempre 0.
+      recebimentosHoje: 0,
+      devolucoesHoje: somar((item) => item.tipo === "cancelamento"),
       saldoEsperadoAtual,
       diferencaAcumulada: arredondar(diferencaAcumulada),
     };
   }
 
   /**
-   * Ponto de integração para o futuro módulo de Vendas: registra `venda`
-   * (entrada à vista), `recebimento_parcela` (entrada — baixa de parcela) ou
-   * `devolucao`/`cancelamento` (saída — sempre limitada pelo chamador ao que
-   * foi de fato recebido, nunca validado aqui). Não passa pelas regras de
-   * `EntradaCaixaDto`/`SaidaCaixaDto` (não há "motivo" obrigatório nem
-   * responsável "backoffice" por padrão) porque a origem já é outro domínio,
-   * não uma movimentação manual do ADMIN.
+   * Ponto de integração com Vendas: registra `venda` (QUALQUER impacto
+   * financeiro positivo — à vista ou baixa de parcela, o Caixa não distingue
+   * mais os dois) ou `cancelamento` (QUALQUER impacto financeiro negativo —
+   * total ou parcial). Nunca chamado por uma rota HTTP genérica: só
+   * `VendasService` decide quando um pagamento está efetivamente PAGO e
+   * chama isto — o Caixa nunca implementa lógica de parcela/cancelamento,
+   * só registra o valor já autorizado.
+   *
+   * O vendedor NUNCA é copiado para cá — quem quiser saber quem vendeu
+   * consulta a Venda via `vendaId` (ver `buscarVendasDoCaixa`).
    */
   async registrarMovimentoDeVenda(dados: {
     caixaId: string;
-    tipo: Extract<TipoMovimentacaoCaixa, "venda" | "recebimento_parcela" | "devolucao" | "cancelamento">;
+    tipo: Extract<TipoMovimentacaoCaixa, "venda" | "cancelamento">;
     descricao: string;
     referencia: string | null;
     vendaId: string;
     vendaCodigo: string;
     formaPagamento: string;
     valor: number;
-    responsavelId: string | null;
-    responsavelNome: string;
     observacao: string;
     idempotencyKey?: string | null;
   }): Promise<void> {
     const caixa = await this.caixasRepository.encontrarPorIdOuFalhar(dados.caixaId);
     this.exigirAberto(caixa);
 
-    const sentido = dados.tipo === "devolucao" || dados.tipo === "cancelamento" ? "saida" : "entrada";
-    const origem = dados.tipo === "recebimento_parcela" ? "parcela" : dados.tipo;
-
-    await this.movimentosRepository.criar({
+    const { movimento, duplicado } = await this.movimentosRepository.criar({
       caixaId: dados.caixaId,
       dataHora: new Date(),
       tipo: dados.tipo,
-      origem,
+      origem: dados.tipo,
       descricao: dados.descricao,
       referencia: dados.referencia,
       vendaId: dados.vendaId,
       vendaCodigo: dados.vendaCodigo,
       formaPagamento: dados.formaPagamento,
       valor: arredondar(dados.valor),
-      sentido,
-      responsavelId: dados.responsavelId,
-      responsavelNome: dados.responsavelNome,
+      sentido: SENTIDO_POR_TIPO[dados.tipo],
       observacao: dados.observacao,
-      motivo: sentido === "saida" ? dados.observacao || null : null,
+      motivo: dados.tipo === "cancelamento" ? dados.observacao || null : null,
       idempotencyKey: dados.idempotencyKey ?? null,
     });
+
+    await this.garantirCaixaAindaAbertoOuReverter(dados.caixaId, movimento, duplicado);
   }
 
+  /**
+   * `entrada`/`saida` são os nomes de ROTA (preservados por compatibilidade
+   * com `POST /:id/entrada`/`POST /:id/saida` já consumidos pelo
+   * Backoffice) — internamente mapeiam para `tipo: "injecao"`/`"sangria"`.
+   * O cliente NUNCA escolhe o `tipo`: o endpoint chamado é que determina.
+   *
+   * Etapa 18.2 — SANGRIA não bloqueia mais por saldo insuficiente: o Caixa
+   * pode ficar negativo (decisão de domínio explícita). Etapa 18.3 —
+   * a proteção contra "movimento em caixa já fechado" não depende mais de
+   * saldo nem de um gate ANTES da gravação: ver `garantirCaixaAindaAbertoOuReverter`.
+   */
   async registrarMovimento(
     caixaId: string,
-    tipo: "entrada" | "saida",
+    rota: "entrada" | "saida",
     dto: EntradaCaixaDto | SaidaCaixaDto,
     usuarioId: string | null,
   ): Promise<CaixaDetalheResposta> {
+    const tipo: TipoMovimentacaoCaixa = rota === "entrada" ? "injecao" : "sangria";
     const caixa = await this.caixasRepository.encontrarPorIdOuFalhar(caixaId);
     this.exigirAberto(caixa);
 
     const valor = arredondar(dto.valor);
-    if (tipo === "saida") {
-      const movimentos = await this.movimentosRepository.listarTodosPorCaixa(caixaId);
-      const saldo = this.calcularResumo(movimentos, caixa.abertura.valorInicial).saldoEsperado;
-      if (valor > saldo) {
-        throw ApiException.validation("Dados inválidos.", [
-          { field: "valor", message: `Saída maior que o saldo disponível (${saldo.toFixed(2)}).` },
-        ]);
-      }
-    }
-
-    const autor = await this.resolverResponsavel(dto.responsavelId ?? caixa.abertura.responsavelId);
-    const motivo = tipo === "saida" ? (dto as SaidaCaixaDto).motivo.trim() : null;
+    const motivo = tipo === "sangria" ? (dto as SaidaCaixaDto).motivo.trim() : null;
 
     const { movimento, duplicado } = await this.movimentosRepository.criar({
       caixaId,
@@ -325,13 +382,13 @@ export class CaixasService {
       vendaCodigo: null,
       formaPagamento: dto.formaPagamento.trim(),
       valor,
-      sentido: tipo,
-      responsavelId: autor.id,
-      responsavelNome: autor.nome,
+      sentido: SENTIDO_POR_TIPO[tipo],
       observacao: dto.observacao?.trim() ?? "",
       motivo,
       idempotencyKey: dto.idempotencyKey ?? null,
     });
+
+    await this.garantirCaixaAindaAbertoOuReverter(caixaId, movimento, duplicado);
 
     if (!duplicado) {
       await this.registrarEvento(caixaId, "caixa.movimento_criado", usuarioId, { tipo, valor: movimento.valor });
@@ -340,12 +397,77 @@ export class CaixasService {
     return this.obterDetalhe(caixaId);
   }
 
+  /**
+   * Etapa 18.3 — fecha, sem transação Mongo, a corrida entre "gravar um
+   * movimento" e "fechar o caixa" (seção 10/12 do pedido da 18.3).
+   *
+   * POR QUE NÃO UM GATE ANTES DA GRAVAÇÃO (como a 18.2 tinha com
+   * `confirmarAberto`): um gate atômico ANTES do insert só reduz a janela,
+   * nunca a fecha — entre o gate e o `movimentosRepository.criar()` (duas
+   * operações em COLEÇÕES diferentes) sempre sobra um intervalo onde
+   * `fecharAtomico` pode intercalar. A 18.2 já documentava isso
+   * honestamente como limitação aceita; a 18.3 fecha essa lacuna sem
+   * transação, verificando DEPOIS do insert em vez de antes.
+   *
+   * ALGORITMO (compensação, não transação):
+   * 1. O movimento já foi inserido (`movimento`/`duplicado` vêm de
+   *    `MovimentosCaixaRepository.criar`).
+   * 2. Se `duplicado === true`: NADA a fazer. O documento já existia — ele
+   *    só pode ter sido criado por uma chamada anterior que, para existir
+   *    com sucesso, já passou por ESTA MESMA verificação em seu próprio
+   *    momento de criação (indução: todo movimento não removido já foi
+   *    validado por este método quando nasceu). Reverificar aqui poderia
+   *    inclusive APAGAR incorretamente um movimento legítimo e antigo só
+   *    porque o caixa fechou muito depois.
+   * 3. Se `duplicado === false` (nós acabamos de inserir): relê o Caixa
+   *    agora. Se `status === "fechado"`, esta gravação perdeu a corrida
+   *    contra um `fechar()` concorrente — o movimento nunca deveria ter
+   *    sido criado. Apaga (`removerPorId`, compensação — nunca visível
+   *    como uma resposta de sucesso para quem chamou) e lança erro. Se
+   *    ainda `"aberto"`, a gravação é legítima.
+   *
+   * GARANTIA: como a checagem é feita comparando o ESTADO ATUAL do Caixa
+   * (não um timestamp nem uma versão capturada antes), o resultado nunca
+   * depende de relógio de parede nem de ordenação de eventos — só do valor
+   * de `status` no momento em que este código realmente executa, que o
+   * MongoDB garante ser consistente para leituras de um único documento.
+   *
+   * LIMITE HONESTO (documentado, não corrigido — ver relatório da 18.3,
+   * seção "Estratégia de atomicidade"): existe uma janela residual,
+   * extremamente estreita, envolvendo TRÊS eventos simultâneos (duas
+   * chamadas com a MESMA `idempotencyKey` colidindo + um fechamento
+   * concorrente) em que o "perdedor" da colisão de chave poderia, por uma
+   * fração de milissegundo, enxergar o movimento antes da compensação do
+   * "vencedor" apagá-lo. Fechar isso por completo exigiria uma transação
+   * multi-documento — inviável hoje porque `mariela_dev_local` é um MongoDB
+   * standalone (transações exigem replica set). Ver justificativa completa
+   * no relatório da Etapa 18.3.
+   */
+  private async garantirCaixaAindaAbertoOuReverter(caixaId: string, movimento: MovimentoCaixaDocument, duplicado: boolean): Promise<void> {
+    if (duplicado) return;
+
+    const caixaAtual = await this.caixasRepository.encontrarPorId(caixaId);
+    if (caixaAtual && caixaAtual.status === "fechado") {
+      await this.movimentosRepository.removerPorId(movimento.id);
+      throw ApiException.validation(
+        "Este caixa foi fechado durante o registro desta operação. Nenhum valor foi salvo — tente novamente (o caixa atualmente aberto, se houver, será usado).",
+      );
+    }
+  }
+
+  /**
+   * Etapa 18.2 — saldo negativo é um estado válido: fechamento permitido com
+   * `valorEsperado`/`diferenca` negativos, sem nenhum limite inferior.
+   * `valorEsperado` continua SEMPRE recalculado pelo backend a partir de
+   * `movimentos_caixa` — nunca aceito do payload (`FechamentoCaixaDto` não
+   * tem esse campo).
+   */
   async fechar(id: string, dto: FechamentoCaixaDto, usuarioId: string | null): Promise<CaixaDetalheResposta> {
     const caixa = await this.caixasRepository.encontrarPorIdOuFalhar(id);
     this.exigirAberto(caixa);
 
     const movimentos = await this.movimentosRepository.listarTodosPorCaixa(id);
-    const valorEsperado = this.calcularResumo(movimentos, caixa.abertura.valorInicial).saldoEsperado;
+    const valorEsperado = this.calcularResumo(movimentos, caixa.valorInicial).saldoEsperado;
     const diferenca = arredondar(dto.valorInformado - valorEsperado);
     const observacao = dto.observacao?.trim() ?? "";
 
@@ -355,15 +477,12 @@ export class CaixasService {
       ]);
     }
 
-    const autor = await this.resolverResponsavel(dto.responsavelId ?? caixa.abertura.responsavelId);
     const atualizado = await this.caixasRepository.fecharAtomico(id, {
-      dataHora: new Date(),
-      responsavelId: autor.id,
-      responsavelNome: autor.nome,
+      dataFechamento: new Date(),
       valorInformado: arredondar(dto.valorInformado),
       valorEsperado,
       diferenca,
-      observacao,
+      observacaoFechamento: observacao,
     });
 
     if (!atualizado) {
@@ -381,27 +500,73 @@ export class CaixasService {
     }
   }
 
-  /** `null`/ausente = o próprio ADMIN (Backoffice); um id = Vendedor real, validado e com nome capturado (snapshot). */
-  private async resolverResponsavel(responsavelId: string | null | undefined): Promise<{ id: string | null; nome: string }> {
-    if (!responsavelId) return { id: null, nome: "Backoffice" };
-    const vendedor = await this.vendedoresRepository.encontrarPorIdOuFalhar(responsavelId);
-    return { id: vendedor.id, nome: vendedor.nome };
+  /**
+   * Camada de CONSULTA (Etapa 18.2, princípio "Vendas = autoridade
+   * comercial"): resolve as vendas distintas referenciadas pelos movimentos
+   * `venda`/`cancelamento` deste caixa. Nunca duplica dado de Venda no
+   * documento do Caixa — só busca e projeta no momento da leitura.
+   */
+  private async buscarVendasDoCaixa(movimentos: MovimentoCaixaDocument[]): Promise<VendaResumoDoCaixa[]> {
+    const ids = Array.from(
+      new Set(
+        movimentos
+          .filter((movimento) => (movimento.tipo === "venda" || movimento.tipo === "cancelamento") && movimento.vendaId)
+          .map((movimento) => movimento.vendaId as string),
+      ),
+    );
+    const vendas = await this.vendasRepository.encontrarPorIds(ids);
+    return vendas.map((venda) => this.paraResumoVenda(venda));
   }
 
-  /** Resumo SEMPRE derivado das movimentações — nunca de um campo persistido (mesma regra do contrato de frontend). */
-  private calcularResumo(movimentos: MovimentoCaixaDocument[], valorAbertura: number): ResumoCaixaCalculado {
-    const somar = (tipos: string[]) => arredondar(movimentos.filter((item) => tipos.includes(item.tipo)).reduce((total, item) => total + item.valor, 0));
+  private paraResumoVenda(venda: VendaDocument): VendaResumoDoCaixa {
+    return {
+      id: venda.id,
+      codigo: venda.codigo,
+      numero: venda.numero,
+      dataVenda: venda.dataVenda,
+      clienteId: venda.clienteId,
+      clienteNome: venda.clienteNome,
+      vendedorId: venda.vendedorId,
+      vendedorNome: venda.vendedorNome,
+      caixaId: venda.caixaId,
+      caixaCodigo: venda.caixaCodigo,
+      totalItens: venda.totalItens,
+      valorBruto: venda.valorBruto,
+      descontoPromocional: venda.descontoPromocional,
+      descontoVenda: venda.descontoVenda,
+      descontoTotal: venda.descontoTotal,
+      valorFinal: venda.valorFinal,
+      valorPago: venda.valorPago,
+      valorPendente: venda.valorPendente,
+      valorDevolvido: venda.valorDevolvido,
+      temPromocao: venda.temPromocao,
+      temDesconto: venda.temDesconto,
+      formaPagamento: venda.formaPagamento,
+      totalParcelas: venda.totalParcelas,
+      parcelasPagas: venda.parcelasPagas,
+      status: venda.status,
+    };
+  }
+
+  /**
+   * Resumo SEMPRE derivado das movimentações — nunca de um campo
+   * persistido. Etapa 18.2 — sem `Math.max(0, ...)`: `saldoEsperado` pode
+   * ser negativo (sangria/cancelamento sem cobertura de saldo é permitido).
+   */
+  private calcularResumo(movimentos: MovimentoCaixaDocument[], valorInicial: number): ResumoCaixaCalculado {
+    const somar = (tipos: TipoMovimentacaoCaixa[]) =>
+      arredondar(movimentos.filter((item) => tipos.includes(item.tipo)).reduce((total, item) => total + item.valor, 0));
 
     const totalVendas = somar(["venda"]);
-    const recebimentos = somar(["recebimento_parcela"]);
-    const entradasManuais = somar(["entrada"]);
-    const saidasManuais = somar(["saida"]);
-    const devolucoes = somar(["devolucao", "cancelamento"]);
+    const recebimentos = 0; // Etapa 18.2 — conceito retirado, sempre incluído em totalVendas.
+    const entradasManuais = somar(["injecao"]);
+    const saidasManuais = somar(["sangria"]);
+    const devolucoes = somar(["cancelamento"]);
     const totalEntradas = arredondar(totalVendas + recebimentos + entradasManuais);
     const totalSaidas = arredondar(saidasManuais + devolucoes);
 
     return {
-      valorAbertura,
+      valorAbertura: valorInicial,
       totalVendas,
       recebimentos,
       entradasManuais,
@@ -409,7 +574,7 @@ export class CaixasService {
       saidasManuais,
       devolucoes,
       totalSaidas,
-      saldoEsperado: arredondar(valorAbertura + totalEntradas - totalSaidas),
+      saldoEsperado: arredondar(valorInicial + totalEntradas - totalSaidas),
       quantidadeVendas: new Set(movimentos.filter((item) => item.tipo === "venda").map((item) => item.vendaId)).size,
       quantidadeMovimentacoes: movimentos.length,
     };
@@ -424,14 +589,12 @@ export class CaixasService {
       case "saldo":
         return copia.sort((a, b) => (a.resumo.saldoEsperado - b.resumo.saldoEsperado) * fator);
       case "diferenca":
-        return copia.sort(
-          (a, b) => (Math.abs(a.documento.fechamento?.diferenca ?? 0) - Math.abs(b.documento.fechamento?.diferenca ?? 0)) * fator,
-        );
+        return copia.sort((a, b) => (Math.abs(a.documento.diferenca ?? 0) - Math.abs(b.documento.diferenca ?? 0)) * fator);
       case "vendas":
         return copia.sort((a, b) => (a.resumo.quantidadeVendas - b.resumo.quantidadeVendas) * fator);
       case "data":
       default:
-        return copia.sort((a, b) => (a.documento.abertura.dataHora.getTime() - b.documento.abertura.dataHora.getTime()) * fator);
+        return copia.sort((a, b) => (a.documento.dataAbertura.getTime() - b.documento.dataAbertura.getTime()) * fator);
     }
   }
 
@@ -441,20 +604,9 @@ export class CaixasService {
       return valores.map((valor) => ({ valor, count: universo.filter((item) => condicaoValor(chave, valor, item, agora)).length }));
     };
 
-    const universoResponsavel = aplicarSelecao(base, selecao, agora, FACETAS_CAIXA.responsavel);
-    const contagemResponsavel = new Map<string, number>();
-    for (const item of universoResponsavel) {
-      const nome = item.documento.abertura.responsavelNome;
-      contagemResponsavel.set(nome, (contagemResponsavel.get(nome) ?? 0) + 1);
-    }
-    const responsaveis = Array.from(contagemResponsavel.entries())
-      .map(([valor, count]) => ({ valor, count }))
-      .sort((a, b) => a.valor.localeCompare(b.valor, "pt-BR"));
-
     return {
       [FACETAS_CAIXA.status]: contarValores(FACETAS_CAIXA.status, STATUS_CAIXA),
       [FACETAS_CAIXA.periodo]: contarValores(FACETAS_CAIXA.periodo, VALORES_PERIODO),
-      [FACETAS_CAIXA.responsavel]: responsaveis,
       [FACETAS_CAIXA.diferenca]: contarValores(FACETAS_CAIXA.diferenca, VALORES_DIFERENCA),
       [FACETAS_CAIXA.saldo]: contarValores(
         FACETAS_CAIXA.saldo,
@@ -464,8 +616,45 @@ export class CaixasService {
   }
 
   private paraRespostaPublica(caixa: CaixaDocument, resumo: ResumoCaixaCalculado): CaixaRespostaPublica {
-    const json = caixa.toJSON() as unknown as { id: string; codigo: string; status: string; abertura: unknown; fechamento: unknown };
-    return { id: json.id, codigo: json.codigo, status: json.status, abertura: json.abertura, fechamento: json.fechamento, resumo };
+    const json = caixa.toJSON() as unknown as {
+      id: string;
+      codigo: string;
+      status: string;
+      valorInicial: number;
+      dataAbertura: Date;
+      observacaoAbertura: string;
+      dataFechamento: Date | null;
+      valorInformado: number | null;
+      valorEsperado: number | null;
+      diferenca: number | null;
+      observacaoFechamento: string;
+    };
+
+    return {
+      id: json.id,
+      codigo: json.codigo,
+      status: json.status,
+      abertura: {
+        dataHora: json.dataAbertura,
+        responsavelId: null,
+        responsavelNome: "Loja",
+        valorInicial: json.valorInicial,
+        observacao: json.observacaoAbertura,
+      },
+      fechamento:
+        json.status === "fechado"
+          ? {
+              dataHora: json.dataFechamento as Date,
+              responsavelId: null,
+              responsavelNome: "Loja",
+              valorInformado: json.valorInformado as number,
+              valorEsperado: json.valorEsperado as number,
+              diferenca: json.diferenca as number,
+              observacao: json.observacaoFechamento,
+            }
+          : null,
+      resumo,
+    };
   }
 
   private async registrarEvento(

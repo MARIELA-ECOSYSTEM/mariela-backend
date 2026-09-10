@@ -94,20 +94,33 @@ describe("PdvCaixaService (integração — MongoDB real)", () => {
   });
 
   describe("abrir", () => {
-    it("usa o vendedor autenticado como responsável — nunca um valor arbitrário", async () => {
+    /**
+     * Etapa 18.2 — o Caixa Geral da Loja NÃO tem mais vínculo de vendedor: o
+     * vendedor autenticado pelo PDV identifica só o AUTOR do evento de
+     * auditoria `caixa.aberto`, nunca é persistido no documento financeiro.
+     * `abertura.responsavelNome` volta sempre `"Loja"` (placeholder fixo de
+     * compatibilidade de contrato, ver `CaixasService.paraRespostaPublica`),
+     * independente de QUAL vendedor abriu.
+     */
+    it("o vendedor autenticado NUNCA é persistido no Caixa — só identifica o autor do evento de auditoria", async () => {
       await fecharSeAberto();
       const vendedor = await criarVendedor();
 
       const caixa = await service.abrir(vendedor.id, { valorInicial: 200, observacao: "Troco inicial" });
 
-      expect((caixa.abertura as { responsavelId: string | null }).responsavelId).toBe(vendedor.id);
-      expect((caixa.abertura as { responsavelNome: string }).responsavelNome).toBe(vendedor.nome);
-      expect((caixa.abertura as { valorInicial: number }).valorInicial).toBe(200);
+      expect(caixa.abertura.responsavelId).toBeNull();
+      expect(caixa.abertura.responsavelNome).toBe("Loja");
+      expect(caixa.abertura.valorInicial).toBe(200);
 
-      // Confirma no banco, não só na resposta.
+      // Confirma no banco: o documento persistido não tem NENHUM campo de vendedor.
       const documento = await connection.collection("caixas").findOne({ codigo: caixa.codigo });
-      expect(documento?.["abertura"].responsavelId).toBe(vendedor.id);
-      expect(documento?.["abertura"].responsavelNome).toBe(vendedor.nome);
+      expect(documento?.["responsavelId"]).toBeUndefined();
+      expect(documento?.["responsavelNome"]).toBeUndefined();
+      expect(documento?.["abertura"]).toBeUndefined(); // domínio persistido é flat (sem subdocumento abertura)
+
+      // O vendedor só aparece no EVENTO de auditoria.
+      const evento = await connection.collection("eventos_caixa").findOne({ caixaId: new Types.ObjectId(caixa.id), tipo: "caixa.aberto" });
+      expect(evento?.["usuarioId"]).toBe(vendedor.id);
 
       await fecharSeAberto();
     });
@@ -134,10 +147,12 @@ describe("PdvCaixaService (integração — MongoDB real)", () => {
       await fecharSeAberto();
     });
 
-    it("vendedor inexistente propaga o erro do CaixasService (não cria caixa nenhum)", async () => {
+    it("Etapa 18.2 — o Caixa não valida mais o vendedor (não tem vínculo): chamar o service diretamente com um id arbitrário não lança; a validação real do vendedor acontece antes, no PdvJwtAuthGuard", async () => {
       await fecharSeAberto();
-      await expect(service.abrir("65f1a2b3c4d5e6f7a8b9c0d1", { valorInicial: 100 })).rejects.toThrow(ApiException);
-      expect(await service.atual()).toBeNull();
+      const caixa = await service.abrir("id-qualquer-nao-validado", { valorInicial: 100 });
+      expect(caixa.abertura.responsavelId).toBeNull();
+      expect(caixa.abertura.responsavelNome).toBe("Loja");
+      await fecharSeAberto();
     });
   });
 });

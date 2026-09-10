@@ -1,6 +1,6 @@
 import { ApiPropertyOptional } from "@nestjs/swagger";
 import { Transform, Type } from "class-transformer";
-import { IsIn, IsInt, IsOptional, IsString, Max, Min } from "class-validator";
+import { IsIn, IsInt, IsOptional, Max, Min } from "class-validator";
 import {
   LIMITE_MAXIMO_MOVIMENTOS,
   LIMITE_PADRAO_MOVIMENTOS,
@@ -22,11 +22,6 @@ export class ListarMovimentosQueryDto {
   @IsOptional()
   @Transform(paraLista)
   tipo: string[] = [];
-
-  @ApiPropertyOptional({ description: "Responsável (id do vendedor, ou omitido para todos)." })
-  @IsOptional()
-  @IsString()
-  responsavelId?: string;
 
   @ApiPropertyOptional({ enum: ["asc", "desc"], default: "desc" })
   @IsOptional()

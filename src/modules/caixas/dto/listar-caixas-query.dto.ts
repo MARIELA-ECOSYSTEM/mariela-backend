@@ -23,11 +23,12 @@ function paraLista({ value }: { value: unknown }): string[] {
 
 /**
  * Espelha os grupos de filtro que a tela de Caixa já expõe
- * (`src/routes/_backoffice/caixa.index.tsx`): status, período, responsável
- * (valores dinâmicos), diferença de fechamento e faixa de saldo esperado.
+ * (`src/routes/_backoffice/caixa.index.tsx`): status, período, diferença de
+ * fechamento e faixa de saldo esperado. Etapa 18.2 — o grupo "responsável"
+ * foi removido (o Caixa não tem mais vínculo de vendedor).
  */
 export class ListarCaixasQueryDto {
-  @ApiPropertyOptional({ description: "Busca por código do caixa ou nome do responsável." })
+  @ApiPropertyOptional({ description: "Busca por código do caixa." })
   @IsOptional()
   @IsString()
   busca?: string;
@@ -51,11 +52,6 @@ export class ListarCaixasQueryDto {
   @IsOptional()
   @Transform(paraLista)
   periodo: string[] = [];
-
-  @ApiPropertyOptional({ description: "CSV com nomes de responsável (valores dinâmicos)." })
-  @IsOptional()
-  @Transform(paraLista)
-  responsavel: string[] = [];
 
   @ApiPropertyOptional({ description: "CSV: conferido, sobra, falta." })
   @IsOptional()

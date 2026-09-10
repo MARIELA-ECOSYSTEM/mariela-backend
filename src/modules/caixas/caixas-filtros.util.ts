@@ -12,8 +12,8 @@ export type SelecaoFacetas = Partial<Record<ChaveFacetaCaixa, string[]>>;
 /**
  * Caixa + resumo já calculado — a unidade de trabalho da filtragem híbrida
  * (Node-side, mesmo padrão de Fornecedores/Coleções/Campanhas): como `resumo`
- * nunca é persistido, filtrar/ordenar por ele exige o conjunto já teve seus
- * resumos calculados a partir de `movimentos_caixa` antes de chegar aqui.
+ * nunca é persistido, filtrar/ordenar por ele exige que o conjunto já tenha
+ * seus resumos calculados a partir de `movimentos_caixa` antes de chegar aqui.
  */
 export interface CaixaComResumo {
   documento: CaixaDocument & { id: string };
@@ -35,7 +35,7 @@ function inicioDoDia(data: Date): Date {
 
 /** Mesma regra de `caixaNoPeriodo` no frontend (`src/utils/caixa.ts`). */
 function noPeriodo(item: CaixaComResumo, periodo: string, agora: Date): boolean {
-  const data = item.documento.abertura.dataHora;
+  const data = item.documento.dataAbertura;
   const hoje = inicioDoDia(agora);
 
   if (periodo === "hoje") return inicioDoDia(data).getTime() === hoje.getTime();
@@ -60,8 +60,8 @@ function naFaixaDeSaldo(item: CaixaComResumo, faixaId: string): boolean {
 }
 
 function temDiferenca(item: CaixaComResumo, valor: string): boolean {
-  if (!item.documento.fechamento) return false;
-  return situacaoDiferenca(item.documento.fechamento.diferenca) === valor;
+  if (item.documento.status !== "fechado" || item.documento.diferenca === null) return false;
+  return situacaoDiferenca(item.documento.diferenca) === valor;
 }
 
 /** Condição de UM valor dentro de um grupo de faceta — `null` = faceta desconhecida. */
@@ -71,8 +71,6 @@ export function condicaoValor(chave: ChaveFacetaCaixa, valor: string, item: Caix
       return item.documento.status === valor;
     case FACETAS_CAIXA.periodo:
       return noPeriodo(item, valor, agora);
-    case FACETAS_CAIXA.responsavel:
-      return item.documento.abertura.responsavelNome === valor;
     case FACETAS_CAIXA.diferenca:
       return temDiferenca(item, valor);
     case FACETAS_CAIXA.saldo:
@@ -99,13 +97,9 @@ export function aplicarSelecao(
   );
 }
 
-/** Busca livre por código do caixa ou nome do responsável da abertura. */
+/** Busca livre por código do caixa. */
 export function filtroBusca(itens: CaixaComResumo[], busca?: string): CaixaComResumo[] {
   const termo = busca?.trim().toLowerCase();
   if (!termo) return itens;
-  return itens.filter(
-    (item) =>
-      item.documento.codigo.toLowerCase().includes(termo) ||
-      item.documento.abertura.responsavelNome.toLowerCase().includes(termo),
-  );
+  return itens.filter((item) => item.documento.codigo.toLowerCase().includes(termo));
 }

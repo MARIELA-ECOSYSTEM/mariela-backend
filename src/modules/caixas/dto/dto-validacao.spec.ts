@@ -91,8 +91,14 @@ describe("FechamentoCaixaDto", () => {
     expect(erros).toHaveLength(0);
   });
 
-  it("rejeita valorInformado negativo", async () => {
-    const dto = plainToInstance(FechamentoCaixaDto, { valorInformado: -1 });
+  it("aceita valorInformado negativo (Etapa 18.2 — Caixa pode fechar negativo)", async () => {
+    const dto = plainToInstance(FechamentoCaixaDto, { valorInformado: -200 });
+    const erros = await validate(dto);
+    expect(erros).toHaveLength(0);
+  });
+
+  it("rejeita valorInformado ausente/não numérico", async () => {
+    const dto = plainToInstance(FechamentoCaixaDto, { valorInformado: "abc" });
     const erros = await validate(dto);
     expect(erros.some((erro) => erro.property === "valorInformado")).toBe(true);
   });

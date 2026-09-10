@@ -215,9 +215,12 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     expect(corpo.data.status).toBe("concluida");
     expect(corpo.data.valorPendente).toBe(0);
 
+    // Etapa 18.2 — a baixa de parcela é `tipo: "venda"` no Caixa (não existe
+    // mais "recebimento" como categoria distinta), somada em `resumo.totalVendas`.
     const detalheCaixa = await fetch(`${baseUrl}/api/v1/caixas/${caixaId}`, { headers: authHeaders() });
-    const corpoCaixa = (await detalheCaixa.json()) as { data: { resumo: { recebimentos: number } } };
-    expect(corpoCaixa.data.resumo.recebimentos).toBe(100);
+    const corpoCaixa = (await detalheCaixa.json()) as { data: { resumo: { totalVendas: number; recebimentos: number } } };
+    expect(corpoCaixa.data.resumo.totalVendas).toBe(200); // 100 do ato + 100 da baixa da parcela
+    expect(corpoCaixa.data.resumo.recebimentos).toBe(0);
   });
 
   it("POST .../parcelas/:parcelaId/baixa numa parcela já paga retorna 400", async () => {
@@ -234,7 +237,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     const { venda, caixa } = await criarVendaFiadaViaHttpSetup(500, 300); // parcela = 200
     const parcela = venda.parcelas[0]!;
     const antes = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
-    const corpoAntes = (await antes.json()) as { data: { resumo: { recebimentos: number } } };
+    const corpoAntes = (await antes.json()) as { data: { resumo: { totalVendas: number } } };
 
     const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/parcelas/${String(parcela._id)}/baixa`, {
       method: "POST",
@@ -252,8 +255,8 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     expect(corpo.data.valorPago).toBe(500); // bruto, nunca 490 (líquido pós-tarifa)
 
     const depois = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
-    const corpoDepois = (await depois.json()) as { data: { resumo: { recebimentos: number } } };
-    expect(corpoDepois.data.resumo.recebimentos - corpoAntes.data.resumo.recebimentos).toBe(200); // bruto, nunca 190 (líquido)
+    const corpoDepois = (await depois.json()) as { data: { resumo: { totalVendas: number } } };
+    expect(corpoDepois.data.resumo.totalVendas - corpoAntes.data.resumo.totalVendas).toBe(200); // bruto, nunca 190 (líquido)
   });
 
   it("Etapa 10.17: retry com a mesma idempotencyKey em .../parcelas/:parcelaId/baixa não duplica o pagamento nem o movimento de caixa", async () => {
@@ -262,7 +265,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     const chave = `parcela-http-idem-${Date.now()}`;
     const payload = JSON.stringify({ idempotencyKey: chave });
     const antes = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
-    const corpoAntes = (await antes.json()) as { data: { resumo: { recebimentos: number } } };
+    const corpoAntes = (await antes.json()) as { data: { resumo: { totalVendas: number } } };
 
     const primeira = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/parcelas/${String(parcela._id)}/baixa`, {
       method: "POST",
@@ -280,8 +283,8 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     expect(corpoSegunda.data.valorPago).toBe(500); // não dobrou (300 + 200, nunca 300 + 400)
 
     const depois = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
-    const corpoDepois = (await depois.json()) as { data: { resumo: { recebimentos: number } } };
-    expect(corpoDepois.data.resumo.recebimentos - corpoAntes.data.resumo.recebimentos).toBe(200); // não duplicou no caixa
+    const corpoDepois = (await depois.json()) as { data: { resumo: { totalVendas: number } } };
+    expect(corpoDepois.data.resumo.totalVendas - corpoAntes.data.resumo.totalVendas).toBe(200); // não duplicou no caixa
   });
 
   it("POST /api/v1/vendas/:id/cancelamento com motivo vazio retorna 400", async () => {
@@ -534,7 +537,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     it("recebimento parcial reduz o pendente e reflete no caixa como recebimento", async () => {
       const { venda, caixa } = await criarVendaFiadaViaHttpSetup(1000, 400);
       const antes = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
-      const corpoAntes = (await antes.json()) as { data: { resumo: { recebimentos: number } } };
+      const corpoAntes = (await antes.json()) as { data: { resumo: { totalVendas: number } } };
 
       const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
         method: "POST",
@@ -548,8 +551,8 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       expect(corpo.data.status).toBe("em_pagamento");
 
       const depois = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
-      const corpoDepois = (await depois.json()) as { data: { resumo: { recebimentos: number } } };
-      expect(corpoDepois.data.resumo.recebimentos - corpoAntes.data.resumo.recebimentos).toBe(250);
+      const corpoDepois = (await depois.json()) as { data: { resumo: { totalVendas: number } } };
+      expect(corpoDepois.data.resumo.totalVendas - corpoAntes.data.resumo.totalVendas).toBe(250);
     });
 
     it("recebimento que quita exatamente o saldo conclui a venda", async () => {
@@ -586,7 +589,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       const adquirente = await adquirentesService.criar({ nome: `Adquirente Recebimento HTTP ${Date.now()}`, tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 4 }] }, null);
       const { venda, caixa } = await criarVendaFiadaViaHttpSetup(500, 300);
       const antes = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
-      const corpoAntes = (await antes.json()) as { data: { resumo: { recebimentos: number } } };
+      const corpoAntes = (await antes.json()) as { data: { resumo: { totalVendas: number } } };
 
       const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
         method: "POST",
@@ -603,8 +606,8 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       expect(corpo.data.valorPago).toBe(500); // bruto, nunca 300+192
 
       const depois = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
-      const corpoDepois = (await depois.json()) as { data: { resumo: { recebimentos: number } } };
-      expect(corpoDepois.data.resumo.recebimentos - corpoAntes.data.resumo.recebimentos).toBe(200); // bruto, nunca 192
+      const corpoDepois = (await depois.json()) as { data: { resumo: { totalVendas: number } } };
+      expect(corpoDepois.data.resumo.totalVendas - corpoAntes.data.resumo.totalVendas).toBe(200); // bruto, nunca 192
     });
 
     it("retry com a mesma idempotencyKey não duplica o recebimento nem o movimento de caixa", async () => {
@@ -612,7 +615,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       const chave = `recebimento-http-idem-${Date.now()}`;
       const payload = JSON.stringify({ forma: "Dinheiro", valor: 100, idempotencyKey: chave });
       const antes = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
-      const corpoAntes = (await antes.json()) as { data: { resumo: { recebimentos: number } } };
+      const corpoAntes = (await antes.json()) as { data: { resumo: { totalVendas: number } } };
 
       const primeira = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, { method: "POST", headers: authHeaders(), body: payload });
       const segunda = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, { method: "POST", headers: authHeaders(), body: payload });
@@ -622,8 +625,8 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       expect(corpoSegunda.data.valorPago).toBe(400); // não virou 500
 
       const depois = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
-      const corpoDepois = (await depois.json()) as { data: { resumo: { recebimentos: number } } };
-      expect(corpoDepois.data.resumo.recebimentos - corpoAntes.data.resumo.recebimentos).toBe(100); // não duplicou no caixa
+      const corpoDepois = (await depois.json()) as { data: { resumo: { totalVendas: number } } };
+      expect(corpoDepois.data.resumo.totalVendas - corpoAntes.data.resumo.totalVendas).toBe(100); // não duplicou no caixa
     });
 
     it("recebimento em venda CANCELADA retorna 400", async () => {
