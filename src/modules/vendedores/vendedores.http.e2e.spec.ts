@@ -137,6 +137,35 @@ describe("HTTP — Vendedores (integração — servidor real)", () => {
     expect(corpo.errors.some((erro) => erro.field === "senha")).toBe(true);
   });
 
+  // Etapa 18.12 — mass assignment de PRIORIDADE MÁXIMA: `senhaHash` é o campo
+  // mais sensível do módulo e NUNCA pode ser aceito diretamente do cliente
+  // (a única forma de definir a senha é o campo `senha`, transformado em hash
+  // pelo service). `codigo` e os agregados de venda também são internos. O
+  // whitelist global (`forbidNonWhitelisted: true`) deve rejeitar o payload
+  // inteiro (400) em vez de simplesmente ignorar os campos extras.
+  it("POST /api/v1/vendedores com senhaHash/codigo/agregados/excluidoEm no payload é rejeitado (400) pelo whitelist global — nunca usados como autoridade", async () => {
+    const resposta = await fetch(`${baseUrl}/api/v1/vendedores`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        nome: "Vendedor Mass Assignment",
+        telefone: telefoneUnico(),
+        ativo: true,
+        senha: "senha123",
+        senhaHash: "$argon2id$v=19$m=19456,t=2,p=1$forjado$forjado",
+        codigo: "VEN-9999",
+        vendas: 999,
+        totalVendido: 999999,
+        ultimaVenda: new Date().toISOString(),
+        criadoEm: new Date().toISOString(),
+        atualizadoEm: new Date().toISOString(),
+        excluidoEm: null,
+        telefoneNormalizado: "00000000000",
+      }),
+    });
+    expect(resposta.status).toBe(400);
+  });
+
   it("fluxo completo: criar → obter → listar (paginação/busca) → status → senha → vendas → atualizar → excluir → 404", async () => {
     const telefone = telefoneUnico();
     const nome = `Vendedor E2E ${Date.now()}`;

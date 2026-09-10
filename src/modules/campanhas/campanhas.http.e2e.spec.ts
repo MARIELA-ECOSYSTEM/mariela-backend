@@ -88,6 +88,29 @@ describe("HTTP — Campanhas (integração — servidor real)", () => {
     expect(corpo.errors.some((erro) => erro.field === "nome")).toBe(true);
   });
 
+  // Etapa 18.11 — mass assignment: `codigo`, `produtosVinculados` e o soft
+  // delete são campos internos/calculados (nunca fazem parte de
+  // `CriarCampanhaDto`). O whitelist global (`forbidNonWhitelisted: true`)
+  // deve rejeitar o payload inteiro (400) em vez de simplesmente ignorar os
+  // campos extras — mesma prova já feita em Coleções (Etapa 18.10).
+  it("POST /api/v1/campanhas com campos internos/calculados no payload é rejeitado (400) pelo whitelist global — nunca usados como autoridade", async () => {
+    const resposta = await fetch(`${baseUrl}/api/v1/campanhas`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        nome: "Campanha Mass Assignment",
+        inicio: "2026-01-01",
+        fim: "2026-03-31",
+        codigo: "CAM-9999",
+        produtosVinculados: 999,
+        criadoEm: new Date().toISOString(),
+        atualizadoEm: new Date().toISOString(),
+        excluidoEm: null,
+      }),
+    });
+    expect(resposta.status).toBe(400);
+  });
+
   it("fluxo completo: criar → obter → listar (paginação/busca) → status → atualizar → excluir → 404", async () => {
     const nome = `Campanha E2E ${Date.now()}`;
 

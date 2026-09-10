@@ -376,6 +376,36 @@ describe("VendedoresService (integração — MongoDB real)", () => {
       const total = await connection.collection("vendedores").countDocuments({ telefoneNormalizado: telefone, excluidoEm: null });
       expect(total).toBe(1); // nunca dois vendedores ativos com o mesmo telefone
     });
+
+    // Etapa 18.12 — mesma corrida de `criar()`, mas em `atualizar()`: dois
+    // vendedores DIFERENTES tentam adotar o MESMO telefone novo ao mesmo
+    // tempo. A pré-checagem (`garantirTelefoneDisponivel`) não fecha essa
+    // janela sozinha — a rede de segurança real é o índice único parcial; o
+    // teste comprova que a corrida termina em erro de negócio tratado
+    // (ApiException), nunca num erro cru de driver vazando da chamada (mesmo
+    // gap já encontrado e corrigido em Clientes/Etapa 18.8 e
+    // Fornecedores/Etapa 18.9).
+    it("duas atualizações concorrentes de vendedores DIFERENTES para o MESMO telefone novo: uma sucede, a outra falha com ApiException (nunca erro cru do driver)", async () => {
+      const telefoneAlvo = telefoneUnico();
+      const vendedorA = await service.criar(payloadVendedor("UpdA"), null);
+      const vendedorB = await service.criar(payloadVendedor("UpdB"), null);
+
+      const resultados = await Promise.allSettled([
+        service.atualizar(vendedorA.id, { nome: vendedorA.nome, telefone: telefoneAlvo, ativo: true }, null),
+        service.atualizar(vendedorB.id, { nome: vendedorB.nome, telefone: telefoneAlvo, ativo: true }, null),
+      ]);
+
+      expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const rejeitado = resultados.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+      expect(rejeitado).toBeDefined();
+      expect(rejeitado?.reason).toBeInstanceOf(ApiException); // nunca um MongoServerError/500 cru
+
+      const total = await connection.collection("vendedores").countDocuments({
+        telefoneNormalizado: telefoneAlvo,
+        excluidoEm: null,
+      });
+      expect(total).toBe(1); // nunca dois vendedores ativos com o mesmo telefone após a corrida
+    });
   });
 });
 
