@@ -215,6 +215,22 @@ describe("EstoqueService (integração — MongoDB real)", () => {
         ),
       ).rejects.toThrow(ApiException);
     });
+
+    // Etapa 18.13 — regra cruzando dois campos opcionais do DTO (`tamanhoId`
+    // XOR `tamanho`), validada em `ProdutosService.ajustarQuantidadeTamanho`
+    // (não no DTO, mesmo critério já usado para `fim >= inicio` em
+    // Coleções/Campanhas) — sem teste dedicado até esta etapa.
+    it("entrada sem tamanhoId E sem tamanho (nome): rejeitada com VALIDATION_ERROR, nunca cria um tamanho vazio", async () => {
+      const produto = await criarProduto();
+      const variante = await produtosService.adicionarVariante(produto.id, { cor: "Rosa" }, null);
+      await expect(
+        service.entrada({ produtoId: produto.id, varianteId: String(variante._id), quantidade: 1 } as EntradaEstoqueDto, null),
+      ).rejects.toThrow(ApiException);
+
+      const final = await produtosService.obterPorId(produto.id);
+      const varFinal = final.variantes.find((v) => String(v._id) === String(variante._id))!;
+      expect(varFinal.tamanhos).toHaveLength(0); // nenhum tamanho "fantasma" criado pela tentativa rejeitada
+    });
   });
 
   describe("listagem", () => {
