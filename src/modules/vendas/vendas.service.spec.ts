@@ -2709,6 +2709,54 @@ describe("VendasService (integração — MongoDB real)", () => {
       await caixasService.fechar(caixa.id, { valorInformado: 1120 }, null);
     });
 
+    it("Etapa 18.25 — listarTodas() devolve todas as vendas, sem paginar", async () => {
+      const produto = await criarProdutoComEstoque(90, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 90 }],
+        },
+        null,
+      );
+
+      const totalNoBanco = await connection.collection("vendas").countDocuments({});
+      const todas = await service.listarTodas();
+      expect(todas).toHaveLength(totalNoBanco);
+      expect(todas.some((item) => item.id === venda.id)).toBe(true);
+      await caixasService.fechar(caixa.id, { valorInformado: 1090 }, null);
+    });
+
+    it("Etapa 18.25 — listarTodas() com mais de 20 vendas nunca trunca (nem cai no limite padrão de listar())", async () => {
+      const produto = await criarProdutoComEstoque(50, 30);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const totalNovas = 22; // > LIMITE_PADRAO (20) de ListarVendasQueryDto
+
+      for (let i = 0; i < totalNovas; i += 1) {
+        await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 50 }],
+          },
+          null,
+        );
+      }
+
+      const totalNoBanco = await connection.collection("vendas").countDocuments({});
+      expect(totalNoBanco).toBeGreaterThan(20);
+
+      const todas = await service.listarTodas();
+      expect(todas).toHaveLength(totalNoBanco);
+
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 + totalNovas * 50 }, null);
+    });
+
     it("obterPorId lança NOT_FOUND para venda inexistente", async () => {
       await expect(service.obterPorId("65f1a2b3c4d5e6f7a8b9c0d1")).rejects.toThrow(ApiException);
     });

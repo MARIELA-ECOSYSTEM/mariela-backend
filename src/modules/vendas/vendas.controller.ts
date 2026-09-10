@@ -1,5 +1,6 @@
-import { Body, Controller, Get, Param, Post, Query, UseGuards } from "@nestjs/common";
+import { Body, Controller, Get, Param, Post, Query, Req, UseGuards } from "@nestjs/common";
 import { ApiBearerAuth, ApiOperation, ApiTags } from "@nestjs/swagger";
+import type { Request } from "express";
 import { CurrentUser } from "../../common/decorators/current-user.decorator.js";
 import { Roles } from "../../common/decorators/roles.decorator.js";
 import { JwtAuthGuard } from "../../common/guards/jwt-auth.guard.js";
@@ -26,9 +27,31 @@ import { RegistrarRecebimentoDto } from "./dto/registrar-recebimento.dto.js";
 export class VendasController {
   constructor(private readonly vendasService: VendasService) {}
 
+  /**
+   * Etapa 18.25 — contrato DUPLO retrocompatível, mesmo padrão exato já
+   * aprovado/implementado em `ClientesController.listar` (13.2),
+   * `FornecedoresController.listar` (14.2), `ColecoesController.listar`
+   * (15.2), `CampanhasController.listar` (16.2), `VendedoresController.listar`
+   * (17.2) e `CaixasController.listar` (18.2): decidido pela presença de
+   * QUALQUER query param na requisição BRUTA (`request.query`, lido ANTES do
+   * `ValidationPipe` preencher os defaults do DTO).
+   *
+   * - `GET /vendas` (zero query params) → contrato LEGADO do Backoffice
+   *   (`vendasApi.listar()`, que nunca envia parâmetro nenhum e espera o
+   *   array COMPLETO de vendas — a tela faz busca/filtro/paginação
+   *   inteiramente no cliente). Ver `VendasService.listarTodas`. Antes desta
+   *   etapa, `VendasController` era o único controller do domínio sem esse
+   *   fallback — vendas além das 20 primeiras (limite padrão de `listar()`)
+   *   ficavam silenciosamente de fora da tela.
+   * - QUALQUER query param presente (`page`, `limit`, `busca`, facetas…) →
+   *   contrato paginado/facetado já existente, inalterado.
+   */
   @Get()
-  @ApiOperation({ summary: "Lista vendas com busca, facetas, ordenação e paginação." })
-  async listar(@Query() query: ListarVendasQueryDto) {
+  @ApiOperation({ summary: "Lista vendas. Sem parâmetros: array completo (contrato legado do Backoffice). Com page/limit/busca/facetas: contrato paginado." })
+  async listar(@Query() query: ListarVendasQueryDto, @Req() request: Request) {
+    if (Object.keys(request.query).length === 0) {
+      return { data: await this.vendasService.listarTodas() };
+    }
     return this.vendasService.listar(query);
   }
 

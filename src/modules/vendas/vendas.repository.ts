@@ -86,6 +86,20 @@ export class VendasRepository {
     }
   }
 
+  /**
+   * Etapa 18.25 — contrato LEGADO do Backoffice, mesmo padrão já aprovado em
+   * Clientes/Fornecedores/Coleções/Campanhas/Vendedores/Caixas: `GET /vendas`
+   * sem NENHUM parâmetro devolve TODAS as vendas (qualquer status, sem
+   * paginar), num array simples — a tela faz busca/filtro/paginação
+   * inteiramente no cliente. Sem `.sort()` de propósito, mesmo critério dos
+   * métodos irmãos (`ClientesRepository.encontrarTodosAtivos`,
+   * `CaixasRepository.listarTodos`, ...): a ordenação é responsabilidade do
+   * chamador desse contrato específico, nunca do repository.
+   */
+  async listarTodas(): Promise<VendaDocument[]> {
+    return this.vendaModel.find().exec();
+  }
+
   async encontrarPorId(id: string): Promise<VendaDocument | null> {
     if (!isValidObjectId(id)) return null;
     return this.vendaModel.findById(id).exec();

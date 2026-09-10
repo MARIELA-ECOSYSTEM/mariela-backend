@@ -382,6 +382,17 @@ export class VendasService {
     }
   }
 
+  /**
+   * Etapa 18.25 — contrato LEGADO do Backoffice (`GET /vendas` sem nenhum
+   * query param), mesmo padrão já aprovado em Clientes/Fornecedores/Coleções/
+   * Campanhas/Vendedores/Caixas: devolve TODAS as vendas, sem truncar pelo
+   * `limit` padrão de `listar()`. Ver `VendasController.listar` para a
+   * decisão de qual contrato usar.
+   */
+  async listarTodas(): Promise<VendaDocument[]> {
+    return this.vendasRepository.listarTodas();
+  }
+
   async listar(query: ListarVendasQueryDto): Promise<ResultadoListaVendas> {
     const selecao: SelecaoFacetas = {
       status: query.status,

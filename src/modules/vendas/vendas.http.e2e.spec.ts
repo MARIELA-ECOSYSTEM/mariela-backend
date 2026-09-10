@@ -182,6 +182,27 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     expect(corpo.facets["status"]).toBeTruthy();
   });
 
+  describe("GET /vendas: contrato duplo retrocompatível (Etapa 18.25)", () => {
+    it("SEM nenhum query param: devolve o array COMPLETO de vendas, sem meta/facets, sem truncar em 20", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas`, { headers: authHeaders() });
+      const corpo = (await resposta.json()) as Record<string, unknown>;
+      expect(resposta.status).toBe(200);
+      expect(Array.isArray(corpo["data"])).toBe(true);
+      expect((corpo["data"] as unknown[]).some((item) => (item as { codigo?: string }).codigo === vendaCodigo)).toBe(true);
+      expect(corpo["meta"]).toBeUndefined();
+      expect(corpo["facets"]).toBeUndefined();
+    });
+
+    it("COM page/limit: preserva o contrato paginado/facetado já existente", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas?page=1&limit=5`, { headers: authHeaders() });
+      const corpo = (await resposta.json()) as { data: unknown[]; meta: { page: number; limit: number }; facets: Record<string, unknown> };
+      expect(resposta.status).toBe(200);
+      expect(corpo.meta.page).toBe(1);
+      expect(corpo.meta.limit).toBe(5);
+      expect(corpo.facets["status"]).toBeTruthy();
+    });
+  });
+
   it("GET /api/v1/vendas/estatisticas retorna as métricas agregadas", async () => {
     const resposta = await fetch(`${baseUrl}/api/v1/vendas/estatisticas`, { headers: authHeaders() });
     const corpo = (await resposta.json()) as { data: { totalVendas: number } };
