@@ -15,13 +15,31 @@ import { StructuredLoggerService } from "./common/logger/structured-logger.servi
 import { validationExceptionFactory } from "./common/pipes/validation-exception-factory.js";
 import type { ApiErrorResponse } from "./common/types/api-response.interface.js";
 
+/**
+ * Etapa 18.23 — fixa o timezone do processo do servidor ANTES de qualquer
+ * outro código rodar, resolvendo a questão transversal já identificada em
+ * etapas anteriores (Dashboard/Vendas/Caixa/Coleções/Campanhas sempre
+ * dependeram do timezone do SO do processo, nunca fixado em lugar nenhum —
+ * um deploy num host/container em UTC produziria "início do dia"/"início do
+ * mês" incorretos para uma loja brasileira). "America/Sao_Paulo" é a única
+ * loja física do ecossistema hoje; se `TZ` já vier definido pelo ambiente
+ * (Docker/systemd/etc.), essa configuração explícita do host tem prioridade
+ * — nunca sobrescrita aqui. Escopado deliberadamente a este processo de
+ * servidor: os testes nunca importam `main.ts` e continuam rodando sob o
+ * timezone ambiente da máquina/CI, exatamente como já validado nos 1156
+ * testes existentes — nenhum comportamento de teste muda por causa disto.
+ */
+if (!process.env["TZ"]) {
+  process.env["TZ"] = "America/Sao_Paulo";
+}
+
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     logger: new StructuredLoggerService(),
   });
 
   const configService = app.get(ConfigService<Configuration>);
-  const { port, apiPrefix } = configService.get("app", { infer: true })!;
+  const { port, apiPrefix, swaggerEnabled } = configService.get("app", { infer: true })!;
   const { origins } = configService.get("cors", { infer: true })!;
 
   app.use(helmet());
@@ -42,14 +60,21 @@ async function bootstrap(): Promise<void> {
   app.useGlobalFilters(new HttpExceptionFilter());
   app.useGlobalInterceptors(new ResponseInterceptor());
 
-  const swaggerConfig = new DocumentBuilder()
-    .setTitle("MARIELA API")
-    .setDescription("API REST central do ecossistema MARIELA (Backoffice, PDV, Vitrine Virtual, Integrações).")
-    .setVersion("0.1.0")
-    .addBearerAuth()
-    .build();
-  const swaggerDocument = SwaggerModule.createDocument(app, swaggerConfig);
-  SwaggerModule.setup("docs", app, swaggerDocument);
+  // Etapa 18.23 — fora de produção, sempre habilitado; em produção, só com
+  // `SWAGGER_ENABLED=true` explícito (ver `configuration.ts#swaggerEnabled`).
+  // Expor o schema completo da API publicamente por padrão em produção não é
+  // necessário para o modo de operação atual (Backoffice/PDV internos) e é
+  // evitável sem custo — quem precisar dele em produção liga por opção.
+  if (swaggerEnabled) {
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle("MARIELA API")
+      .setDescription("API REST central do ecossistema MARIELA (Backoffice, PDV, Vitrine Virtual, Integrações).")
+      .setVersion("0.1.0")
+      .addBearerAuth()
+      .build();
+    const swaggerDocument = SwaggerModule.createDocument(app, swaggerConfig);
+    SwaggerModule.setup("docs", app, swaggerDocument);
+  }
 
   // As rotas dos controllers só são de fato montadas no adapter HTTP durante
   // `init()` (chamado implicitamente por `listen()`). Chamando-o explicitamente
@@ -80,7 +105,11 @@ async function bootstrap(): Promise<void> {
   const logger = new Logger("Bootstrap");
   logger.log(`API disponível em http://localhost:${port}/${apiPrefix}`);
   logger.log(`Health check em http://localhost:${port}/health`);
-  logger.log(`Documentação Swagger em http://localhost:${port}/docs`);
+  logger.log(
+    swaggerEnabled
+      ? `Documentação Swagger em http://localhost:${port}/docs`
+      : "Documentação Swagger desabilitada (produção sem SWAGGER_ENABLED=true).",
+  );
 }
 
 void bootstrap();

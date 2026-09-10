@@ -4,6 +4,9 @@
   "private": true,
   "description": "MARIELA — API REST (NestJS) consumida pelo Backoffice, PDV, Vitrine Virtual e Integrações.",
   "type": "module",
+  "engines": {
+    "bun": ">=1.4.0"
+  },
   "scripts": {
     "build": "nest build",
     "start": "nest start",
@@ -38,5 +41,8 @@
     "@types/node": "^26.4.1",
     "source-map-support": "^0.5.21",
     "typescript": "^6"
+  },
+  "overrides": {
+    "multer": "2.3.0"
   }
 }

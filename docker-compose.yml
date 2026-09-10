@@ -1,0 +1,30 @@
+# Etapa 18.23 — orquestração mínima para rodar o backend + MongoDB num único
+# host (o cenário de implantação mais simples para a loja física: uma
+# máquina/servidor único, sem necessidade de um cluster).
+#
+# Não substitui uma estratégia de backup: o volume nomeado `mongodb_data`
+# persiste os dados no host, mas backup/retenção/teste de restore continuam
+# sendo responsabilidade operacional (ver README.md, seção "Backup").
+services:
+  mongodb:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - mongodb
+    env_file:
+      - .env
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017/mariela
+    ports:
+      - "3000:3000"
+
+volumes:
+  mongodb_data:
