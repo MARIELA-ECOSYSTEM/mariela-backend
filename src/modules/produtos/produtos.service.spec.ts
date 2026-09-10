@@ -253,5 +253,97 @@ describe("ProdutosService (integração — MongoDB real)", () => {
         service.definirPromocao(produto.id, { ehPromocao: true, precoPromocional: 100 }, null),
       ).rejects.toThrow(ApiException);
     });
+
+    // Etapa 18.7 — margem negativa é matematicamente válida (venda abaixo do
+    // custo, ex.: liquidação de prejuízo) e não deve ser bloqueada nem
+    // arredondada para zero: só o preço efetivo <= 0 devolve 0 (ver `precos.util.ts`).
+    it("permite e calcula corretamente margem negativa (venda abaixo do custo)", async () => {
+      const produto = await service.criar(payloadProduto("U", { precoCusto: 100, precoVenda: 50 }), null);
+      expect(produto.margemLucro).toBe(-100); // (50-100)/50*100
+    });
+  });
+
+  /**
+   * Etapa 18.7 — prova de concorrência REAL (Promise.all/allSettled contra o
+   * MongoDB de teste), não apenas descrição das estratégias já documentadas
+   * no código (`SequenciasRepository.proximoValor` para o código sequencial,
+   * `adicionarVarianteAtomico`/`$push` atômico para cor, `salvarComRetentativa`
+   * com retry em `VersionError` para as demais mutações do documento).
+   */
+  describe("concorrência (Etapa 18.7)", () => {
+    it("L/M. 15 criações concorrentes: todas succeed, todos os codProduto são distintos (nenhuma colisão)", async () => {
+      const resultados = await Promise.allSettled(
+        Array.from({ length: 15 }, (_, indice) => service.criar(payloadProduto(`CONC-${indice}`), null)),
+      );
+      expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);
+
+      const codigos = resultados
+        .filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof service.criar>>> => r.status === "fulfilled")
+        .map((r) => r.value.codProduto);
+      expect(new Set(codigos).size).toBe(15); // nenhum código repetido sob concorrência real
+    });
+
+    it("variantes com cores DIFERENTES adicionadas concorrentemente ao MESMO produto: todas persistem, quantidadeTotal nunca perde escrita", async () => {
+      const produto = await service.criar(payloadProduto("CONC-VAR"), null);
+      const cores = ["Preto", "Branco", "Azul", "Verde", "Vermelho", "Amarelo"];
+
+      const resultados = await Promise.allSettled(cores.map((cor) => service.adicionarVariante(produto.id, { cor }, null)));
+      expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);
+
+      const final = await service.obterPorId(produto.id);
+      expect(final.variantes).toHaveLength(cores.length); // nenhuma variante perdida por escrita concorrente
+      expect(new Set(final.variantes.map((v) => v.corNormalizada)).size).toBe(cores.length);
+    });
+
+    it("variantes com a MESMA cor adicionadas concorrentemente ao mesmo produto: só UMA vence, as demais são rejeitadas (nunca duplicam)", async () => {
+      const produto = await service.criar(payloadProduto("CONC-VAR-DUP"), null);
+
+      const resultados = await Promise.allSettled(
+        Array.from({ length: 5 }, () => service.adicionarVariante(produto.id, { cor: "Preto" }, null)),
+      );
+      const sucesso = resultados.filter((r) => r.status === "fulfilled");
+      const falha = resultados.filter((r) => r.status === "rejected");
+      expect(sucesso).toHaveLength(1);
+      expect(falha).toHaveLength(4);
+
+      const final = await service.obterPorId(produto.id);
+      expect(final.variantes.filter((v) => v.corNormalizada === "preto")).toHaveLength(1);
+    });
+
+    it("dois tamanhos DIFERENTES adicionados concorrentemente à MESMA variante: ambos persistem via retry de salvarComRetentativa (nenhum lost update)", async () => {
+      const produto = await service.criar(payloadProduto("CONC-TAM"), null);
+      const variante = await service.adicionarVariante(produto.id, { cor: "Preto" }, null);
+
+      const resultados = await Promise.allSettled([
+        service.adicionarTamanho(produto.id, String(variante._id), { tamanho: "P", quantidade: 5 }, null),
+        service.adicionarTamanho(produto.id, String(variante._id), { tamanho: "M", quantidade: 7 }, null),
+      ]);
+      expect(resultados.every((r) => r.status === "fulfilled")).toBe(true); // sem VersionError vazando ao chamador
+
+      const final = await service.obterPorId(produto.id);
+      const varFinal = final.variantes.find((v) => String(v._id) === String(variante._id))!;
+      expect(varFinal.tamanhos).toHaveLength(2); // os dois tamanhos sobreviveram, nenhum sobrescrito
+      expect(varFinal.quantidadeVariante).toBe(12); // 5 + 7 — derivado corretamente após o retry
+      expect(final.quantidadeTotal).toBe(12);
+    });
+
+    it("duas atualizações concorrentes do MESMO produto: ambas succeed via retry otimista, documento final consistente", async () => {
+      const produto = await service.criar(payloadProduto("CONC-UPD", { precoCusto: 50, precoVenda: 100 }), null);
+      const dtoBase = { nome: produto.nome, categoria: produto.categoria, precoCusto: 50, ehNovidade: false };
+
+      const resultados = await Promise.allSettled([
+        service.atualizar(produto.id, { ...dtoBase, precoVenda: 120 }, null),
+        service.atualizar(produto.id, { ...dtoBase, precoVenda: 150 }, null),
+      ]);
+      expect(resultados.every((r) => r.status === "fulfilled")).toBe(true); // retry absorve o VersionError, nunca propaga 409 ao chamador
+
+      const final = await service.obterPorId(produto.id);
+      expect([120, 150]).toContain(final.precoVenda); // uma das duas escritas venceu por último — nunca um valor corrompido/misturado
+      expect(final.margemLucro).toBe(calcularMargemEsperada(50, final.precoVenda));
+    });
   });
 });
+
+function calcularMargemEsperada(custo: number, precoEfetivoValor: number): number {
+  return Number((((precoEfetivoValor - custo) / precoEfetivoValor) * 100).toFixed(2));
+}

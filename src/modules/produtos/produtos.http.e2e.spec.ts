@@ -473,4 +473,53 @@ describe("HTTP — Produtos (integração — servidor real)", () => {
       expect(corpo.data.fotoPrincipalVarianteId).toBeNull();
     });
   });
+
+  /**
+   * Etapa 18.7 — concorrência REAL na fronteira HTTP (requisições `fetch`
+   * genuinamente concorrentes, não apenas chamadas de função em paralelo):
+   * prova que a geração de código sequencial e a inserção atômica de
+   * variante seguram sob concorrência mesmo passando por todo o pipeline
+   * (Guard → ValidationPipe → Controller → Service → MongoDB).
+   */
+  describe("concorrência real via HTTP (Etapa 18.7)", () => {
+    it("10 POST /produtos genuinamente concorrentes nunca colidem em codProduto", async () => {
+      const respostas = await Promise.all(
+        Array.from({ length: 10 }, () =>
+          fetch(`${baseUrl}/api/v1/produtos`, {
+            method: "POST",
+            headers: jsonHeaders(adminAccessToken),
+            body: JSON.stringify(payloadProduto()),
+          }),
+        ),
+      );
+      expect(respostas.every((r) => r.status === 201)).toBe(true);
+
+      const corpos = (await Promise.all(respostas.map((r) => r.json()))) as { data: { codProduto: string } }[];
+      const codigos = corpos.map((c) => c.data.codProduto);
+      expect(new Set(codigos).size).toBe(10);
+    });
+
+    it("2 POST /produtos/:id/variantes concorrentes com a MESMA cor: só um 201, o outro 400 (nunca duas variantes iguais)", async () => {
+      const produto = await criarProdutoViaHttp();
+
+      const respostas = await Promise.all([
+        fetch(`${baseUrl}/api/v1/produtos/${produto.id}/variantes`, {
+          method: "POST",
+          headers: jsonHeaders(adminAccessToken),
+          body: JSON.stringify({ cor: "Turquesa" }),
+        }),
+        fetch(`${baseUrl}/api/v1/produtos/${produto.id}/variantes`, {
+          method: "POST",
+          headers: jsonHeaders(adminAccessToken),
+          body: JSON.stringify({ cor: "turquesa" }),
+        }),
+      ]);
+      const status = respostas.map((r) => r.status).sort();
+      expect(status).toEqual([201, 400]);
+
+      const detalhe = await fetch(`${baseUrl}/api/v1/produtos/${produto.id}`, { headers: jsonHeaders(adminAccessToken) });
+      const corpoDetalhe = (await detalhe.json()) as { data: { variantes: unknown[] } };
+      expect(corpoDetalhe.data.variantes).toHaveLength(1);
+    });
+  });
 });
