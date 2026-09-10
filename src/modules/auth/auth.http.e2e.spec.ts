@@ -98,6 +98,26 @@ describe("HTTP — autenticação e proteção de rotas (integração — servid
     expect(resposta.status).toBe(200);
   });
 
+  it("Etapa 18.20 — GET /api/v1/produtos com token ADULTERADO (assinatura inválida) retorna 401", async () => {
+    // Altera o último caractere da assinatura (3ª parte do JWT) — payload
+    // continua decodificável, mas a assinatura não bate mais com o segredo.
+    const partes = accessToken.split(".");
+    const assinaturaAdulterada = partes[2]!.slice(0, -1) + (partes[2]!.endsWith("A") ? "B" : "A");
+    const tokenAdulterado = `${partes[0]}.${partes[1]}.${assinaturaAdulterada}`;
+
+    const resposta = await fetch(`${baseUrl}/api/v1/produtos`, {
+      headers: { authorization: `Bearer ${tokenAdulterado}` },
+    });
+    expect(resposta.status).toBe(401);
+  });
+
+  it("Etapa 18.20 — GET /api/v1/produtos com token malformado (não é um JWT) retorna 401", async () => {
+    const resposta = await fetch(`${baseUrl}/api/v1/produtos`, {
+      headers: { authorization: "Bearer isto-nao-e-um-jwt-valido" },
+    });
+    expect(resposta.status).toBe(401);
+  });
+
   it("POST /api/v1/auth/login com credenciais corretas devolve tokens no envelope padrão", async () => {
     const email = `teste.http.login.${Date.now()}@mariela.dev`;
     const authService = app.get(AuthService);

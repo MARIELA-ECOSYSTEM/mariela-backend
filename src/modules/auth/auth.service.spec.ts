@@ -173,6 +173,25 @@ describe("AuthService (integração — MongoDB real)", () => {
       );
     });
 
+    it("Etapa 18.20 — usuário desativado após emitir o token: refresh rejeita e revoga TODAS as sessões dele", async () => {
+      const email = emailUnico("REFRESH-INATIVO");
+      await service.criarAdminSeed({ nome: "Refresh Inativo", email, senha: "senha-correta-123" });
+
+      const sessao1 = await service.login({ usuario: email, senha: "senha-correta-123" }, contextoTeste);
+      const sessao2 = await service.login({ usuario: email, senha: "senha-correta-123" }, contextoTeste);
+
+      await connection.collection("usuarios").updateOne({ email }, { $set: { ativo: false } });
+
+      await expect(service.refresh({ refreshToken: sessao1.refreshToken }, contextoTeste)).rejects.toThrow(
+        ApiException,
+      );
+      // A desativação já revoga a sessão QUE TENTOU renovar; confirma que a
+      // OUTRA sessão (nunca usada desde a desativação) também foi derrubada.
+      await expect(service.refresh({ refreshToken: sessao2.refreshToken }, contextoTeste)).rejects.toThrow(
+        ApiException,
+      );
+    });
+
     it("detecta reutilização de um refresh token já revogado e derruba a família inteira de sessões", async () => {
       const email = emailUnico("REUSE");
       await service.criarAdminSeed({ nome: "Reuse", email, senha: "senha-correta-123" });
