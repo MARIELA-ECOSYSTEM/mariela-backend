@@ -101,6 +101,16 @@ export class ClientesRepository {
    * versionamento otimista do Mongoose (`__v`); se outra requisição alterou o
    * documento entre a leitura e a gravação, `save()` rejeita com
    * `VersionError` e a operação é refeita do zero.
+   *
+   * Etapa 18.8 — além do `VersionError`, este `save()` também pode colidir
+   * com o índice único parcial de `telefoneNormalizado` (dois clientes
+   * DIFERENTES atualizados concorrentemente para o mesmo telefone novo — a
+   * pré-checagem de `ClientesService.garantirTelefoneDisponivel` não fecha
+   * essa janela sozinha, mesma corrida rara já tratada em `criar()`). Sem
+   * este catch, a corrida vazava como `MongoServerError`/500 cru em vez do
+   * 409 já usado pelo resto do domínio para este caso — confirmado por teste
+   * (`clientes.service.spec.ts`, "duas atualizações concorrentes… para o
+   * MESMO telefone novo") antes desta correção.
    */
   async salvarComRetentativa(id: string, mutar: (cliente: ClienteDocument) => void, tentativas = 3): Promise<ClienteDocument> {
     for (let tentativa = 1; tentativa <= tentativas; tentativa += 1) {
@@ -109,6 +119,9 @@ export class ClientesRepository {
       try {
         return await cliente.save();
       } catch (erro) {
+        if (this.ehErroDeTelefoneDuplicado(erro)) {
+          throw ApiException.conflict("Já existe um cliente cadastrado com este telefone.");
+        }
         if (!(erro instanceof MongooseErrors.VersionError) || tentativa === tentativas) throw erro;
       }
     }

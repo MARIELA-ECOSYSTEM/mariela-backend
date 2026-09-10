@@ -136,6 +136,28 @@ describe("HTTP — Clientes (integração — servidor real)", () => {
     expect(corpo.errors.some((erro) => erro.field === "nome" || erro.field === "telefone")).toBe(true);
   });
 
+  // Etapa 18.8 — mass assignment: `codigo`, os agregados de compra e o soft
+  // delete são campos internos/calculados (nunca fazem parte de `CriarClienteDto`).
+  // O whitelist global (`forbidNonWhitelisted: true`) deve rejeitar o payload
+  // inteiro (400) em vez de simplesmente ignorar os campos extras.
+  it("POST /api/v1/clientes com campos internos/calculados no payload é rejeitado (400) pelo whitelist global — nunca usados como autoridade", async () => {
+    const resposta = await fetch(`${baseUrl}/api/v1/clientes`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        nome: "Cliente Mass Assignment",
+        telefone: telefoneUnico(),
+        codigo: "CLI-9999",
+        compras: 999,
+        totalComprado: 999999,
+        ultimaCompra: new Date().toISOString(),
+        excluidoEm: null,
+        telefoneNormalizado: "00000000000",
+      }),
+    });
+    expect(resposta.status).toBe(400);
+  });
+
   it("fluxo completo: criar → obter → listar (paginação/busca) → atualizar → excluir → 404", async () => {
     const telefone = telefoneUnico();
     const nome = `Cliente E2E ${Date.now()}`;

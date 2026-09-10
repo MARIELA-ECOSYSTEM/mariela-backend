@@ -340,6 +340,34 @@ describe("ClientesService (integração — MongoDB real)", () => {
       const total = await connection.collection("clientes").countDocuments({ telefoneNormalizado: telefone.replace(/\D/g, ""), excluidoEm: null });
       expect(total).toBe(1); // nunca dois clientes ativos com o mesmo telefone
     });
+
+    // Etapa 18.8 — mesma corrida de `criar()`, mas em `atualizar()`: dois
+    // clientes DIFERENTES tentam adotar o MESMO telefone novo ao mesmo tempo.
+    // `garantirTelefoneDisponivel` (pré-checagem) não fecha essa janela sozinha
+    // — a rede de segurança real é o índice único parcial; o teste comprova
+    // que a corrida termina em erro de negócio tratado (ApiException), nunca
+    // num erro cru de driver vazando da chamada.
+    it("duas atualizações concorrentes de clientes DIFERENTES para o MESMO telefone novo: uma sucede, a outra falha com ApiException (nunca erro cru do driver)", async () => {
+      const telefoneAlvo = telefoneUnico();
+      const clienteA = await service.criar(payloadCliente("UpdA"), null);
+      const clienteB = await service.criar(payloadCliente("UpdB"), null);
+
+      const resultados = await Promise.allSettled([
+        service.atualizar(clienteA.id, { nome: clienteA.nome, telefone: telefoneAlvo }, null),
+        service.atualizar(clienteB.id, { nome: clienteB.nome, telefone: telefoneAlvo }, null),
+      ]);
+
+      expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const rejeitado = resultados.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+      expect(rejeitado).toBeDefined();
+      expect(rejeitado?.reason).toBeInstanceOf(ApiException); // nunca um MongoServerError/500 cru
+
+      const total = await connection.collection("clientes").countDocuments({
+        telefoneNormalizado: telefoneAlvo.replace(/\D/g, ""),
+        excluidoEm: null,
+      });
+      expect(total).toBe(1); // nunca dois clientes ativos com o mesmo telefone após a corrida
+    });
   });
 });
 
