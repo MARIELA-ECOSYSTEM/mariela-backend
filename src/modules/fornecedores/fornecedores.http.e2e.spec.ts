@@ -94,6 +94,28 @@ describe("HTTP — Fornecedores (integração — servidor real)", () => {
     expect(corpo.errors.some((erro) => erro.field === "nome")).toBe(true);
   });
 
+  // Etapa 18.9 — mass assignment: `codigo` e os agregados comerciais
+  // (`produtosVinculados`/`valorEmCusto`/`ultimaEntrada`) são campos
+  // internos/calculados (nunca fazem parte de `CriarFornecedorDto`). O
+  // whitelist global (`forbidNonWhitelisted: true`) deve rejeitar o payload
+  // inteiro (400) em vez de simplesmente ignorar os campos extras.
+  it("POST /api/v1/fornecedores com campos internos/calculados no payload é rejeitado (400) pelo whitelist global — nunca usados como autoridade", async () => {
+    const resposta = await fetch(`${baseUrl}/api/v1/fornecedores`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        nome: "Fornecedor Mass Assignment",
+        codigo: "FOR-9999",
+        produtosVinculados: 999,
+        valorEmCusto: 999999,
+        ultimaEntrada: new Date().toISOString(),
+        excluidoEm: null,
+        telefoneNormalizado: "00000000000",
+      }),
+    });
+    expect(resposta.status).toBe(400);
+  });
+
   it("fluxo completo: criar → obter → listar (paginação/busca) → atualizar → excluir → 404", async () => {
     const telefone = telefoneUnico();
     const nome = `Fornecedor E2E ${Date.now()}`;

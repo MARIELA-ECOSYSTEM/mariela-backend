@@ -365,5 +365,33 @@ describe("FornecedoresService (integração — MongoDB real)", () => {
         expect(resultados.filter((r) => r.status === "rejected")).toHaveLength(1);
       }
     });
+
+    // Etapa 18.9 — mesma corrida de `criar()`, mas em `atualizar()`: dois
+    // fornecedores DIFERENTES tentam adotar o MESMO telefone novo ao mesmo
+    // tempo. A pré-checagem (`garantirTelefoneDisponivel`) não fecha essa
+    // janela sozinha — a rede de segurança real é o índice único parcial; o
+    // teste comprova que a corrida termina em erro de negócio tratado
+    // (ApiException), nunca num erro cru de driver vazando da chamada.
+    it("duas atualizações concorrentes de fornecedores DIFERENTES para o MESMO telefone novo: uma sucede, a outra falha com ApiException (nunca erro cru do driver)", async () => {
+      const telefoneAlvo = telefoneUnico();
+      const fornecedorA = await service.criar(payloadFornecedor("UpdA"), null);
+      const fornecedorB = await service.criar(payloadFornecedor("UpdB"), null);
+
+      const resultados = await Promise.allSettled([
+        service.atualizar(fornecedorA.id, { nome: fornecedorA.nome, telefone: telefoneAlvo }, null),
+        service.atualizar(fornecedorB.id, { nome: fornecedorB.nome, telefone: telefoneAlvo }, null),
+      ]);
+
+      expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const rejeitado = resultados.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+      expect(rejeitado).toBeDefined();
+      expect(rejeitado?.reason).toBeInstanceOf(ApiException); // nunca um MongoServerError/500 cru
+
+      const total = await connection.collection("fornecedores").countDocuments({
+        telefoneNormalizado: telefoneAlvo.replace(/\D/g, ""),
+        excluidoEm: null,
+      });
+      expect(total).toBe(1); // nunca dois fornecedores ativos com o mesmo telefone após a corrida
+    });
   });
 });

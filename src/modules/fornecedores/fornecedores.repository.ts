@@ -75,6 +75,17 @@ export class FornecedoresRepository {
    * com o versionamento otimista do Mongoose (`__v`); se outra requisição
    * alterou o documento entre a leitura e a gravação, `save()` rejeita com
    * `VersionError` e a operação é refeita do zero.
+   *
+   * Etapa 18.9 — além do `VersionError`, este `save()` também pode colidir
+   * com o índice único parcial de `telefoneNormalizado` (dois fornecedores
+   * DIFERENTES atualizados concorrentemente para o mesmo telefone novo — a
+   * pré-checagem de `FornecedoresService.garantirTelefoneDisponivel` não
+   * fecha essa janela sozinha, mesma corrida rara já tratada em `criar()` e
+   * já corrigida em `ClientesRepository.salvarComRetentativa`, Etapa 18.8).
+   * Sem este catch, a corrida vazava como `MongoServerError`/500 cru em vez
+   * do 409 já usado pelo resto do domínio para este caso — confirmado por
+   * teste (`fornecedores.service.spec.ts`, "duas atualizações concorrentes…
+   * para o MESMO telefone novo") antes desta correção.
    */
   async salvarComRetentativa(id: string, mutar: (fornecedor: FornecedorDocument) => void, tentativas = 3): Promise<FornecedorDocument> {
     for (let tentativa = 1; tentativa <= tentativas; tentativa += 1) {
@@ -83,6 +94,9 @@ export class FornecedoresRepository {
       try {
         return await fornecedor.save();
       } catch (erro) {
+        if (this.ehErroDeTelefoneDuplicado(erro)) {
+          throw ApiException.conflict("Já existe um fornecedor cadastrado com este telefone.");
+        }
         if (!(erro instanceof MongooseErrors.VersionError) || tentativa === tentativas) throw erro;
       }
     }
