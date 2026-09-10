@@ -3,7 +3,7 @@ import { ConfigModule } from "@nestjs/config";
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import type { Connection } from "mongoose";
+import { Types, type Connection } from "mongoose";
 import configuration from "../../config/configuration.js";
 import { validateEnv } from "../../config/env.validation.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
@@ -163,6 +163,32 @@ describe("PdvAuthService (integração — MongoDB real)", () => {
       // Reapresenta o token JÁ ROTACIONADO (reuso) — deve derrubar até o token novo.
       await expect(service.refresh({ refreshToken: login.refreshToken }, CONTEXTO)).rejects.toThrow(ApiException);
       await expect(service.refresh({ refreshToken: renovado.refreshToken }, CONTEXTO)).rejects.toThrow(ApiException);
+    });
+
+    it("Etapa 18.22 — duas requisições CONCORRENTES com o MESMO refresh token: só uma rotaciona, a outra é rejeitada (CAS real, nunca duas sessões válidas)", async () => {
+      const vendedor = await criarVendedor();
+      const login = await service.login({ codigo: vendedor.codigo, senha: "senha123" }, CONTEXTO);
+
+      const resultados = await Promise.allSettled([
+        service.refresh({ refreshToken: login.refreshToken }, CONTEXTO),
+        service.refresh({ refreshToken: login.refreshToken }, CONTEXTO),
+      ]);
+
+      const sucesso = resultados.filter((r) => r.status === "fulfilled");
+      const falhas = resultados.filter((r) => r.status === "rejected");
+      expect(sucesso).toHaveLength(1);
+      expect(falhas).toHaveLength(1);
+
+      // A corrida perdida é reconhecida como "reutilização" (o token já foi
+      // revogado pela vencedora) — mata a família, inclusive o token novo da
+      // rotação vencedora, mesmo comportamento já provado para reuso sequencial.
+      const vencedora = (sucesso[0] as PromiseFulfilledResult<Awaited<ReturnType<typeof service.refresh>>>).value;
+      await expect(service.refresh({ refreshToken: vencedora.refreshToken }, CONTEXTO)).rejects.toThrow(ApiException);
+
+      const totalSessoesAtivas = await connection
+        .collection("vendedor_refresh_tokens")
+        .countDocuments({ vendedorId: new Types.ObjectId(vendedor.id), revogadoEm: null });
+      expect(totalSessoesAtivas).toBe(0);
     });
 
     it("vendedor desativado depois do login: o próximo refresh é rejeitado e a família inteira é revogada", async () => {

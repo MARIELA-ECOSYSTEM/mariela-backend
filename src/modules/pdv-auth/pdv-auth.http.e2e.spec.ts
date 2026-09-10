@@ -216,6 +216,20 @@ describe("HTTP — PDV Auth (integração — servidor real)", () => {
       expect(resposta.status).toBe(401);
     });
 
+    it("Etapa 18.22 — token bem-formado com assinatura ADULTERADA retorna 401 (nunca aceita por coincidência de formato)", async () => {
+      const vendedor = await criarVendedorSeed();
+      const tokenValido = await assinarTokenPdv({ sub: vendedor.id, vendedorId: vendedor.id, codigo: vendedor.codigo, tipo: "PDV" });
+
+      // Altera o último caractere da assinatura (3ª parte do JWT) — payload
+      // continua decodificável, mas a assinatura não bate mais com o segredo.
+      const partes = tokenValido.split(".");
+      const assinaturaAdulterada = partes[2]!.slice(0, -1) + (partes[2]!.endsWith("A") ? "B" : "A");
+      const tokenAdulterado = `${partes[0]}.${partes[1]}.${assinaturaAdulterada}`;
+
+      const resposta = await fetch(`${baseUrl}/api/v1/pdv/auth/me`, { headers: { authorization: `Bearer ${tokenAdulterado}` } });
+      expect(resposta.status).toBe(401);
+    });
+
     it("token expirado retorna 401", async () => {
       const vendedor = await criarVendedorSeed();
       const tokenExpirado = await assinarTokenPdv(
