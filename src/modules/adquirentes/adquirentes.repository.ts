@@ -14,8 +14,35 @@ export interface ListaAdquirentesResultado {
 export class AdquirentesRepository {
   constructor(@InjectModel(Adquirente.name) private readonly adquirenteModel: Model<AdquirenteDocument>) {}
 
+  /**
+   * `AdquirentesService.criar` já checa nome duplicado ANTES de chamar isto
+   * (defesa primária, mensagem de erro melhor). Este `catch` é só a rede de
+   * segurança para a corrida rara entre essa checagem e a gravação (duas
+   * criações simultâneas com o mesmo nome) — quem perde a corrida esbarra no
+   * índice único parcial de `nomeNormalizado` (erro 11000) e, sem isto,
+   * receberia um 500 cru em vez do 409 já usado pelo resto do domínio para
+   * este mesmo caso (Etapa 18.19, mesmo padrão de
+   * `ClientesRepository.criar`/`FornecedoresRepository.criar`/`VendedoresRepository.criar`).
+   */
   async criar(dados: DadosCriarAdquirente): Promise<AdquirenteDocument> {
-    return this.adquirenteModel.create(dados);
+    try {
+      return await this.adquirenteModel.create(dados);
+    } catch (erro) {
+      if (this.ehErroDeNomeDuplicado(erro)) {
+        throw ApiException.conflict("Já existe uma adquirente cadastrada com este nome.");
+      }
+      throw erro;
+    }
+  }
+
+  private ehErroDeNomeDuplicado(erro: unknown): boolean {
+    if (typeof erro !== "object" || erro === null || !("code" in erro) || (erro as { code: unknown }).code !== 11000) {
+      return false;
+    }
+    const keyPattern = (erro as { keyPattern?: Record<string, unknown> }).keyPattern;
+    if (keyPattern) return "nomeNormalizado" in keyPattern;
+    const mensagem = String((erro as { message?: unknown }).message ?? "");
+    return mensagem.includes("nomeNormalizado");
   }
 
   async encontrarPorId(id: string): Promise<AdquirenteDocument | null> {
@@ -63,6 +90,13 @@ export class AdquirentesRepository {
    * aplica `mutar` e salva com o versionamento otimista do Mongoose (`__v`);
    * se outra requisição alterou o documento entre a leitura e a gravação,
    * `save()` rejeita com `VersionError` e a operação é refeita do zero.
+   *
+   * Etapa 18.19 — além do `VersionError`, este `save()` também pode colidir
+   * com o índice único parcial de `nomeNormalizado` (duas adquirentes
+   * DIFERENTES atualizadas concorrentemente para o mesmo nome novo — a
+   * pré-checagem de `AdquirentesService.garantirNomeDisponivel` não fecha essa
+   * janela sozinha, mesma corrida já corrigida em `criar()` acima e em
+   * `ClientesRepository`/`FornecedoresRepository`/`VendedoresRepository.salvarComRetentativa`).
    */
   async salvarComRetentativa(id: string, mutar: (adquirente: AdquirenteDocument) => void, tentativas = 3): Promise<AdquirenteDocument> {
     for (let tentativa = 1; tentativa <= tentativas; tentativa += 1) {
@@ -71,6 +105,9 @@ export class AdquirentesRepository {
       try {
         return await adquirente.save();
       } catch (erro) {
+        if (this.ehErroDeNomeDuplicado(erro)) {
+          throw ApiException.conflict("Já existe uma adquirente cadastrada com este nome.");
+        }
         if (!(erro instanceof MongooseErrors.VersionError) || tentativa === tentativas) throw erro;
       }
     }

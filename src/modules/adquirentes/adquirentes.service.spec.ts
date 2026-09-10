@@ -77,6 +77,36 @@ describe("AdquirentesService (integração — MongoDB real)", () => {
       await expect(service.criar(payloadAdquirente("x", { nome: "CIELO TESTE XYZ" }), null)).rejects.toBeInstanceOf(ApiException);
     });
 
+    it("Etapa 18.19 — 15 criações concorrentes com o MESMO nome: só uma vence, as demais recebem 409 (nunca um erro cru do Mongo)", async () => {
+      const nome = "Adquirente Corrida Concorrente";
+      const resultados = await Promise.allSettled(
+        Array.from({ length: 15 }, (_, i) => service.criar(payloadAdquirente(`corrida-${i}`, { nome }), null)),
+      );
+      const sucesso = resultados.filter((r) => r.status === "fulfilled");
+      const falhas = resultados.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+      expect(sucesso).toHaveLength(1);
+      expect(falhas).toHaveLength(14);
+      for (const f of falhas) {
+        expect(f.reason).toBeInstanceOf(ApiException);
+      }
+    });
+
+    it("Etapa 18.19 — duas atualizações concorrentes de adquirentes DIFERENTES para o MESMO nome novo: só uma vence, a outra recebe 409", async () => {
+      const a = await service.criar(payloadAdquirente("renomear-a"), null);
+      const b = await service.criar(payloadAdquirente("renomear-b"), null);
+      const nomeNovo = "Adquirente Nome Novo Disputado";
+
+      const resultados = await Promise.allSettled([
+        service.atualizar(a.id, { nome: nomeNovo }, null),
+        service.atualizar(b.id, { nome: nomeNovo }, null),
+      ]);
+      const sucesso = resultados.filter((r) => r.status === "fulfilled");
+      const falhas = resultados.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+      expect(sucesso).toHaveLength(1);
+      expect(falhas).toHaveLength(1);
+      expect(falhas[0]?.reason).toBeInstanceOf(ApiException);
+    });
+
     it("permite cadastrar sem tabela de tarifas e configurar depois", async () => {
       const criada = await service.criar(payloadAdquirente("Sem Tarifa"), null);
       expect(criada.tabelaTarifas).toEqual([]);
