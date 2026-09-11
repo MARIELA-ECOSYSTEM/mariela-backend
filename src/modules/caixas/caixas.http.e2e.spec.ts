@@ -223,6 +223,70 @@ describe("HTTP — Caixas (integração — servidor real)", () => {
     await fecharTudoQueEstiverAberto();
   });
 
+  describe("GET /caixas/:id/movimentacoes: contrato duplo (Etapa 20.01A)", () => {
+    it("SEM page/limit: devolve TODO o histórico, nunca truncado pelo limite padrão (50)", async () => {
+      const abertura = await fetch(`${baseUrl}/api/v1/caixas`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ valorInicial: 100 }),
+      });
+      const { data: caixa } = (await abertura.json()) as { data: { id: string } };
+
+      const quantidade = 55;
+      for (let indice = 0; indice < quantidade; indice += 1) {
+        await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}/entrada`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ descricao: `Ajuste ${indice}`, valor: 1, formaPagamento: "Dinheiro" }),
+        });
+      }
+
+      const resposta = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}/movimentacoes`, { headers: authHeaders() });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as {
+        data: unknown[];
+        meta: { total: number; page: number; limit: number; totalPages: number };
+      };
+      expect(corpo.data).toHaveLength(quantidade);
+      expect(corpo.meta.total).toBe(quantidade);
+      expect(corpo.meta.limit).toBe(quantidade);
+      expect(corpo.meta.totalPages).toBe(1);
+
+      await fecharTudoQueEstiverAberto();
+    });
+
+    it("COM page/limit explícitos: preserva o contrato paginado existente, truncando de verdade", async () => {
+      const abertura = await fetch(`${baseUrl}/api/v1/caixas`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ valorInicial: 100 }),
+      });
+      const { data: caixa } = (await abertura.json()) as { data: { id: string } };
+
+      for (let indice = 0; indice < 5; indice += 1) {
+        await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}/entrada`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ descricao: `Ajuste ${indice}`, valor: 1, formaPagamento: "Dinheiro" }),
+        });
+      }
+
+      const resposta = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}/movimentacoes?page=1&limit=2`, {
+        headers: authHeaders(),
+      });
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as {
+        data: unknown[];
+        meta: { total: number; page: number; limit: number; totalPages: number };
+      };
+      expect(corpo.data).toHaveLength(2);
+      expect(corpo.meta.total).toBe(5);
+      expect(corpo.meta.totalPages).toBe(3);
+
+      await fecharTudoQueEstiverAberto();
+    });
+  });
+
   it("GET /api/v1/caixas com paginação e busca encontra o caixa pelo código", async () => {
     const caixas = await connection.collection("caixas").find().sort({ criadoEm: -1 }).limit(1).toArray();
     const codigo = caixas[0]?.["codigo"] as string;

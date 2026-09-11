@@ -15,6 +15,8 @@ export interface ListarProdutosParams {
   selecao: SelecaoFacetas;
   page: number;
   limit: number;
+  /** Etapa 20.01A — `false` devolve TODOS os itens que casam o filtro, sem `$skip`/`$limit`. Default `true` (comportamento inalterado). */
+  paginar?: boolean;
 }
 
 export interface ListaProdutosResultado {
@@ -101,6 +103,12 @@ export class ProdutosRepository {
     const campoOrdenacao = params.ordenarPor === "precoVenda" ? "precoEfetivoOrdenacao" : params.ordenarPor;
     const direcao = params.ordem === "desc" ? -1 : 1;
     const skip = (params.page - 1) * params.limit;
+    const paginar = params.paginar ?? true;
+
+    /** Estágios de corte de página — omitidos quando `paginar` é `false` (Etapa 20.01A: contrato legado sem truncar). */
+    const estagiosDePaginacao: PipelineStage.FacetPipelineStage[] = paginar
+      ? [{ $skip: skip }, { $limit: params.limit }]
+      : [];
 
     const pipeline: PipelineStage[] = [
       { $match: base },
@@ -167,8 +175,7 @@ export class ProdutosRepository {
           pagina: [
             { $match: filtroCompleto },
             { $sort: { [campoOrdenacao]: direcao } },
-            { $skip: skip },
-            { $limit: params.limit },
+            ...estagiosDePaginacao,
             // Campo só existe para permitir ordenar pelo preço vigente — nunca deve vazar na resposta pública.
             { $unset: "precoEfetivoOrdenacao" },
           ],

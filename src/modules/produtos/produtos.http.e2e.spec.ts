@@ -182,6 +182,71 @@ describe("HTTP — Produtos (integração — servidor real)", () => {
     });
   });
 
+  describe("GET /produtos: contrato duplo (Etapa 20.01A)", () => {
+    it("SEM page/limit: devolve TODOS os produtos que casam o filtro, nunca truncados pelo limite padrão (20)", async () => {
+      const marcador = `Contrato20_01A_${Date.now()}`;
+      const quantidade = 22;
+      for (let indice = 0; indice < quantidade; indice += 1) {
+        await criarProdutoViaHttp({ nome: `${marcador} ${indice}` });
+      }
+
+      // Continua enviando `busca`/`ordenarPor`/`ordem` (como o Backoffice sempre
+      // faz, via `produtosApi.listar`) — só NÃO envia page/limit.
+      const resposta = await fetch(
+        `${baseUrl}/api/v1/produtos?busca=${encodeURIComponent(marcador)}&ordenarPor=nome&ordem=asc`,
+        { headers: jsonHeaders(adminAccessToken) },
+      );
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as {
+        data: { nome: string }[];
+        meta: { total: number; page: number; limit: number; totalPages: number };
+        facets: Record<string, unknown>;
+      };
+      expect(corpo.data).toHaveLength(quantidade);
+      expect(corpo.meta.total).toBe(quantidade);
+      expect(corpo.meta.limit).toBe(quantidade);
+      expect(corpo.meta.page).toBe(1);
+      expect(corpo.meta.totalPages).toBe(1);
+      expect(corpo.facets["categorias"]).toBeTruthy();
+    });
+
+    it("COM page/limit explícitos: preserva o contrato paginado existente, truncando de verdade", async () => {
+      const marcador = `Contrato20_01A_Paginado_${Date.now()}`;
+      for (let indice = 0; indice < 3; indice += 1) {
+        await criarProdutoViaHttp({ nome: `${marcador} ${indice}` });
+      }
+
+      const resposta = await fetch(
+        `${baseUrl}/api/v1/produtos?busca=${encodeURIComponent(marcador)}&page=1&limit=2`,
+        { headers: jsonHeaders(adminAccessToken) },
+      );
+      expect(resposta.status).toBe(200);
+      const corpo = (await resposta.json()) as {
+        data: unknown[];
+        meta: { total: number; page: number; limit: number; totalPages: number };
+      };
+      expect(corpo.data).toHaveLength(2);
+      expect(corpo.meta.total).toBe(3);
+      expect(corpo.meta.page).toBe(1);
+      expect(corpo.meta.limit).toBe(2);
+      expect(corpo.meta.totalPages).toBe(2);
+    });
+
+    it("COM apenas `limit` (sem `page`): já ativa o contrato paginado — nunca o legado", async () => {
+      const marcador = `Contrato20_01A_SoLimit_${Date.now()}`;
+      for (let indice = 0; indice < 3; indice += 1) {
+        await criarProdutoViaHttp({ nome: `${marcador} ${indice}` });
+      }
+
+      const resposta = await fetch(`${baseUrl}/api/v1/produtos?busca=${encodeURIComponent(marcador)}&limit=2`, {
+        headers: jsonHeaders(adminAccessToken),
+      });
+      const corpo = (await resposta.json()) as { data: unknown[]; meta: { total: number; limit: number } };
+      expect(corpo.data).toHaveLength(2);
+      expect(corpo.meta.total).toBe(3);
+    });
+  });
+
   describe("PUT /produtos/:id", () => {
     it("atualiza os dados cadastrais e recalcula a margem", async () => {
       const produto = await criarProdutoViaHttp({ precoCusto: 50, precoVenda: 100 });

@@ -239,14 +239,28 @@ export class CaixasService {
     return this.obterDetalhe(caixa.id);
   }
 
-  async listarMovimentos(caixaId: string, query: ListarMovimentosQueryDto): Promise<{ data: MovimentoCaixaDocument[]; meta: ApiMeta }> {
+  /**
+   * Etapa 20.01A — `paginado` decide se o histórico é truncado por
+   * `page`/`limit` ou devolvido por completo; ver `CaixasController
+   * .movimentacoes` para o critério de quando cada modo é usado. Filtro por
+   * `tipo` e `ordem` são aplicados da mesma forma nos dois modos.
+   */
+  async listarMovimentos(
+    caixaId: string,
+    query: ListarMovimentosQueryDto,
+    paginado = true,
+  ): Promise<{ data: MovimentoCaixaDocument[]; meta: ApiMeta }> {
     await this.caixasRepository.encontrarPorIdOuFalhar(caixaId);
-    const { itens, total } = await this.movimentosRepository.listarPaginadoPorCaixa(caixaId, {
-      tipo: query.tipo,
-      ordem: query.ordem,
-      page: query.page,
-      limit: query.limit,
-    });
+    const { itens, total } = await this.movimentosRepository.listarPaginadoPorCaixa(
+      caixaId,
+      { tipo: query.tipo, ordem: query.ordem, page: query.page, limit: query.limit },
+      paginado,
+    );
+
+    if (!paginado) {
+      return { data: itens, meta: { total, page: 1, limit: total, totalPages: 1 } };
+    }
+
     return {
       data: itens,
       meta: { total, page: query.page, limit: query.limit, totalPages: Math.max(1, Math.ceil(total / query.limit)) },

@@ -106,6 +106,63 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       expect(resultado.meta.total).toBe(1);
       expect(resultado.meta.page).toBe(1);
     });
+
+    it("Etapa 20.01A — paginado=false devolve TODOS os produtos que casam o filtro, sem truncar pelo limit", async () => {
+      const marcador = `SemPaginacao ${Date.now()}`;
+      const quantidade = 22;
+      for (let indice = 0; indice < quantidade; indice += 1) {
+        await service.criar(payloadProduto(`H${indice}`, { nome: `${marcador} ${indice}` }), null);
+      }
+
+      const resultado = await service.listar(
+        {
+          busca: marcador,
+          ordenarPor: "nome",
+          ordem: "asc",
+          page: 1,
+          limit: 20,
+          categorias: [],
+          colecoes: [],
+          campanhas: [],
+          fornecedores: [],
+          estoque: [],
+          promocao: [],
+          novidade: [],
+        },
+        false,
+      );
+
+      expect(resultado.data).toHaveLength(quantidade);
+      expect(resultado.meta.total).toBe(quantidade);
+      expect(resultado.meta.limit).toBe(quantidade);
+      expect(resultado.meta.totalPages).toBe(1);
+    });
+
+    it("Etapa 20.01A — paginado=true (default) continua truncando pelo limit informado", async () => {
+      const marcador = `ComPaginacao ${Date.now()}`;
+      for (let indice = 0; indice < 3; indice += 1) {
+        await service.criar(payloadProduto(`I${indice}`, { nome: `${marcador} ${indice}` }), null);
+      }
+
+      const resultado = await service.listar({
+        busca: marcador,
+        ordenarPor: "nome",
+        ordem: "asc",
+        page: 1,
+        limit: 2,
+        categorias: [],
+        colecoes: [],
+        campanhas: [],
+        fornecedores: [],
+        estoque: [],
+        promocao: [],
+        novidade: [],
+      });
+
+      expect(resultado.data).toHaveLength(2);
+      expect(resultado.meta.total).toBe(3);
+      expect(resultado.meta.totalPages).toBe(2);
+    });
   });
 
   describe("atualização e validação", () => {

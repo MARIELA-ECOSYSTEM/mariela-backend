@@ -83,10 +83,25 @@ export class CaixasController {
     return { data: await this.caixasService.obterDetalhe(id) };
   }
 
+  /**
+   * Etapa 20.01A — contrato DUPLO decidido pela presença explícita de `page`
+   * OU `limit` na query BRUTA (`request.query`, lida ANTES do
+   * `ValidationPipe` preencher os defaults do DTO):
+   *
+   * - SEM `page`/`limit` → contrato LEGADO do Backoffice (`caixasApi
+   *   .movimentacoes(id)`, que nunca envia parâmetro nenhum e espera o
+   *   histórico COMPLETO do caixa — a tela não pagina). `tipo`/`ordem`
+   *   continuam aplicados normalmente.
+   * - `page` OU `limit` presentes → contrato paginado já existente, inalterado.
+   */
   @Get(":id/movimentacoes")
-  @ApiOperation({ summary: "Histórico paginado de movimentações do caixa (injeção/sangria/venda/cancelamento)." })
-  async movimentacoes(@Param("id") id: string, @Query() query: ListarMovimentosQueryDto) {
-    return this.caixasService.listarMovimentos(id, query);
+  @ApiOperation({
+    summary:
+      "Histórico de movimentações do caixa. Sem page/limit: todas (contrato legado do Backoffice). Com page/limit: paginado.",
+  })
+  async movimentacoes(@Param("id") id: string, @Query() query: ListarMovimentosQueryDto, @Req() request: Request) {
+    const paginado = "page" in request.query || "limit" in request.query;
+    return this.caixasService.listarMovimentos(id, query, paginado);
   }
 
   @Post(":id/entrada")

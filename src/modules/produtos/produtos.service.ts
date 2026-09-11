@@ -72,7 +72,15 @@ export class ProdutosService {
     return produto;
   }
 
-  async listar(query: ListarProdutosQueryDto): Promise<ResultadoListaProdutos> {
+  /**
+   * Etapa 20.01A — `paginado` decide se a página `data` é truncada por
+   * `page`/`limit` ou devolvida por completo; ver `ProdutosController.listar`
+   * para o critério de quando cada modo é usado. Busca/ordenação/facetas são
+   * SEMPRE aplicadas da mesma forma nos dois modos — só a paginação em si
+   * muda. Quando `paginado` é `false`, `meta` reflete a lista inteira (mesmo
+   * formato hoje devolvido pelo mock do Backoffice: `limit === total`).
+   */
+  async listar(query: ListarProdutosQueryDto, paginado = true): Promise<ResultadoListaProdutos> {
     const selecao: SelecaoFacetas = {
       categorias: query.categorias,
       colecoes: query.colecoes,
@@ -90,7 +98,16 @@ export class ProdutosService {
       selecao,
       page: query.page,
       limit: query.limit,
+      paginar: paginado,
     });
+
+    if (!paginado) {
+      return {
+        data: itens,
+        meta: { total, page: 1, limit: total, totalPages: 1 },
+        facets,
+      };
+    }
 
     return {
       data: itens,

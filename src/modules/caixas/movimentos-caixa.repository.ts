@@ -156,17 +156,31 @@ export class MovimentosCaixaRepository implements OnModuleInit {
     return this.movimentoModel.find({ dataHora: { $gte: inicio, $lt: fim } }).exec();
   }
 
-  async listarPaginadoPorCaixa(caixaId: string, params: ListarMovimentosParams): Promise<ListaMovimentosResultado> {
+  /**
+   * Etapa 20.01A — `paginar=false` devolve TODO o histórico que casa `tipo`/
+   * `ordem` (sem `.skip()`/`.limit()`), para o contrato legado do Backoffice
+   * (`caixasApi.movimentacoes(id)`, que nunca envia `page`/`limit` e espera o
+   * array completo — sem isto, um caixa com mais movimentações que o limite
+   * padrão tinha histórico antigo ocultado silenciosamente). Default `true`
+   * preserva o comportamento paginado existente para quem já envia `page`/
+   * `limit` explicitamente. Filtro/ordenação são idênticos nos dois modos.
+   */
+  async listarPaginadoPorCaixa(
+    caixaId: string,
+    params: ListarMovimentosParams,
+    paginar = true,
+  ): Promise<ListaMovimentosResultado> {
     const filtro: Record<string, unknown> = { caixaId };
     if (params.tipo.length > 0) filtro["tipo"] = { $in: params.tipo };
 
     const direcao = params.ordem === "asc" ? 1 : -1;
-    const skip = (params.page - 1) * params.limit;
+    let consulta = this.movimentoModel.find(filtro).sort({ dataHora: direcao });
+    if (paginar) {
+      const skip = (params.page - 1) * params.limit;
+      consulta = consulta.skip(skip).limit(params.limit);
+    }
 
-    const [itens, total] = await Promise.all([
-      this.movimentoModel.find(filtro).sort({ dataHora: direcao }).skip(skip).limit(params.limit).exec(),
-      this.movimentoModel.countDocuments(filtro).exec(),
-    ]);
+    const [itens, total] = await Promise.all([consulta.exec(), this.movimentoModel.countDocuments(filtro).exec()]);
 
     return { itens, total };
   }

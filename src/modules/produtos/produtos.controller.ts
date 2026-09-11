@@ -1,5 +1,6 @@
-import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Patch, Post, Put, Query, UseGuards } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Patch, Post, Put, Query, Req, UseGuards } from "@nestjs/common";
 import { ApiBearerAuth, ApiOperation, ApiTags } from "@nestjs/swagger";
+import type { Request } from "express";
 import { CurrentUser } from "../../common/decorators/current-user.decorator.js";
 import { Roles } from "../../common/decorators/roles.decorator.js";
 import { JwtAuthGuard } from "../../common/guards/jwt-auth.guard.js";
@@ -38,10 +39,30 @@ export class ProdutosController {
     return { data: await this.produtosService.criar(dto, usuarioId) };
   }
 
+  /**
+   * Etapa 20.01A — contrato DUPLO decidido pela presença explícita de `page`
+   * OU `limit` na query BRUTA (`request.query`, lida ANTES do `ValidationPipe`
+   * preencher os defaults do DTO) — critério mais estrito que o dos módulos
+   * irmãos (`Object.keys(request.query).length === 0`) porque o Backoffice
+   * SEMPRE envia `busca`/`ordenarPor`/`ordem`/facetas em `produtosApi.listar`,
+   * mesmo sem filtro ativo (ver `ProdutoFiltros`), então "zero query params"
+   * nunca ocorreria de fato aqui.
+   *
+   * - SEM `page`/`limit` → contrato LEGADO do Backoffice: busca/ordenação/
+   *   facetas continuam aplicadas normalmente, mas SEM truncar por página —
+   *   devolve todos os produtos que casam o filtro (a tela faz sua própria
+   *   paginação local sobre o array completo). Ver `ProdutosService.listar`.
+   * - `page` OU `limit` presentes → contrato paginado/facetado já existente,
+   *   inalterado.
+   */
   @Get()
-  @ApiOperation({ summary: "Lista produtos com busca, facetas e paginação." })
-  async listar(@Query() query: ListarProdutosQueryDto) {
-    return this.produtosService.listar(query);
+  @ApiOperation({
+    summary:
+      "Lista produtos com busca e facetas. Sem page/limit: todos os itens filtrados (contrato legado do Backoffice). Com page/limit: paginado.",
+  })
+  async listar(@Query() query: ListarProdutosQueryDto, @Req() request: Request) {
+    const paginado = "page" in request.query || "limit" in request.query;
+    return this.produtosService.listar(query, paginado);
   }
 
   @Get(":id")

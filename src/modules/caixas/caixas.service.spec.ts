@@ -507,6 +507,36 @@ describe("CaixasService (integração — MongoDB real)", () => {
     });
   });
 
+  describe("movimentações — contrato duplo (Etapa 20.01A)", () => {
+    it("paginado=false devolve TODO o histórico, sem truncar pelo limite padrão (50)", async () => {
+      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const quantidade = 55;
+      for (let indice = 0; indice < quantidade; indice += 1) {
+        await service.registrarMovimento(caixa.id, "entrada", { descricao: `Ajuste ${indice}`, valor: 1, formaPagamento: "Dinheiro" }, null);
+      }
+
+      const todos = await service.listarMovimentos(caixa.id, queryMovimentosPadrao(), false);
+      expect(todos.data).toHaveLength(quantidade);
+      expect(todos.meta.total).toBe(quantidade);
+      expect(todos.meta.limit).toBe(quantidade);
+      expect(todos.meta.totalPages).toBe(1);
+      await fecharTudoQueEstiverAberto();
+    });
+
+    it("paginado=true (default) continua truncando pelo limit informado", async () => {
+      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      for (let indice = 0; indice < 5; indice += 1) {
+        await service.registrarMovimento(caixa.id, "entrada", { descricao: `Ajuste ${indice}`, valor: 1, formaPagamento: "Dinheiro" }, null);
+      }
+
+      const pagina = await service.listarMovimentos(caixa.id, queryMovimentosPadrao({ limit: 2, page: 1 }));
+      expect(pagina.data).toHaveLength(2);
+      expect(pagina.meta.total).toBe(5);
+      expect(pagina.meta.totalPages).toBe(3);
+      await fecharTudoQueEstiverAberto();
+    });
+  });
+
   describe("listagem: busca, paginação, ordenação e facetas", () => {
     it("busca por código do caixa encontra o registro", async () => {
       const caixa = await service.abrir({ valorInicial: 100 }, null);
