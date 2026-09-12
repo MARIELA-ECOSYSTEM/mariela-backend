@@ -23,6 +23,7 @@ import { ProdutosModule } from "./modules/produtos/produtos.module.js";
 import { SaudeModule } from "./modules/saude/saude.module.js";
 import { VendasModule } from "./modules/vendas/vendas.module.js";
 import { VendedoresModule } from "./modules/vendedores/vendedores.module.js";
+import { WhatsappModule } from "./modules/whatsapp/whatsapp.module.js";
 
 @Module({
   imports: [
@@ -63,6 +64,7 @@ import { VendedoresModule } from "./modules/vendedores/vendedores.module.js";
     PdvClientesModule,
     PdvProdutosModule,
     PdvVendasModule,
+    WhatsappModule,
   ],
 })
 export class AppModule {}

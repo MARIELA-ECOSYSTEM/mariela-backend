@@ -23,8 +23,87 @@ services:
       - .env
     environment:
       MONGODB_URI: mongodb://mongodb:27017/mariela
+      # Aponta para o serviço `evolution-api` desta mesma composição — só tem
+      # efeito se EVOLUTION_API_KEY (segredo, vem do .env) também estiver
+      # definida; caso contrário a integração de WhatsApp fica desabilitada
+      # (ver `WhatsappService`/`configuration.ts`).
+      EVOLUTION_API_URL: http://evolution-api:8080
     ports:
       - "3000:3000"
 
+  # ---------------------------------------------------------------------------
+  # Evolution API (Etapa Pré-22) — infraestrutura EXTERNA ao MARIELA, usada só
+  # como cliente HTTP (ver `EvolutionApiProvider`). Postgres/Redis abaixo são
+  # exigidos pela própria Evolution API (persistência de instâncias/sessões e
+  # cache/fila internos) — NÃO são o futuro Redis do MARIELA (Etapa 17 do
+  # roadmap geral): propositalmente isolados em rede/volumes próprios, nunca
+  # reaproveitados pelo serviço `api` acima.
+  #
+  # Versão pinada em v2.3.7 (última estável antes da série 2.4.x, que passou a
+  # exigir ativação de licença) — não usar `latest`. Reavaliar a versão junto
+  # com a licença antes de qualquer upgrade (ver relatório da Etapa Pré-22).
+  #
+  # `profiles: [whatsapp]` — nenhum destes 3 serviços sobe com um `docker
+  # compose up` comum (o comportamento existente de `mongodb`+`api` continua
+  # idêntico ao de antes desta etapa). Para incluir o WhatsApp:
+  #   docker compose --profile whatsapp up
+  # ---------------------------------------------------------------------------
+  evolution-postgres:
+    image: postgres:15
+    restart: unless-stopped
+    profiles: ["whatsapp"]
+    environment:
+      POSTGRES_USER: evolution
+      POSTGRES_PASSWORD: evolution
+      POSTGRES_DB: evolution
+    volumes:
+      - evolution_postgres_data:/var/lib/postgresql/data
+    networks:
+      - evolution-net
+
+  evolution-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    profiles: ["whatsapp"]
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - evolution_redis_data:/data
+    networks:
+      - evolution-net
+
+  evolution-api:
+    image: atendai/evolution-api:v2.3.7
+    restart: unless-stopped
+    profiles: ["whatsapp"]
+    depends_on:
+      - evolution-postgres
+      - evolution-redis
+    environment:
+      SERVER_URL: http://localhost:8081
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY:?defina EVOLUTION_API_KEY no .env antes de subir --profile whatsapp}
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://evolution:evolution@evolution-postgres:5432/evolution?schema=evolution_api
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://evolution-redis:6379/1
+    volumes:
+      - evolution_instances:/evolution/instances
+    ports:
+      # Host 8081, nunca 8080: o dev server (Vite) do Backoffice já usa 8080.
+      - "8081:8080"
+    networks:
+      - evolution-net
+      - default
+
 volumes:
   mongodb_data:
+  evolution_postgres_data:
+  evolution_redis_data:
+  evolution_instances:
+
+networks:
+  evolution-net:
+    # Rede própria da Evolution API (ela + seu Postgres/Redis internos) — o
+    # serviço `api` do MARIELA fala com `evolution-api` pela rede `default`
+    # (ver acima), nunca acessa `evolution-postgres`/`evolution-redis`
+    # diretamente.
+    driver: bridge

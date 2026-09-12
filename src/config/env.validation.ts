@@ -90,6 +90,35 @@ class EnvironmentVariables {
   @IsOptional()
   @IsIn(["true", "false"], { message: "SWAGGER_ENABLED deve ser \"true\" ou \"false\"." })
   SWAGGER_ENABLED?: string;
+
+  /**
+   * Etapa Pré-22 — WhatsApp via Evolution API/Baileys. Deliberadamente
+   * OPCIONAIS (nenhum `@IsNotEmpty`/obrigatoriedade): ausentes, a integração
+   * fica desabilitada (`WhatsappService` responde `WHATSAPP_NOT_CONFIGURED`)
+   * em vez de impedir o boot da API — mesmo racional de outras etapas ainda
+   * não ativadas neste ambiente (dev/test nunca precisam da Evolution rodando).
+   */
+  @IsOptional()
+  @IsString()
+  WHATSAPP_OWNER_PHONE = "";
+
+  @IsOptional()
+  @IsString()
+  EVOLUTION_API_URL = "";
+
+  @IsOptional()
+  @IsString()
+  EVOLUTION_API_KEY = "";
+
+  @IsOptional()
+  @IsString()
+  EVOLUTION_INSTANCE_NAME = "mariela-whatsapp";
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1000)
+  EVOLUTION_TIMEOUT_MS = 10000;
 }
 
 const CAMPOS_SEGREDO_JWT = [

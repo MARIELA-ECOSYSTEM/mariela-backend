@@ -34,12 +34,31 @@ export interface CorsConfig {
   origins: string[];
 }
 
+/**
+ * Etapa Pré-22 — WhatsApp via Evolution API/Baileys. `ownerPhone` é o número
+ * da loja (identidade da instância, não um segredo); `evolution.*` é
+ * credencial/infraestrutura técnica. Nenhum dos dois é lido fora deste
+ * namespace (ver `WhatsappModule`). Tudo opcional: ausência de
+ * `evolution.apiUrl`/`apiKey` só desabilita a integração (`WhatsappService`
+ * responde `WHATSAPP_NOT_CONFIGURED`), nunca impede o boot da API.
+ */
+export interface WhatsappConfig {
+  ownerPhone: string;
+  evolution: {
+    apiUrl: string;
+    apiKey: string;
+    instanceName: string;
+    timeoutMs: number;
+  };
+}
+
 export interface Configuration {
   app: AppConfig;
   database: DatabaseConfig;
   jwt: JwtConfig;
   pdvJwt: PdvJwtConfig;
   cors: CorsConfig;
+  whatsapp: WhatsappConfig;
 }
 
 export default (): Configuration => {
@@ -73,6 +92,15 @@ export default (): Configuration => {
         .split(",")
         .map((origem) => origem.trim())
         .filter(Boolean),
+    },
+    whatsapp: {
+      ownerPhone: process.env["WHATSAPP_OWNER_PHONE"] ?? "",
+      evolution: {
+        apiUrl: process.env["EVOLUTION_API_URL"] ?? "",
+        apiKey: process.env["EVOLUTION_API_KEY"] ?? "",
+        instanceName: process.env["EVOLUTION_INSTANCE_NAME"] ?? "mariela-whatsapp",
+        timeoutMs: Number(process.env["EVOLUTION_TIMEOUT_MS"] ?? 10000),
+      },
     },
   };
 };

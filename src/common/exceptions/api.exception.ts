@@ -87,4 +87,57 @@ export class ApiException extends HttpException {
   static userInactive(message = "Este usuário foi desativado."): ApiException {
     return new ApiException({ statusCode: HttpStatus.UNAUTHORIZED, code: ERROR_CODES.USER_INACTIVE, message });
   }
+
+  /** Evolution API inacessível (rede, DNS, conexão recusada) — nunca confundido com "não configurado". */
+  static evolutionUnavailable(message = "Serviço de WhatsApp indisponível no momento."): ApiException {
+    return new ApiException({
+      statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+      code: ERROR_CODES.EVOLUTION_UNAVAILABLE,
+      message,
+    });
+  }
+
+  /** `EVOLUTION_API_URL`/`EVOLUTION_API_KEY` ausentes — integração nunca foi configurada neste ambiente. */
+  static whatsappNotConfigured(message = "Integração de WhatsApp não configurada neste ambiente."): ApiException {
+    return new ApiException({
+      statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+      code: ERROR_CODES.WHATSAPP_NOT_CONFIGURED,
+      message,
+    });
+  }
+
+  /** Instância existe mas não está com sessão WhatsApp ativa (precisa conectar/escanear QR). */
+  static whatsappNotConnected(message = "O WhatsApp da loja não está conectado."): ApiException {
+    return new ApiException({
+      statusCode: HttpStatus.CONFLICT,
+      code: ERROR_CODES.WHATSAPP_NOT_CONNECTED,
+      message,
+    });
+  }
+
+  static whatsappInvalidNumber(message = "Telefone inválido para envio de WhatsApp.", errors: ApiFieldError[] = []): ApiException {
+    return new ApiException({
+      statusCode: HttpStatus.BAD_REQUEST,
+      code: ERROR_CODES.WHATSAPP_INVALID_NUMBER,
+      message,
+      errors,
+    });
+  }
+
+  /** A Evolution API respondeu, mas recusou/falhou o envio (não mascarar como sucesso). */
+  static whatsappSendFailed(message = "Não foi possível enviar a mensagem pelo WhatsApp."): ApiException {
+    return new ApiException({
+      statusCode: HttpStatus.BAD_GATEWAY,
+      code: ERROR_CODES.WHATSAPP_SEND_FAILED,
+      message,
+    });
+  }
+
+  static whatsappTimeout(message = "Tempo esgotado ao comunicar com o provedor de WhatsApp."): ApiException {
+    return new ApiException({
+      statusCode: HttpStatus.GATEWAY_TIMEOUT,
+      code: ERROR_CODES.WHATSAPP_TIMEOUT,
+      message,
+    });
+  }
 }
