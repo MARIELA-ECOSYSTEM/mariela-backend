@@ -102,12 +102,32 @@ describe("EvolutionApiProvider", () => {
       expect((await provider.conectar()).status).toBe("CONNECTED");
     });
 
-    it("devolve o QR code em base64 quando presente na resposta", async () => {
+    it("devolve o QR code em base64 quando presente na resposta (forma achatada — connecting/close)", async () => {
       globalThis.fetch = (async () => respostaJson({ base64: "data:image/png;base64,ABC123" })) as typeof fetch;
       const provider = new EvolutionApiProvider(configServiceFake());
       const status = await provider.conectar();
       expect(status.status).toBe("QRCODE");
       expect(status.qrCode).toBe("data:image/png;base64,ABC123");
+    });
+
+    it("devolve o QR code quando vem na forma aninhada `qrcode.base64` (fallback de estado desconhecido)", async () => {
+      globalThis.fetch = (async () =>
+        respostaJson({
+          instance: { instanceName: "mariela-whatsapp-teste", status: "algum-estado-nao-mapeado" },
+          qrcode: { base64: "data:image/png;base64,ANINHADO", code: "2@pareamento" },
+        })) as typeof fetch;
+      const provider = new EvolutionApiProvider(configServiceFake());
+      const status = await provider.conectar();
+      expect(status.status).toBe("QRCODE");
+      expect(status.qrCode).toBe("data:image/png;base64,ANINHADO");
+    });
+
+    it("NUNCA fabrica uma imagem a partir de `code` (string de pareamento, não bytes de PNG) — devolve CONNECTING sem QR", async () => {
+      globalThis.fetch = (async () => respostaJson({ code: "2@y8eK+bjtEjUWy9/algum-pareamento", count: 1 })) as typeof fetch;
+      const provider = new EvolutionApiProvider(configServiceFake());
+      const status = await provider.conectar();
+      expect(status.status).toBe("CONNECTING");
+      expect(status.qrCode).toBeNull();
     });
 
     it("devolve CONNECTING quando não há QR nem estado open", async () => {
@@ -118,7 +138,7 @@ describe("EvolutionApiProvider", () => {
   });
 
   describe("desconectar", () => {
-    it("chama POST /instance/logout e devolve DISCONNECTED", async () => {
+    it("chama DELETE /instance/logout (não POST) — corrigido na auditoria pós-commit contra o router real da Evolution API 2.3.7", async () => {
       let metodoUsado = "";
       globalThis.fetch = (async (url: string, init?: RequestInit) => {
         metodoUsado = init?.method ?? "";
@@ -129,14 +149,112 @@ describe("EvolutionApiProvider", () => {
       const provider = new EvolutionApiProvider(configServiceFake());
       const status = await provider.desconectar();
 
-      expect(metodoUsado).toBe("POST");
+      expect(metodoUsado).toBe("DELETE");
       expect(status.status).toBe("DISCONNECTED");
     });
 
-    it("é idempotente: desconectar uma instância já desconectada também responde OK", async () => {
-      globalThis.fetch = (async () => respostaJson({ status: "SUCCESS" })) as typeof fetch;
+    it("logout de instância aberta (2xx) devolve DISCONNECTED diretamente, sem consultar connectionState", async () => {
+      let chamadasConnectionState = 0;
+      globalThis.fetch = (async (url: string) => {
+        if (url.includes("connectionState")) chamadasConnectionState += 1;
+        return respostaJson({ status: "SUCCESS", error: false, response: { message: "Instance logged out" } });
+      }) as typeof fetch;
+
       const provider = new EvolutionApiProvider(configServiceFake());
-      await expect(provider.desconectar()).resolves.toMatchObject({ status: "DISCONNECTED" });
+      const status = await provider.desconectar();
+
+      expect(status.status).toBe("DISCONNECTED");
+      expect(chamadasConnectionState).toBe(0);
+    });
+
+    it("logout já desconectado (400 real da Evolution) é tratado como sucesso idempotente SOMENTE após confirmar via connectionState que o estado é close", async () => {
+      globalThis.fetch = (async (url: string, init?: RequestInit) => {
+        if (init?.method === "DELETE") {
+          return respostaJson({ message: 'The "mariela-whatsapp-teste" instance is not connected' }, 400);
+        }
+        expect(url).toContain("/instance/connectionState/mariela-whatsapp-teste");
+        return respostaJson({ instance: { instanceName: "mariela-whatsapp-teste", state: "close" } });
+      }) as typeof fetch;
+
+      const provider = new EvolutionApiProvider(configServiceFake());
+      const status = await provider.desconectar();
+
+      expect(status.status).toBe("DISCONNECTED");
+    });
+
+    it("outro 400 (connectionState NÃO confirma close) continua sendo erro — não presume sucesso só pelo status", async () => {
+      globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+        if (init?.method === "DELETE") {
+          return respostaJson({ message: "Bad Request — algum outro motivo" }, 400);
+        }
+        return respostaJson({ instance: { state: "open" } });
+      }) as typeof fetch;
+
+      const provider = new EvolutionApiProvider(configServiceFake());
+      try {
+        await provider.desconectar();
+        throw new Error("deveria ter lançado");
+      } catch (erro) {
+        expect(erro).toBeInstanceOf(ApiException);
+        expect((erro as ApiException).code).toBe("EVOLUTION_UNAVAILABLE");
+      }
+    });
+
+    it("401 (autenticação) é propagado como erro, nunca como sucesso", async () => {
+      globalThis.fetch = (async () => respostaJson({ message: "Unauthorized" }, 401)) as typeof fetch;
+      const provider = new EvolutionApiProvider(configServiceFake());
+      await expect(provider.desconectar()).rejects.toThrow(ApiException);
+    });
+
+    it("403 (autorização) é propagado como erro, nunca como sucesso", async () => {
+      globalThis.fetch = (async () => respostaJson({ message: "Forbidden" }, 403)) as typeof fetch;
+      const provider = new EvolutionApiProvider(configServiceFake());
+      await expect(provider.desconectar()).rejects.toThrow(ApiException);
+    });
+
+    it("404 (instância inexistente) mantém o tratamento existente (WHATSAPP_NOT_CONNECTED)", async () => {
+      globalThis.fetch = (async () => respostaJson({ message: "not found" }, 404)) as typeof fetch;
+      const provider = new EvolutionApiProvider(configServiceFake());
+      try {
+        await provider.desconectar();
+        throw new Error("deveria ter lançado");
+      } catch (erro) {
+        expect(erro).toBeInstanceOf(ApiException);
+        expect((erro as ApiException).code).toBe("WHATSAPP_NOT_CONNECTED");
+      }
+    });
+
+    it("500 (Evolution indisponível/falha externa) é propagado como EVOLUTION_UNAVAILABLE", async () => {
+      globalThis.fetch = (async () => respostaJson({ message: "Internal Server Error" }, 500)) as typeof fetch;
+      const provider = new EvolutionApiProvider(configServiceFake());
+      try {
+        await provider.desconectar();
+        throw new Error("deveria ter lançado");
+      } catch (erro) {
+        expect(erro).toBeInstanceOf(ApiException);
+        expect((erro as ApiException).code).toBe("EVOLUTION_UNAVAILABLE");
+      }
+    });
+
+    it("timeout no logout lança WHATSAPP_TIMEOUT", async () => {
+      globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const erro = new Error("The operation was aborted.");
+            erro.name = "AbortError";
+            reject(erro);
+          });
+        });
+      }) as typeof fetch;
+
+      const provider = new EvolutionApiProvider(configServiceFake({ timeoutMs: 20 }));
+      try {
+        await provider.desconectar();
+        throw new Error("deveria ter lançado");
+      } catch (erro) {
+        expect(erro).toBeInstanceOf(ApiException);
+        expect((erro as ApiException).code).toBe("WHATSAPP_TIMEOUT");
+      }
     });
   });
 

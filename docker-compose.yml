@@ -72,7 +72,10 @@ services:
       - evolution-net
 
   evolution-api:
-    image: atendai/evolution-api:v2.3.7
+    # Namespace corrigido (auditoria pós-commit): `atendai/evolution-api` não
+    # publica mais tags 2.x além de v2.2.3 — o projeto migrou para
+    # `evoapicloud/evolution-api`, onde a tag v2.3.7 realmente existe.
+    image: evoapicloud/evolution-api:v2.3.7
     restart: unless-stopped
     profiles: ["whatsapp"]
     depends_on:
