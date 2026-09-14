@@ -72,7 +72,9 @@ docker compose up --build -d
 
 Sobe a API (`Dockerfile`, multi-stage, usuário não-root, `HEALTHCHECK` embutido usando `/health`) e um MongoDB de conveniência num único host — o cenário mais simples de implantação para a loja física. `docker-compose.yml` espera um `.env` já preenchido no diretório do projeto (`env_file: .env`).
 
-> O `Dockerfile`/`docker-compose.yml` foram escritos e revisados nesta etapa mas **não foram validados com um build real** (ambiente de desenvolvimento sem Docker disponível) — valide `docker compose up --build` antes do primeiro uso em produção.
+A porta do MongoDB (27017) é publicada só em `127.0.0.1` (loopback do próprio host) — suficiente para `mongosh`/`mongodump` administrativos locais, mas não alcançável pela rede. O Mongo deste compose **ainda não tem autenticação configurada**; isso é uma pendência conhecida antes de um ambiente produtivo real (ver relatório da Etapa 27) — não depender só do isolamento de rede como única defesa.
+
+> O `Dockerfile`/`docker-compose.yml` foram escritos e revisados mas **não foram validados com um build/subida reais** (ambiente de desenvolvimento sem Docker disponível) — valide `docker compose up --build` antes do primeiro uso em produção.
 
 Para um deploy sem Docker, compile e rode diretamente:
 
@@ -93,7 +95,7 @@ Se o MongoDB de produção for auto-hospedado (ex.: dentro do próprio `docker-c
 
 ## CI/CD
 
-Não há workflow de CI configurado neste repositório (`.github/workflows`) nesta etapa — o modo de implantação atual (deploy manual/on-premise para uma única loja) não o exige como bloqueador. Ver `docs/` ou o histórico de etapas de auditoria (`18.x`) para o estado de maturidade de cada módulo antes de considerar automatizar o pipeline.
+`.github/workflows/ci.yml` roda em todo Pull Request e todo push em `main`: instalação determinística (`bun install --frozen-lockfile`), typecheck, suíte completa (contra um MongoDB de serviço do próprio runner) e build de produção. Não há deploy automático — esse é um passo manual/operacional separado (ver seção "Deploy com Docker" acima).
 
 ## Arquitetura
 

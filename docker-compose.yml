@@ -12,13 +12,49 @@ services:
     volumes:
       - mongodb_data:/data/db
     ports:
-      - "27017:27017"
+      # Etapa 27 — publicada só em loopback (127.0.0.1), nunca em todas as
+      # interfaces: o serviço `api` NUNCA precisou desta publicação para
+      # funcionar (alcança `mongodb` pelo nome do serviço, na rede interna do
+      # Compose — ver `MONGODB_URI` abaixo). A publicação existe unicamente
+      # para permitir `mongosh`/`mongodump`/Compass a partir do PRÓPRIO host
+      # (ex.: backup manual, inspeção administrativa). Antes desta etapa,
+      # publicar em todas as interfaces + Mongo sem autenticação (nenhuma
+      # configurada neste compose) deixava o banco alcançável por qualquer
+      # processo que chegasse à rede do host — o risco de maior severidade
+      # identificado na auditoria da Etapa 27. Autenticação do Mongo em si
+      # continua como pendência explícita (ver relatório da Etapa 27) — fora
+      # do escopo desta alteração, que corrige só a superfície de rede.
+      - "127.0.0.1:27017:27017"
+    healthcheck:
+      # Etapa 27 — sem isto, `api.depends_on` só esperava o CONTAINER do Mongo
+      # iniciar, não o processo do banco ficar pronto para aceitar conexões;
+      # combinado com o timeout curto do Mongoose (fail-fast deliberado, ver
+      # `src/database/mongoose.config.ts`), a primeira subida a frio podia
+      # gerar um ou mais crash-loops da `api` até o Mongo terminar de
+      # inicializar o data directory (mitigado, não eliminado, por
+      # `restart: unless-stopped`). Mesmo comando já usado no CI (Etapa 25).
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand({ping:1})"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    logging:
+      # Etapa 27 — driver padrão (`json-file`) sem limite cresce
+      # indefinidamente no disco do host ao longo do tempo; teto razoável
+      # para um serviço de banco de dados de uma loja única.
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   api:
     build: .
     restart: unless-stopped
     depends_on:
-      - mongodb
+      # Etapa 27 — espera o Mongo estar de fato PRONTO (healthcheck acima),
+      # não só com o container iniciado (ver comentário do `healthcheck` do
+      # `mongodb`).
+      mongodb:
+        condition: service_healthy
     env_file:
       - .env
     environment:
@@ -29,7 +65,17 @@ services:
       # (ver `WhatsappService`/`configuration.ts`).
       EVOLUTION_API_URL: http://evolution-api:8080
     ports:
+      # Etapa 27 — permanece publicada em todas as interfaces (diferente do
+      # Mongo acima): é a ÚNICA forma de alcançar a API enquanto não existir
+      # um reverse proxy na frente (fora do escopo desta etapa — ver
+      # relatório). Quando o proxy existir, isto deve passar a ser só
+      # "127.0.0.1:3000:3000" (ou nem publicado, se o proxy rodar na mesma
+      # rede Docker) — documentado como pendência, não alterado agora.
       - "3000:3000"
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ---------------------------------------------------------------------------
   # Evolution API (Etapa Pré-22) — infraestrutura EXTERNA ao MARIELA, usada só

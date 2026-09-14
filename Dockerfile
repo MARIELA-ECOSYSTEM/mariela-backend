@@ -11,8 +11,14 @@
 # (incluindo devDependencies, necessárias para `nest build`) e compila; a
 # etapa final `runtime` reinstala só as dependências de produção, copia
 # unicamente `dist/` e roda com um usuário não-root.
+#
+# Etapa 27 — imagem base pinada por versão EXATA (não `oven/bun:1`, que é uma
+# tag móvel e pode mudar de conteúdo entre rebuilds): mesma versão já validada
+# localmente e no CI (bun 1.4.2). Reavaliar/atualizar deliberadamente quando
+# houver motivo (nova versão do Bun testada), nunca por atualização silenciosa
+# da tag.
 
-FROM oven/bun:1 AS deps
+FROM oven/bun:1.4.2 AS deps
 WORKDIR /app
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
@@ -22,7 +28,7 @@ WORKDIR /app
 COPY . .
 RUN bun run build
 
-FROM oven/bun:1-slim AS runtime
+FROM oven/bun:1.4.2-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ENV TZ=America/Sao_Paulo
