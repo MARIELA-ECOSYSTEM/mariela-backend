@@ -1,0 +1,76 @@
+name: CI
+
+# Etapa 25 — CI mínimo: valida cada Pull Request e cada push em `main` antes
+# de qualquer merge/deploy. Não faz deploy — só o gate de qualidade
+# (instalação determinística, typecheck, suíte completa, build de produção,
+# audit de dependências). Ver README.md/relatório da Etapa 25 para o
+# racional completo (inclusive a investigação de flakiness da suíte).
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    name: Typecheck, Test, Build, Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # MongoDB real e local ao runner — mesmo racional dos testes locais
+    # (`src/test-utils/mongo-teste.util.ts`): a suíte valida comportamento
+    # genuíno do MongoDB (concorrência, índices, agregação), nunca um dublê
+    # em memória. Mesma tag `mongo:7` já usada em `docker-compose.yml`.
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 10s
+
+    # Etapa 25 — TODOS os valores abaixo são fictícios, existem só para
+    # satisfazer `validateEnv` (src/config/env.validation.ts) dentro do
+    # sandbox efêmero do runner. NUNCA correspondem a nenhum segredo real
+    # (JWT/Evolution API/MongoDB) de nenhum ambiente. `NODE_ENV=test` evita a
+    # exigência de 32+ caracteres que só se aplica em produção
+    # (`validarSegredosDeProducao`). Nenhum destes valores é lido de
+    # `secrets.*` do GitHub — não há segredo real algum nesta etapa.
+    env:
+      NODE_ENV: test
+      MONGODB_URI: mongodb://127.0.0.1:27017/mariela_test
+      MONGODB_URI_TESTE: mongodb://127.0.0.1:27017/mariela_test
+      JWT_ACCESS_SECRET: ci-fake-jwt-access-secret-nunca-usar-fora-do-runner
+      JWT_REFRESH_SECRET: ci-fake-jwt-refresh-secret-nunca-usar-fora-do-runner
+      PDV_JWT_ACCESS_SECRET: ci-fake-pdv-access-secret-nunca-usar-fora-do-runner
+      PDV_JWT_REFRESH_SECRET: ci-fake-pdv-refresh-secret-nunca-usar-fora-do-runner
+      CORS_ORIGINS: ""
+      SWAGGER_ENABLED: "false"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instala o Bun (versão pinada, igual ao ambiente de desenvolvimento)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Instala dependências (lockfile congelado — instalação determinística)
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Testes (suíte completa)
+        run: bun test
+
+      - name: Build de produção
+        run: bun run build
+
+      - name: Audit de dependências
+        run: bun audit
