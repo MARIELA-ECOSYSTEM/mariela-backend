@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import type { Connection } from "mongoose";
+import { Types, type Connection } from "mongoose";
 import { AppModule } from "../../app.module.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
@@ -216,6 +216,66 @@ describe("AuthService (integração — MongoDB real)", () => {
         ApiException,
       );
     });
+
+    it("Etapa 26 — duas requisições CONCORRENTES com o MESMO refresh token: só uma rotaciona, a outra é rejeitada (CAS real, nunca duas sessões válidas)", async () => {
+      const email = emailUnico("CONCORRENCIA");
+      await service.criarAdminSeed({ nome: "Concorrencia", email, senha: "senha-correta-123" });
+      const login = await service.login({ usuario: email, senha: "senha-correta-123" }, contextoTeste);
+
+      const resultados = await Promise.allSettled([
+        service.refresh({ refreshToken: login.refreshToken }, contextoTeste),
+        service.refresh({ refreshToken: login.refreshToken }, contextoTeste),
+      ]);
+
+      const sucesso = resultados.filter((r) => r.status === "fulfilled");
+      const falhas = resultados.filter((r) => r.status === "rejected");
+      expect(sucesso).toHaveLength(1);
+      expect(falhas).toHaveLength(1);
+
+      // A corrida perdida é reconhecida como "reutilização" (o token já foi
+      // revogado pela vencedora) — mata a família, inclusive o token novo da
+      // rotação vencedora (Etapa 26: nunca escapa por timing).
+      const vencedora = (sucesso[0] as PromiseFulfilledResult<Awaited<ReturnType<typeof service.refresh>>>).value;
+      await expect(service.refresh({ refreshToken: vencedora.refreshToken }, contextoTeste)).rejects.toThrow(
+        ApiException,
+      );
+
+      const usuario = await connection.collection("usuarios").findOne({ email });
+      const totalSessoesAtivas = await connection
+        .collection("refresh_tokens")
+        .countDocuments({ usuarioId: new Types.ObjectId(String(usuario!["_id"])), revogadoEm: null });
+      expect(totalSessoesAtivas).toBe(0);
+    });
+
+    it("Etapa 26 — estresse: 50 rodadas de concorrência real não produzem NENHUMA violação (fecho da corrida comprovado, não só no caso feliz)", async () => {
+      const RODADAS = 50;
+      for (let rodada = 0; rodada < RODADAS; rodada += 1) {
+        const email = emailUnico(`ESTRESSE-${rodada}`);
+        await service.criarAdminSeed({ nome: `Estresse ${rodada}`, email, senha: "senha-correta-123" });
+        const login = await service.login({ usuario: email, senha: "senha-correta-123" }, contextoTeste);
+
+        const resultados = await Promise.allSettled([
+          service.refresh({ refreshToken: login.refreshToken }, contextoTeste),
+          service.refresh({ refreshToken: login.refreshToken }, contextoTeste),
+        ]);
+
+        const sucesso = resultados.filter((r) => r.status === "fulfilled");
+        const falhas = resultados.filter((r) => r.status === "rejected");
+        expect(sucesso).toHaveLength(1);
+        expect(falhas).toHaveLength(1);
+
+        const vencedora = (sucesso[0] as PromiseFulfilledResult<Awaited<ReturnType<typeof service.refresh>>>).value;
+        await expect(service.refresh({ refreshToken: vencedora.refreshToken }, contextoTeste)).rejects.toThrow(
+          ApiException,
+        );
+
+        const usuario = await connection.collection("usuarios").findOne({ email });
+        const totalSessoesAtivas = await connection
+          .collection("refresh_tokens")
+          .countDocuments({ usuarioId: new Types.ObjectId(String(usuario!["_id"])), revogadoEm: null });
+        expect(totalSessoesAtivas).toBe(0);
+      }
+    }, 45_000); // 50 rodadas com I/O real de Mongo (+ argon2id por seed) — acima do timeout padrão de 5s do bun:test.
   });
 
   describe("logout", () => {

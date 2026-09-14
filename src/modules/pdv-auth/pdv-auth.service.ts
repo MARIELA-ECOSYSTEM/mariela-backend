@@ -66,12 +66,64 @@ export class PdvAuthService {
     return { ...tokens, vendedor: this.paraVendedorPublico(vendedor) };
   }
 
+  /**
+   * Etapa 26 — fecha a corrida em que o token novo da requisição VENCEDORA
+   * podia escapar da varredura de reuso (`revogarTodosDoVendedor`), quando
+   * essa varredura (disparada pela PERDEDORA) rodava ANTES do `criar()` do
+   * token novo terminar. Reprodução controlada: 1 violação em 150 iterações
+   * de duas chamadas concorrentes reais (`Promise.allSettled`) contra o
+   * mesmo refresh token.
+   *
+   * Correção de ORDEM (não de política nova nem de lógica de decisão nova):
+   * o candidato de rotação agora é criado ANTES da decisão atômica de quem
+   * vence (`revogarSeValido`, inalterada). Prova por causalidade: a criação
+   * do candidato da vencedora acontece, na MESMA requisição, antes da sua
+   * própria chamada a `revogarSeValido` que sucede; como essa chamada só
+   * pode suceder se rodar ANTES da chamada da perdedora (que só falha por
+   * observar `revogadoEm` já setado — MongoDB serializa updates no mesmo
+   * documento), e a perdedora só dispara a varredura DEPOIS de falhar, por
+   * transitividade a varredura sempre roda depois da criação do candidato —
+   * nunca antes. Isso vale para QUALQUER entrelaçamento das duas
+   * requisições, não só o cenário exato reproduzido.
+   *
+   * A decisão de segurança em si (quem vence, o que conta como reuso, a
+   * política de matar a família inteira) permanece EXATAMENTE a mesma —
+   * só a ordem das operações mudou.
+   */
   async refresh(dto: RefreshPdvDto, contexto: ContextoRequisicaoPdv): Promise<ResultadoAutenticacaoPdv> {
     const tokenHash = this.hashRefreshToken(dto.refreshToken);
     const agora = new Date();
+
+    // Peek NÃO-atômico: só decide SE vale a pena criar um candidato antes da
+    // hora. A decisão de segurança em si continua sendo feita
+    // exclusivamente pelo `findOneAndUpdate` atômico de `revogarSeValido`
+    // logo abaixo — nunca por este peek (só evita criar/descartar um
+    // candidato à toa quando o token já está obviamente inválido).
+    const antesDaDecisao = await this.pdvAuthRepository.encontrarPorHash(tokenHash);
+    const pareceValido = antesDaDecisao != null && antesDaDecisao.revogadoEm == null && antesDaDecisao.expiresAt > agora;
+
+    let candidato: { accessToken: string; refreshToken: string; expiresIn: number } | null = null;
+    let candidatoTokenHash: string | null = null;
+
+    if (pareceValido) {
+      const vendedorDoCandidato = await this.vendedoresRepository.encontrarPorId(String(antesDaDecisao!.vendedorId));
+      if (vendedorDoCandidato) {
+        candidato = await this.emitirTokens(vendedorDoCandidato, contexto);
+        candidatoTokenHash = this.hashRefreshToken(candidato.refreshToken);
+      }
+    }
+
     const anterior = await this.pdvAuthRepository.revogarSeValido(tokenHash, agora);
 
     if (!anterior) {
+      // Perdeu a corrida (ou o token já não era mais válido por outro
+      // motivo). O candidato criado acima nunca é vinculado nem devolvido:
+      // se houver reuso genuíno, a varredura de `tratarFalhaDeRefresh` já o
+      // alcança (mesmo vendedor, ainda `revogadoEm: null`); revoga
+      // explicitamente aqui também para nunca deixar um refresh token
+      // válido e órfão no banco nos casos em que a varredura não roda (ex.:
+      // o token original só expirou, sem reuso).
+      if (candidatoTokenHash) await this.pdvAuthRepository.revogarSeValido(candidatoTokenHash, agora);
       await this.tratarFalhaDeRefresh(tokenHash, agora, contexto);
       // `tratarFalhaDeRefresh` sempre lança — isto é inatingível, só satisfaz o tipo de retorno.
       throw ApiException.refreshTokenInvalid();
@@ -80,12 +132,14 @@ export class PdvAuthService {
     const vendedor = await this.vendedoresRepository.encontrarPorId(String(anterior.vendedorId));
     if (!vendedor) throw ApiException.refreshTokenInvalid();
     if (!vendedor.ativo) {
+      if (candidatoTokenHash) await this.pdvAuthRepository.revogarSeValido(candidatoTokenHash, agora);
       await this.pdvAuthRepository.revogarTodosDoVendedor(vendedor._id as Types.ObjectId, agora);
       throw ApiException.userInactive();
     }
 
-    const tokens = await this.emitirTokens(vendedor, contexto);
-    await this.pdvAuthRepository.marcarSubstituto(tokenHash, this.hashRefreshToken(tokens.refreshToken));
+    const tokens = candidato ?? (await this.emitirTokens(vendedor, contexto));
+    const tokensHash = candidatoTokenHash ?? this.hashRefreshToken(tokens.refreshToken);
+    await this.pdvAuthRepository.marcarSubstituto(tokenHash, tokensHash);
     await this.registrarEvento(vendedor.id, "pdv.refresh", contexto);
 
     return { ...tokens, vendedor: this.paraVendedorPublico(vendedor) };

@@ -191,6 +191,34 @@ describe("PdvAuthService (integração — MongoDB real)", () => {
       expect(totalSessoesAtivas).toBe(0);
     });
 
+    it("Etapa 26 — estresse: 50 rodadas de concorrência real não produzem NENHUMA violação (fecho da corrida comprovado, não só no caso feliz)", async () => {
+      const RODADAS = 50;
+      for (let rodada = 0; rodada < RODADAS; rodada += 1) {
+        const vendedor = await criarVendedor();
+        const login = await service.login({ codigo: vendedor.codigo, senha: "senha123" }, CONTEXTO);
+
+        const resultados = await Promise.allSettled([
+          service.refresh({ refreshToken: login.refreshToken }, CONTEXTO),
+          service.refresh({ refreshToken: login.refreshToken }, CONTEXTO),
+        ]);
+
+        const sucesso = resultados.filter((r) => r.status === "fulfilled");
+        const falhas = resultados.filter((r) => r.status === "rejected");
+        expect(sucesso).toHaveLength(1);
+        expect(falhas).toHaveLength(1);
+
+        const vencedora = (sucesso[0] as PromiseFulfilledResult<Awaited<ReturnType<typeof service.refresh>>>).value;
+        await expect(service.refresh({ refreshToken: vencedora.refreshToken }, CONTEXTO)).rejects.toThrow(
+          ApiException,
+        );
+
+        const totalSessoesAtivas = await connection
+          .collection("vendedor_refresh_tokens")
+          .countDocuments({ vendedorId: new Types.ObjectId(vendedor.id), revogadoEm: null });
+        expect(totalSessoesAtivas).toBe(0);
+      }
+    }, 30_000); // 50 rodadas com I/O real de Mongo — acima do timeout padrão de 5s do bun:test.
+
     it("vendedor desativado depois do login: o próximo refresh é rejeitado e a família inteira é revogada", async () => {
       const vendedor = await criarVendedor();
       const login = await service.login({ codigo: vendedor.codigo, senha: "senha123" }, CONTEXTO);

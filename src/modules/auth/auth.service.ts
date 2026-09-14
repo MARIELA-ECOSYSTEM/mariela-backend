@@ -109,12 +109,39 @@ export class AuthService {
     return { ...tokens, usuario: this.paraUsuarioPublico(usuario) };
   }
 
+  /**
+   * Etapa 26 — mesma correção, mesmo racional de `PdvAuthService.refresh`
+   * (ver o comentário completo lá): fecha a corrida em que o token novo da
+   * requisição VENCEDORA podia escapar da varredura de reuso
+   * (`revogarTodosDoUsuario`) por timing. Correção de ORDEM: o candidato de
+   * rotação é criado ANTES da decisão atômica de quem vence
+   * (`revogarSeValido`, inalterada) — por causalidade (MongoDB serializa
+   * updates no mesmo documento), a varredura da perdedora só pode rodar
+   * depois da criação do candidato da vencedora, nunca antes, em qualquer
+   * entrelaçamento. A política de segurança em si não muda.
+   */
   async refresh(dto: RefreshTokenDto, contexto: ContextoRequisicao): Promise<ResultadoAutenticacao> {
     const tokenHash = this.hashRefreshToken(dto.refreshToken);
     const agora = new Date();
+
+    const antesDaDecisao = await this.refreshTokensRepository.encontrarPorHash(tokenHash);
+    const pareceValido = antesDaDecisao != null && antesDaDecisao.revogadoEm == null && antesDaDecisao.expiresAt > agora;
+
+    let candidato: { accessToken: string; refreshToken: string; expiresIn: number } | null = null;
+    let candidatoTokenHash: string | null = null;
+
+    if (pareceValido) {
+      const usuarioDoCandidato = await this.usuariosRepository.encontrarPorId(String(antesDaDecisao!.usuarioId));
+      if (usuarioDoCandidato) {
+        candidato = await this.emitirTokens(usuarioDoCandidato, contexto);
+        candidatoTokenHash = this.hashRefreshToken(candidato.refreshToken);
+      }
+    }
+
     const anterior = await this.refreshTokensRepository.revogarSeValido(tokenHash, agora);
 
     if (!anterior) {
+      if (candidatoTokenHash) await this.refreshTokensRepository.revogarSeValido(candidatoTokenHash, agora);
       await this.tratarFalhaDeRefresh(tokenHash, agora, contexto);
       // `tratarFalhaDeRefresh` sempre lança — isto é inatingível, só satisfaz o tipo de retorno.
       throw ApiException.refreshTokenInvalid();
@@ -123,12 +150,14 @@ export class AuthService {
     const usuario = await this.usuariosRepository.encontrarPorId(String(anterior.usuarioId));
     if (!usuario) throw ApiException.refreshTokenInvalid();
     if (!usuario.ativo) {
+      if (candidatoTokenHash) await this.refreshTokensRepository.revogarSeValido(candidatoTokenHash, agora);
       await this.refreshTokensRepository.revogarTodosDoUsuario(usuario._id, agora);
       throw ApiException.userInactive();
     }
 
-    const tokens = await this.emitirTokens(usuario, contexto);
-    await this.refreshTokensRepository.marcarSubstituto(tokenHash, this.hashRefreshToken(tokens.refreshToken));
+    const tokens = candidato ?? (await this.emitirTokens(usuario, contexto));
+    const tokensHash = candidatoTokenHash ?? this.hashRefreshToken(tokens.refreshToken);
+    await this.refreshTokensRepository.marcarSubstituto(tokenHash, tokensHash);
     await this.registrarEvento(usuario.id, "REFRESH", contexto);
 
     return { ...tokens, usuario: this.paraUsuarioPublico(usuario) };
