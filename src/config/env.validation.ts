@@ -119,6 +119,27 @@ class EnvironmentVariables {
   @IsInt()
   @Min(1000)
   EVOLUTION_TIMEOUT_MS = 10000;
+
+  /**
+   * Etapa 24 — rate limiting GLOBAL/moderado (`@nestjs/throttler`, aplicado a
+   * TODAS as rotas via `APP_GUARD`), configurável por ambiente porque é o
+   * único dos três níveis de throttle (global/login/WhatsApp) que faz sentido
+   * ajustar sem redeploy, conforme o tráfego real observado em produção. Os
+   * limites de login/WhatsApp permanecem constantes fixas (mesmo padrão já
+   * usado por `LOGIN_THROTTLE_MAX_TENTATIVAS`), pois são valores de segurança
+   * calibrados deliberadamente, não parâmetros operacionais.
+   */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  RATE_LIMIT_GLOBAL_LIMIT = 300;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1000)
+  RATE_LIMIT_GLOBAL_TTL_MS = 60000;
 }
 
 const CAMPOS_SEGREDO_JWT = [

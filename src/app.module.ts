@@ -1,8 +1,11 @@
 import { Module } from "@nestjs/common";
 import { ConfigModule, ConfigService } from "@nestjs/config";
+import { APP_GUARD } from "@nestjs/core";
 import { JwtModule } from "@nestjs/jwt";
+import { ThrottlerModule } from "@nestjs/throttler";
 import configuration, { type Configuration } from "./config/configuration.js";
 import { validateEnv } from "./config/env.validation.js";
+import { AppThrottlerGuard } from "./common/guards/app-throttler.guard.js";
 import { DatabaseModule } from "./database/database.module.js";
 import { AdquirentesModule } from "./modules/adquirentes/adquirentes.module.js";
 import { AuthModule } from "./modules/auth/auth.module.js";
@@ -45,6 +48,31 @@ import { WhatsappModule } from "./modules/whatsapp/whatsapp.module.js";
         signOptions: { expiresIn: configService.get("jwt.accessExpiresIn", { infer: true }) },
       }),
     }),
+    /**
+     * Etapa 24 — piso GLOBAL/moderado de rate limiting, aplicado a TODA rota
+     * via `AppThrottlerGuard` como `APP_GUARD` abaixo (inclusive `/health`,
+     * por isso `SaudeController` usa `@SkipThrottle()` — o HEALTHCHECK do
+     * Docker nunca pode ser derrubado por isto). Limite generoso de propósito
+     * (300 req/60s por IP = 5 req/s sustentado): existe só como barreira
+     * contra abuso/DoS grosseiro, nunca deve ser percebido em uso normal de
+     * dashboard/CRUDs/sincronização do PDV. Endpoints críticos (`/auth/login`,
+     * `/pdv/auth/login`, `/integracoes/whatsapp/mensagens`) sobrescrevem este
+     * mesmo throttler "default" com limites bem mais restritos via `@Throttle`
+     * no próprio controller — não precisam de um throttler nomeado à parte.
+     */
+    ThrottlerModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService<Configuration>) => ({
+        throttlers: [
+          {
+            name: "default",
+            limit: configService.get("rateLimit.globalLimit", { infer: true })!,
+            ttl: configService.get("rateLimit.globalTtlMs", { infer: true })!,
+          },
+        ],
+      }),
+    }),
     SaudeModule,
     AuthModule,
     AdquirentesModule,
@@ -65,6 +93,11 @@ import { WhatsappModule } from "./modules/whatsapp/whatsapp.module.js";
     PdvProdutosModule,
     PdvVendasModule,
     WhatsappModule,
+  ],
+  providers: [
+    // Etapa 24 — aplica `AppThrottlerGuard` a toda rota da aplicação (ver
+    // comentário do `ThrottlerModule.forRootAsync` acima).
+    { provide: APP_GUARD, useClass: AppThrottlerGuard },
   ],
 })
 export class AppModule {}

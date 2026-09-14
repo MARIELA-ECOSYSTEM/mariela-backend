@@ -13,6 +13,7 @@ import { validationExceptionFactory } from "../../common/pipes/validation-except
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { CaixasService, type CaixaDetalheResposta } from "../caixas/caixas.service.js";
+import { PdvAuthService } from "../pdv-auth/pdv-auth.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 
 /**
@@ -91,17 +92,20 @@ describe("HTTP — PDV Caixa (integração — servidor real)", () => {
     if (atual) await caixasService.fechar(atual.id, { valorInformado: atual.resumo.saldoEsperado }, null);
   }
 
+  /**
+   * Etapa 24 — login via `PdvAuthService` direto (mesmo padrão do
+   * `authService.login(...)` do `beforeAll` acima), não mais via HTTP: este
+   * arquivo testa o fluxo de Caixa do PDV, não o endpoint de login em si (já
+   * coberto por `pdv-auth.http.e2e.spec.ts`), e chama esta função uma vez por
+   * cenário — o suficiente para ultrapassar o novo rate limit de
+   * `POST /pdv/auth/login` (Etapa 24) se passasse pela rota HTTP real.
+   */
   async function criarELogarVendedor(): Promise<{ id: string; codigo: string; nome: string; accessToken: string }> {
     const vendedoresService = app.get(VendedoresService);
+    const pdvAuthService = app.get(PdvAuthService);
     const vendedor = await vendedoresService.criar({ nome: "Vendedora HTTP PDV Caixa", telefone: telefoneUnico(), ativo: true, senha: "senha123" }, null);
-
-    const respostaLogin = await fetch(`${baseUrl}/api/v1/pdv/auth/login`, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify({ codigo: vendedor.codigo, senha: "senha123" }),
-    });
-    const corpo = (await respostaLogin.json()) as { data: { accessToken: string } };
-    return { id: vendedor.id, codigo: vendedor.codigo, nome: vendedor.nome, accessToken: corpo.data.accessToken };
+    const login = await pdvAuthService.login({ codigo: vendedor.codigo, senha: "senha123" }, { ip: null, userAgent: null });
+    return { id: vendedor.id, codigo: vendedor.codigo, nome: vendedor.nome, accessToken: login.accessToken };
   }
 
   it("GET /api/v1/pdv/caixa/atual SEM token retorna 401", async () => {

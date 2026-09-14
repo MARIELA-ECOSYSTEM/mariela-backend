@@ -1,5 +1,6 @@
 import { Controller, Get, HttpStatus, Res } from "@nestjs/common";
 import { ApiOperation, ApiTags } from "@nestjs/swagger";
+import { SkipThrottle } from "@nestjs/throttler";
 import type { Response } from "express";
 import { SaudeService, type StatusSaude } from "./saude.service.js";
 
@@ -17,7 +18,16 @@ import { SaudeService, type StatusSaude } from "./saude.service.js";
  * interceptors globais continuam processando o valor de retorno normalmente,
  * só o código de status é definido manualmente.
  */
+/**
+ * Etapa 24 — `@SkipThrottle()` nunca deixa o rate limiting global (Etapa 24,
+ * ver `AppModule`) responder 429 aqui: o HEALTHCHECK do `Dockerfile` chama
+ * este endpoint a cada 30s a partir do próprio container, e um orquestrador
+ * (Docker/K8s) que receber um 429 de liveness/readiness mataria/reiniciaria
+ * o processo — uma regressão bem mais grave do que a ausência de rate
+ * limiting neste endpoint específico, que não expõe nenhuma operação sensível.
+ */
 @ApiTags("Saúde")
+@SkipThrottle()
 @Controller("health")
 export class SaudeController {
   constructor(private readonly saudeService: SaudeService) {}

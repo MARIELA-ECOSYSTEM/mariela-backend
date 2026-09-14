@@ -1,10 +1,12 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Post, UseGuards } from "@nestjs/common";
 import { ApiBearerAuth, ApiOperation, ApiTags } from "@nestjs/swagger";
+import { Throttle } from "@nestjs/throttler";
 import { CurrentUser } from "../../common/decorators/current-user.decorator.js";
 import { Roles } from "../../common/decorators/roles.decorator.js";
 import { JwtAuthGuard } from "../../common/guards/jwt-auth.guard.js";
 import { RolesGuard } from "../../common/guards/roles.guard.js";
 import { EnviarMensagemWhatsappDto } from "./dto/enviar-mensagem-whatsapp.dto.js";
+import { WHATSAPP_SEND_THROTTLE_LIMITE, WHATSAPP_SEND_THROTTLE_TTL_MS } from "./whatsapp.constants.js";
 import { WhatsappService } from "./whatsapp.service.js";
 
 /**
@@ -41,6 +43,14 @@ export class WhatsappController {
     return { data: await this.whatsappService.desconectar() };
   }
 
+  /**
+   * Etapa 24 — sobrescreve o throttler "default" (global, ver `AppModule`)
+   * com um limite mais restrito para este endpoint (ver `whatsapp.constants
+   * .ts`): cada chamada pode acionar a Evolution API, então o limite roda
+   * ANTES do handler (guard do Nest) — nunca chega a `WhatsappService`/
+   * `EvolutionApiProvider` quando bloqueada.
+   */
+  @Throttle({ default: { limit: WHATSAPP_SEND_THROTTLE_LIMITE, ttl: WHATSAPP_SEND_THROTTLE_TTL_MS } })
   @Post("mensagens")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: "Envia uma mensagem de WhatsApp para um Cliente, Fornecedor ou Vendedor cadastrado." })

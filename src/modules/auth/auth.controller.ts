@@ -1,8 +1,10 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Post, Req, UseGuards } from "@nestjs/common";
 import { ApiBearerAuth, ApiOperation, ApiTags } from "@nestjs/swagger";
+import { Throttle } from "@nestjs/throttler";
 import type { Request } from "express";
 import { CurrentUser } from "../../common/decorators/current-user.decorator.js";
 import { JwtAuthGuard } from "../../common/guards/jwt-auth.guard.js";
+import { AUTH_LOGIN_THROTTLE_LIMITE, AUTH_LOGIN_THROTTLE_TTL_MS } from "./auth.constants.js";
 import type { ContextoRequisicao } from "./auth.service.js";
 import { AuthService } from "./auth.service.js";
 import { LoginDto } from "./dto/login.dto.js";
@@ -13,6 +15,8 @@ import { RefreshTokenDto } from "./dto/refresh-token.dto.js";
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
+  /** Etapa 24 — sobrescreve o throttler "default" (global, ver `AppModule`) com um limite bem mais restrito para este endpoint (ver `auth.constants.ts`). */
+  @Throttle({ default: { limit: AUTH_LOGIN_THROTTLE_LIMITE, ttl: AUTH_LOGIN_THROTTLE_TTL_MS } })
   @Post("login")
   @ApiOperation({ summary: "Login administrativo — devolve access token, refresh token e o usuário." })
   async login(@Body() dto: LoginDto, @Req() request: Request) {

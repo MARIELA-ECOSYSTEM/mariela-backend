@@ -15,6 +15,7 @@ import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { CaixasService } from "../caixas/caixas.service.js";
 import { ClientesService } from "../clientes/clientes.service.js";
+import { PdvAuthService } from "../pdv-auth/pdv-auth.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 
@@ -101,17 +102,24 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     if (atual) await caixasService.fechar(atual.id, { valorInformado: atual.resumo.saldoEsperado }, null);
   }
 
+  /**
+   * Etapa 24 — login via `PdvAuthService` direto (mesmo padrão já usado pelo
+   * `authService.login(...)` do `beforeAll` acima), não mais via HTTP: este
+   * arquivo testa o CICLO DE VENDA do PDV, não o endpoint de login em si (já
+   * coberto por `pdv-auth.http.e2e.spec.ts`) — mas essa função é chamada uma
+   * vez por cenário de teste (23 vezes neste arquivo), o que ultrapassaria de
+   * longe o novo rate limit de `POST /pdv/auth/login` (Etapa 24,
+   * `PDV_AUTH_LOGIN_THROTTLE_LIMITE`) se passasse pela rota HTTP real —
+   * inflar esse limite de segurança só para acomodar este padrão de teste
+   * enfraqueceria a proteção contra força bruta para todo o resto do sistema.
+   */
   async function criarELogarVendedor(ativo = true): Promise<{ id: string; codigo: string; accessToken: string }> {
     const vendedoresService = app.get(VendedoresService);
+    const pdvAuthService = app.get(PdvAuthService);
     const vendedor = await vendedoresService.criar({ nome: "Vendedora HTTP PDV Vendas", telefone: telefoneUnico(), ativo: true, senha: "senha123" }, null);
-    const respostaLogin = await fetch(`${baseUrl}/api/v1/pdv/auth/login`, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify({ codigo: vendedor.codigo, senha: "senha123" }),
-    });
-    const corpo = (await respostaLogin.json()) as { data: { accessToken: string } };
+    const login = await pdvAuthService.login({ codigo: vendedor.codigo, senha: "senha123" }, { ip: null, userAgent: null });
     if (!ativo) await vendedoresService.alterarStatus(vendedor.id, { ativo: false }, null);
-    return { id: vendedor.id, codigo: vendedor.codigo, accessToken: corpo.data.accessToken };
+    return { id: vendedor.id, codigo: vendedor.codigo, accessToken: login.accessToken };
   }
 
   async function criarCliente(): Promise<{ id: string }> {

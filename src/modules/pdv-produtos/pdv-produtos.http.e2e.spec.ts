@@ -12,6 +12,7 @@ import { ResponseInterceptor } from "../../common/interceptors/response.intercep
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
+import { PdvAuthService } from "../pdv-auth/pdv-auth.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 
@@ -81,20 +82,23 @@ describe("HTTP — PDV Produtos (integração — servidor real)", () => {
     await app.close();
   });
 
+  /**
+   * Etapa 24 — login via `PdvAuthService` direto (mesmo padrão do
+   * `authService.login(...)` do `beforeAll` acima), não mais via HTTP: este
+   * arquivo testa o catálogo do PDV, não o endpoint de login em si (já
+   * coberto por `pdv-auth.http.e2e.spec.ts`), e chama esta função uma vez por
+   * cenário — o suficiente para ultrapassar o novo rate limit de
+   * `POST /pdv/auth/login` (Etapa 24) se passasse pela rota HTTP real.
+   */
   async function criarELogarVendedor(ativo = true): Promise<{ id: string; codigo: string; accessToken: string }> {
     const vendedoresService = app.get(VendedoresService);
+    const pdvAuthService = app.get(PdvAuthService);
     const vendedor = await vendedoresService.criar({ nome: "Vendedora HTTP PDV Produtos", telefone: telefoneUnico(), ativo: true, senha: "senha123" }, null);
-
-    const respostaLogin = await fetch(`${baseUrl}/api/v1/pdv/auth/login`, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify({ codigo: vendedor.codigo, senha: "senha123" }),
-    });
-    const corpo = (await respostaLogin.json()) as { data: { accessToken: string } };
+    const login = await pdvAuthService.login({ codigo: vendedor.codigo, senha: "senha123" }, { ip: null, userAgent: null });
 
     if (!ativo) await vendedoresService.alterarStatus(vendedor.id, { ativo: false }, null);
 
-    return { id: vendedor.id, codigo: vendedor.codigo, accessToken: corpo.data.accessToken };
+    return { id: vendedor.id, codigo: vendedor.codigo, accessToken: login.accessToken };
   }
 
   async function criarProdutoComEstoque(nome: string, precoVenda = 150, quantidade = 5) {

@@ -52,6 +52,18 @@ export interface WhatsappConfig {
   };
 }
 
+/**
+ * Etapa 24 — só o piso GLOBAL/moderado (aplicado a toda rota via `APP_GUARD`)
+ * é configurável por ambiente. Os limites específicos de login (`/auth/login`,
+ * `/pdv/auth/login`) e de envio de WhatsApp são constantes de segurança fixas
+ * (ver `auth.constants.ts`, `pdv-auth.constants.ts`, `whatsapp.constants.ts`),
+ * não pertencem a este namespace.
+ */
+export interface RateLimitConfig {
+  globalLimit: number;
+  globalTtlMs: number;
+}
+
 export interface Configuration {
   app: AppConfig;
   database: DatabaseConfig;
@@ -59,6 +71,7 @@ export interface Configuration {
   pdvJwt: PdvJwtConfig;
   cors: CorsConfig;
   whatsapp: WhatsappConfig;
+  rateLimit: RateLimitConfig;
 }
 
 export default (): Configuration => {
@@ -101,6 +114,10 @@ export default (): Configuration => {
         instanceName: process.env["EVOLUTION_INSTANCE_NAME"] ?? "mariela-whatsapp",
         timeoutMs: Number(process.env["EVOLUTION_TIMEOUT_MS"] ?? 10000),
       },
+    },
+    rateLimit: {
+      globalLimit: Number(process.env["RATE_LIMIT_GLOBAL_LIMIT"] ?? 300),
+      globalTtlMs: Number(process.env["RATE_LIMIT_GLOBAL_TTL_MS"] ?? 60000),
     },
   };
 };
