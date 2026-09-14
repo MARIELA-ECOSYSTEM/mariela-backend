@@ -70,11 +70,11 @@ Adequado tanto como *liveness* (o processo respondeu) quanto *readiness* (o banc
 docker compose up --build -d
 ```
 
-Sobe a API (`Dockerfile`, multi-stage, usuário não-root, `HEALTHCHECK` embutido usando `/health`) e um MongoDB de conveniência num único host — o cenário mais simples de implantação para a loja física. `docker-compose.yml` espera um `.env` já preenchido no diretório do projeto (`env_file: .env`).
+Sobe a API (`Dockerfile`, multi-stage, usuário não-root, `HEALTHCHECK` embutido usando `/health`) e um MongoDB autenticado num único host — o cenário mais simples de implantação para a loja física. `docker-compose.yml` espera um `.env` já preenchido no diretório do projeto (`env_file: .env`), incluindo as 4 credenciais do MongoDB descritas em `.env.example` (usuário root administrativo + usuário de aplicação, escopado só ao banco `mariela` — ver comentários lá e em `docker/mongo-init/init-mariela-user.js`).
 
-A porta do MongoDB (27017) é publicada só em `127.0.0.1` (loopback do próprio host) — suficiente para `mongosh`/`mongodump` administrativos locais, mas não alcançável pela rede. O Mongo deste compose **ainda não tem autenticação configurada**; isso é uma pendência conhecida antes de um ambiente produtivo real (ver relatório da Etapa 27) — não depender só do isolamento de rede como única defesa.
+A porta do MongoDB (27017) é publicada só em `127.0.0.1` (loopback do próprio host) — suficiente para `mongosh`/`mongodump` administrativos locais, mas não alcançável pela rede; combinado com a autenticação, mesmo quem alcançar essa porta pelo host precisa de credencial válida.
 
-> O `Dockerfile`/`docker-compose.yml` foram escritos e revisados mas **não foram validados com um build/subida reais** (ambiente de desenvolvimento sem Docker disponível) — valide `docker compose up --build` antes do primeiro uso em produção.
+> O `Dockerfile`/`docker-compose.yml` (incluindo a autenticação do MongoDB da Etapa 28) foram escritos e revisados mas **não foram validados com um build/subida reais** (ambiente de desenvolvimento sem Docker disponível) — valide `docker compose up --build` antes do primeiro uso em produção, prestando atenção especial à criação do usuário de aplicação (só acontece na primeira inicialização, com o volume vazio).
 
 Para um deploy sem Docker, compile e rode diretamente:
 

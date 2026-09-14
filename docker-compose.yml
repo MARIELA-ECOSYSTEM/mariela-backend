@@ -9,21 +9,41 @@ services:
   mongodb:
     image: mongo:7
     restart: unless-stopped
+    environment:
+      # Etapa 28 — habilita autenticação na instância inteira. A imagem
+      # oficial cria este usuário ROOT (banco `admin`, papel `root`) na
+      # PRIMEIRA inicialização com o data directory vazio; nunca reaplicado
+      # depois. Só para administração (backup, criação de outros usuários) —
+      # a aplicação NUNCA se conecta com este usuário (ver `api.environment
+      # .MONGODB_URI` abaixo, que usa o usuário de aplicação criado pelo
+      # script em ./docker/mongo-init). Valores vêm só do .env real do
+      # servidor — nunca hardcoded aqui.
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:?defina MONGO_INITDB_ROOT_USERNAME no .env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:?defina MONGO_INITDB_ROOT_PASSWORD no .env}
+      # Lidas só pelo script de init abaixo (nunca pela imagem em si) — cria
+      # o usuário de APLICAÇÃO, escopado unicamente ao banco `mariela`, com
+      # o papel mínimo (`readWrite`, nunca root).
+      MARIELA_APP_MONGO_USER: ${MARIELA_APP_MONGO_USER:?defina MARIELA_APP_MONGO_USER no .env}
+      MARIELA_APP_MONGO_PASSWORD: ${MARIELA_APP_MONGO_PASSWORD:?defina MARIELA_APP_MONGO_PASSWORD no .env}
     volumes:
       - mongodb_data:/data/db
+      # Etapa 28 — só executado pela imagem oficial na PRIMEIRA inicialização
+      # (data directory vazio); nunca roda de novo num volume já existente.
+      # Montado somente leitura — este container nunca deve escrever aqui.
+      - ./docker/mongo-init:/docker-entrypoint-initdb.d:ro
     ports:
       # Etapa 27 — publicada só em loopback (127.0.0.1), nunca em todas as
       # interfaces: o serviço `api` NUNCA precisou desta publicação para
       # funcionar (alcança `mongodb` pelo nome do serviço, na rede interna do
       # Compose — ver `MONGODB_URI` abaixo). A publicação existe unicamente
       # para permitir `mongosh`/`mongodump`/Compass a partir do PRÓPRIO host
-      # (ex.: backup manual, inspeção administrativa). Antes desta etapa,
-      # publicar em todas as interfaces + Mongo sem autenticação (nenhuma
-      # configurada neste compose) deixava o banco alcançável por qualquer
-      # processo que chegasse à rede do host — o risco de maior severidade
-      # identificado na auditoria da Etapa 27. Autenticação do Mongo em si
-      # continua como pendência explícita (ver relatório da Etapa 27) — fora
-      # do escopo desta alteração, que corrige só a superfície de rede.
+      # (ex.: backup manual, inspeção administrativa). Antes da Etapa 27,
+      # publicar em todas as interfaces + Mongo sem autenticação deixava o
+      # banco alcançável por qualquer processo que chegasse à rede do host —
+      # o risco de maior severidade identificado naquela auditoria.
+      # Autenticação (Etapa 28, ver `environment` acima) fecha a segunda
+      # metade do mesmo risco: mesmo alguém alcançando esta porta pelo host
+      # agora precisa de credencial válida.
       - "127.0.0.1:27017:27017"
     healthcheck:
       # Etapa 27 — sem isto, `api.depends_on` só esperava o CONTAINER do Mongo
@@ -58,7 +78,13 @@ services:
     env_file:
       - .env
     environment:
-      MONGODB_URI: mongodb://mongodb:27017/mariela
+      # Etapa 28 — usuário de APLICAÇÃO (readWrite só em `mariela`, criado
+      # pelo script em ./docker/mongo-init na primeira subida), nunca o
+      # usuário root do serviço `mongodb` acima. `authSource=mariela` porque
+      # o usuário foi criado NAQUELE banco, não em `admin` (onde só o root
+      # vive). Credenciais interpoladas do .env real do servidor — nunca
+      # hardcoded aqui.
+      MONGODB_URI: mongodb://${MARIELA_APP_MONGO_USER:?defina MARIELA_APP_MONGO_USER no .env}:${MARIELA_APP_MONGO_PASSWORD:?defina MARIELA_APP_MONGO_PASSWORD no .env}@mongodb:27017/mariela?authSource=mariela
       # Aponta para o serviço `evolution-api` desta mesma composição — só tem
       # efeito se EVOLUTION_API_KEY (segredo, vem do .env) também estiver
       # definida; caso contrário a integração de WhatsApp fica desabilitada
