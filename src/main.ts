@@ -38,6 +38,15 @@ async function bootstrap(): Promise<void> {
     logger: new StructuredLoggerService(),
   });
 
+  // Etapa 29 — confia em exatamente 1 hop de proxy à frente da aplicação (o
+  // proxy do Render, único reverse proxy real desta arquitetura) — nunca
+  // `true`/`'*'` (confiaria em qualquer proxy informado via `X-Forwarded-*`,
+  // tornando `req.ip` falsificável por qualquer cliente). Precisa vir antes
+  // de qualquer middleware que leia `req.ip` (rate limiting da Etapa 24,
+  // `helmet()`, etc.) — sem isto, `req.ip` refletiria sempre o IP do proxy
+  // do Render, nunca o do cliente final.
+  app.set("trust proxy", 1);
+
   const configService = app.get(ConfigService<Configuration>);
   const { port, apiPrefix, swaggerEnabled } = configService.get("app", { infer: true })!;
   const { origins } = configService.get("cors", { infer: true })!;
