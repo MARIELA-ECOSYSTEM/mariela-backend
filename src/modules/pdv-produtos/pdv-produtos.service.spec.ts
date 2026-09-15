@@ -170,8 +170,17 @@ describe("PdvProdutosService (integração — MongoDB real)", () => {
     });
 
     it("nunca expõe campos administrativos (precoCusto, margemLucro, corNormalizada, fornecedorId, colecaoId, campanhaId)", async () => {
-      const produto = await criarProduto({ fornecedorId: "for-1", colecaoId: "col-1", campanhaId: "cam-1" });
+      const produto = await criarProduto();
       await adicionarVarianteComEstoque(produto.id, "Preto", [{ tamanho: "P", quantidade: 1 }]);
+      // Etapa 10.23 — `ProdutosService.criar` agora valida a EXISTÊNCIA de
+      // fornecedor/coleção/campanha referenciados (correção 6.10); este
+      // teste é sobre MASCARAMENTO na leitura pelo PDV, não sobre
+      // integridade referencial na escrita (já coberta em
+      // `produtos.service.spec.ts`) — por isso os valores são gravados
+      // diretamente no documento persistido, contornando a validação de
+      // escrita, só para confirmar que a PROJEÇÃO do PDV nunca vaza esses
+      // campos independentemente do que exista no documento administrativo.
+      await connection.collection("produtos").updateOne({ _id: produto._id }, { $set: { fornecedorId: "for-1", colecaoId: "col-1", campanhaId: "cam-1" } });
 
       const resultado = await service.listar({ busca: produto.nome, ordenarPor: "nome", ordem: "asc", page: 1, limit: 30 });
       const item = resultado.data.find((p) => p.id === produto.id)!;

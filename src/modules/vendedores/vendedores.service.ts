@@ -181,11 +181,14 @@ export class VendedoresService {
   }
 
   /**
-   * Soft delete incondicional — diferente de Fornecedores/Campanhas (que
-   * bloqueiam exclusão quando há produtos vinculados), não há hoje nenhuma
-   * dependência ativa de Vendedor a checar: o módulo de Vendas ainda não
-   * existe. O soft delete por si só já preserva o histórico futuro (mesma
-   * decisão de Cliente).
+   * Soft delete incondicional — diferente de Fornecedores/Coleções/Campanhas
+   * (que bloqueiam exclusão quando há produtos vinculados), aqui o bloqueio
+   * NÃO faz sentido mesmo com o módulo de Vendas existindo: vendas passadas
+   * são fatos históricos que nunca devem impedir a desativação de um(a)
+   * vendedor(a) que saiu da equipe — o soft delete por si só já preserva
+   * esse histórico (`VendasRepository.encontrarPorVendedorId`, usado por
+   * `listarVendas` abaixo, nunca filtra por vendedor ativo). Mesma decisão de
+   * Cliente.
    */
   async excluir(id: string, usuarioId: string | null): Promise<void> {
     const vendedor = await this.vendedoresRepository.encontrarPorIdOuFalhar(id);

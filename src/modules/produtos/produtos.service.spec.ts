@@ -5,8 +5,12 @@ import { Test, type TestingModule } from "@nestjs/testing";
 import type { Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
+import { CampanhasService } from "../campanhas/campanhas.service.js";
+import { ColecoesService } from "../colecoes/colecoes.service.js";
+import { FornecedoresService } from "../fornecedores/fornecedores.service.js";
 import type { CriarProdutoDto } from "./dto/criar-produto.dto.js";
 import { ProdutosModule } from "./produtos.module.js";
+import { ProdutosRepository } from "./produtos.repository.js";
 import { ProdutosService } from "./produtos.service.js";
 
 // `ProdutosController` usa `@UseGuards(JwtAuthGuard)`, que injeta `JwtService`
@@ -33,6 +37,10 @@ function payloadProduto(sufixo: string, extra: Partial<CriarProdutoDto> = {}): C
 describe("ProdutosService (integração — MongoDB real)", () => {
   let moduleRef: TestingModule;
   let service: ProdutosService;
+  let produtosRepository: ProdutosRepository;
+  let fornecedoresService: FornecedoresService;
+  let colecoesService: ColecoesService;
+  let campanhasService: CampanhasService;
   let connection: Connection;
 
   beforeAll(async () => {
@@ -40,6 +48,10 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       imports: [mongooseModuloDeTeste(), JWT_MODULO_DE_TESTE, ProdutosModule],
     }).compile();
     service = moduleRef.get(ProdutosService);
+    produtosRepository = moduleRef.get(ProdutosRepository);
+    fornecedoresService = moduleRef.get(FornecedoresService);
+    colecoesService = moduleRef.get(ColecoesService);
+    campanhasService = moduleRef.get(CampanhasService);
     connection = moduleRef.get(getConnectionToken());
   });
 
@@ -47,6 +59,12 @@ describe("ProdutosService (integração — MongoDB real)", () => {
     await connection.collection("produtos").deleteMany({});
     await connection.collection("sequencias").deleteMany({});
     await connection.collection("eventos_produto").deleteMany({});
+    await connection.collection("fornecedores").deleteMany({});
+    await connection.collection("eventos_fornecedor").deleteMany({});
+    await connection.collection("colecoes").deleteMany({});
+    await connection.collection("eventos_colecao").deleteMany({});
+    await connection.collection("campanhas").deleteMany({});
+    await connection.collection("eventos_campanha").deleteMany({});
     await moduleRef.close();
   });
 
@@ -220,6 +238,70 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       const variante = await service.adicionarVariante(produtoB.id, { cor: "Verde" }, null);
       expect(variante.cor).toBe("Verde");
     });
+
+    /**
+     * Etapa 10.23 — correção 6.5: uma cor sem NENHUM caractere alfanumérico
+     * (ex.: "!!!") gera `codVariante` vazio de segmento → cai para o
+     * `codProduto` puro (`formatarCodigoVariante`). Uma SEGUNDA cor nessas
+     * condições no MESMO produto (cores diferentes o bastante para passar na
+     * checagem de `corNormalizada`, mas ambas sem alfanumérico) geraria dois
+     * `codVariante` idênticos. Rejeitado aqui como erro de domínio (400)
+     * ANTES de qualquer escrita — nunca dependendo de um duplicate-key do
+     * Mongo (que, verificado empiricamente contra o MongoDB real abaixo,
+     * nem sequer acontece: um índice único multikey não protege contra
+     * duplicatas DENTRO do mesmo documento, só entre documentos diferentes).
+     */
+    it("rejeita cor sem nenhum caractere alfanumérico com erro de validação (400)", async () => {
+      const produto = await service.criar(payloadProduto("SEM-ALFANUM"), null);
+      await expect(service.adicionarVariante(produto.id, { cor: "!!!" }, null)).rejects.toThrow(ApiException);
+      try {
+        await service.adicionarVariante(produto.id, { cor: "###" }, null);
+        throw new Error("Deveria ter lançado ApiException.");
+      } catch (erro) {
+        expect(erro).toBeInstanceOf(ApiException);
+        expect((erro as ApiException).getStatus()).toBe(400);
+      }
+      const atualizado = await service.obterPorId(produto.id);
+      expect(atualizado.variantes).toHaveLength(0); // nenhuma variante inválida foi persistida
+    });
+
+    /**
+     * Prova, contra o MongoDB real (não um teste artificial da
+     * implementação), a causa raiz CORRIGIDA que motivou a validação acima:
+     * contornando a validação de serviço (chamando o repository diretamente,
+     * como o código fazia ANTES desta correção), duas cores sem alfanumérico
+     * geram `codVariante` idênticos e o MongoDB os aceita SEM ERRO — o índice
+     * único em `variantes.codVariante` não impede duplicatas dentro do MESMO
+     * documento. Ou seja: sem a validação de entrada, o resultado não seria
+     * um 500 (a premissa original da auditoria), e sim uma inconsistência de
+     * dados SILENCIOSA — o que torna a validação de entrada a ÚNICA defesa
+     * real, não uma camada redundante sobre uma proteção do banco.
+     */
+    it("sem a validação de entrada, o MongoDB aceitaria dois codVariante idênticos silenciosamente (prova da causa raiz real)", async () => {
+      const produto = await service.criar(payloadProduto("SEM-VALIDACAO"), null);
+      const primeira = await produtosRepository.adicionarVarianteAtomico(produto.id, {
+        cor: "!!!",
+        corNormalizada: "!!!",
+        codVariante: produto.codProduto,
+        quantidadeVariante: 0,
+        foto: null,
+        video: null,
+        tamanhos: [],
+      });
+      expect(primeira).not.toBeNull();
+
+      const segunda = await produtosRepository.adicionarVarianteAtomico(produto.id, {
+        cor: "###",
+        corNormalizada: "###", // diferente de "!!!" — passa pela checagem de corNormalizada
+        codVariante: produto.codProduto, // MESMO codVariante da primeira
+        quantidadeVariante: 0,
+        foto: null,
+        video: null,
+        tamanhos: [],
+      });
+      expect(segunda).not.toBeNull(); // nenhum erro — confirma que o índice sozinho NÃO bastava
+      expect(segunda!.variantes.filter((v) => v.codVariante === produto.codProduto)).toHaveLength(2); // dois SKUs idênticos, silenciosamente
+    });
   });
 
   describe("tamanhos e estoque derivado", () => {
@@ -318,6 +400,19 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       const produto = await service.criar(payloadProduto("U", { precoCusto: 100, precoVenda: 50 }), null);
       expect(produto.margemLucro).toBe(-100); // (50-100)/50*100
     });
+
+    // Etapa 10.23 — correção 6.11.2: antes, desativar a promoção mantinha
+    // `precoPromocional` com o valor antigo ("fantasma") no documento — sem
+    // impacto funcional (precoEfetivo sempre checa `ehPromocao` primeiro, e
+    // reativar exige um novo valor no DTO), mas um dado enganoso para quem
+    // inspecionasse o documento diretamente.
+    it("desativar a promoção zera precoPromocional (nunca mantém o valor antigo)", async () => {
+      const produto = await service.criar(payloadProduto("V-PROMO", { precoCusto: 50, precoVenda: 100 }), null);
+      await service.definirPromocao(produto.id, { ehPromocao: true, precoPromocional: 80 }, null);
+      const desativada = await service.definirPromocao(produto.id, { ehPromocao: false }, null);
+      expect(desativada.ehPromocao).toBe(false);
+      expect(desativada.precoPromocional).toBeNull();
+    });
   });
 
   /**
@@ -397,6 +492,101 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       const final = await service.obterPorId(produto.id);
       expect([120, 150]).toContain(final.precoVenda); // uma das duas escritas venceu por último — nunca um valor corrompido/misturado
       expect(final.margemLucro).toBe(calcularMargemEsperada(50, final.precoVenda));
+    });
+  });
+
+  /**
+   * Etapa 10.23 — correção 6.10: antes, `criar()`/`atualizar()` aceitavam
+   * QUALQUER string em `fornecedorId`/`colecaoId`/`campanhaId`, mesmo
+   * apontando para um registro inexistente ou já soft-deleted — apesar da
+   * regra espelhada já estabelecida ("não é possível excluir Fornecedor/
+   * Coleção/Campanha com produtos vinculados") tornar essa garantia
+   * ilusória sem o check no sentido inverso. Real contra MongoDB (cria e
+   * exclui os registros de verdade), nunca um teste artificial da própria
+   * implementação.
+   */
+  describe("integridade referencial de fornecedor/coleção/campanha (Etapa 10.23)", () => {
+    it("cria produto normalmente quando fornecedor/coleção/campanha existem e estão ativos", async () => {
+      const fornecedor = await fornecedoresService.criar({ nome: `Fornecedor Ref ${Date.now()}` }, null);
+      const colecao = await colecoesService.criar(
+        { nome: `Coleção Ref ${Date.now()}`, inicio: "2026-01-01", fim: "2026-03-01" },
+        null,
+      );
+      const campanha = await campanhasService.criar(
+        { nome: `Campanha Ref ${Date.now()}`, inicio: "2026-01-01", fim: "2026-03-01" },
+        null,
+      );
+
+      const produto = await service.criar(
+        payloadProduto("REF-OK", { fornecedorId: fornecedor.id, colecaoId: colecao.id, campanhaId: campanha.id }),
+        null,
+      );
+      expect(produto.fornecedorId).toBe(fornecedor.id);
+      expect(produto.colecaoId).toBe(colecao.id);
+      expect(produto.campanhaId).toBe(campanha.id);
+    });
+
+    it("rejeita criação com fornecedorId inexistente", async () => {
+      await expect(
+        service.criar(payloadProduto("REF-FORN-INEXISTENTE", { fornecedorId: "65f1a2b3c4d5e6f7a8b9c0d1" }), null),
+      ).rejects.toThrow(ApiException);
+    });
+
+    it("rejeita criação com colecaoId inexistente", async () => {
+      await expect(
+        service.criar(payloadProduto("REF-COL-INEXISTENTE", { colecaoId: "65f1a2b3c4d5e6f7a8b9c0d1" }), null),
+      ).rejects.toThrow(ApiException);
+    });
+
+    it("rejeita criação com campanhaId inexistente", async () => {
+      await expect(
+        service.criar(payloadProduto("REF-CAMP-INEXISTENTE", { campanhaId: "65f1a2b3c4d5e6f7a8b9c0d1" }), null),
+      ).rejects.toThrow(ApiException);
+    });
+
+    it("rejeita criação apontando para fornecedor JÁ soft-deleted", async () => {
+      const fornecedor = await fornecedoresService.criar({ nome: `Fornecedor Excluído ${Date.now()}` }, null);
+      await fornecedoresService.excluir(fornecedor.id, null);
+
+      await expect(
+        service.criar(payloadProduto("REF-FORN-EXCLUIDO", { fornecedorId: fornecedor.id }), null),
+      ).rejects.toThrow(ApiException);
+    });
+
+    it("rejeita atualização apontando para coleção JÁ soft-deleted (regra vale também na edição, não só na criação)", async () => {
+      const colecao = await colecoesService.criar(
+        { nome: `Coleção Excluída ${Date.now()}`, inicio: "2026-01-01", fim: "2026-03-01" },
+        null,
+      );
+      const produto = await service.criar(payloadProduto("REF-COL-ATUALIZAR"), null);
+      await colecoesService.excluir(colecao.id, null);
+
+      await expect(
+        service.atualizar(
+          produto.id,
+          { nome: produto.nome, categoria: produto.categoria, precoCusto: 50, precoVenda: 100, ehNovidade: false, colecaoId: colecao.id },
+          null,
+        ),
+      ).rejects.toThrow(ApiException);
+
+      const inalterado = await service.obterPorId(produto.id);
+      expect(inalterado.colecaoId).toBeNull(); // a atualização rejeitada não deixou nenhum efeito parcial
+    });
+
+    it("permite referenciar uma campanha INATIVA (ativo=false), mas não excluída — ativo≠excluído", async () => {
+      const campanha = await campanhasService.criar(
+        { nome: `Campanha Inativa ${Date.now()}`, inicio: "2026-01-01", fim: "2026-03-01", ativo: false },
+        null,
+      );
+      const produto = await service.criar(payloadProduto("REF-CAMP-INATIVA", { campanhaId: campanha.id }), null);
+      expect(produto.campanhaId).toBe(campanha.id);
+    });
+
+    it("continua aceitando produto SEM nenhuma referência (todas opcionais, comportamento inalterado)", async () => {
+      const produto = await service.criar(payloadProduto("REF-NENHUMA"), null);
+      expect(produto.fornecedorId).toBeNull();
+      expect(produto.colecaoId).toBeNull();
+      expect(produto.campanhaId).toBeNull();
     });
   });
 });

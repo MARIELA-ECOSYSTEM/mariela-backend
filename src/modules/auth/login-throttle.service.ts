@@ -23,7 +23,29 @@ interface RegistroTentativas {
 export class LoginThrottleService {
   private readonly tentativas = new Map<string, RegistroTentativas>();
 
+  /**
+   * Etapa 10.23 — CORREÇÃO: sem isto, `tentativas` só cresce (nunca uma
+   * entrada é removida) — uma tentativa de login com uma chave nova (IP+
+   * e-mail diferentes) sempre cria uma entrada, mesmo depois de expirada; num
+   * processo de longa duração, isso é um vazamento de memória lento porém
+   * indefinido. Varre e remove só entradas JÁ expiradas (`!dentroDaJanela`) —
+   * o mesmo critério que `verificar()`/`registrarFalha()` já usam para tratar
+   * uma entrada expirada como equivalente a "não existir"; remover uma
+   * entrada expirada é por construção um NO-OP do ponto de vista de quem
+   * chama (nenhuma entrada ATIVA é tocada). Chamada em TODA verificação
+   * (sucesso ou falha, já que `verificar()` roda em toda tentativa de login,
+   * mais frequente que `registrarFalha()`) — solução simples e determinística
+   * (nenhum timer/`setInterval`, nenhuma dependência nova), custo O(n) sobre
+   * um Map que, pela própria natureza do throttle, permanece pequeno.
+   */
+  private limparExpiradas(): void {
+    for (const [chave, registro] of this.tentativas) {
+      if (!this.dentroDaJanela(registro)) this.tentativas.delete(chave);
+    }
+  }
+
   verificar(chave: string): void {
+    this.limparExpiradas();
     const registro = this.tentativas.get(chave);
     if (!registro) return;
 
@@ -44,6 +66,11 @@ export class LoginThrottleService {
 
   registrarSucesso(chave: string): void {
     this.tentativas.delete(chave);
+  }
+
+  /** Exposto só para teste de regressão (Etapa 10.23) — nunca usado em produção. */
+  tamanhoParaTeste(): number {
+    return this.tentativas.size;
   }
 
   private dentroDaJanela(registro: RegistroTentativas): boolean {

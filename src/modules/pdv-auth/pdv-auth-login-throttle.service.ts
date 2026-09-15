@@ -21,7 +21,15 @@ interface RegistroTentativas {
 export class PdvAuthLoginThrottleService {
   private readonly tentativas = new Map<string, RegistroTentativas>();
 
+  /** Etapa 10.23 — mesma correção e mesma justificativa de `modules/auth/login-throttle.service.ts` (ADMIN), duplicada aqui de propósito. */
+  private limparExpiradas(): void {
+    for (const [chave, registro] of this.tentativas) {
+      if (!this.dentroDaJanela(registro)) this.tentativas.delete(chave);
+    }
+  }
+
   verificar(chave: string): void {
+    this.limparExpiradas();
     const registro = this.tentativas.get(chave);
     if (!registro) return;
 
@@ -42,6 +50,11 @@ export class PdvAuthLoginThrottleService {
 
   registrarSucesso(chave: string): void {
     this.tentativas.delete(chave);
+  }
+
+  /** Exposto só para teste de regressão (Etapa 10.23) — nunca usado em produção. */
+  tamanhoParaTeste(): number {
+    return this.tentativas.size;
   }
 
   private dentroDaJanela(registro: RegistroTentativas): boolean {

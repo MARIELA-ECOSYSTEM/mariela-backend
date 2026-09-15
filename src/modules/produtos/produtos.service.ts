@@ -1,8 +1,11 @@
-import { Injectable } from "@nestjs/common";
+import { forwardRef, Inject, Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model, Types } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
+import { CampanhasRepository } from "../campanhas/campanhas.repository.js";
+import { ColecoesRepository } from "../colecoes/colecoes.repository.js";
+import { FornecedoresRepository } from "../fornecedores/fornecedores.repository.js";
 import { CHAVE_SEQUENCIA_PRODUTO, DIGITOS_CODIGO_PRODUTO, PREFIXO_CODIGO_PRODUTO } from "./produtos.constants.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
 import type { AdicionarTamanhoDto } from "./dto/adicionar-tamanho.dto.js";
@@ -14,7 +17,7 @@ import type { DefinirFotoPrincipalDto } from "./dto/definir-foto-principal.dto.j
 import type { DefinirNovidadeDto } from "./dto/definir-novidade.dto.js";
 import type { DefinirPromocaoDto } from "./dto/definir-promocao.dto.js";
 import type { ListarProdutosQueryDto } from "./dto/listar-produtos-query.dto.js";
-import { conflitoTamanhoUnico, formatarCodigoVariante, normalizarCor, normalizarTamanho } from "./utils/normalizacao.util.js";
+import { conflitoTamanhoUnico, formatarCodigoVariante, normalizarCor, normalizarSegmentoCodigo, normalizarTamanho } from "./utils/normalizacao.util.js";
 import { arredondarMoeda, calcularMargem, precoEfetivo } from "./utils/precos.util.js";
 import { ProdutosRepository } from "./produtos.repository.js";
 import type { DadosNovaVariante } from "./produtos.types.js";
@@ -35,9 +38,22 @@ export class ProdutosService {
     private readonly produtosRepository: ProdutosRepository,
     private readonly sequenciasService: SequenciasService,
     @InjectModel(EventoProduto.name) private readonly eventoModel: Model<EventoProdutoDocument>,
+    // Etapa 10.23 — correção 6.10: injeção via `forwardRef` (ver
+    // `produtos.module.ts`) — dependência circular genuína entre módulos,
+    // resolvida da forma padrão do NestJS, nunca acesso direto ao Mongoose
+    // dessas 3 entidades (sempre pelo Repository que já é a autoridade de
+    // cada uma, mesmo princípio já estabelecido no resto do projeto).
+    @Inject(forwardRef(() => FornecedoresRepository)) private readonly fornecedoresRepository: FornecedoresRepository,
+    @Inject(forwardRef(() => ColecoesRepository)) private readonly colecoesRepository: ColecoesRepository,
+    @Inject(forwardRef(() => CampanhasRepository)) private readonly campanhasRepository: CampanhasRepository,
   ) {}
 
   async criar(dto: CriarProdutoDto, usuarioId: string | null): Promise<ProdutoDocument> {
+    const colecaoId = dto.colecaoId?.trim() || null;
+    const campanhaId = dto.campanhaId?.trim() || null;
+    const fornecedorId = dto.fornecedorId?.trim() || null;
+    await this.validarReferencias({ fornecedorId, colecaoId, campanhaId });
+
     const codProduto = await this.sequenciasService.proximoCodigo(
       CHAVE_SEQUENCIA_PRODUTO,
       PREFIXO_CODIGO_PRODUTO,
@@ -52,9 +68,9 @@ export class ProdutosService {
       nome: dto.nome.trim(),
       descricao: dto.descricao?.trim() ?? "",
       categoria: dto.categoria.trim(),
-      colecaoId: dto.colecaoId?.trim() || null,
-      campanhaId: dto.campanhaId?.trim() || null,
-      fornecedorId: dto.fornecedorId?.trim() || null,
+      colecaoId,
+      campanhaId,
+      fornecedorId,
       precoCusto,
       precoVenda,
       margemLucro: calcularMargem(precoCusto, precoEfetivo({ precoVenda, ehPromocao: false, precoPromocional: null })),
@@ -126,6 +142,11 @@ export class ProdutosService {
   }
 
   async atualizar(id: string, dto: AtualizarProdutoDto, usuarioId: string | null): Promise<ProdutoDocument> {
+    const colecaoId = dto.colecaoId?.trim() || null;
+    const campanhaId = dto.campanhaId?.trim() || null;
+    const fornecedorId = dto.fornecedorId?.trim() || null;
+    await this.validarReferencias({ fornecedorId, colecaoId, campanhaId });
+
     const precoCusto = arredondarMoeda(dto.precoCusto);
     const precoVenda = arredondarMoeda(dto.precoVenda);
 
@@ -146,9 +167,9 @@ export class ProdutosService {
       documento.nome = dto.nome.trim();
       documento.descricao = dto.descricao?.trim() ?? "";
       documento.categoria = dto.categoria.trim();
-      documento.colecaoId = dto.colecaoId?.trim() || null;
-      documento.campanhaId = dto.campanhaId?.trim() || null;
-      documento.fornecedorId = dto.fornecedorId?.trim() || null;
+      documento.colecaoId = colecaoId;
+      documento.campanhaId = campanhaId;
+      documento.fornecedorId = fornecedorId;
       documento.precoCusto = precoCusto;
       documento.precoVenda = precoVenda;
       documento.ehNovidade = dto.ehNovidade ?? false;
@@ -183,7 +204,14 @@ export class ProdutosService {
         documento.ehPromocao = true;
         documento.precoPromocional = preco;
       } else {
+        // Etapa 10.23 — CORREÇÃO: zera o valor ao desativar (era mantido como
+        // valor "fantasma" do banco). Sem impacto funcional em nenhum momento
+        // (`precoEfetivo` sempre checa `ehPromocao` primeiro, e reativar exige
+        // um novo `precoPromocional` no DTO — nunca reaproveita este campo) —
+        // só higiene do dado persistido, evitando um valor antigo enganoso
+        // para quem inspecionar o documento diretamente.
         documento.ehPromocao = false;
+        documento.precoPromocional = null;
       }
       this.recalcularDerivados(documento);
     });
@@ -233,6 +261,33 @@ export class ProdutosService {
     // Confirma a existência do produto ANTES de tudo, só para reportar 404 vs.
     // "cor duplicada" corretamente — a inserção em si é atômica (ver repository).
     const produtoAtual = await this.produtosRepository.encontrarPorIdOuFalhar(produtoId);
+
+    // Etapa 10.23 — CORREÇÃO: `codVariante` é `${codProduto}-${segmento}` ou,
+    // quando `segmento` fica vazio (cor sem NENHUM caractere alfanumérico
+    // após normalização — ex.: "!!!", "🎨", "。。。"), cai para `codProduto`
+    // puro (`formatarCodigoVariante`). Uma SEGUNDA cor nessas condições no
+    // MESMO produto (cores diferentes o bastante para passar na checagem de
+    // unicidade de `corNormalizada`, ex.: "!!!" ≠ "@@@") geraria dois
+    // `codVariante` IDÊNTICOS.
+    //
+    // Correção de causa raiz (Etapa 10.23, verificado empiricamente contra o
+    // MongoDB real): a premissa original era "isso rejeita com duplicate-key
+    // do índice único (`variantes.codVariante`), gerando um 500 não tratado"
+    // — testado e CONFIRMADO FALSO: um índice único multikey do MongoDB não
+    // impede duas entradas IDÊNTICAS dentro do MESMO documento (só entre
+    // documentos DIFERENTES) — o `$push` de uma segunda cor colidente é
+    // aceito silenciosamente. O risco real, portanto, não é um 500: é uma
+    // inconsistência de dados SILENCIOSA (dois SKUs/`codVariante` iguais
+    // coexistindo na mesma produto, sem nenhum erro) — potencialmente pior,
+    // por ser invisível. Validado AQUI, antes de qualquer escrita, como erro
+    // de domínio (400). `normalizarCor` (unicidade de cor) e
+    // `formatarCodigoVariante` (geração do código) continuam exatamente como
+    // estavam; só a ENTRADA passa a ser validada.
+    if (!normalizarSegmentoCodigo(dto.cor)) {
+      throw ApiException.validation("Dados inválidos.", [
+        { field: "cor", message: "A cor deve conter ao menos um caractere alfanumérico." },
+      ]);
+    }
 
     const corNormalizada = normalizarCor(dto.cor);
     const novaVariante: DadosNovaVariante = {
@@ -410,6 +465,45 @@ export class ProdutosService {
     const variante = produto.variantes.find((item) => String(item._id) === varianteId) as VarianteDocument | undefined;
     if (!variante) throw ApiException.notFound("Variante não encontrada.");
     return variante;
+  }
+
+  /**
+   * Etapa 10.23 — correção 6.10: valida que `fornecedorId`/`colecaoId`/
+   * `campanhaId`, quando informados, referenciam registros que EXISTEM (não
+   * soft-deleted) — mesma regra já espelhada, no sentido inverso, pelo
+   * bloqueio de exclusão dessas 3 entidades quando há produtos vinculados
+   * (`FornecedoresService.excluir`/`ColecoesService.excluir`/
+   * `CampanhasService.excluir`, todos com a mesma mensagem "possui produtos
+   * vinculados"). Sem esta checagem, essa garantia era ilusória: um produto
+   * sempre podia apontar para uma entidade JÁ soft-deleted, nunca bloqueada
+   * na criação/edição.
+   *
+   * Deliberadamente NÃO valida o campo `ativo` (Coleções/Campanhas) — uma
+   * entidade inativa mas não excluída é um estado reversível e válido de
+   * negócio (ex.: campanha sazonal encerrada), e o próprio bloqueio de
+   * exclusão espelhado também nunca considerou `ativo`, só `excluidoEm`.
+   * Cada verificação é independente e só roda se o respectivo campo foi
+   * informado — `null` (sem referência) nunca é validado.
+   */
+  private async validarReferencias(referencias: { fornecedorId: string | null; colecaoId: string | null; campanhaId: string | null }): Promise<void> {
+    if (referencias.fornecedorId) {
+      const fornecedor = await this.fornecedoresRepository.encontrarPorId(referencias.fornecedorId);
+      if (!fornecedor) {
+        throw ApiException.validation("Dados inválidos.", [{ field: "fornecedorId", message: "Fornecedor não encontrado." }]);
+      }
+    }
+    if (referencias.colecaoId) {
+      const colecao = await this.colecoesRepository.encontrarPorId(referencias.colecaoId);
+      if (!colecao) {
+        throw ApiException.validation("Dados inválidos.", [{ field: "colecaoId", message: "Coleção não encontrada." }]);
+      }
+    }
+    if (referencias.campanhaId) {
+      const campanha = await this.campanhasRepository.encontrarPorId(referencias.campanhaId);
+      if (!campanha) {
+        throw ApiException.validation("Dados inválidos.", [{ field: "campanhaId", message: "Campanha não encontrada." }]);
+      }
+    }
   }
 
   /** Única função que recalcula estoque/margem — nunca duplicar esta lógica em outro lugar do módulo. */

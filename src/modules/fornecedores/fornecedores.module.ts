@@ -1,4 +1,4 @@
-import { Module } from "@nestjs/common";
+import { forwardRef, Module } from "@nestjs/common";
 import { MongooseModule } from "@nestjs/mongoose";
 import { ProdutosModule } from "../produtos/produtos.module.js";
 import { SequenciasModule } from "../sequencias/sequencias.module.js";
@@ -18,7 +18,12 @@ import { Fornecedor, FornecedorSchema } from "./schemas/fornecedor.schema.js";
     // Agregados comerciais (produtosVinculados/valorEmCusto/ultimaEntrada) e o
     // bloqueio de exclusão com produtos vinculados reusam `ProdutosRepository`
     // — mesmo padrão de `EstoqueModule`, nunca acesso direto ao Mongoose de Produtos.
-    ProdutosModule,
+    //
+    // Etapa 10.23 — `forwardRef`: `ProdutosModule` agora importa
+    // `FornecedoresModule` de volta (validação de existência ao criar/
+    // atualizar produto, correção 6.10) — dependência circular genuína,
+    // resolvida da forma padrão do NestJS.
+    forwardRef(() => ProdutosModule),
   ],
   controllers: [FornecedoresController],
   providers: [FornecedoresService, FornecedoresRepository],
