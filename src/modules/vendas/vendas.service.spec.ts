@@ -2561,7 +2561,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Desistência do cliente" }, "admin-teste");
       expect(cancelada.status).toBe("cancelada");
       expect(cancelada.valorDevolvido).toBe(400);
-      expect(cancelada.cancelamento?.tipo).toBe("integral");
+      expect(cancelada.cancelamentos[0]?.tipo).toBe("integral");
 
       const produtoAtualizado = await produtosService.obterPorId(produto.produtoId);
       const tamanho = produtoAtualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
@@ -3877,15 +3877,22 @@ describe("VendasService (integração — MongoDB real)", () => {
         { tipo: "parcial", motivo: "Teste N (A)", itens: [{ itemId: String(itemA._id), quantidade: 1 }] },
         null,
       );
-      // `cancelamento.valorDevolvido` é o valor DESTE evento (não o acumulado da venda).
-      expect(devolvidaA.cancelamento?.valorDevolvido).toBe(90);
+      // Etapa 10.22 — `cancelamentos` é um ARRAY de eventos: cada devolução
+      // parcial ADICIONA um novo evento (nunca sobrescreve o anterior).
+      // `cancelamentos[N].valorDevolvido` é o valor DESTE evento específico
+      // (não o acumulado da venda, que é `venda.valorDevolvido`).
+      expect(devolvidaA.cancelamentos).toHaveLength(1);
+      expect(devolvidaA.cancelamentos[0]?.valorDevolvido).toBe(90);
 
       const devolvidaB = await service.cancelar(
         venda.id,
         { tipo: "parcial", motivo: "Teste N (B)", itens: [{ itemId: String(itemB._id), quantidade: 1 }] },
         null,
       );
-      expect(devolvidaB.cancelamento?.valorDevolvido).toBe(180);
+      // O primeiro evento (A) continua preservado — nunca sobrescrito pelo segundo (B).
+      expect(devolvidaB.cancelamentos).toHaveLength(2);
+      expect(devolvidaB.cancelamentos[0]?.valorDevolvido).toBe(90);
+      expect(devolvidaB.cancelamentos[1]?.valorDevolvido).toBe(180);
       expect(devolvidaB.valorDevolvido).toBe(270); // acumulado: 90 (A) + 180 (B)
       await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
     });
@@ -3989,8 +3996,8 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(cancelada.vendedorId).toBe(vendedor.id);
       expect(cancelada.caixaId).toBe(caixa.id);
       expect(cancelada.dataVenda).toEqual(venda.dataVenda);
-      expect(cancelada.cancelamento).not.toBeNull();
-      expect(cancelada.cancelamento?.itens[0]?.quantidade).toBe(1);
+      expect(cancelada.cancelamentos).toHaveLength(1);
+      expect(cancelada.cancelamentos[0]?.itens[0]?.quantidade).toBe(1);
       await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
     });
 
@@ -4429,7 +4436,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           { tipo: "parcial", motivo: "Teste E", itens: [{ itemId: String(itemA._id), quantidade: 1 }] },
           null,
         );
-        expect(devolvida.cancelamento?.valorDevolvido).toBe(90); // 100 × (270/300)
+        expect(devolvida.cancelamentos[0]?.valorDevolvido).toBe(90); // 100 × (270/300)
         await caixasService.fechar(caixa.id, { valorInformado: 1180 }, null); // 1000 + 270 - 90
       });
 
@@ -5044,7 +5051,10 @@ describe("VendasService (integração — MongoDB real)", () => {
         await connection.collection("movimentos_caixa").deleteMany({ vendaId: venda.id, tipo: "cancelamento" });
         await connection
           .collection("vendas")
-          .updateOne({ _id: new Types.ObjectId(venda.id) }, { $set: { "cancelamento.itens.$[].restaurado": false } });
+          .updateOne(
+            { _id: new Types.ObjectId(venda.id) },
+            { $set: { "cancelamentos.$[].itens.$[].restaurado": false, "cancelamentos.$[].itens.$[].restaurando": false } },
+          );
 
         const meioDoCrash = await produtosService.obterPorId(produto.produtoId);
         expect(meioDoCrash.variantes[0]!.tamanhos[0]!.quantidade).toBe(2); // "desfeito" — simula que nunca restaurou
@@ -5082,7 +5092,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         await service.cancelar(venda.id, { tipo: "integral", motivo: "Primeira", idempotencyKey: chave }, null);
         const retry = await service.cancelar(venda.id, { tipo: "integral", motivo: "Retry", idempotencyKey: chave }, null);
         expect(retry.status).toBe("cancelada");
-        expect(retry.cancelamento?.valorDevolvido).toBe(300); // H. consistência do valor devolvido
+        expect(retry.cancelamentos[0]?.valorDevolvido).toBe(300); // H. consistência do valor devolvido
 
         const atualizado = await produtosService.obterPorId(produto.produtoId);
         expect(atualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(4);
@@ -5376,17 +5386,20 @@ describe("VendasService (integração — MongoDB real)", () => {
         null,
       );
       const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste reivindicação" }, null);
-      const itemId = cancelada.cancelamento!.itens[0]!.itemId;
+      const eventoId = String(cancelada.cancelamentos[0]!._id);
+      const itemId = cancelada.cancelamentos[0]!.itens[0]!.itemId;
 
       // Reabre a reivindicação manualmente (simula um cenário onde duas
       // chamadas de reconciliação concorrentes disputam o MESMO item ainda
       // não restaurado) e dispara duas reivindicações concorrentes de verdade.
-      await connection.collection("vendas").updateOne({ _id: new Types.ObjectId(venda.id) }, { $set: { "cancelamento.itens.$[].restaurado": false } });
+      await connection
+        .collection("vendas")
+        .updateOne({ _id: new Types.ObjectId(venda.id) }, { $set: { "cancelamentos.$[].itens.$[].restaurado": false, "cancelamentos.$[].itens.$[].restaurando": false } });
 
       const vendasRepository = moduleRef.get(VendasRepository);
       const resultados = await Promise.all([
-        vendasRepository.marcarItemDevolvidoRestaurado(venda.id, itemId),
-        vendasRepository.marcarItemDevolvidoRestaurado(venda.id, itemId),
+        vendasRepository.reivindicarRestauracaoDeItem(venda.id, eventoId, itemId),
+        vendasRepository.reivindicarRestauracaoDeItem(venda.id, eventoId, itemId),
       ]);
       expect(resultados.filter(Boolean)).toHaveLength(1); // só uma reivindicação vence
       // Caixa: 1000 inicial + 200 de entrada - 200 de saída (cancelamento integral) = 1000.
@@ -5411,18 +5424,226 @@ describe("VendasService (integração — MongoDB real)", () => {
         null,
       );
       const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste itens diferentes" }, null);
-      const [itemId1, itemId2] = cancelada.cancelamento!.itens.map((i) => i.itemId);
+      const eventoId = String(cancelada.cancelamentos[0]!._id);
+      const [itemId1, itemId2] = cancelada.cancelamentos[0]!.itens.map((i) => i.itemId);
 
-      await connection.collection("vendas").updateOne({ _id: new Types.ObjectId(venda.id) }, { $set: { "cancelamento.itens.$[].restaurado": false } });
+      await connection
+        .collection("vendas")
+        .updateOne({ _id: new Types.ObjectId(venda.id) }, { $set: { "cancelamentos.$[].itens.$[].restaurado": false, "cancelamentos.$[].itens.$[].restaurando": false } });
 
       const vendasRepository = moduleRef.get(VendasRepository);
       const [resultado1, resultado2] = await Promise.all([
-        vendasRepository.marcarItemDevolvidoRestaurado(venda.id, itemId1!),
-        vendasRepository.marcarItemDevolvidoRestaurado(venda.id, itemId2!),
+        vendasRepository.reivindicarRestauracaoDeItem(venda.id, eventoId, itemId1!),
+        vendasRepository.reivindicarRestauracaoDeItem(venda.id, eventoId, itemId2!),
       ]);
       expect(resultado1).toBe(true);
       expect(resultado2).toBe(true); // itens diferentes — ambas reivindicações vencem
       // Caixa: 1000 inicial + 200 de entrada - 200 de saída (cancelamento integral) = 1000.
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+  });
+
+  describe("Etapa 10.22 — histórico de múltiplos eventos de cancelamento + restauração de estoque confirmada", () => {
+    it("TESTE 1: uma devolução parcial cria exatamente 1 evento, com o item correto e restaurado=true ao final", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+        },
+        null,
+      );
+      const itemId = String(venda.itens[0]!._id);
+
+      const devolvida = await service.cancelar(venda.id, { tipo: "parcial", motivo: "Teste 1", itens: [{ itemId, quantidade: 1 }] }, null);
+
+      expect(devolvida.cancelamentos).toHaveLength(1);
+      expect(devolvida.cancelamentos[0]?.itens).toHaveLength(1);
+      expect(devolvida.cancelamentos[0]?.itens[0]?.itemId).toBe(itemId);
+      expect(devolvida.cancelamentos[0]?.itens[0]?.quantidade).toBe(1);
+
+      // `restaurarEstoquePendente` persiste `restaurado:true` via `updateOne`
+      // direto (não via `.save()`) — o objeto `devolvida` devolvido por
+      // `cancelar()` é o snapshot de ANTES dessa restauração; a confirmação
+      // final precisa ser lida de volta do banco.
+      const confirmada = await service.obterPorId(venda.id);
+      expect(confirmada.cancelamentos[0]?.itens[0]?.restaurado).toBe(true);
+
+      const atualizado = await produtosService.obterPorId(produto.produtoId);
+      const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
+      expect(tamanho.quantidade).toBe(4); // 5 - 2 (venda) + 1 (devolução) = 4
+      // Caixa: 1000 inicial + 200 de entrada - 100 de saída (devolução de 1 de 2 unidades a 100 cada) = 1100.
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("TESTE 2/3: três devoluções parciais sucessivas do mesmo item acumulam 3 eventos — nenhum sobrescreve o anterior", async () => {
+      const produto = await criarProdutoComEstoque(100, 6);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 3 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 300 }],
+        },
+        null,
+      );
+      const itemId = String(venda.itens[0]!._id);
+
+      const d1 = await service.cancelar(venda.id, { tipo: "parcial", motivo: "Devolução 1", itens: [{ itemId, quantidade: 1 }] }, null);
+      expect(d1.cancelamentos).toHaveLength(1);
+
+      const d2 = await service.cancelar(venda.id, { tipo: "parcial", motivo: "Devolução 2", itens: [{ itemId, quantidade: 1 }] }, null);
+      expect(d2.cancelamentos).toHaveLength(2);
+      expect(d2.cancelamentos[0]?.motivo).toBe("Devolução 1"); // primeiro evento PRESERVADO, nunca sobrescrito
+
+      const d3 = await service.cancelar(venda.id, { tipo: "parcial", motivo: "Devolução 3", itens: [{ itemId, quantidade: 1 }] }, null);
+      expect(d3.cancelamentos).toHaveLength(3);
+      expect(d3.cancelamentos.map((e) => e.motivo)).toEqual(["Devolução 1", "Devolução 2", "Devolução 3"]);
+      expect(d3.status).toBe("cancelada"); // as 3 unidades da venda foram todas devolvidas
+
+      // Confirmação final lida do banco (ver TESTE 1 sobre por que o objeto
+      // devolvido por `cancelar()` pode estar defasado quanto a `restaurado`).
+      const confirmada = await service.obterPorId(venda.id);
+      expect(confirmada.cancelamentos.every((e) => e.itens[0]?.restaurado)).toBe(true); // todos os 3 eventos confirmados restaurados
+
+      const atualizado = await produtosService.obterPorId(produto.produtoId);
+      const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
+      expect(tamanho.quantidade).toBe(6); // 6 - 3 (venda) + 3 (3 devoluções de 1 unidade cada) = 6
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("TESTE 4: replay da mesma idempotencyKey não cria um segundo evento nem duplica a restauração", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+        },
+        null,
+      );
+      const itemId = String(venda.itens[0]!._id);
+      const chave = `teste4-replay-${Date.now()}`;
+
+      const primeira = await service.cancelar(venda.id, { tipo: "parcial", motivo: "Teste 4", itens: [{ itemId, quantidade: 1 }], idempotencyKey: chave }, null);
+      expect(primeira.cancelamentos).toHaveLength(1);
+
+      const replay = await service.cancelar(venda.id, { tipo: "parcial", motivo: "Teste 4", itens: [{ itemId, quantidade: 1 }], idempotencyKey: chave }, null);
+      expect(replay.cancelamentos).toHaveLength(1); // nenhum segundo evento
+      expect(replay.valorDevolvido).toBe(primeira.valorDevolvido); // nenhum segundo estorno
+
+      const atualizado = await produtosService.obterPorId(produto.produtoId);
+      const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
+      expect(tamanho.quantidade).toBe(4); // nenhuma segunda baixa/restauração: 5-2+1=4, nunca 5
+      // Caixa: 1000 inicial + 200 de entrada - 100 de saída (devolução de 1 de 2 unidades a 100 cada, uma única vez) = 1100.
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("TESTE 5: duas devoluções parciais concorrentes de itens DIFERENTES são ambas preservadas, nenhum evento perdido", async () => {
+      const produtoA = await criarProdutoComEstoque(100, 5);
+      const produtoB = await criarProdutoComEstoque(150, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            { produtoId: produtoA.produtoId, varianteId: produtoA.varianteId, tamanhoId: produtoA.tamanhoId, quantidade: 1 },
+            { produtoId: produtoB.produtoId, varianteId: produtoB.varianteId, tamanhoId: produtoB.tamanhoId, quantidade: 1 },
+          ],
+          pagamentos: [{ forma: "Dinheiro", valor: 250 }],
+        },
+        null,
+      );
+      const itemA = venda.itens.find((i) => i.produtoId === produtoA.produtoId)!;
+      const itemB = venda.itens.find((i) => i.produtoId === produtoB.produtoId)!;
+
+      const resultados = await Promise.allSettled([
+        service.cancelar(venda.id, { tipo: "parcial", motivo: "Devolução item A", itens: [{ itemId: String(itemA._id), quantidade: 1 }] }, null),
+        service.cancelar(venda.id, { tipo: "parcial", motivo: "Devolução item B", itens: [{ itemId: String(itemB._id), quantidade: 1 }] }, null),
+      ]);
+      // Nenhuma das duas é rejeitada: são itens diferentes, não conflitam —
+      // apenas colidem na escrita otimista do documento, resolvida pelo retry
+      // de `salvarComRetentativa` (nunca perde um evento por causa da corrida).
+      expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);
+
+      const final = await service.obterPorId(venda.id);
+      expect(final.cancelamentos).toHaveLength(2);
+      const motivos = final.cancelamentos.map((e) => e.motivo).sort();
+      expect(motivos).toEqual(["Devolução item A", "Devolução item B"]);
+
+      const produtoAAtual = await produtosService.obterPorId(produtoA.produtoId);
+      const tamanhoA = produtoAAtual.variantes[0]!.tamanhos.find((t) => String(t._id) === produtoA.tamanhoId)!;
+      expect(tamanhoA.quantidade).toBe(5); // restaurado
+      const produtoBAtual = await produtosService.obterPorId(produtoB.produtoId);
+      const tamanhoB = produtoBAtual.variantes[0]!.tamanhos.find((t) => String(t._id) === produtoB.tamanhoId)!;
+      expect(tamanhoB.quantidade).toBe(5); // restaurado
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("TESTE 7/8: falha genuína na restauração física NUNCA marca restaurado=true e permanece retryable; retry posterior completa a restauração", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+        },
+        null,
+      );
+      const chave = `teste7-falha-restauracao-${Date.now()}`;
+
+      const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste 7", idempotencyKey: chave }, null);
+      const antesDaFalha = await produtosService.obterPorId(produto.produtoId);
+      expect(antesDaFalha.variantes[0]!.tamanhos[0]!.quantidade).toBe(5); // já restaurado normalmente pelo fluxo síncrono
+
+      // Simula uma falha GENUÍNA de restauração (não "produto excluído"): reabre
+      // a reivindicação (como se nunca tivesse sido confirmada) e força o
+      // produto a um estado que faz `ajustarQuantidadeTamanho` rejeitar
+      // (`resultado < 0`) — sem usar mocks, só estado real do MongoDB.
+      await connection
+        .collection("vendas")
+        .updateOne(
+          { _id: new Types.ObjectId(venda.id) },
+          { $set: { "cancelamentos.$[].itens.$[].restaurado": false, "cancelamentos.$[].itens.$[].restaurando": false } },
+        );
+      await connection.collection("produtos").updateOne({ _id: new Types.ObjectId(produto.produtoId) }, { $set: { "variantes.0.tamanhos.0.quantidade": -100 } });
+
+      // Retry (mesma idempotencyKey) tenta reconciliar — a restauração falha
+      // genuinamente; o item deve permanecer restaurado=false (nunca marcado
+      // sem confirmação real de sucesso).
+      const retryComFalha = await service.cancelar(venda.id, { tipo: "integral", motivo: "Retry com falha", idempotencyKey: chave }, null);
+      expect(retryComFalha.status).toBe("cancelada"); // a venda em si não é afetada pela falha de restauração
+      const docApósFalha = await connection.collection("vendas").findOne({ _id: new Types.ObjectId(venda.id) });
+      const eventoApósFalha = (docApósFalha!["cancelamentos"] as { itens: { itemId: string; restaurado: boolean; restaurando: boolean }[] }[])[0]!;
+      expect(eventoApósFalha.itens[0]!.restaurado).toBe(false); // NUNCA marcado sem sucesso confirmado
+      expect(eventoApósFalha.itens[0]!.restaurando).toBe(false); // reivindicação liberada — retryable
+
+      // Corrige o estado do produto (simula que o problema real foi resolvido)
+      // e tenta de novo (TESTE 8): a restauração agora deve completar sozinha,
+      // dentro do próprio fluxo de `cancelar()` (nada de reivindicação manual).
+      await connection.collection("produtos").updateOne({ _id: new Types.ObjectId(produto.produtoId) }, { $set: { "variantes.0.tamanhos.0.quantidade": 0 } });
+
+      const retryComSucesso = await service.cancelar(venda.id, { tipo: "integral", motivo: "Retry com sucesso", idempotencyKey: chave }, null);
+      expect(retryComSucesso.status).toBe("cancelada");
+      const docFinal = await connection.collection("vendas").findOne({ _id: new Types.ObjectId(venda.id) });
+      const eventoFinal = (docFinal!["cancelamentos"] as { itens: { restaurado: boolean }[] }[])[0]!;
+      expect(eventoFinal.itens[0]!.restaurado).toBe(true);
+      const produtoFinal = await produtosService.obterPorId(produto.produtoId);
+      expect(produtoFinal.variantes[0]!.tamanhos[0]!.quantidade).toBe(2); // 0 + 2 restaurado, nunca duplicado
       await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
     });
   });

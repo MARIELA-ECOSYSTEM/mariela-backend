@@ -8,26 +8,39 @@ import { ListarVendasQueryDto } from "./listar-vendas-query.dto.js";
 import { RegistrarRecebimentoDto } from "./registrar-recebimento.dto.js";
 
 describe("BaixarParcelaDto", () => {
-  it("aceita payload vazio (mantém a forma de pagamento da venda)", async () => {
-    const dto = plainToInstance(BaixarParcelaDto, {});
-    const erros = await validate(dto);
-    expect(erros).toHaveLength(0);
-  });
-
-  it("aceita formaPagamento informada", async () => {
-    const dto = plainToInstance(BaixarParcelaDto, { formaPagamento: "PIX" });
-    const erros = await validate(dto);
-    expect(erros).toHaveLength(0);
-  });
-
-  it("aceita idempotencyKey opcional", async () => {
+  it("aceita payload só com idempotencyKey (mantém a forma de pagamento da venda)", async () => {
     const dto = plainToInstance(BaixarParcelaDto, { idempotencyKey: "chave-123" });
     const erros = await validate(dto);
     expect(erros).toHaveLength(0);
   });
 
+  it("aceita formaPagamento informada junto com idempotencyKey", async () => {
+    const dto = plainToInstance(BaixarParcelaDto, { formaPagamento: "PIX", idempotencyKey: "chave-123" });
+    const erros = await validate(dto);
+    expect(erros).toHaveLength(0);
+  });
+
+  // Etapa 10.22 — idempotencyKey passou de opcional para OBRIGATÓRIA (correção 6.4).
+  it("rejeita payload vazio — idempotencyKey é obrigatória", async () => {
+    const dto = plainToInstance(BaixarParcelaDto, {});
+    const erros = await validate(dto);
+    expect(erros.some((erro) => erro.property === "idempotencyKey")).toBe(true);
+  });
+
+  it("rejeita quando idempotencyKey está ausente mesmo com outros campos válidos", async () => {
+    const dto = plainToInstance(BaixarParcelaDto, { formaPagamento: "PIX" });
+    const erros = await validate(dto);
+    expect(erros.some((erro) => erro.property === "idempotencyKey")).toBe(true);
+  });
+
   it("rejeita idempotencyKey vazia quando informada (Etapa 10.17)", async () => {
     const dto = plainToInstance(BaixarParcelaDto, { idempotencyKey: "" });
+    const erros = await validate(dto);
+    expect(erros.some((erro) => erro.property === "idempotencyKey")).toBe(true);
+  });
+
+  it("rejeita idempotencyKey acima de 200 caracteres", async () => {
+    const dto = plainToInstance(BaixarParcelaDto, { idempotencyKey: "a".repeat(201) });
     const erros = await validate(dto);
     expect(erros.some((erro) => erro.property === "idempotencyKey")).toBe(true);
   });
@@ -74,26 +87,26 @@ describe("CancelamentoDto", () => {
 });
 
 describe("RegistrarRecebimentoDto", () => {
-  it("aceita recebimento simples em dinheiro", async () => {
-    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "Dinheiro", valor: 100 });
+  it("aceita recebimento simples em dinheiro com idempotencyKey", async () => {
+    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "Dinheiro", valor: 100, idempotencyKey: "chave-123" });
     const erros = await validate(dto);
     expect(erros).toHaveLength(0);
   });
 
   it("rejeita forma vazia", async () => {
-    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "", valor: 100 });
+    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "", valor: 100, idempotencyKey: "chave-123" });
     const erros = await validate(dto);
     expect(erros.some((erro) => erro.property === "forma")).toBe(true);
   });
 
   it("rejeita valor zero ou negativo", async () => {
-    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "Dinheiro", valor: 0 });
+    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "Dinheiro", valor: 0, idempotencyKey: "chave-123" });
     const erros = await validate(dto);
     expect(erros.some((erro) => erro.property === "valor")).toBe(true);
   });
 
   it("rejeita valor ausente", async () => {
-    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "Dinheiro" });
+    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "Dinheiro", idempotencyKey: "chave-123" });
     const erros = await validate(dto);
     expect(erros.some((erro) => erro.property === "valor")).toBe(true);
   });
@@ -105,21 +118,29 @@ describe("RegistrarRecebimentoDto", () => {
       modalidade: "credito",
       adquirenteId: "65f1a2b3c4d5e6f7a8b9c0d1",
       parcelas: 3,
+      idempotencyKey: "chave-123",
     });
     const erros = await validate(dto);
     expect(erros).toHaveLength(0);
   });
 
   it("rejeita modalidade fora do enum", async () => {
-    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "Cartão", valor: 100, modalidade: "boleto" });
+    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "Cartão", valor: 100, modalidade: "boleto", idempotencyKey: "chave-123" });
     const erros = await validate(dto);
     expect(erros.some((erro) => erro.property === "modalidade")).toBe(true);
   });
 
-  it("aceita idempotencyKey opcional", async () => {
-    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "Dinheiro", valor: 100, idempotencyKey: "chave-123" });
+  // Etapa 10.22 — idempotencyKey passou de opcional para OBRIGATÓRIA (correção 6.4).
+  it("rejeita quando idempotencyKey está ausente mesmo com forma/valor válidos", async () => {
+    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "Dinheiro", valor: 100 });
     const erros = await validate(dto);
-    expect(erros).toHaveLength(0);
+    expect(erros.some((erro) => erro.property === "idempotencyKey")).toBe(true);
+  });
+
+  it("rejeita idempotencyKey acima de 200 caracteres", async () => {
+    const dto = plainToInstance(RegistrarRecebimentoDto, { forma: "Dinheiro", valor: 100, idempotencyKey: "a".repeat(201) });
+    const erros = await validate(dto);
+    expect(erros.some((erro) => erro.property === "idempotencyKey")).toBe(true);
   });
 
   it("rejeita idempotencyKey vazia quando informada", async () => {

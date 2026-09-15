@@ -1,12 +1,15 @@
-import { ApiPropertyOptional } from "@nestjs/swagger";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
 import { Type } from "class-transformer";
 import { IsIn, IsInt, IsNotEmpty, IsNumber, IsOptional, IsPositive, IsString, Max, MaxLength, Min } from "class-validator";
 import { MODALIDADES_PAGAMENTO, type ModalidadePagamento } from "../vendas.constants.js";
 
 /**
  * Espelha `BaixaParcelaPayload` (`src/types/venda.ts`). `formaPagamento`
- * (campo legado) continua funcionando sozinho — payload `{ formaPagamento }`
- * ou até `{}` seguem aceitos exatamente como antes (Etapa 10.11 é ADITIVA).
+ * (campo legado) continua funcionando sozinho — payload
+ * `{ formaPagamento, idempotencyKey }` segue aceito exatamente como antes
+ * (Etapa 10.11 é ADITIVA); um `{}` totalmente vazio não é mais aceito a
+ * partir da Etapa 10.22 (ver `idempotencyKey` abaixo — passou a ser
+ * obrigatória).
  *
  * Campos novos (Etapa 10.11) — todos opcionais, mesma forma de
  * `PagamentoVendaPdvDto`/`RegistrarRecebimentoDto`: quando `modalidade` é
@@ -57,9 +60,19 @@ export class BaixarParcelaDto {
   @MaxLength(200)
   observacao?: string;
 
-  @ApiPropertyOptional({ description: "Protege contra retry duplicado — opcional, mas recomendada." })
-  @IsOptional()
+  /**
+   * Etapa 10.22 — OBRIGATÓRIA (era opcional até esta etapa): operação
+   * financeira administrativa, sem proteção nenhuma contra duplo-clique/retry
+   * de rede sem uma chave. O Backoffice já sempre envia esta chave desde a
+   * Etapa 18.30 (`gerarIdempotencyKey()`, `vendas.$id.tsx`) — esta mudança
+   * não quebra o contrato real com o frontend, só fecha a lacuna de quem
+   * chamasse a API diretamente sem ela. Tipo TS permanece opcional de
+   * propósito (`?:`), não `!:` — `VendasService.baixarParcela` também é
+   * chamado internamente (testes, reconciliação) fora do `ValidationPipe`.
+   */
+  @ApiProperty({ description: "Protege contra retry duplicado — obrigatória desde a Etapa 10.22." })
   @IsString()
-  @IsNotEmpty({ message: "idempotencyKey não pode ser vazia quando informada." })
+  @IsNotEmpty({ message: "idempotencyKey é obrigatória." })
+  @MaxLength(200)
   idempotencyKey?: string;
 }

@@ -15,10 +15,12 @@ import { MODALIDADES_PAGAMENTO, type ModalidadePagamento } from "../vendas.const
  * `PagamentoVendaPdvDto` diretamente para não criar uma dependência do módulo
  * `vendas` sobre `pdv-vendas` (sentido contrário ao já estabelecido).
  *
- * `idempotencyKey` é OPCIONAL (diferente do PDV): mesmo padrão administrativo/
- * interno já usado em `DadosCriarVenda.idempotencyKey` — o Backoffice pode
- * informá-la para proteger contra retry de rede, mas seu uso mais comum
- * (clique manual de um operador) não depende disso para ser seguro.
+ * `idempotencyKey` — Etapa 10.22: OBRIGATÓRIA (era opcional/administrativa,
+ * diferente do PDV, até esta etapa). O Backoffice já sempre envia esta chave
+ * desde a Etapa 18.30 (`gerarIdempotencyKey()`, `vendas.$id.tsx`), então esta
+ * mudança não quebra o contrato real com o frontend — só fecha a lacuna de
+ * quem chamasse a API diretamente sem ela (um duplo-clique/retry de rede sem
+ * chave nunca tinha proteção nenhuma contra duplo lançamento financeiro).
  */
 export class RegistrarRecebimentoDto {
   @ApiProperty({ example: "Dinheiro", maxLength: 60 })
@@ -57,9 +59,10 @@ export class RegistrarRecebimentoDto {
   @IsString()
   adquirenteId?: string;
 
-  @ApiPropertyOptional({ description: "Protege contra retry duplicado — opcional, mas recomendada." })
-  @IsOptional()
+  /** Tipo TS permanece opcional de propósito (`?:`) — `VendasService.receberPagamento` também é chamado internamente (testes) fora do `ValidationPipe`. */
+  @ApiProperty({ description: "Protege contra retry duplicado — obrigatória desde a Etapa 10.22." })
   @IsString()
-  @IsNotEmpty({ message: "idempotencyKey não pode ser vazia quando informada." })
+  @IsNotEmpty({ message: "idempotencyKey é obrigatória." })
+  @MaxLength(200)
   idempotencyKey?: string;
 }

@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { HttpStatus, Injectable, Logger } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model, Types } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
@@ -64,6 +64,8 @@ export class VendasService {
    * do zero (ver "Problemas encontrados" no relatório da Etapa 05 do PDV).
    */
   private readonly criacoesEmAndamento = new Map<string, Promise<VendaDocument>>();
+
+  private readonly logger = new Logger(VendasService.name);
 
   constructor(
     private readonly vendasRepository: VendasRepository,
@@ -275,10 +277,26 @@ export class VendasService {
         baixados.push(solicitado);
       }
     } catch (erro) {
+      // Etapa 10.22 — CORREÇÃO: uma falha do PRÓPRIO rollback nunca pode ser
+      // engolida silenciosamente (era `.catch(() => undefined)` até esta
+      // etapa) — se isso acontecer, o estoque de `item` fica permanentemente
+      // decrementado sem nenhuma venda correspondente, e sem log nenhum
+      // ninguém saberia. Registrado com detalhe suficiente para reconciliação
+      // manual; o erro ORIGINAL (`erro`, a causa de ter chegado aqui) é
+      // sempre o que se propaga — o erro do rollback nunca o substitui.
       for (const item of baixados) {
-        await this.produtosService
-          .ajustarQuantidadeTamanho(item.produtoId, item.varianteId, { tamanhoId: item.tamanhoId, delta: item.quantidade, exigirExistente: true })
-          .catch(() => undefined);
+        try {
+          await this.produtosService.ajustarQuantidadeTamanho(item.produtoId, item.varianteId, {
+            tamanhoId: item.tamanhoId,
+            delta: item.quantidade,
+            exigirExistente: true,
+          });
+        } catch (erroRollback) {
+          this.logger.error(
+            `Falha ao desfazer a baixa de estoque do produto ${item.produtoId} (variante ${item.varianteId}, tamanho ${item.tamanhoId}, quantidade ${item.quantidade}) após erro na criação da venda — estoque pode estar permanentemente decrementado sem venda correspondente; requer reconciliação manual.`,
+            erroRollback instanceof Error ? erroRollback.stack : String(erroRollback),
+          );
+        }
       }
       throw erro;
     }
@@ -334,7 +352,7 @@ export class VendasService {
       pagamentos,
       parcelas,
       historico,
-      cancelamento: null,
+      cancelamentos: [],
       status: valorPendente > 0 ? "em_pagamento" : "concluida",
       idempotencyKey: dados.idempotencyKey ?? null,
     } satisfies DadosPersistirVenda);
@@ -817,25 +835,30 @@ export class VendasService {
    *
    * Etapa 10.13 — IDEMPOTÊNCIA E RECUPERAÇÃO:
    *
-   * 1. REPLAY: se `dto.idempotencyKey` for informada e a venda já estiver
-   *    cancelada com essa MESMA chave (`venda.cancelamento.idempotencyKey`),
-   *    a chamada é a MESMA operação lógica repetida — em vez de rejeitar com
-   *    "já cancelada", RECONCILIA efeitos ainda faltantes (estoque/caixa, ver
-   *    `reconciliarCancelamento`) e devolve a venda. Uma venda cancelada por
-   *    OUTRA chave (ou sem chave) continua rejeitando normalmente — nunca
-   *    permite dois cancelamentos DIFERENTES. Sem `idempotencyKey` (contrato
-   *    legado), o comportamento é IDÊNTICO ao de antes: sempre rejeita.
+   * 1. REPLAY: se `dto.idempotencyKey` for informada e já existir um evento
+   *    em `venda.cancelamentos` com essa MESMA chave, a chamada é a MESMA
+   *    operação lógica repetida — em vez de rejeitar com "já cancelada",
+   *    RECONCILIA efeitos ainda faltantes (estoque/caixa, ver
+   *    `reconciliarCancelamento`) e devolve a venda. Uma chave reusada para
+   *    tipo/itens DIFERENTES continua rejeitando normalmente — nunca permite
+   *    dois cancelamentos DIFERENTES sob a mesma chave. Sem `idempotencyKey`
+   *    (contrato legado), o comportamento é IDÊNTICO ao de antes: sempre
+   *    cria um novo evento.
    *
    * 2. RECUPERAÇÃO GRANULAR DE ESTOQUE: fecha a janela "venda salva como
    *    cancelada → processo cai → estoque nunca restaurado → retry rejeitado
-   *    antes de terminar". Cada linha de `cancelamento.itens` carrega seu
-   *    próprio `restaurado: boolean`, `false` na gravação inicial e só vira
-   *    `true` depois que `ProdutosService.ajustarQuantidadeTamanho` roda de
-   *    fato para aquela linha (nunca junto com a gravação do cancelamento em
-   *    si) — ver `restaurarEstoquePendente`. A "reivindicação" de cada item é
-   *    atômica (`VendasRepository.marcarItemDevolvidoRestaurado`), então a
-   *    mesma unidade nunca é devolvida duas vezes mesmo sob duas chamadas
-   *    (replay + concorrência) rodando ao mesmo tempo.
+   *    antes de terminar". Cada linha de item devolvido, dentro de CADA
+   *    evento de `cancelamentos[]` (Etapa 10.22 — array de eventos, nunca
+   *    mais "o" cancelamento único), carrega seu próprio `restaurado:
+   *    boolean`, `false` na gravação inicial e só vira `true` DEPOIS que
+   *    `ProdutosService.ajustarQuantidadeTamanho` confirma sucesso (nunca
+   *    junto com a gravação do cancelamento em si, nem antes da confirmação
+   *    — bug corrigido na Etapa 10.22) — ver `restaurarEstoquePendente`. A
+   *    "reivindicação" de cada item é atômica e em DUAS fases
+   *    (`VendasRepository.reivindicarRestauracaoDeItem` +
+   *    `marcarItemRestaurado`/`liberarReivindicacaoDeItem`), então a mesma
+   *    unidade nunca é devolvida duas vezes mesmo sob duas chamadas (replay +
+   *    concorrência) rodando ao mesmo tempo.
    *
    * 3. MOVIMENTO DE CAIXA: sempre re-garantido via
    *    `garantirMovimentoDeCancelamento` — idempotente por chave GLOBAL
@@ -865,9 +888,17 @@ export class VendasService {
     // operação (ou um reaproveitamento indevido da chave para uma operação
     // DIFERENTE) precisa ser reconhecido independentemente do status atual —
     // não só quando o cancelamento anterior fechou a venda por completo.
-    if (dto.idempotencyKey && vendaAtual.cancelamento?.idempotencyKey === dto.idempotencyKey) {
-      this.verificarMesmaOperacaoDeCancelamento(vendaAtual.cancelamento, dto);
-      return this.reconciliarCancelamento(vendaAtual, dto.idempotencyKey);
+    //
+    // Etapa 10.22 — agora busca entre TODOS os eventos já registrados
+    // (`cancelamentos[]`, nunca mais "o" cancelamento único): uma venda pode
+    // ter várias devoluções parciais anteriores, cada uma com sua própria
+    // `idempotencyKey`.
+    const eventoExistenteNaEntrada = dto.idempotencyKey
+      ? vendaAtual.cancelamentos.find((evento) => evento.idempotencyKey === dto.idempotencyKey)
+      : undefined;
+    if (eventoExistenteNaEntrada) {
+      this.verificarMesmaOperacaoDeCancelamento(eventoExistenteNaEntrada, dto);
+      return this.reconciliarCancelamento(vendaAtual, eventoExistenteNaEntrada);
     }
     if (vendaAtual.status === "cancelada") {
       throw ApiException.validation("Esta venda já está cancelada.");
@@ -885,6 +916,18 @@ export class VendasService {
     const motivo = dto.motivo.trim();
     const agora = new Date();
     let eraReplayConcorrente = false;
+    // Etapa 10.22 — o evento EFETIVAMENTE aplicado nesta chamada (novo ou
+    // reconhecido como replay concorrente dentro do retry) — capturado
+    // diretamente do documento que acaba sendo salvo, mesmo padrão já usado
+    // por `pagamentoAplicado` em `receberPagamento`/`baixarParcela`. Evita
+    // qualquer ambiguidade de "qual evento é este" depois do retry: cada
+    // tentativa reatribui estas variáveis contra o documento FRESCO dela.
+    // `valorDevolvidoDoEvento` é capturado separadamente (nunca lido de volta
+    // de `eventoAplicado` fora do callback) só para contornar uma inferência
+    // do compilador (`never`) ao ler uma propriedade de um subdocumento
+    // Mongoose armazenado numa variável `let` de escopo externo.
+    let eventoAplicado: CancelamentoVenda | null = null;
+    let valorDevolvidoDoEvento = 0;
 
     const venda = await this.vendasRepository.salvarComRetentativa(vendaId, (documento) => {
       // Mesma checagem de replay/conflito da entrada da função, agora contra
@@ -892,11 +935,16 @@ export class VendasService {
       // chamada com a MESMA chave (replay concorrente genuíno, ou reuso
       // indevido para operação diferente) venceu a escrita entre a leitura
       // inicial e agora.
-      if (dto.idempotencyKey && documento.cancelamento?.idempotencyKey === dto.idempotencyKey) {
-        this.verificarMesmaOperacaoDeCancelamento(documento.cancelamento, dto);
+      const eventoExistenteNaTentativa = dto.idempotencyKey
+        ? documento.cancelamentos.find((evento) => evento.idempotencyKey === dto.idempotencyKey)
+        : undefined;
+      if (eventoExistenteNaTentativa) {
+        this.verificarMesmaOperacaoDeCancelamento(eventoExistenteNaTentativa, dto);
         // É a MESMA operação — não muta de novo; a reconciliação fora deste
         // callback cuida do resto (estoque/caixa).
         eraReplayConcorrente = true;
+        eventoAplicado = eventoExistenteNaTentativa as CancelamentoVenda;
+        valorDevolvidoDoEvento = eventoExistenteNaTentativa.valorDevolvido;
         return;
       }
       if (documento.status === "cancelada") {
@@ -943,7 +991,11 @@ export class VendasService {
 
       const valorDevolvidoDaTentativa = arredondar(devolvidosDaTentativa.reduce((total, item) => total + item.valor, 0));
       documento.valorDevolvido = arredondar(documento.valorDevolvido + valorDevolvidoDaTentativa);
-      documento.cancelamento = {
+      // Etapa 10.22 — CORREÇÃO: ADICIONA um novo evento (nunca mais
+      // sobrescreve `documento.cancelamento`, que causava a perda de
+      // histórico de devoluções parciais anteriores — ver relatório da
+      // correção). `cancelamento` (legado, singular) nunca é mais escrito.
+      documento.cancelamentos.push({
         tipo: dto.tipo,
         motivo,
         dataHora: agora,
@@ -951,7 +1003,10 @@ export class VendasService {
         valorDevolvido: valorDevolvidoDaTentativa,
         itens: devolvidosDaTentativa,
         idempotencyKey: dto.idempotencyKey ?? null,
-      } as never;
+      } as never);
+      const eventoRecemCriado = documento.cancelamentos[documento.cancelamentos.length - 1]!;
+      eventoAplicado = eventoRecemCriado as CancelamentoVenda;
+      valorDevolvidoDoEvento = eventoRecemCriado.valorDevolvido;
       documento.historico.push({
         dataHora: agora,
         tipo: dto.tipo === "integral" ? "cancelamento" : "devolucao",
@@ -973,8 +1028,19 @@ export class VendasService {
     // reconciliação (idempotente item a item / por chave global) usada num
     // replay explícito — cobre também a corrida "perdi a gravação, mas a
     // operação é minha" (`eraReplayConcorrente`) sem nenhum código duplicado.
+    //
+    // Etapa 10.22 — `restaurarEstoquePendente` processa TODOS os eventos da
+    // venda (não só o desta chamada): isso é o que torna qualquer chamada
+    // subsequente a `cancelar()`/reconciliação capaz de completar uma
+    // restauração que ficou pendente de uma tentativa ANTERIOR (retry
+    // orgânico, sem mecanismo dedicado). `garantirMovimentoDeCancelamento`
+    // agora opera sobre o evento ESPECÍFICO capturado acima — nunca mais
+    // "o" cancelamento (que deixou de existir como conceito único).
+    const eventoFinal: CancelamentoVenda | null = eventoAplicado;
     await this.restaurarEstoquePendente(venda);
-    await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, dto.idempotencyKey);
+    if (eventoFinal) {
+      await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, eventoFinal);
+    }
 
     // `vendaAtual` já não podia estar cancelada aqui (a checagem no início da
     // função teria lançado ou reconciliado antes) — os agregados revertem só
@@ -984,14 +1050,14 @@ export class VendasService {
     }
 
     await this.registrarEvento(venda.id, dto.tipo === "integral" ? "venda.cancelada" : "venda.devolvida", usuarioId, {
-      valorDevolvido: venda.cancelamento?.valorDevolvido ?? 0,
+      valorDevolvido: valorDevolvidoDoEvento,
     });
     return venda;
   }
 
   /**
-   * Etapa 10.14 — confirma que uma `idempotencyKey` reencontrada em
-   * `venda.cancelamento` representa a MESMA operação pedida agora, nunca
+   * Etapa 10.14 — confirma que uma `idempotencyKey` reencontrada num evento
+   * de `venda.cancelamentos` representa a MESMA operação pedida agora, nunca
    * apenas "a mesma chave". Um cancelamento PARCIAL bem-sucedido não fecha a
    * venda (status continua "em_pagamento"), então nada além desta checagem
    * impediria reaproveitar a chave para um `tipo`/conjunto de itens
@@ -1021,69 +1087,120 @@ export class VendasService {
   }
 
   /**
-   * Reconcilia uma venda JÁ cancelada pela MESMA `idempotencyKey` (Etapa
-   * 10.13) — chamado quando `cancelar()` detecta, ANTES de qualquer
+   * Reconcilia uma venda que JÁ tem um evento com a MESMA `idempotencyKey`
+   * (Etapa 10.13) — chamado quando `cancelar()` detecta, ANTES de qualquer
    * mutação, que a operação já foi persistida (crash ou retry de rede
    * depois do `salvarComRetentativa` original). Só completa o que faltar
-   * (estoque/caixa); nunca reaplica o cancelamento em si — o snapshot em
-   * `venda.cancelamento` já existe e é imutável a partir daqui.
+   * (estoque/caixa) de TODOS os eventos pendentes da venda; nunca reaplica
+   * o evento em si — o snapshot em `evento` já existe e é imutável a partir
+   * daqui.
    */
-  private async reconciliarCancelamento(venda: VendaDocument, idempotencyKey: string): Promise<VendaDocument> {
+  private async reconciliarCancelamento(venda: VendaDocument, evento: CancelamentoVenda): Promise<VendaDocument> {
     const caixaAtual = await this.caixasService.obterAtual();
     if (!caixaAtual) {
       throw ApiException.validation("Nenhum caixa aberto. Abra o caixa antes de concluir o cancelamento.");
     }
     await this.restaurarEstoquePendente(venda);
-    await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, idempotencyKey);
+    await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, evento);
     return this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
   }
 
   /**
-   * Restaura o estoque de cada linha de `cancelamento.itens` que AINDA não
-   * tiver sido restaurada (Etapa 10.13) — sempre relê a venda antes de
-   * decidir (nunca confia num snapshot potencialmente desatualizado sob
-   * concorrência) e usa `VendasRepository.marcarItemDevolvidoRestaurado`
-   * como uma reivindicação ATÔMICA por item: só quem GANHA a reivindicação
-   * chama `devolverAoEstoque` para aquela linha — a mesma unidade nunca é
-   * devolvida duas vezes, mesmo com replay e concorrência reais disputando a
-   * MESMA venda cancelada ao mesmo tempo.
+   * Etapa 10.22 — CORREÇÃO: restaura o estoque de cada linha AINDA pendente
+   * (`restaurado: false`) de TODOS os eventos em `cancelamentos[]` (nunca
+   * mais só "o" cancelamento) — sempre relê a venda antes de decidir (nunca
+   * confia num snapshot potencialmente desatualizado sob concorrência).
+   *
+   * Reivindicação em DUAS fases, nunca mais uma escrita só: primeiro
+   * `reivindicarRestauracaoDeItem` (CAS `restaurado:false AND
+   * restaurando≠true` → `restaurando:true`) garante exclusividade ANTES de
+   * qualquer tentativa física; só então `devolverAoEstoque` roda de fato; só
+   * SUCESSO confirmado marca `restaurado:true`
+   * (`VendasRepository.marcarItemRestaurado`) — uma falha genuína NUNCA
+   * marca o item como restaurado (bug corrigido nesta etapa) e libera a
+   * reivindicação (`liberarReivindicacaoDeItem`) para uma tentativa futura
+   * poder tentar de novo. A única exceção: produto/variante genuinamente
+   * excluído (`ApiException` 404) é aceito como "nada a restaurar" e marcado
+   * concluído — mesmo comportamento histórico já existente antes desta
+   * etapa, preservado deliberadamente.
    */
   private async restaurarEstoquePendente(venda: VendaDocument): Promise<void> {
     const atual = await this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
-    if (!atual.cancelamento) return;
-    for (const devolvido of atual.cancelamento.itens) {
-      if (devolvido.restaurado) continue;
-      const reivindicado = await this.vendasRepository.marcarItemDevolvidoRestaurado(venda.id, devolvido.itemId);
-      if (!reivindicado) continue; // outra chamada já reivindicou (ou já concluiu) este item.
-      const item = atual.itens.find((registro) => String(registro._id) === devolvido.itemId);
-      if (item) await this.devolverAoEstoque(item, devolvido.quantidade);
+    for (const evento of atual.cancelamentos) {
+      const eventoId = String(evento._id);
+      for (const devolvido of evento.itens) {
+        if (devolvido.restaurado) continue;
+        const reivindicado = await this.vendasRepository.reivindicarRestauracaoDeItem(venda.id, eventoId, devolvido.itemId);
+        if (!reivindicado) continue; // outra chamada já reivindicou (ou já concluiu) este item.
+
+        const item = atual.itens.find((registro) => String(registro._id) === devolvido.itemId);
+        try {
+          if (item) await this.devolverAoEstoque(item, devolvido.quantidade);
+          await this.vendasRepository.marcarItemRestaurado(venda.id, eventoId, devolvido.itemId);
+        } catch (erro) {
+          if (this.erroDeProdutoOuVarianteExcluido(erro)) {
+            // Produto/variante não existe mais — nada a restaurar fisicamente;
+            // aceita como concluído (mesmo comportamento histórico já existente).
+            await this.vendasRepository.marcarItemRestaurado(venda.id, eventoId, devolvido.itemId);
+            continue;
+          }
+          // Falha genuína (ex.: conflito de concorrência esgotando os retries
+          // de `ProdutosRepository.salvarComRetentativa`) — NUNCA marca
+          // restaurado, libera a reivindicação para uma tentativa futura, e
+          // NUNCA engole o erro silenciosamente: fica registrado para
+          // investigação/reconciliação manual.
+          await this.vendasRepository.liberarReivindicacaoDeItem(venda.id, eventoId, devolvido.itemId);
+          this.logger.error(
+            `Falha ao restaurar estoque da venda ${atual.codigo} (evento ${eventoId}, item ${devolvido.itemId}, quantidade ${devolvido.quantidade}) — item permanece pendente para nova tentativa.`,
+            erro instanceof Error ? erro.stack : String(erro),
+          );
+        }
+      }
     }
   }
 
+  /** `ApiException` com status 404 — único caso em que uma falha de restauração de estoque é aceita como "nada a fazer" (produto/variante genuinamente excluído). */
+  private erroDeProdutoOuVarianteExcluido(erro: unknown): boolean {
+    return erro instanceof ApiException && erro.getStatus() === HttpStatus.NOT_FOUND;
+  }
+
   /**
-   * Garante o movimento de caixa do cancelamento/devolução — sempre a partir
-   * do snapshot JÁ PERSISTIDO em `venda.cancelamento` (nunca de um valor
-   * calculado ad-hoc pelo chamador), para que chamar isto de novo
-   * (replay/reconciliação) seja idempotente por construção. Chave DERIVADA
-   * GLOBAL (Etapa 10.13) `${vendaId}:cancelamento:${idempotencyKey}` — nunca
-   * duplica mesmo que o caixa atualmente aberto seja outro (ver
-   * `movimento-caixa.schema.ts`). Sem `idempotencyKey`, nenhuma deduplicação
-   * (mesmo padrão do resto do projeto).
+   * Garante o movimento de caixa de UM evento específico de cancelamento/
+   * devolução — sempre a partir do snapshot JÁ PERSISTIDO do evento (nunca
+   * de um valor calculado ad-hoc pelo chamador), para que chamar isto de
+   * novo (replay/reconciliação) seja idempotente por construção. Chave
+   * DERIVADA GLOBAL (Etapa 10.13) `${vendaId}:cancelamento:${idempotencyKey}`
+   * — nunca duplica mesmo que o caixa atualmente aberto seja outro (ver
+   * `movimento-caixa.schema.ts`). Sem `idempotencyKey` no evento, nenhuma
+   * deduplicação (mesmo padrão do resto do projeto).
+   *
+   * Etapa 10.22 — CORREÇÃO: uma venda pode ter vários eventos agora; o valor
+   * enviado ao caixa por ESTE evento é limitado ao que ainda resta de
+   * `valorPago` depois de descontar os eventos ANTERIORES a ele (mesma
+   * fórmula de antes — `min(valorDevolvido, valorPago)` — quando só existe 1
+   * evento, já que a soma de eventos anteriores é 0 nesse caso).
    */
-  private async garantirMovimentoDeCancelamento(caixaId: string, venda: VendaDocument, idempotencyKey: string | undefined): Promise<void> {
+  private async garantirMovimentoDeCancelamento(caixaId: string, venda: VendaDocument, evento: CancelamentoVenda): Promise<void> {
     const atual = await this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
-    if (!atual.cancelamento) return;
-    const valorParaCaixa = arredondar(Math.min(atual.cancelamento.valorDevolvido, atual.valorPago));
+    const eventoId = String(evento._id);
+    const indice = atual.cancelamentos.findIndex((item) => String(item._id) === eventoId);
+    if (indice === -1) return; // defensivo: o evento não existe mais no documento persistido.
+
+    const eventoAtual = atual.cancelamentos[indice]!;
+    const somaEventosAnteriores = arredondar(
+      atual.cancelamentos.slice(0, indice).reduce((total, item) => total + item.valorDevolvido, 0),
+    );
+    const valorParaCaixa = arredondar(Math.min(eventoAtual.valorDevolvido, Math.max(0, atual.valorPago - somaEventosAnteriores)));
     if (valorParaCaixa <= 0) return;
     await this.caixasService.registrarMovimentoDeVenda({
       caixaId,
       // Etapa 18.2 — o Caixa não distingue mais cancelamento total de
       // devolução parcial (ambos são `tipo: "cancelamento"`, sentido saída);
-      // essa distinção continua existindo aqui, só em `atual.cancelamento.tipo`
+      // essa distinção continua existindo aqui, só em `evento.tipo`
       // (autoridade comercial de Vendas), refletida na descrição do lançamento.
       tipo: "cancelamento",
       descricao:
-        atual.cancelamento.tipo === "integral"
+        eventoAtual.tipo === "integral"
           ? `Cancelamento da venda ${atual.codigo} · ${atual.clienteNome}`
           : `Devolução parcial da venda ${atual.codigo} · ${atual.clienteNome}`,
       referencia: atual.codigo,
@@ -1091,8 +1208,8 @@ export class VendasService {
       vendaCodigo: atual.codigo,
       formaPagamento: atual.formaPagamento,
       valor: valorParaCaixa,
-      observacao: atual.cancelamento.motivo,
-      idempotencyKey: idempotencyKey ? `${venda.id}:cancelamento:${idempotencyKey}` : null,
+      observacao: eventoAtual.motivo,
+      idempotencyKey: eventoAtual.idempotencyKey ? `${venda.id}:cancelamento:${eventoAtual.idempotencyKey}` : null,
     });
   }
 
@@ -1406,15 +1523,19 @@ export class VendasService {
     });
   }
 
+  /**
+   * Etapa 10.22 — CORREÇÃO: não engole mais erros (`.catch(() => undefined)`
+   * removido) — o chamador (`restaurarEstoquePendente`) é quem decide o que
+   * fazer com uma falha (produto/variante excluído → aceita como concluído;
+   * qualquer outro erro → registra e mantém pendente para retry).
+   */
   private async devolverAoEstoque(item: ItemVenda, quantidade: number): Promise<void> {
     if (!item.varianteId) return;
-    await this.produtosService
-      .ajustarQuantidadeTamanho(item.produtoId, item.varianteId, {
-        tamanho: item.tamanho ?? undefined,
-        delta: quantidade,
-        exigirExistente: false,
-      })
-      .catch(() => undefined); // produto/variante pode ter sido excluído — não impede o cancelamento administrativo.
+    await this.produtosService.ajustarQuantidadeTamanho(item.produtoId, item.varianteId, {
+      tamanho: item.tamanho ?? undefined,
+      delta: quantidade,
+      exigirExistente: false,
+    });
   }
 
   private montarParcelas(valorPendente: number, totalParcelas: number, dataVenda: Date) {

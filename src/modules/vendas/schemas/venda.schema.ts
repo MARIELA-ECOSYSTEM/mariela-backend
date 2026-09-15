@@ -222,21 +222,62 @@ export class ItemDevolvido {
    * Etapa 10.13 — marca se o estoque desta linha JÁ foi fisicamente
    * devolvido (`ProdutosService.ajustarQuantidadeTamanho`). `false` até a
    * restauração de fato acontecer; vira `true` via uma atualização atômica
-   * dedicada (`VendasRepository.marcarItemDevolvidoRestaurado`), NUNCA junto
+   * dedicada (`VendasRepository.marcarItemRestaurado`), NUNCA junto
    * com a gravação do cancelamento em si — isso é o que permite recuperar um
    * cancelamento que persistiu mas caiu antes de restaurar o estoque (ou
    * restaurou só parte dos itens) sem jamais devolver a mesma unidade duas
    * vezes num retry/reconciliação. `default: true` para qualquer venda
    * cancelada ANTES desta etapa (nunca existiram sem estoque já restaurado
    * pelo fluxo síncrono antigo) — nunca reabre uma restauração antiga.
+   *
+   * Etapa 10.22 — CORREÇÃO: só vira `true` DEPOIS que
+   * `ProdutosService.ajustarQuantidadeTamanho` confirma sucesso (nunca antes,
+   * como acontecia até esta etapa). Ver `restaurando` abaixo para a
+   * reivindicação que torna isso seguro sob concorrência.
    */
   @Prop({ type: Boolean, default: true })
   restaurado!: boolean;
+
+  /**
+   * Etapa 10.22 — reivindicação EM ANDAMENTO desta linha: `true` entre o
+   * momento em que uma chamada "ganha o direito" de tentar restaurar o
+   * estoque físico (CAS `restaurado:false AND restaurando≠true` →
+   * `restaurando:true`, ver `VendasRepository.reivindicarRestauracaoDeItem`)
+   * e o momento em que essa tentativa termina (sucesso → `restaurado:true`;
+   * falha → volta a `false`, liberando para nova tentativa). Sem este campo,
+   * a reivindicação teria que virar `restaurado:true` imediatamente — a
+   * causa raiz do bug corrigido nesta etapa (item marcado restaurado sem o
+   * estoque físico ter sido de fato incrementado). `default: false` — nunca
+   * existe reivindicação em andamento para vendas anteriores a esta etapa.
+   *
+   * Risco residual aceito (mesma classe de limitação já assumida em todo o
+   * módulo sem transação multi-documento): um crash do processo exatamente
+   * entre a reivindicação e a finalização deixaria este campo preso em
+   * `true` para sempre, sem retry automático — nenhum mecanismo de
+   * expiração/lease foi introduzido (fora do escopo desta correção).
+   */
+  @Prop({ type: Boolean, default: false })
+  restaurando!: boolean;
 }
 export const ItemDevolvidoSchema = SchemaFactory.createForClass(ItemDevolvido);
 
-@Schema({ _id: false })
+/**
+ * Etapa 10.22 — CORREÇÃO: um EVENTO de cancelamento/devolução (nunca mais "o"
+ * cancelamento da venda — uma venda pode ter vários, um por devolução
+ * parcial). Agora vive em `Venda.cancelamentos` (array, append-only) em vez
+ * de um único campo sobrescrito a cada chamada — ver histórico do bug
+ * corrigido no relatório desta etapa. `_id: true` (mudou de `false`): cada
+ * evento precisa de identidade própria e estável para que
+ * `VendasRepository.reivindicarRestauracaoDeItem`/`marcarItemRestaurado`
+ * consigam escopar corretamente `arrayFilters` de DOIS níveis (evento + item)
+ * — o mesmo `itemId` pode aparecer em mais de um evento (devoluções parciais
+ * sucessivas do mesmo item da venda).
+ */
+@Schema({ _id: true })
 export class CancelamentoVenda {
+  /** Identidade própria do evento (`_id: true`) — atribuída pelo Mongoose, nunca por `@Prop` (mesmo padrão de `criadoEm`/`atualizadoEm` em `Venda`). */
+  _id!: Types.ObjectId;
+
   @Prop({ type: String, required: true, enum: ["integral", "parcial"] })
   tipo!: "integral" | "parcial";
 
@@ -267,6 +308,7 @@ export class CancelamentoVenda {
   idempotencyKey!: string | null;
 }
 export const CancelamentoVendaSchema = SchemaFactory.createForClass(CancelamentoVenda);
+aplicarSerializacaoPadrao(CancelamentoVendaSchema);
 
 /**
  * Contrato alinhado a `VendaDetalhe`/`VendaResumo` (`src/types/venda.ts`).
@@ -375,8 +417,30 @@ export class Venda {
   @Prop({ type: [EventoHistoricoVendaSchema], default: [] })
   historico!: EventoHistoricoVenda[];
 
+  /**
+   * LEGADO — campo congelado a partir da Etapa 10.22, nunca mais escrito.
+   * Existia como "o" (único) cancelamento da venda antes desta etapa;
+   * substituído por `cancelamentos` (array, abaixo) porque um objeto único
+   * sobrescrito a cada devolução parcial perdia histórico e podia perder o
+   * rastreamento de itens ainda pendentes de restauração de estoque (ver
+   * relatório da correção). Mantido só para permitir LEITURA de qualquer
+   * documento eventualmente já persistido antes desta etapa — nenhuma
+   * migração foi executada (sem acesso a produção neste ambiente; ver
+   * relatório, seção "Compatibilidade com documentos existentes").
+   */
   @Prop({ type: CancelamentoVendaSchema, default: null })
   cancelamento!: CancelamentoVenda | null;
+
+  /**
+   * Etapa 10.22 — histórico completo de eventos de cancelamento/devolução
+   * (substituiu `cancelamento`, acima). Append-only: `VendasService.cancelar`
+   * sempre ADICIONA um novo evento, nunca sobrescreve os anteriores — uma
+   * venda pode acumular várias devoluções parciais ao longo do tempo, cada
+   * uma preservada com seus próprios itens e seu próprio estado de
+   * restauração de estoque por item.
+   */
+  @Prop({ type: [CancelamentoVendaSchema], default: [] })
+  cancelamentos!: Types.DocumentArray<CancelamentoVenda>;
 
   @Prop({ type: String, required: true, enum: STATUS_VENDA, default: "em_pagamento" })
   status!: StatusVenda;

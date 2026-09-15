@@ -1,6 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
-import { Error as MongooseErrors, isValidObjectId, type Model, type PipelineStage } from "mongoose";
+import { Error as MongooseErrors, isValidObjectId, Types, type Model, type PipelineStage } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, FacetOption } from "../../common/types/api-response.interface.js";
 import {
@@ -130,30 +130,81 @@ export class VendasRepository {
   }
 
   /**
-   * "Reivindica" atomicamente o direito de restaurar o estoque de UMA linha
-   * de `cancelamento.itens` (Etapa 10.13) — `updateOne` com `arrayFilters`,
+   * Etapa 10.22 — "Reivindica" atomicamente o DIREITO DE TENTAR restaurar o
+   * estoque de UMA linha de UM evento de `cancelamentos[]` (nunca a
+   * restauração em si — ver `marcarItemRestaurado`/`liberarReivindicacaoDeItem`
+   * abaixo). `updateOne` com `arrayFilters` de DOIS níveis (evento + item),
    * fora de `salvarComRetentativa`/versionamento otimista de propósito: é uma
-   * escrita condicional autocontida (`WHERE restaurado = false`), do tipo
-   * "compare-and-swap" — o mesmo padrão de idempotência por índice único já
-   * usado em `VendasRepository.criar`/`MovimentosCaixaRepository.criar`,
-   * aplicado aqui a um campo em vez de um índice.
+   * escrita condicional autocontida (`WHERE restaurado=false AND
+   * restaurando≠true`), do tipo "compare-and-swap" — mesmo padrão de
+   * idempotência por índice único já usado em
+   * `VendasRepository.criar`/`MovimentosCaixaRepository.criar`, aplicado aqui
+   * a campos em vez de um índice.
    *
-   * Devolve `true` só para quem GANHOU a reivindicação (deve prosseguir e
-   * chamar `ProdutosService.ajustarQuantidadeTamanho`); `false` quando o item
-   * já estava `restaurado` (outra chamada já tratou, ou é uma reconciliação
-   * repetida) — o chamador NUNCA deve restaurar estoque quando isto devolve
-   * `false`. Sob duas chamadas concorrentes tentando reconciliar o MESMO
-   * item, o Mongo garante que só uma delas terá `modifiedCount === 1`.
+   * Devolve `true` só para quem GANHOU a reivindicação (deve prosseguir,
+   * tentar `ProdutosService.ajustarQuantidadeTamanho` e SÓ DEPOIS chamar
+   * `marcarItemRestaurado`/`liberarReivindicacaoDeItem` conforme o
+   * resultado); `false` quando o item já estava `restaurado` ou já tinha uma
+   * reivindicação em andamento (`restaurando:true`) — o chamador NUNCA deve
+   * tentar restaurar estoque quando isto devolve `false`. Sob duas chamadas
+   * concorrentes disputando o MESMO item, o Mongo garante que só uma delas
+   * terá `modifiedCount === 1`.
    */
-  async marcarItemDevolvidoRestaurado(vendaId: string, itemId: string): Promise<boolean> {
+  async reivindicarRestauracaoDeItem(vendaId: string, eventoId: string, itemId: string): Promise<boolean> {
     const resultado = await this.vendaModel
       .updateOne(
-        { _id: vendaId, "cancelamento.itens": { $elemMatch: { itemId, restaurado: false } } },
-        { $set: { "cancelamento.itens.$[item].restaurado": true } },
-        { arrayFilters: [{ "item.itemId": itemId, "item.restaurado": false }] },
+        {
+          _id: vendaId,
+          cancelamentos: {
+            $elemMatch: { _id: new Types.ObjectId(eventoId), itens: { $elemMatch: { itemId, restaurado: false, restaurando: { $ne: true } } } },
+          },
+        },
+        { $set: { "cancelamentos.$[evt].itens.$[item].restaurando": true } },
+        {
+          arrayFilters: [
+            { "evt._id": new Types.ObjectId(eventoId) },
+            { "item.itemId": itemId, "item.restaurado": false, "item.restaurando": { $ne: true } },
+          ],
+        },
       )
       .exec();
     return resultado.modifiedCount === 1;
+  }
+
+  /**
+   * Confirma a restauração de UMA linha já reivindicada (só quem ganhou
+   * `reivindicarRestauracaoDeItem` deve chamar isto) — chamado SOMENTE depois
+   * que `ProdutosService.ajustarQuantidadeTamanho` confirma sucesso. Sem
+   * checagem condicional adicional: a exclusividade já foi garantida na
+   * reivindicação (nenhuma outra chamada consegue estar processando o mesmo
+   * item ao mesmo tempo).
+   */
+  async marcarItemRestaurado(vendaId: string, eventoId: string, itemId: string): Promise<void> {
+    await this.vendaModel
+      .updateOne(
+        { _id: vendaId },
+        { $set: { "cancelamentos.$[evt].itens.$[item].restaurado": true, "cancelamentos.$[evt].itens.$[item].restaurando": false } },
+        { arrayFilters: [{ "evt._id": new Types.ObjectId(eventoId) }, { "item.itemId": itemId }] },
+      )
+      .exec();
+  }
+
+  /**
+   * Libera a reivindicação de UMA linha cuja tentativa de restauração física
+   * FALHOU (motivo genuíno, não "produto/variante excluído" — ver
+   * `VendasService.restaurarEstoquePendente`) — volta `restaurando` para
+   * `false` sem nunca tocar `restaurado` (que permanece `false`), permitindo
+   * que uma execução futura tente de novo. Nunca chamado pelo vencedor de uma
+   * reivindicação bem-sucedida.
+   */
+  async liberarReivindicacaoDeItem(vendaId: string, eventoId: string, itemId: string): Promise<void> {
+    await this.vendaModel
+      .updateOne(
+        { _id: vendaId },
+        { $set: { "cancelamentos.$[evt].itens.$[item].restaurando": false } },
+        { arrayFilters: [{ "evt._id": new Types.ObjectId(eventoId) }, { "item.itemId": itemId }] },
+      )
+      .exec();
   }
 
   async listarComFacetas(params: ListarVendasParams): Promise<ListaVendasResultado> {
@@ -257,7 +308,7 @@ export class VendasRepository {
   async encontrarPorClienteId(clienteId: string): Promise<VendaDocument[]> {
     return this.vendaModel
       .find({ clienteId })
-      .select("-itens -pagamentos -parcelas -historico -cancelamento -observacao -idempotencyKey")
+      .select("-itens -pagamentos -parcelas -historico -cancelamento -cancelamentos -observacao -idempotencyKey")
       .sort({ dataVenda: -1 })
       .exec();
   }
@@ -272,7 +323,7 @@ export class VendasRepository {
   async encontrarPorVendedorId(vendedorId: string): Promise<VendaDocument[]> {
     return this.vendaModel
       .find({ vendedorId })
-      .select("-itens -pagamentos -parcelas -historico -cancelamento -observacao -idempotencyKey")
+      .select("-itens -pagamentos -parcelas -historico -cancelamento -cancelamentos -observacao -idempotencyKey")
       .sort({ dataVenda: -1 })
       .exec();
   }
@@ -291,7 +342,7 @@ export class VendasRepository {
     if (validos.length === 0) return [];
     return this.vendaModel
       .find({ _id: { $in: validos } })
-      .select("-itens -pagamentos -parcelas -historico -cancelamento -observacao -idempotencyKey")
+      .select("-itens -pagamentos -parcelas -historico -cancelamento -cancelamentos -observacao -idempotencyKey")
       .sort({ dataVenda: -1 })
       .exec();
   }
@@ -316,7 +367,7 @@ export class VendasRepository {
   async encontrarRecentes(limite: number): Promise<VendaDocument[]> {
     return this.vendaModel
       .find({})
-      .select("-itens -pagamentos -parcelas -historico -cancelamento -observacao -idempotencyKey")
+      .select("-itens -pagamentos -parcelas -historico -cancelamento -cancelamentos -observacao -idempotencyKey")
       .sort({ dataVenda: -1 })
       .limit(limite)
       .exec();

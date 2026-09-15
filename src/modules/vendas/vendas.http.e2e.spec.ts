@@ -229,7 +229,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/parcelas/${parcelaId}/baixa`, {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ formaPagamento: "PIX" }),
+      body: JSON.stringify({ formaPagamento: "PIX", idempotencyKey: `baixa-parcela-http-${Date.now()}` }),
     });
     const corpo = (await resposta.json()) as { data: { status: string; valorPendente: number } };
     expect(resposta.status).toBe(201);
@@ -248,7 +248,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/parcelas/${parcelaId}/baixa`, {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({}),
+      body: JSON.stringify({ idempotencyKey: `baixa-parcela-http-ja-paga-${Date.now()}` }),
     });
     expect(resposta.status).toBe(400);
   });
@@ -263,7 +263,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/parcelas/${String(parcela._id)}/baixa`, {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1 }),
+      body: JSON.stringify({ modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, idempotencyKey: `baixa-parcela-http-tarifa-${Date.now()}` }),
     });
     expect(resposta.status).toBe(201);
     const corpo = (await resposta.json()) as {
@@ -323,10 +323,10 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       headers: authHeaders(),
       body: JSON.stringify({ tipo: "integral", motivo: "Cancelamento de teste HTTP" }),
     });
-    const corpo = (await resposta.json()) as { data: { status: string; cancelamento: { tipo: string } | null } };
+    const corpo = (await resposta.json()) as { data: { status: string; cancelamentos: { tipo: string }[] } };
     expect(resposta.status).toBe(201);
     expect(corpo.data.status).toBe("cancelada");
-    expect(corpo.data.cancelamento?.tipo).toBe("integral");
+    expect(corpo.data.cancelamentos[0]?.tipo).toBe("integral");
   });
 
   describe("POST /api/v1/vendas/:id/cancelamento (Etapa 10.9)", () => {
@@ -492,8 +492,11 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
         expect(segunda.status).toBe(409); // conflito de idempotência, nunca 201/400 silencioso
 
         const final = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}`, { headers: authHeaders() });
-        const corpoFinal = (await final.json()) as { data: { cancelamento: { tipo: string } | null } };
-        expect(corpoFinal.data.cancelamento?.tipo).toBe("integral"); // nunca sobrescrito pela tentativa diferente
+        const corpoFinal = (await final.json()) as { data: { cancelamentos: { tipo: string }[] } };
+        // Nunca sobrescrito pela tentativa diferente — e, Etapa 10.22, o
+        // conflito nem sequer chega a criar um segundo evento em `cancelamentos`.
+        expect(corpoFinal.data.cancelamentos).toHaveLength(1);
+        expect(corpoFinal.data.cancelamentos[0]?.tipo).toBe("integral");
       });
 
       it("Etapa 10.14: retry da mesma idempotencyKey após o caixa original fechar e outro abrir não duplica nem migra o movimento", async () => {
@@ -563,7 +566,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify({ forma: "Dinheiro", valor: 250 }),
+        body: JSON.stringify({ forma: "Dinheiro", valor: 250, idempotencyKey: `recebimento-http-parcial-${Date.now()}` }),
       });
       expect(resposta.status).toBe(201);
       const corpo = (await resposta.json()) as { data: { valorPago: number; valorPendente: number; status: string } };
@@ -581,7 +584,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify({ forma: "PIX", valor: 200 }),
+        body: JSON.stringify({ forma: "PIX", valor: 200, idempotencyKey: `recebimento-http-quita-${Date.now()}` }),
       });
       expect(resposta.status).toBe(201);
       const corpo = (await resposta.json()) as { data: { status: string; valorPendente: number } };
@@ -594,7 +597,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify({ forma: "Dinheiro", valor: 201 }),
+        body: JSON.stringify({ forma: "Dinheiro", valor: 201, idempotencyKey: `recebimento-http-excede-${Date.now()}` }),
       });
       const corpo = (await resposta.json()) as { code: string };
       expect(resposta.status).toBe(400);
@@ -615,7 +618,14 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/recebimentos`, {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify({ forma: "Crédito", modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1, valor: 200 }),
+        body: JSON.stringify({
+          forma: "Crédito",
+          modalidade: "credito",
+          adquirenteId: adquirente.id,
+          parcelas: 1,
+          valor: 200,
+          idempotencyKey: `recebimento-http-tarifa-${Date.now()}`,
+        }),
       });
       expect(resposta.status).toBe(201);
       const corpo = (await resposta.json()) as {
@@ -737,7 +747,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaA.id}/parcelas/${parcelaDeB}/baixa`, {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify({}),
+        body: JSON.stringify({ idempotencyKey: `baixa-parcela-http-cross-venda-${Date.now()}` }),
       });
       expect(resposta.status).toBe(404);
 

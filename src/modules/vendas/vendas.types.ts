@@ -141,7 +141,8 @@ export interface DadosPersistirVenda {
   pagamentos: unknown[];
   parcelas: unknown[];
   historico: unknown[];
-  cancelamento: null;
+  /** Etapa 10.22 — sempre `[]` na criação; `cancelamento` (legado) nunca é escrito a partir desta etapa (default `null` do schema). */
+  cancelamentos: unknown[];
   status: "em_pagamento" | "concluida";
   idempotencyKey: string | null;
 }
