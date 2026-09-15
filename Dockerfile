@@ -34,8 +34,14 @@ ENV NODE_ENV=production
 ENV TZ=America/Sao_Paulo
 
 COPY package.json bun.lock ./
+# Etapa 30 — `oven/bun:1.4.2-slim` é baseada em Debian, não Alpine: não tem
+# `addgroup`/`adduser` (utilitários do BusyBox/Alpine); o equivalente Debian
+# (pacote `shadow`, já presente na imagem base) é `groupadd`/`useradd`. Falha
+# real observada no primeiro deploy no Render: `addgroup: not found` (exit
+# 127) — corrigido só aqui, sem trocar a imagem base nem remover o
+# usuário não-root.
 RUN bun install --frozen-lockfile --production && \
-    addgroup --system app && adduser --system --ingroup app app
+    groupadd --system app && useradd --system --gid app app
 COPY --from=build /app/dist ./dist
 
 USER app
