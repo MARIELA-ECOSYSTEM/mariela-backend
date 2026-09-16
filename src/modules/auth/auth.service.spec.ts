@@ -296,6 +296,82 @@ describe("AuthService (integração — MongoDB real)", () => {
     });
   });
 
+  describe("redefinirSenhaAdmin", () => {
+    it("atualiza a senha e a nova senha passa a funcionar no login (a antiga deixa de funcionar)", async () => {
+      const email = emailUnico("RESET-OK");
+      await service.criarAdminSeed({ nome: "Reset OK", email, senha: "senha-antiga-123" });
+
+      const resultado = await service.redefinirSenhaAdmin({ email, senha: "senha-nova-456" });
+      expect(resultado.status).toBe("atualizado");
+
+      await expect(service.login({ usuario: email, senha: "senha-nova-456" }, contextoTeste)).resolves.toBeDefined();
+      await expect(service.login({ usuario: email, senha: "senha-antiga-123" }, contextoTeste)).rejects.toThrow(
+        ApiException,
+      );
+    });
+
+    it("preserva integralmente codigo, nome, email, role, ativo, ultimoLoginEm e criadoEm — só senhaHash muda", async () => {
+      const email = emailUnico("RESET-PRESERVA");
+      await service.criarAdminSeed({ nome: "Reset Preserva", email, senha: "senha-antiga-123" });
+      await service.login({ usuario: email, senha: "senha-antiga-123" }, contextoTeste); // popula ultimoLoginEm
+
+      const antes = await connection.collection("usuarios").findOne({ email });
+      const resultado = await service.redefinirSenhaAdmin({ email, senha: "senha-nova-456" });
+      const depois = await connection.collection("usuarios").findOne({ email });
+
+      expect(resultado.status).toBe("atualizado");
+      expect(depois!["senhaHash"]).not.toBe(antes!["senhaHash"]);
+      expect(depois!["codigo"]).toBe(antes!["codigo"]);
+      expect(depois!["nome"]).toBe(antes!["nome"]);
+      expect(depois!["email"]).toBe(antes!["email"]);
+      expect(depois!["role"]).toBe(antes!["role"]);
+      expect(depois!["ativo"]).toBe(antes!["ativo"]);
+      expect(depois!["ultimoLoginEm"]).toEqual(antes!["ultimoLoginEm"]);
+      expect(depois!["criadoEm"]).toEqual(antes!["criadoEm"]);
+    });
+
+    it("trata maiúsculas/minúsculas e espaços do e-mail como o mesmo usuário (normalização)", async () => {
+      const email = emailUnico("RESET-NORM");
+      await service.criarAdminSeed({ nome: "Reset Norm", email, senha: "senha-antiga-123" });
+
+      const resultado = await service.redefinirSenhaAdmin({
+        email: `  ${email.toUpperCase()}  `,
+        senha: "senha-nova-456",
+      });
+      expect(resultado.status).toBe("atualizado");
+      await expect(service.login({ usuario: email, senha: "senha-nova-456" }, contextoTeste)).resolves.toBeDefined();
+    });
+
+    it("retorna nao_encontrado e não cria/altera nada quando o e-mail não existe", async () => {
+      const email = emailUnico("RESET-INEXISTENTE");
+      const totalAntes = await connection.collection("usuarios").countDocuments({});
+
+      const resultado = await service.redefinirSenhaAdmin({ email, senha: "senha-nova-456" });
+
+      expect(resultado.status).toBe("nao_encontrado");
+      const totalDepois = await connection.collection("usuarios").countDocuments({});
+      expect(totalDepois).toBe(totalAntes);
+      expect(await connection.collection("usuarios").findOne({ email })).toBeNull();
+    });
+
+    it("retorna nao_admin e não altera nada quando o usuário existe mas não é ADMIN", async () => {
+      const email = emailUnico("RESET-NAO-ADMIN");
+      await service.criarAdminSeed({ nome: "Reset Nao Admin", email, senha: "senha-antiga-123" });
+      // Role "NAO_ADMIN" não é alcançável via código real (hoje só existe
+      // ADMIN) — gravado direto na coleção só para simular o cenário
+      // defensivo do requisito, mesmo padrão já usado nos testes de "ativo".
+      await connection.collection("usuarios").updateOne({ email }, { $set: { role: "NAO_ADMIN" } });
+      const antes = await connection.collection("usuarios").findOne({ email });
+
+      const resultado = await service.redefinirSenhaAdmin({ email, senha: "senha-nova-456" });
+      const depois = await connection.collection("usuarios").findOne({ email });
+
+      expect(resultado.status).toBe("nao_admin");
+      expect(depois!["senhaHash"]).toBe(antes!["senhaHash"]);
+      expect(depois).toEqual(antes);
+    });
+  });
+
   describe("me", () => {
     it("devolve o usuário autenticado sem a senha", async () => {
       const email = emailUnico("ME");

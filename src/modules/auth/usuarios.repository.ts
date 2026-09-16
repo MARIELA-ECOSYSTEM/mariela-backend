@@ -45,6 +45,11 @@ export class UsuariosRepository {
     await this.usuarioModel.updateOne({ _id: id }, { $set: { ultimoLoginEm: new Date() } }).exec();
   }
 
+  /** Usado só pela recuperação administrativa de senha (`bun run admin:reset-password`) — nunca toca em outro campo. */
+  async atualizarSenhaHash(id: string, senhaHash: string): Promise<void> {
+    await this.usuarioModel.updateOne({ _id: id }, { $set: { senhaHash } }).exec();
+  }
+
   private ehErroDeChaveDuplicada(erro: unknown): boolean {
     return typeof erro === "object" && erro !== null && "code" in erro && (erro as { code: unknown }).code === 11000;
   }

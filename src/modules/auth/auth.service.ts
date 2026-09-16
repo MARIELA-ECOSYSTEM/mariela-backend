@@ -83,6 +83,31 @@ export class AuthService {
     return { criado: true, usuario: this.paraUsuarioPublico(usuario) };
   }
 
+  /**
+   * Usado SÓ pelo script de recuperação (`bun run admin:reset-password`) —
+   * mesma decisão de não expor rota HTTP pública (§19, ver `criarAdminSeed`).
+   * Nunca cria, nunca apaga, nunca altera qualquer campo além de `senhaHash`
+   * — reaproveita o MESMO `hashSenha` (Argon2id) usado no cadastro e no
+   * login, para a nova senha ser verificável pelo `login` normalmente.
+   */
+  async redefinirSenhaAdmin(dados: {
+    email: string;
+    senha: string;
+  }): Promise<
+    | { status: "nao_encontrado" }
+    | { status: "nao_admin"; usuario: UsuarioPublico }
+    | { status: "atualizado"; usuario: UsuarioPublico }
+  > {
+    const emailNormalizado = this.normalizarEmail(dados.email);
+    const usuario = await this.usuariosRepository.encontrarPorEmail(emailNormalizado);
+    if (!usuario) return { status: "nao_encontrado" };
+    if (usuario.role !== "ADMIN") return { status: "nao_admin", usuario: this.paraUsuarioPublico(usuario) };
+
+    const senhaHash = await this.hashSenha(dados.senha);
+    await this.usuariosRepository.atualizarSenhaHash(usuario.id, senhaHash);
+    return { status: "atualizado", usuario: this.paraUsuarioPublico(usuario) };
+  }
+
   async login(dto: LoginDto, contexto: ContextoRequisicao): Promise<ResultadoAutenticacao> {
     const emailNormalizado = this.normalizarEmail(dto.usuario);
     const chaveThrottle = `${contexto.ip ?? "desconhecido"}:${emailNormalizado}`;
