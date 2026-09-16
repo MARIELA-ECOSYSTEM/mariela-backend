@@ -17,12 +17,14 @@ import { ConfiguracoesModule } from "./modules/configuracoes/configuracoes.modul
 import { DashboardModule } from "./modules/dashboard/dashboard.module.js";
 import { EstoqueModule } from "./modules/estoque/estoque.module.js";
 import { FornecedoresModule } from "./modules/fornecedores/fornecedores.module.js";
+import { IntegracoesModule } from "./modules/integracoes/integracoes.module.js";
 import { PdvAuthModule } from "./modules/pdv-auth/pdv-auth.module.js";
 import { PdvCaixaModule } from "./modules/pdv-caixa/pdv-caixa.module.js";
 import { PdvClientesModule } from "./modules/pdv-clientes/pdv-clientes.module.js";
 import { PdvProdutosModule } from "./modules/pdv-produtos/pdv-produtos.module.js";
 import { PdvVendasModule } from "./modules/pdv-vendas/pdv-vendas.module.js";
 import { ProdutosModule } from "./modules/produtos/produtos.module.js";
+import { RelatoriosModule } from "./modules/relatorios/relatorios.module.js";
 import { SaudeModule } from "./modules/saude/saude.module.js";
 import { VendasModule } from "./modules/vendas/vendas.module.js";
 import { VendedoresModule } from "./modules/vendedores/vendedores.module.js";
@@ -87,6 +89,8 @@ import { WhatsappModule } from "./modules/whatsapp/whatsapp.module.js";
     CaixasModule,
     VendasModule,
     DashboardModule,
+    RelatoriosModule,
+    IntegracoesModule,
     PdvAuthModule,
     PdvCaixaModule,
     PdvClientesModule,
