@@ -21,6 +21,7 @@ import {
   type ModalidadePagamento,
 } from "./vendas.constants.js";
 import type { SelecaoFacetas } from "./vendas-filtros.util.js";
+import { calcularFaturamento } from "./faturamento.util.js";
 import { VendasRepository } from "./vendas.repository.js";
 import type { BaixarParcelaDto } from "./dto/baixar-parcela.dto.js";
 import type { CancelamentoDto } from "./dto/cancelamento.dto.js";
@@ -446,7 +447,10 @@ export class VendasService {
 
   async estatisticas(): Promise<{
     totalVendas: number;
+    /** @deprecated Ambíguo — mantido por compatibilidade, sempre igual a `faturamentoLiquido`. Use `faturamentoBruto`/`faturamentoLiquido`. */
     faturamento: number;
+    faturamentoBruto: number;
+    faturamentoLiquido: number;
     ticketMedio: number;
     itensVendidos: number;
     vendasEmPagamento: number;
@@ -463,12 +467,18 @@ export class VendasService {
     const faturaveis = vendas.filter((venda) => venda.status !== "cancelada");
     const canceladas = vendas.filter((venda) => venda.status === "cancelada");
     const emPagamento = vendas.filter((venda) => venda.status === "em_pagamento");
-    const faturamento = arredondar(faturaveis.reduce((total, venda) => total + venda.valorFinal - venda.valorDevolvido, 0));
+    // Fonte única (Fase 29B.1) — mesma fórmula usada pelo Dashboard, para os
+    // dois nunca mais divergirem sobre o que "faturamento" significa. O campo
+    // legado `faturamento` sempre igualou o LÍQUIDO (nunca o bruto) — mantido
+    // assim por compatibilidade retroativa.
+    const { faturamentoBruto, faturamentoLiquido } = calcularFaturamento(vendas);
 
     return {
       totalVendas: vendas.length,
-      faturamento,
-      ticketMedio: faturaveis.length ? arredondar(faturamento / faturaveis.length) : 0,
+      faturamento: faturamentoLiquido,
+      faturamentoBruto,
+      faturamentoLiquido,
+      ticketMedio: faturaveis.length ? arredondar(faturamentoLiquido / faturaveis.length) : 0,
       itensVendidos: faturaveis.reduce((total, venda) => total + venda.totalItens, 0),
       vendasEmPagamento: emPagamento.length,
       valorEmAberto: arredondar(emPagamento.reduce((total, venda) => total + venda.valorPendente, 0)),

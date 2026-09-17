@@ -357,7 +357,7 @@ export class VendasRepository {
     return this.vendaModel
       .find(
         { dataVenda: { $gte: inicio, $lt: fim } },
-        { status: 1, dataVenda: 1, valorFinal: 1, vendedorId: 1, clienteId: 1 },
+        { status: 1, dataVenda: 1, valorFinal: 1, valorDevolvido: 1, vendedorId: 1, clienteId: 1 },
       )
       .lean()
       .exec();
@@ -395,6 +395,7 @@ export interface VendaResumoFinanceiro {
   status: string;
   dataVenda: Date;
   valorFinal: number;
+  valorDevolvido: number;
   vendedorId: string;
   clienteId: string | null;
 }

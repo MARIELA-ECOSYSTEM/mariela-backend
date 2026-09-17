@@ -2761,7 +2761,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       await expect(service.obterPorId("65f1a2b3c4d5e6f7a8b9c0d1")).rejects.toThrow(ApiException);
     });
 
-    it("estatísticas somam faturamento e excluem canceladas", async () => {
+    it("estatísticas somam faturamento e excluem canceladas (bruto e líquido caem pelo mesmo valor quando não há devolução)", async () => {
       const produto = await criarProdutoComEstoque(80, 5);
       const vendedor = await criarVendedor();
       const caixa = await abrirCaixa();
@@ -2780,7 +2780,47 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       expect(depois.vendasCanceladas).toBe(antes.vendasCanceladas + 1);
       expect(depois.faturamento).toBeLessThanOrEqual(antes.faturamento);
+      // Venda cancelada some INTEIRAMENTE dos dois indicadores (Fase 29B.1).
+      expect(depois.faturamentoBruto).toBeCloseTo(antes.faturamentoBruto - 80, 2);
+      expect(depois.faturamentoLiquido).toBeCloseTo(antes.faturamentoLiquido - 80, 2);
+      // Campo legado `faturamento` continua igual ao líquido (compatibilidade retroativa).
+      expect(depois.faturamento).toBeCloseTo(depois.faturamentoLiquido, 2);
       await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("devolução parcial reduz faturamentoLiquido em /vendas/estatisticas sem reduzir faturamentoBruto", async () => {
+      const produtoA = await criarProdutoComEstoque(150, 5);
+      const produtoB = await criarProdutoComEstoque(50, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            { produtoId: produtoA.produtoId, varianteId: produtoA.varianteId, tamanhoId: produtoA.tamanhoId, quantidade: 1 },
+            { produtoId: produtoB.produtoId, varianteId: produtoB.varianteId, tamanhoId: produtoB.tamanhoId, quantidade: 1 },
+          ],
+          pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+        },
+        null,
+      );
+      const itemDevolvidoId = String(venda.itens[1]!._id);
+      const antes = await service.estatisticas();
+
+      const devolvida = await service.cancelar(
+        venda.id,
+        { tipo: "parcial", motivo: "Teste stats devolução parcial", itens: [{ itemId: itemDevolvidoId, quantidade: 1 }] },
+        null,
+      );
+      expect(devolvida.status).not.toBe("cancelada"); // só 1 dos 2 itens voltou.
+      expect(devolvida.valorDevolvido).toBe(50);
+
+      const depois = await service.estatisticas();
+      // valorFinal (200) continua contando inteiro no bruto — só o líquido cai 50.
+      expect(depois.faturamentoBruto).toBeCloseTo(antes.faturamentoBruto, 2);
+      expect(depois.faturamentoLiquido).toBeCloseTo(antes.faturamentoLiquido - 50, 2);
+      await caixasService.fechar(caixa.id, { valorInformado: 1150 }, null);
     });
   });
 

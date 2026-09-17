@@ -11,6 +11,7 @@ import type { CriarFornecedorDto } from "../fornecedores/dto/criar-fornecedor.dt
 import { FornecedoresService } from "../fornecedores/fornecedores.service.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
+import { calcularFaturamento } from "../vendas/faturamento.util.js";
 import { VendasService } from "../vendas/vendas.service.js";
 import type { DadosCriarVenda } from "../vendas/vendas.types.js";
 import type { CriarVendedorDto } from "../vendedores/dto/criar-vendedor.dto.js";
@@ -166,6 +167,14 @@ describe("DashboardService (integração — MongoDB real)", () => {
       expect(depois.vendas.vendasMes).toBe(antes.vendas.vendasMes + 1);
       expect(depois.vendas.faturamentoMes).toBeCloseTo(antes.vendas.faturamentoMes + 100, 2);
       expect(depois.vendas.ultimasVendas.some((item) => item.id === venda.id && item.valorFinal === 100)).toBe(true);
+
+      // Fase 29B.1 — sem devolução, bruto e líquido avançam pelo mesmo valor
+      // em TODOS os recortes, e o campo legado `faturamentoMes` é sempre o bruto.
+      expect(depois.vendas.faturamentoBrutoHoje).toBeCloseTo(antes.vendas.faturamentoBrutoHoje + 100, 2);
+      expect(depois.vendas.faturamentoLiquidoHoje).toBeCloseTo(antes.vendas.faturamentoLiquidoHoje + 100, 2);
+      expect(depois.vendas.faturamentoBrutoMes).toBeCloseTo(antes.vendas.faturamentoBrutoMes + 100, 2);
+      expect(depois.vendas.faturamentoLiquidoMes).toBeCloseTo(antes.vendas.faturamentoLiquidoMes + 100, 2);
+      expect(depois.vendas.faturamentoMes).toBeCloseTo(depois.vendas.faturamentoBrutoMes, 2);
     });
 
     it("venda EM_PAGAMENTO (paga parcialmente) também conta pelo valorFinal, não pelo valorPago", async () => {
@@ -194,6 +203,46 @@ describe("DashboardService (integração — MongoDB real)", () => {
       expect(depois.vendas.vendasMes).toBe(antes.vendas.vendasMes + 1);
       // Conta o valorFinal (300) inteiro, não o valorPago (100).
       expect(depois.vendas.faturamentoMes).toBeCloseTo(antes.vendas.faturamentoMes + 300, 2);
+      // EM_PAGAMENTO sem devolução: bruto e líquido avançam igualmente pelo
+      // valorFinal — pagamento posterior (ainda não recebido) não é contado
+      // duas vezes nem influencia o líquido (Fase 29B.1, requisito 7).
+      expect(depois.vendas.faturamentoBrutoMes).toBeCloseTo(antes.vendas.faturamentoBrutoMes + 300, 2);
+      expect(depois.vendas.faturamentoLiquidoMes).toBeCloseTo(antes.vendas.faturamentoLiquidoMes + 300, 2);
+    });
+
+    it("devolução parcial reduz faturamentoLiquidoMes sem reduzir faturamentoBrutoMes", async () => {
+      const produtoA = await criarProdutoComEstoque(50, 150, 5);
+      const produtoB = await criarProdutoComEstoque(25, 50, 5);
+      const vendedor = await criarVendedor();
+      const antes = await dashboardService.resumo();
+
+      const { caixa, fechar } = await abrirEFecharCaixa();
+      const venda = await vendasService.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            { produtoId: produtoA.produtoId, varianteId: produtoA.varianteId, tamanhoId: produtoA.tamanhoId, quantidade: 1 },
+            { produtoId: produtoB.produtoId, varianteId: produtoB.varianteId, tamanhoId: produtoB.tamanhoId, quantidade: 1 },
+          ],
+          pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+        },
+        null,
+      );
+      const itemDevolvidoId = String(venda.itens[1]!._id);
+      const devolvida = await vendasService.cancelar(
+        venda.id,
+        { tipo: "parcial", motivo: "Teste dashboard devolução parcial", itens: [{ itemId: itemDevolvidoId, quantidade: 1 }] },
+        null,
+      );
+      expect(devolvida.status).not.toBe("cancelada");
+      expect(devolvida.valorDevolvido).toBe(50);
+      await fechar(1150); // recebeu 200, devolveu 50 → saldo 1000 + 200 - 50.
+
+      const depois = await dashboardService.resumo();
+      // valorFinal (200) inteiro continua no bruto; só o líquido cai os 50 devolvidos.
+      expect(depois.vendas.faturamentoBrutoMes).toBeCloseTo(antes.vendas.faturamentoBrutoMes + 200, 2);
+      expect(depois.vendas.faturamentoLiquidoMes).toBeCloseTo(antes.vendas.faturamentoLiquidoMes + 150, 2);
     });
 
     it("venda cancelada não conta no faturamento (efeito líquido zero comparado ao estado anterior à criação)", async () => {
@@ -221,6 +270,9 @@ describe("DashboardService (integração — MongoDB real)", () => {
       const depoisCancelamento = await dashboardService.resumo();
       expect(depoisCancelamento.vendas.vendasMes).toBe(antes.vendas.vendasMes);
       expect(depoisCancelamento.vendas.faturamentoMes).toBeCloseTo(antes.vendas.faturamentoMes, 2);
+      // Cancelada some INTEIRAMENTE de bruto e líquido (Fase 29B.1, requisito 7).
+      expect(depoisCancelamento.vendas.faturamentoBrutoMes).toBeCloseTo(antes.vendas.faturamentoBrutoMes, 2);
+      expect(depoisCancelamento.vendas.faturamentoLiquidoMes).toBeCloseTo(antes.vendas.faturamentoLiquidoMes, 2);
     });
 
     it("mês anterior fica zerado (nenhuma venda pode ser criada com data retroativa) e crescimentoMensalPercentual não divide por zero", async () => {
@@ -244,6 +296,14 @@ describe("DashboardService (integração — MongoDB real)", () => {
       expect(resumo.vendas.evolucao).toHaveLength(diasNoMesAtual);
       const somaVendasNaEvolucao = resumo.vendas.evolucao.reduce((total, ponto) => total + ponto.vendas, 0);
       expect(somaVendasNaEvolucao).toBe(resumo.vendas.vendasMes);
+
+      // Fase 29B.1, requisito 8 — a soma diária de bruto/líquido bate com os
+      // agregados do mês (mesma fórmula, nunca dois cálculos divergentes).
+      const somaBrutoNaEvolucao = resumo.vendas.evolucao.reduce((total, ponto) => total + ponto.faturamentoBruto, 0);
+      const somaLiquidoNaEvolucao = resumo.vendas.evolucao.reduce((total, ponto) => total + ponto.faturamentoLiquido, 0);
+      expect(somaBrutoNaEvolucao).toBeCloseTo(resumo.vendas.faturamentoBrutoMes, 2);
+      expect(somaLiquidoNaEvolucao).toBeCloseTo(resumo.vendas.faturamentoLiquidoMes, 2);
+      expect(resumo.vendas.evolucao.every((ponto) => ponto.faturamento === ponto.faturamentoBruto)).toBe(true);
     });
   });
 
@@ -340,6 +400,56 @@ describe("DashboardService (integração — MongoDB real)", () => {
       expect(posicaoTop).toBeLessThan(posicaoBaixo);
       expect(posicaoSemVendas).toBe(-1);
       expect(ranking[posicaoTop]!.ticketMedio).toBeCloseTo(300, 2);
+      // Fase 29B.1 — sem devolução, bruto = líquido = faturamento (legado) para cada vendedor.
+      expect(ranking[posicaoTop]!.faturamentoBruto).toBeCloseTo(300, 2);
+      expect(ranking[posicaoTop]!.faturamentoLiquido).toBeCloseTo(300, 2);
+      expect(ranking[posicaoTop]!.faturamento).toBeCloseTo(ranking[posicaoTop]!.faturamentoBruto, 2);
+    });
+
+    it("ranking usa a MESMA fórmula canônica de faturamento do restante do sistema (Fase 29B.1, requisito 6/8)", async () => {
+      const produtoA = await criarProdutoComEstoque(50, 150, 5);
+      const produtoB = await criarProdutoComEstoque(25, 50, 5);
+      const vendedor = await criarVendedor();
+
+      // Venda A: sem devolução (bruto = líquido = 150).
+      await venderPagoIntegral(vendedor.id, produtoA, 150);
+
+      // Venda B: com devolução parcial de 1 dos 2 itens (bruto 200, líquido 150).
+      const { caixa, fechar } = await abrirEFecharCaixa();
+      const vendaB = await vendasService.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [
+            { produtoId: produtoA.produtoId, varianteId: produtoA.varianteId, tamanhoId: produtoA.tamanhoId, quantidade: 1 },
+            { produtoId: produtoB.produtoId, varianteId: produtoB.varianteId, tamanhoId: produtoB.tamanhoId, quantidade: 1 },
+          ],
+          pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+        },
+        null,
+      );
+      const itemDevolvidoId = String(vendaB.itens[1]!._id);
+      await vendasService.cancelar(
+        vendaB.id,
+        { tipo: "parcial", motivo: "Teste ranking devolução parcial", itens: [{ itemId: itemDevolvidoId, quantidade: 1 }] },
+        null,
+      );
+      await fechar(1150);
+
+      // Fonte independente da verdade: a MESMA função pura, alimentada com os
+      // valores reais persistidos das 2 vendas deste vendedor.
+      const esperado = calcularFaturamento([
+        { status: "concluida", valorFinal: 150, valorDevolvido: 0 },
+        { status: "em_pagamento", valorFinal: 200, valorDevolvido: 50 },
+      ]);
+
+      const resumo = await dashboardService.resumo();
+      const entradaRanking = resumo.vendedores.ranking.find((item) => item.vendedorId === vendedor.id);
+      expect(entradaRanking).toBeDefined();
+      expect(entradaRanking!.faturamentoBruto).toBeCloseTo(esperado.faturamentoBruto, 2);
+      expect(entradaRanking!.faturamentoLiquido).toBeCloseTo(esperado.faturamentoLiquido, 2);
+      expect(entradaRanking!.faturamentoBruto).toBeCloseTo(350, 2);
+      expect(entradaRanking!.faturamentoLiquido).toBeCloseTo(300, 2);
     });
 
     it("vendedor inativo entra em `inativos`, ativo entra em `ativos`", async () => {

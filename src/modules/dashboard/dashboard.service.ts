@@ -1,5 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { ClientesRepository } from "../clientes/clientes.repository.js";
+import { calcularFaturamento } from "../vendas/faturamento.util.js";
 import { FornecedoresRepository } from "../fornecedores/fornecedores.repository.js";
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { arredondarMoeda, precoEfetivo } from "../produtos/utils/precos.util.js";
@@ -72,11 +73,14 @@ function evolucaoDoMes(vendasDoMes: VendaResumoFinanceiro[], chave: string): Pon
   const pontos: PontoEvolucaoVendas[] = [];
   for (let dia = 1; dia <= diasNoMes(chave); dia += 1) {
     const doDia = vendasDoMes.filter((venda) => venda.dataVenda.getDate() === dia);
+    const { faturamentoBruto, faturamentoLiquido } = calcularFaturamento(doDia);
     pontos.push({
       data: `${chave}-${String(dia).padStart(2, "0")}`,
       label: `${String(dia).padStart(2, "0")}/${mes}`,
       vendas: doDia.length,
-      faturamento: somarValorFinal(doDia),
+      faturamento: faturamentoBruto,
+      faturamentoBruto,
+      faturamentoLiquido,
     });
   }
   return pontos;
@@ -142,22 +146,39 @@ export class DashboardService {
     const doMesAtual = doisMeses.filter((venda) => venda.dataVenda >= inicioMesAtual);
     const doMesAnterior = doisMeses.filter((venda) => venda.dataVenda < inicioMesAtual);
 
-    const faturamentoMes = somarValorFinal(doMesAtual);
-    const faturamentoMesAnterior = somarValorFinal(doMesAnterior);
+    // Fonte única (Fase 29B.1): bruto/líquido nunca mais calculados
+    // separadamente em cada recorte — `faturamentoMes`/`faturamentoMesAnterior`
+    // seguem representando o BRUTO (mesmo valor/semântica de sempre, usado
+    // logo abaixo em `ticketMedioMes`/`crescimentoMensalPercentual`, ambos
+    // inalterados nesta fase).
+    const faturamentoHojeCalc = calcularFaturamento(doHoje);
+    const faturamentoSemanaCalc = calcularFaturamento(daSemana);
+    const faturamentoMesCalc = calcularFaturamento(doMesAtual);
+    const faturamentoMesAnteriorCalc = calcularFaturamento(doMesAnterior);
+    const faturamentoMes = faturamentoMesCalc.faturamentoBruto;
+    const faturamentoMesAnterior = faturamentoMesAnteriorCalc.faturamentoBruto;
 
     const vendas: DashboardVendas = {
       mesReferencia: chave,
       mesLabel: labelMes(chave),
       mesesDisponiveis,
       vendasHoje: doHoje.length,
-      faturamentoHoje: somarValorFinal(doHoje),
+      faturamentoHoje: faturamentoHojeCalc.faturamentoBruto,
+      faturamentoBrutoHoje: faturamentoHojeCalc.faturamentoBruto,
+      faturamentoLiquidoHoje: faturamentoHojeCalc.faturamentoLiquido,
       vendasSemana: daSemana.length,
-      faturamentoSemana: somarValorFinal(daSemana),
+      faturamentoSemana: faturamentoSemanaCalc.faturamentoBruto,
+      faturamentoBrutoSemana: faturamentoSemanaCalc.faturamentoBruto,
+      faturamentoLiquidoSemana: faturamentoSemanaCalc.faturamentoLiquido,
       vendasMes: doMesAtual.length,
       faturamentoMes,
+      faturamentoBrutoMes: faturamentoMesCalc.faturamentoBruto,
+      faturamentoLiquidoMes: faturamentoMesCalc.faturamentoLiquido,
       ticketMedioMes: doMesAtual.length ? arredondarMoeda(faturamentoMes / doMesAtual.length) : 0,
       vendasMesAnterior: doMesAnterior.length,
       faturamentoMesAnterior,
+      faturamentoBrutoMesAnterior: faturamentoMesAnteriorCalc.faturamentoBruto,
+      faturamentoLiquidoMesAnterior: faturamentoMesAnteriorCalc.faturamentoLiquido,
       crescimentoMensalPercentual: faturamentoMesAnterior
         ? arredondarMoeda(((faturamentoMes - faturamentoMesAnterior) / faturamentoMesAnterior) * 100)
         : 0,
@@ -221,14 +242,16 @@ export class DashboardService {
     const ranking: RankingVendedor[] = vendedores
       .map((vendedor) => {
         const suas = doMesAtual.filter((venda) => venda.vendedorId === vendedor.id);
-        const faturamento = somarValorFinal(suas);
+        const { faturamentoBruto, faturamentoLiquido } = calcularFaturamento(suas);
         return {
           vendedorId: vendedor.id,
           nome: vendedor.nome,
           foto: vendedor.foto,
           vendas: suas.length,
-          faturamento,
-          ticketMedio: suas.length ? arredondarMoeda(faturamento / suas.length) : 0,
+          faturamento: faturamentoBruto,
+          faturamentoBruto,
+          faturamentoLiquido,
+          ticketMedio: suas.length ? arredondarMoeda(faturamentoBruto / suas.length) : 0,
         };
       })
       .filter((item) => item.vendas > 0)

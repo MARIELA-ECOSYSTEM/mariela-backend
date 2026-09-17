@@ -12,7 +12,12 @@ export interface PontoEvolucaoVendas {
   data: string;
   label: string;
   vendas: number;
+  /** @deprecated Ambíguo — mantido por compatibilidade, sempre igual a `faturamentoBruto`. Use `faturamentoBruto`/`faturamentoLiquido`. */
   faturamento: number;
+  /** Σ valorFinal (Fase 29B.1). */
+  faturamentoBruto: number;
+  /** Σ (valorFinal - valorDevolvido) (Fase 29B.1). */
+  faturamentoLiquido: number;
 }
 
 export interface VendaResumoDashboard {
@@ -48,14 +53,26 @@ export interface DashboardVendas {
   mesLabel: string;
   mesesDisponiveis: MesReferencia[];
   vendasHoje: number;
+  /** @deprecated Ambíguo — mantido por compatibilidade, sempre igual a `faturamentoBrutoHoje`. Use `faturamentoBrutoHoje`/`faturamentoLiquidoHoje`. */
   faturamentoHoje: number;
+  faturamentoBrutoHoje: number;
+  faturamentoLiquidoHoje: number;
   vendasSemana: number;
+  /** @deprecated Ambíguo — mantido por compatibilidade, sempre igual a `faturamentoBrutoSemana`. Use `faturamentoBrutoSemana`/`faturamentoLiquidoSemana`. */
   faturamentoSemana: number;
+  faturamentoBrutoSemana: number;
+  faturamentoLiquidoSemana: number;
   vendasMes: number;
+  /** @deprecated Ambíguo — mantido por compatibilidade, sempre igual a `faturamentoBrutoMes`. Use `faturamentoBrutoMes`/`faturamentoLiquidoMes`. */
   faturamentoMes: number;
+  faturamentoBrutoMes: number;
+  faturamentoLiquidoMes: number;
   ticketMedioMes: number;
   vendasMesAnterior: number;
+  /** @deprecated Ambíguo — mantido por compatibilidade, sempre igual a `faturamentoBrutoMesAnterior`. Use `faturamentoBrutoMesAnterior`/`faturamentoLiquidoMesAnterior`. */
   faturamentoMesAnterior: number;
+  faturamentoBrutoMesAnterior: number;
+  faturamentoLiquidoMesAnterior: number;
   crescimentoMensalPercentual: number;
   evolucao: PontoEvolucaoVendas[];
   ultimasVendas: VendaResumoDashboard[];
@@ -104,7 +121,10 @@ export interface RankingVendedor {
   nome: string;
   foto: string | null;
   vendas: number;
+  /** @deprecated Ambíguo — mantido por compatibilidade, sempre igual a `faturamentoBruto`. Use `faturamentoBruto`/`faturamentoLiquido`. */
   faturamento: number;
+  faturamentoBruto: number;
+  faturamentoLiquido: number;
   ticketMedio: number;
 }
 
