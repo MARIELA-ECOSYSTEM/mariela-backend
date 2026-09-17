@@ -4,6 +4,7 @@ import { InjectModel } from "@nestjs/mongoose";
 import type { Model, Types } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
+import { PdvAuthRepository } from "../pdv-auth/pdv-auth.repository.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
 import type { VendaDocument } from "../vendas/schemas/venda.schema.js";
 import { VendasRepository } from "../vendas/vendas.repository.js";
@@ -53,6 +54,7 @@ export class VendedoresService {
     private readonly vendedoresRepository: VendedoresRepository,
     private readonly sequenciasService: SequenciasService,
     private readonly vendasRepository: VendasRepository,
+    private readonly pdvAuthRepository: PdvAuthRepository,
     @InjectModel(EventoVendedor.name) private readonly eventoModel: Model<EventoVendedorDocument>,
   ) {}
 
@@ -171,13 +173,25 @@ export class VendedoresService {
     return vendedor;
   }
 
-  /** Redefinição dedicada de senha — nunca registra a senha (nem o hash) no evento de auditoria. */
+  /**
+   * Redefinição dedicada de senha — nunca registra a senha (nem o hash) no
+   * evento de auditoria.
+   *
+   * Fase 29B.3 (F29-06): depois de trocar a senha, revoga TODAS as sessões
+   * PDV emitidas antes desta operação (mesma função já usada por
+   * `PdvAuthService` para reagir a reutilização de refresh token ou a um
+   * vendedor inativado — nenhum mecanismo novo). Sem isto, um refresh token
+   * emitido antes da redefinição continuaria válido até sua expiração
+   * natural (até `PDV_JWT_REFRESH_EXPIRES_IN`, hoje 12h) mesmo com a senha
+   * já trocada pelo Backoffice.
+   */
   async redefinirSenha(id: string, dto: RedefinirSenhaVendedorDto, usuarioId: string | null): Promise<void> {
     const senhaHash = await this.hashSenha(dto.senha);
     const vendedor = await this.vendedoresRepository.salvarComRetentativa(id, (documento) => {
       documento.senhaHash = senhaHash;
     });
     await this.registrarEvento(vendedor.id, "vendedor.senha_redefinida", usuarioId, {});
+    await this.pdvAuthRepository.revogarTodosDoVendedor(vendedor._id as Types.ObjectId, new Date());
   }
 
   /**

@@ -1,5 +1,7 @@
 import { Module } from "@nestjs/common";
 import { MongooseModule } from "@nestjs/mongoose";
+import { PdvAuthRepository } from "../pdv-auth/pdv-auth.repository.js";
+import { VendedorRefreshToken, VendedorRefreshTokenSchema } from "../pdv-auth/schemas/vendedor-refresh-token.schema.js";
 import { SequenciasModule } from "../sequencias/sequencias.module.js";
 import { Venda, VendaSchema } from "../vendas/schemas/venda.schema.js";
 import { VendasRepository } from "../vendas/vendas.repository.js";
@@ -24,11 +26,20 @@ import { EventoVendedor, EventoVendedorSchema } from "./schemas/evento-vendedor.
       // estabelecida (Vendas depende de Vendedores, nunca o contrário) — mesmo
       // padrão já usado em `ClientesModule` (Etapa 13.2).
       { name: Venda.name, schema: VendaSchema },
+      // Fase 29B.3 (F29-06) — mesmo racional exato do `Venda` acima:
+      // `PdvAuthModule` importa `VendedoresModule` (para `verificarSenha`),
+      // então importar `PdvAuthModule` de volta aqui criaria uma dependência
+      // circular. `PdvAuthRepository` só depende do model `VendedorRefreshToken`
+      // (nenhuma outra dependência), então registrá-lo aqui com seu próprio
+      // model reusa a MESMA classe/lógica de revogação (nunca uma segunda
+      // implementação) sem inverter a direção de dependência já estabelecida
+      // (PdvAuth depende de Vendedores, nunca o contrário).
+      { name: VendedorRefreshToken.name, schema: VendedorRefreshTokenSchema },
     ]),
     SequenciasModule,
   ],
   controllers: [VendedoresController],
-  providers: [VendedoresService, VendedoresRepository, VendasRepository],
+  providers: [VendedoresService, VendedoresRepository, VendasRepository, PdvAuthRepository],
   exports: [VendedoresService, VendedoresRepository],
 })
 export class VendedoresModule {}

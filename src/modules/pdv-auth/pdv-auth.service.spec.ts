@@ -227,6 +227,37 @@ describe("PdvAuthService (integração — MongoDB real)", () => {
 
       await expect(service.refresh({ refreshToken: login.refreshToken }, CONTEXTO)).rejects.toThrow(ApiException);
     });
+
+    it("Fase 29B.3 (F29-06) — redefinição de senha pelo Backoffice revoga o refresh token PDV emitido antes dela", async () => {
+      const vendedor = await criarVendedor();
+
+      // Sessão PDV emitida ANTES da redefinição de senha.
+      const loginAntigo = await service.login({ codigo: vendedor.codigo, senha: "senha123" }, CONTEXTO);
+
+      // Redefinição de senha, feita pelo Backoffice (mesmo mecanismo de `VendedoresController`).
+      await vendedoresService.redefinirSenha(vendedor.id, { senha: "senhaNovaPosReset" }, "admin-teste");
+
+      // 1) A senha antiga deixa de funcionar.
+      await expect(service.login({ codigo: vendedor.codigo, senha: "senha123" }, CONTEXTO)).rejects.toThrow(
+        ApiException,
+      );
+
+      // 2) O refresh token emitido ANTES da redefinição não consegue gerar nova sessão.
+      await expect(service.refresh({ refreshToken: loginAntigo.refreshToken }, CONTEXTO)).rejects.toThrow(
+        ApiException,
+      );
+
+      // 3) A nova senha funciona e gera uma sessão válida nova.
+      const loginNovo = await service.login({ codigo: vendedor.codigo, senha: "senhaNovaPosReset" }, CONTEXTO);
+      expect(loginNovo.accessToken).toBeTruthy();
+      expect(loginNovo.refreshToken).toBeTruthy();
+      expect(loginNovo.vendedor.id).toBe(vendedor.id);
+
+      // 4) A sessão NOVA (emitida depois da redefinição) continua funcionando normalmente — a
+      //    revogação atinge só as sessões anteriores, nunca a que acabou de ser criada.
+      const renovado = await service.refresh({ refreshToken: loginNovo.refreshToken }, CONTEXTO);
+      expect(renovado.accessToken).toBeTruthy();
+    });
   });
 
   describe("logout", () => {
