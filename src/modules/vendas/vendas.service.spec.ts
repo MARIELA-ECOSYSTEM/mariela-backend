@@ -2709,6 +2709,56 @@ describe("VendasService (integração — MongoDB real)", () => {
       await caixasService.fechar(caixa.id, { valorInformado: 1120 }, null);
     });
 
+    it("Fase 29B.2 — página 1 e página 2 trazem vendas diferentes, com meta consistente", async () => {
+      const produto = await criarProdutoComEstoque(60, 10);
+      const vendedor = await criarVendedor();
+      for (let indice = 0; indice < 5; indice += 1) {
+        const caixa = await abrirCaixa();
+        await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 60 }],
+          },
+          null,
+        );
+        await caixasService.fechar(caixa.id, { valorInformado: 1060 }, null);
+      }
+
+      // `busca` de Vendas casa por vendedorNome (entre outros) — um vendedor
+      // recém-criado com nome único isola exatamente estas 5 vendas.
+      const primeiraPagina = await service.listar(queryPadrao({ busca: vendedor.nome, limit: 2, page: 1 }));
+      const segundaPagina = await service.listar(queryPadrao({ busca: vendedor.nome, limit: 2, page: 2 }));
+      expect(primeiraPagina.data).toHaveLength(2);
+      expect(segundaPagina.data).toHaveLength(2);
+      expect(primeiraPagina.meta.total).toBe(5);
+      expect(primeiraPagina.meta.totalPages).toBe(3);
+      expect(primeiraPagina.data[0]?.id).not.toBe(segundaPagina.data[0]?.id);
+    });
+
+    it("Fase 29B.2 — página além do total: data vazio, meta consistente, sem erro", async () => {
+      const produto = await criarProdutoComEstoque(70, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 70 }],
+        },
+        null,
+      );
+
+      const resultado = await service.listar(queryPadrao({ busca: vendedor.nome, page: 999, limit: 20 }));
+      expect(resultado.data).toEqual([]);
+      expect(resultado.meta.total).toBe(1);
+      expect(resultado.meta.page).toBe(999);
+      expect(resultado.meta.totalPages).toBe(1);
+      await caixasService.fechar(caixa.id, { valorInformado: 1070 }, null);
+    });
+
     it("Etapa 18.25 — listarTodas() devolve todas as vendas, sem paginar", async () => {
       const produto = await criarProdutoComEstoque(90, 5);
       const vendedor = await criarVendedor();

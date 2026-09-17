@@ -4,6 +4,7 @@ import { plainToInstance } from "class-transformer";
 import { validate } from "class-validator";
 import { AdicionarTamanhoDto } from "./adicionar-tamanho.dto.js";
 import { CriarProdutoDto } from "./criar-produto.dto.js";
+import { ListarProdutosQueryDto } from "./listar-produtos-query.dto.js";
 import { EntradaEstoqueDto } from "../../estoque/dto/entrada-estoque.dto.js";
 
 describe("AdicionarTamanhoDto", () => {
@@ -53,6 +54,30 @@ describe("CriarProdutoDto", () => {
     });
     const erros = await validate(dto);
     expect(erros).toHaveLength(0);
+  });
+});
+
+describe("ListarProdutosQueryDto", () => {
+  it("aplica os defaults quando nada é informado", async () => {
+    const dto = plainToInstance(ListarProdutosQueryDto, {});
+    const erros = await validate(dto);
+    expect(erros).toHaveLength(0);
+    expect(dto.ordenarPor).toBe("nome");
+    expect(dto.ordem).toBe("asc");
+    expect(dto.page).toBe(1);
+    expect(dto.limit).toBe(20);
+  });
+
+  it("Fase 29B.2 — rejeita limit acima do máximo permitido (100)", async () => {
+    const dto = plainToInstance(ListarProdutosQueryDto, { limit: "500" });
+    const erros = await validate(dto);
+    expect(erros.some((erro) => erro.property === "limit")).toBe(true);
+  });
+
+  it("Fase 29B.2 — rejeita page menor que 1", async () => {
+    const dto = plainToInstance(ListarProdutosQueryDto, { page: "0" });
+    const erros = await validate(dto);
+    expect(erros.some((erro) => erro.property === "page")).toBe(true);
   });
 });
 

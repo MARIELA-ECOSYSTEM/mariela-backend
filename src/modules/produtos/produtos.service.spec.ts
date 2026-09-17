@@ -181,6 +181,34 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       expect(resultado.meta.total).toBe(3);
       expect(resultado.meta.totalPages).toBe(2);
     });
+
+    it("Fase 29B.2 — página além do total: data vazio, meta consistente, sem erro", async () => {
+      const marcador = `AlemDoLimite ${Date.now()}`;
+      for (let indice = 0; indice < 3; indice += 1) {
+        await service.criar(payloadProduto(`J${indice}`, { nome: `${marcador} ${indice}` }), null);
+      }
+
+      const resultado = await service.listar({
+        busca: marcador,
+        ordenarPor: "nome",
+        ordem: "asc",
+        page: 999,
+        limit: 20,
+        categorias: [],
+        colecoes: [],
+        campanhas: [],
+        fornecedores: [],
+        estoque: [],
+        promocao: [],
+        novidade: [],
+      });
+
+      expect(resultado.data).toEqual([]);
+      expect(resultado.meta.total).toBe(3);
+      expect(resultado.meta.page).toBe(999);
+      expect(resultado.meta.limit).toBe(20);
+      expect(resultado.meta.totalPages).toBe(1);
+    });
   });
 
   describe("atualização e validação", () => {

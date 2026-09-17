@@ -180,6 +180,18 @@ describe("ClientesService (integração — MongoDB real)", () => {
       expect(primeiraPagina.data[0]?.id).not.toBe(segundaPagina.data[0]?.id);
     });
 
+    it("Fase 29B.2 — página além do total: data vazio, meta consistente, sem erro", async () => {
+      const prefixo = `AlemDoLimite${Date.now()}`;
+      await service.criar(payloadCliente(prefixo, { nome: prefixo }), null);
+
+      const resultado = await service.listar(queryPadrao({ busca: prefixo, page: 999, limit: 20 }));
+      expect(resultado.data).toEqual([]);
+      expect(resultado.meta.total).toBe(1);
+      expect(resultado.meta.page).toBe(999);
+      expect(resultado.meta.limit).toBe(20);
+      expect(resultado.meta.totalPages).toBe(1);
+    });
+
     it("ordena por nome (asc/desc)", async () => {
       const prefixo = `Ord${Date.now()}`;
       await service.criar(payloadCliente("Z", { nome: `${prefixo} Zulu` }), null);
