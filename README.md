@@ -85,13 +85,9 @@ bun run start:prod
 
 ## Backup e recuperação do MongoDB
 
-**Fora do escopo deste backend** — é responsabilidade operacional da infraestrutura de banco de dados escolhida para produção. Requisitos mínimos recomendados, independentemente do provedor:
+Produção roda no MongoDB Atlas, plano **Free (M0)** — que **não** oferece Cloud Backup/snapshots nativos (confirmado na documentação oficial da MongoDB, Fase 29-FI.1). O mecanismo em uso é `mongodump`/`mongorestore` agendado externamente, com script pronto e testado em `ops/backup/` (scripts operacionais, fora do backend — nunca uma dependência do projeto). Procedimento completo, política de retenção e checklist de validação de restore: ver [`docs/backup-mongodb.md`](docs/backup-mongodb.md).
 
-- Backup automático recorrente (diário, no mínimo) dos dados de produção.
-- Retenção definida (ex.: 30 dias) compatível com a necessidade de auditoria financeira da loja (Vendas/Caixas).
-- Teste de restore periódico comprovado — um backup nunca testado não é um backup confiável.
-
-Se o MongoDB de produção for auto-hospedado (ex.: dentro do próprio `docker-compose.yml` acima), `mongodump`/`mongorestore` agendados contra o volume `mongodb_data` são o mínimo aceitável; um provedor gerenciado (Atlas ou equivalente) normalmente já resolve isso nativamente.
+Se o MongoDB de produção migrar para auto-hospedado (ex.: dentro do próprio `docker-compose.yml` acima) ou para um tier Atlas com Cloud Backup nativo (M10+/Flex), reavaliar se os scripts em `ops/backup/` continuam necessários ou se o backup nativo do provedor passa a ser suficiente.
 
 ## CI/CD
 
