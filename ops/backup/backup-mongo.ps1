@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Backup lógico diário do MongoDB Atlas (plano Free) via mongodump.
 
