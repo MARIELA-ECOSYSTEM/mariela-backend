@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Restaura um backup do MARIELA num banco de TESTE local — nunca em produção.
 
@@ -40,9 +40,11 @@ if (-not $mongorestore) {
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $bancoDestino = "mariela_restore_test_$stamp"
 $destinoUri = "mongodb://127.0.0.1:27017"
+# Banco de PRODUÇÃO de onde o archive foi gerado (definido pela MONGODB_BACKUP_URI do backup-mongo.ps1).
+$bancoOrigem = "marielaDB"
 
 Write-Host "Restaurando '$ArquivoBackup' em '$bancoDestino' (localhost, banco descartável)..."
-& mongorestore --uri="$destinoUri" --gzip --archive="$ArquivoBackup" --nsFrom="mariela.*" --nsTo="$bancoDestino.*"
+& mongorestore --uri="$destinoUri" --gzip --archive="$ArquivoBackup" --nsFrom="$bancoOrigem.*" --nsTo="$bancoDestino.*"
 $exitCode = $LASTEXITCODE
 
 if ($exitCode -ne 0) {

@@ -21,26 +21,35 @@ Ou baixe o `.zip`/`.msi` oficial e adicione `bin/` ao PATH.
 Script: `ops/backup/backup-mongo.ps1`.
 
 1. Defina a variável de ambiente `MONGODB_BACKUP_URI` com a connection string do usuário **dedicado de backup** (ver seção "Credenciais" abaixo) — nunca como argumento de linha de comando, nunca em arquivo versionado.
-2. Rode: `powershell -File ops/backup/backup-mongo.ps1`
-3. O script: executa `mongodump --db=mariela --gzip --archive=...`, confere exit code e tamanho do arquivo, e aplica a retenção (remove backups com mais de 30 dias, nunca deixando menos de 2 cópias válidas).
+2. Rode: `powershell -File ops/backup/backup-mongo.ps1 -BackupDir "M:\Backup-sistema-mariela"`
+3. O script: executa `mongodump --uri=<MONGODB_BACKUP_URI> --gzip --archive=<temporário>`, confere exit code e tamanho do arquivo, e só então renomeia o dump para o nome definitivo `mariela_prod_yyyyMMdd_HHmm.archive.gz`; por fim aplica a retenção (remove backups com mais de 30 dias, nunca deixando menos de 2 cópias válidas).
 4. Agende via **Task Scheduler do Windows** (máquina do operador) ou cron (se rodar num servidor Linux/CI) — nenhuma infraestrutura nova foi introduzida para isso.
 
+### Banco dumpado
+- O banco de produção é **`marielaDB`**. O script **não passa `--db`**: o banco é o definido pela própria `MONGODB_BACKUP_URI` (`mongodb+srv://.../marielaDB?...`), e o `mongodump` recusa uma URI e um `--db` que divirjam.
+- Se a URI não definir nenhum banco, o script aborta (sem banco na URI o `mongodump` dumparia todos os bancos acessíveis ao usuário).
+- No archive, os namespaces ficam como `marielaDB.<collection>` — é a origem usada no restore de teste.
+
+### Arquivo temporário e falhas
+O dump é gravado primeiro como `mariela_prod_yyyyMMdd_HHmm.archive.gz.tmp`. Esse nome não casa com o padrão da retenção. Se o `mongodump` falhar, ou o arquivo não existir ou vier vazio, o temporário é apagado e o script termina com erro **sem rotacionar nada** — um dump parcial nunca vira "cópia válida".
+
 ### Local de armazenamento
-O diretório padrão (`%USERPROFILE%\mariela-backups`) é um exemplo — **o operador deve apontar `-BackupDir` para um local privado fora da infraestrutura de produção** (não o mesmo ambiente Render da aplicação), idealmente com pelo menos uma segunda cópia num local privado adicional (ex.: pasta de nuvem pessoal/corporativa já em uso, sem contratar serviço novo).
+O destino definido pelo operador é **`M:\Backup-sistema-mariela`** (passar sempre `-BackupDir`; o padrão do script, `%USERPROFILE%\mariela-backups`, é apenas um exemplo). Deve ser um local privado fora da infraestrutura de produção (não o mesmo ambiente Render da aplicação), idealmente com pelo menos uma segunda cópia num local privado adicional (ex.: pasta de nuvem pessoal/corporativa já em uso, sem contratar serviço novo).
 
 ## Credenciais necessárias (nunca solicitadas/expostas neste repositório)
 
 - **Credencial**: connection string de um usuário Atlas dedicado ao backup.
-- **Permissão**: papel `read` no banco `mariela` — nunca o usuário de aplicação (read-write), nunca um usuário admin da organização.
+- **Permissão**: papel `read` no banco `marielaDB` — nunca o usuário de aplicação (read-write), nunca um usuário admin da organização.
 - **Configuração**: o IP de onde o backup roda precisa estar na IP Access List do projeto Atlas.
 
-Se o usuário dedicado ainda não existir: **ação manual do operador** — criar no console do Atlas (Database Access → Add New Database User → papel `Read` restrito ao banco `mariela`).
+Se o usuário dedicado ainda não existir: **ação manual do operador** — criar no console do Atlas (Database Access → Add New Database User → papel `Read` restrito ao banco `marielaDB`).
 
 ## Restore de teste
 
-Script: `ops/backup/restore-test.ps1 -ArquivoBackup <caminho do .archive.gz>`.
+Script: `ops/backup/restore-test.ps1 -ArquivoBackup <caminho do .archive.gz>` (ex.: `M:\Backup-sistema-mariela\mariela_prod_yyyyMMdd_HHmm.archive.gz`).
 
-- Restaura **sempre** contra `localhost` (MongoDB local — o mesmo usado em desenvolvimento), num banco novo e descartável (`mariela_restore_test_<timestamp>`) — o script não aceita um host remoto como destino, por segurança.
+- Restaura **sempre** contra `127.0.0.1:27017` (MongoDB local — o mesmo usado em desenvolvimento), num banco novo e descartável (`mariela_restore_test_<timestamp>`) — o script não aceita um host remoto nem uma URI como destino, por segurança.
+- Namespace de origem: `marielaDB.*` (o nome do banco de produção), mapeado para `mariela_restore_test_<timestamp>.*` via `--nsFrom`/`--nsTo`.
 - **Nunca** aponta para produção.
 
 ### Validação pós-restore (checklist)
@@ -63,7 +72,8 @@ Ao terminar, sempre derrubar o banco de teste (`mongosh --eval "db.getSiblingDB(
 ## Retenção
 
 - 30 backups diários.
-- Nunca menos de 2 cópias válidas simultâneas, mesmo que isso signifique manter um backup além dos 30 dias.
+- Nunca menos de 2 cópias válidas simultâneas, mesmo que isso signifique manter um backup além dos 30 dias. A contagem desconta as remoções já feitas na mesma rotina, e, se o mínimo barrar uma remoção, ficam as cópias mais recentes.
+- Só arquivos `mariela_prod_*.archive.gz` são considerados; qualquer outro arquivo no diretório é ignorado e nunca removido.
 
 ## Restore periódico (não apenas o de validação inicial)
 
