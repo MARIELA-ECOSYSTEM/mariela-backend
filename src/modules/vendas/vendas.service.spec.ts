@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, setSystemTime } from "bun:test";
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
@@ -155,6 +155,37 @@ describe("VendasService (integração — MongoDB real)", () => {
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(8);
       await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+    });
+
+    it("o código usa a data LOCAL (America/Sao_Paulo) da venda, não a UTC — 22:30 de 10/03 local é 11/03 em UTC", async () => {
+      const produto = await criarProdutoComEstoque(100, 10);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const dados: DadosCriarVenda = {
+        vendedorId: vendedor.id,
+        caixaId: caixa.id,
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+      };
+
+      // Relógio e fuso fixados só em volta da criação; tudo o mais (produto, caixa) usa o relógio real.
+      const tzOriginal = process.env["TZ"];
+      process.env["TZ"] = "America/Sao_Paulo"; // UTC-3 em março/2026 (sem horário de verão)
+      setSystemTime(new Date("2026-03-11T01:30:00.000Z")); // = 10/03/2026 22:30 em São Paulo
+      try {
+        const instante = new Date();
+        expect(instante.toISOString().slice(0, 10)).toBe("2026-03-11"); // UTC já virou o dia…
+        expect(instante.getDate()).toBe(10); // …mas o fuso local ainda não (garante que o cenário realmente diferencia os dois)
+
+        const venda = await service.criar(dados, "admin-teste");
+        expect(venda.codigo).toMatch(/^VENDA-2026-03-10-\d{4}$/);
+        expect(venda.dataVenda.toISOString()).toBe("2026-03-11T01:30:00.000Z"); // instante persistido continua intacto (UTC)
+      } finally {
+        setSystemTime();
+        if (tzOriginal === undefined) delete process.env["TZ"];
+        else process.env["TZ"] = tzOriginal;
+      }
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
     });
 
     it("marca EM_PAGAMENTO com uma parcela cobrindo o valor pendente quando o pagamento é parcial", async () => {

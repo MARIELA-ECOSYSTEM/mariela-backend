@@ -84,6 +84,7 @@ describe("HTTP — Configurações (integração — servidor real)", () => {
 
   afterAll(async () => {
     await connection.collection("configuracoes").deleteMany({});
+    await connection.collection("eventos_configuracao").deleteMany({});
     await connection.collection("vendedores").deleteMany({});
     await connection.collection("eventos_vendedor").deleteMany({});
     await connection.collection("vendedor_refresh_tokens").deleteMany({});
@@ -173,6 +174,67 @@ describe("HTTP — Configurações (integração — servidor real)", () => {
         body: JSON.stringify(semEndereco),
       });
       expect(resposta.status).toBe(400);
+    });
+  });
+
+  describe("auditoria via HTTP", () => {
+    function subDoToken(token: string): string {
+      const payload = JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString("utf8")) as { sub: string };
+      return payload.sub;
+    }
+
+    it("PUT loja, POST e DELETE de lista gravam eventos_configuracao com o ADMIN autenticado como ator e sem alterar o contrato de resposta", async () => {
+      const adminId = subDoToken(adminAccessToken);
+      const valor = `Auditoria HTTP ${Date.now()}`;
+      await connection.collection("eventos_configuracao").deleteMany({});
+
+      const loja = await fetch(`${baseUrl}/api/v1/configuracoes/loja`, {
+        method: "PUT",
+        headers: jsonHeaders(adminAccessToken),
+        body: JSON.stringify(lojaValida({ nome: "Loja Auditada HTTP" })),
+      });
+      expect(loja.status).toBe(200);
+      const adicionar = await fetch(`${baseUrl}/api/v1/configuracoes/categorias`, {
+        method: "POST",
+        headers: jsonHeaders(adminAccessToken),
+        body: JSON.stringify({ valor }),
+      });
+      expect(adicionar.status).toBe(201);
+      const remover = await fetch(`${baseUrl}/api/v1/configuracoes/categorias/${encodeURIComponent(valor)}`, {
+        method: "DELETE",
+        headers: jsonHeaders(adminAccessToken),
+      });
+      expect(remover.status).toBe(200);
+      const corpoRemover = (await remover.json()) as { data: Record<string, unknown> };
+      expect(Object.keys(corpoRemover.data).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "tamanhos"].sort());
+
+      const eventos = await connection.collection("eventos_configuracao").find({}).sort({ criadoEm: 1 }).toArray();
+      expect(eventos.map((evento) => evento["tipo"])).toEqual([
+        "configuracao.loja_atualizada",
+        "configuracao.item_adicionado",
+        "configuracao.item_removido",
+      ]);
+      expect(eventos.every((evento) => evento["usuarioId"] === adminId)).toBe(true);
+      expect(eventos[1]!["detalhes"]).toEqual({ lista: "categorias", valor });
+      expect(eventos[2]!["detalhes"]).toEqual({ lista: "categorias", valor });
+    });
+
+    it("requisição rejeitada (400/409/404) não grava evento", async () => {
+      await connection.collection("eventos_configuracao").deleteMany({});
+      const valor = `SemEventoHTTP ${Date.now()}`;
+      await fetch(`${baseUrl}/api/v1/configuracoes/cores`, { method: "POST", headers: jsonHeaders(adminAccessToken), body: JSON.stringify({ valor }) });
+      await connection.collection("eventos_configuracao").deleteMany({}); // descarta o evento do POST bem-sucedido acima
+
+      const duplicado = await fetch(`${baseUrl}/api/v1/configuracoes/cores`, { method: "POST", headers: jsonHeaders(adminAccessToken), body: JSON.stringify({ valor }) });
+      const vazio = await fetch(`${baseUrl}/api/v1/configuracoes/cores`, { method: "POST", headers: jsonHeaders(adminAccessToken), body: JSON.stringify({ valor: "" }) });
+      const inexistente = await fetch(`${baseUrl}/api/v1/configuracoes/cores/${encodeURIComponent(`Inexistente-${Date.now()}`)}`, {
+        method: "DELETE",
+        headers: jsonHeaders(adminAccessToken),
+      });
+      const semToken = await fetch(`${baseUrl}/api/v1/configuracoes/cores`, { method: "POST", headers: jsonHeaders(), body: JSON.stringify({ valor: "SemToken" }) });
+      expect([duplicado.status, vazio.status, inexistente.status, semToken.status]).toEqual([409, 400, 404, 401]);
+
+      expect(await connection.collection("eventos_configuracao").countDocuments({})).toBe(0);
     });
   });
 

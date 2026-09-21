@@ -113,6 +113,10 @@ export class ProdutosRepository {
     const pipeline: PipelineStage[] = [
       { $match: base },
       {
+        // ATENÇÃO: esta regra PRECISA existir aqui, dentro do pipeline do Mongo (a ordenação por preço roda no banco,
+        // antes da paginação), então não dá para chamar `precoEfetivo()` daqui. A fonte de verdade da regra é
+        // `precoEfetivo()` em `utils/precos.util.ts`: se ela mudar, atualize as DUAS ao mesmo tempo, senão a
+        // ordenação por preço passa a divergir do preço realmente cobrado/exibido.
         $addFields: {
           precoEfetivoOrdenacao: {
             $cond: [

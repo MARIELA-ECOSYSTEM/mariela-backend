@@ -1,5 +1,6 @@
 import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Post, Put, UseGuards } from "@nestjs/common";
 import { ApiBearerAuth, ApiOperation, ApiTags } from "@nestjs/swagger";
+import { CurrentUser } from "../../common/decorators/current-user.decorator.js";
 import { Roles } from "../../common/decorators/roles.decorator.js";
 import { JwtAuthGuard } from "../../common/guards/jwt-auth.guard.js";
 import { RolesGuard } from "../../common/guards/roles.guard.js";
@@ -28,20 +29,20 @@ export class ConfiguracoesController {
 
   @Put("loja")
   @ApiOperation({ summary: "Substitui integralmente os dados da loja." })
-  async atualizarLoja(@Body() dto: AtualizarLojaDto) {
-    return { data: await this.configuracoesService.atualizarLoja(dto) };
+  async atualizarLoja(@Body() dto: AtualizarLojaDto, @CurrentUser("sub") usuarioId: string) {
+    return { data: await this.configuracoesService.atualizarLoja(dto, usuarioId) };
   }
 
   @Post(":lista")
   @ApiOperation({ summary: "Adiciona um valor a uma das listas (categorias, tamanhos, cores, formasPagamento)." })
-  async adicionarItem(@Param("lista") lista: string, @Body() dto: AdicionarItemListaDto) {
-    return { data: await this.configuracoesService.adicionarItem(lista, dto.valor) };
+  async adicionarItem(@Param("lista") lista: string, @Body() dto: AdicionarItemListaDto, @CurrentUser("sub") usuarioId: string) {
+    return { data: await this.configuracoesService.adicionarItem(lista, dto.valor, usuarioId) };
   }
 
   @Delete(":lista/:valor")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: "Remove um valor de uma das listas." })
-  async removerItem(@Param("lista") lista: string, @Param("valor") valor: string) {
-    return { data: await this.configuracoesService.removerItem(lista, valor) };
+  async removerItem(@Param("lista") lista: string, @Param("valor") valor: string, @CurrentUser("sub") usuarioId: string) {
+    return { data: await this.configuracoesService.removerItem(lista, valor, usuarioId) };
   }
 }

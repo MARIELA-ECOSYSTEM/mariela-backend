@@ -303,7 +303,10 @@ export class VendasService {
     }
 
     const valor = await this.sequenciasService.proximoValor(CHAVE_SEQUENCIA_VENDA);
-    const codigo = `${PREFIXO_CODIGO_VENDA}-${dataVenda.toISOString().slice(0, 10)}-${String(valor).padStart(DIGITOS_CODIGO_VENDA, "0")}`;
+    // Data no fuso local do servidor (America/Sao_Paulo, ver `main.ts`) — não `toISOString()`, que é UTC e
+    // rotularia como "amanhã" uma venda feita à noite, divergindo do dia usado por Dashboard/Relatórios.
+    const dataCodigo = `${dataVenda.getFullYear()}-${String(dataVenda.getMonth() + 1).padStart(2, "0")}-${String(dataVenda.getDate()).padStart(2, "0")}`;
+    const codigo = `${PREFIXO_CODIGO_VENDA}-${dataCodigo}-${String(valor).padStart(DIGITOS_CODIGO_VENDA, "0")}`;
     const numero = String(valor).padStart(DIGITOS_NUMERO_VENDA, "0");
 
     const historico = [

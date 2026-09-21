@@ -36,6 +36,38 @@ describe("AtualizarLojaDto", () => {
     expect(erros).toHaveLength(0);
   });
 
+  describe("email", () => {
+    const base = { nome: "Loja", logo: "", telefone: "", whatsapp: "", endereco: enderecoValido() };
+    const erroDeEmail = async (email: unknown) => {
+      const erros = await validate(plainToInstance(AtualizarLojaDto, { ...base, email }));
+      return erros.find((erro) => erro.property === "email");
+    };
+
+    it("aceita e-mail com formato válido", async () => {
+      expect(await erroDeEmail("contato@loja.com")).toBeUndefined();
+      expect(await erroDeEmail("a.b+c@sub.dominio.com.br")).toBeUndefined();
+    });
+
+    it("continua aceitando e-mail vazio ou só com espaços (comportamento atual preservado)", async () => {
+      expect(await erroDeEmail("")).toBeUndefined();
+      expect(await erroDeEmail("   ")).toBeUndefined();
+    });
+
+    it("rejeita e-mail preenchido com formato inválido, com a mesma mensagem do módulo de Fornecedores", async () => {
+      for (const invalido of ["contato", "contato@", "@loja.com", "contato@loja", "contato loja.com"]) {
+        const erro = await erroDeEmail(invalido);
+        expect(erro?.constraints?.["matches"]).toBe("E-mail inválido.");
+      }
+    });
+
+    it("continua rejeitando e-mail ausente/nulo/de tipo errado e acima de 160 caracteres", async () => {
+      expect((await erroDeEmail(undefined))?.constraints?.["isString"]).toBeDefined();
+      expect((await erroDeEmail(null))?.constraints?.["isString"]).toBeDefined();
+      expect((await erroDeEmail(123))?.constraints?.["isString"]).toBeDefined();
+      expect((await erroDeEmail(`${"a".repeat(160)}@loja.com`))?.constraints?.["maxLength"]).toBeDefined();
+    });
+  });
+
   it("rejeita endereco ausente", async () => {
     const dto = plainToInstance(AtualizarLojaDto, { nome: "Loja", logo: "", telefone: "", whatsapp: "", email: "" });
     const erros = await validate(dto);

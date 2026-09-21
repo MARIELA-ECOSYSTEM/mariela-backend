@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
@@ -18,6 +18,10 @@ const JWT_MODULO_DE_TESTE = JwtModule.register({
   secret: "segredo-de-teste",
   signOptions: { expiresIn: "15m" },
 });
+
+const USUARIO_ID = "64b000000000000000000001";
+/** Ator exclusivo dos testes de auditoria: isola os eventos deles dos gerados pelos demais testes do arquivo. */
+const USUARIO_AUDITORIA_ID = "64b000000000000000000002";
 
 function lojaValida(extra: Partial<AtualizarLojaDto> = {}): AtualizarLojaDto {
   return {
@@ -46,6 +50,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
 
   afterAll(async () => {
     await connection.collection("configuracoes").deleteMany({});
+    await connection.collection("eventos_configuracao").deleteMany({ usuarioId: { $in: [USUARIO_ID, USUARIO_AUDITORIA_ID] } });
     await moduleRef.close();
   });
 
@@ -85,20 +90,20 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const antesDoUpdate = antes.atualizadoEm.getTime();
       await new Promise((resolve) => setTimeout(resolve, 5));
 
-      const atualizada = await service.atualizarLoja(lojaValida());
+      const atualizada = await service.atualizarLoja(lojaValida(), USUARIO_ID);
       expect(atualizada.loja.nome).toBe("Loja Exemplo");
       expect(atualizada.loja.endereco.cidade).toBe("São Paulo");
       expect(atualizada.atualizadoEm.getTime()).toBeGreaterThan(antesDoUpdate);
     });
 
     it("aplica trim nos campos da loja", async () => {
-      const atualizada = await service.atualizarLoja(lojaValida({ nome: "  Loja Com Espaços  " }));
+      const atualizada = await service.atualizarLoja(lojaValida({ nome: "  Loja Com Espaços  " }), USUARIO_ID);
       expect(atualizada.loja.nome).toBe("Loja Com Espaços");
     });
 
     it("uma segunda atualização substitui a anterior por inteiro", async () => {
-      await service.atualizarLoja(lojaValida({ nome: "Primeira" }));
-      const segunda = await service.atualizarLoja(lojaValida({ nome: "Segunda" }));
+      await service.atualizarLoja(lojaValida({ nome: "Primeira" }), USUARIO_ID);
+      const segunda = await service.atualizarLoja(lojaValida({ nome: "Segunda" }), USUARIO_ID);
       expect(segunda.loja.nome).toBe("Segunda");
 
       const total = await connection.collection("configuracoes").countDocuments({});
@@ -109,34 +114,34 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
   describe("listas: adicionar/remover", () => {
     it("adiciona categoria, tamanho, cor e forma de pagamento", async () => {
       const chave = Date.now();
-      const apos1 = await service.adicionarItem("categorias", `Vestidos-${chave}`);
+      const apos1 = await service.adicionarItem("categorias", `Vestidos-${chave}`, USUARIO_ID);
       expect(apos1.categorias).toContain(`Vestidos-${chave}`);
 
-      const apos2 = await service.adicionarItem("tamanhos", `M-${chave}`);
+      const apos2 = await service.adicionarItem("tamanhos", `M-${chave}`, USUARIO_ID);
       expect(apos2.tamanhos).toContain(`M-${chave}`);
 
-      const apos3 = await service.adicionarItem("cores", `Azul-${chave}`);
+      const apos3 = await service.adicionarItem("cores", `Azul-${chave}`, USUARIO_ID);
       expect(apos3.cores).toContain(`Azul-${chave}`);
 
-      const apos4 = await service.adicionarItem("formasPagamento", `PIX-${chave}`);
+      const apos4 = await service.adicionarItem("formasPagamento", `PIX-${chave}`, USUARIO_ID);
       expect(apos4.formasPagamento).toContain(`PIX-${chave}`);
     });
 
     it("aplica trim no valor antes de adicionar", async () => {
       const chave = `Trim-${Date.now()}`;
-      const resultado = await service.adicionarItem("categorias", `  ${chave}  `);
+      const resultado = await service.adicionarItem("categorias", `  ${chave}  `, USUARIO_ID);
       expect(resultado.categorias).toContain(chave);
       expect(resultado.categorias).not.toContain(`  ${chave}  `);
     });
 
     it("rejeita valor vazio (só espaços) com VALIDATION_ERROR", async () => {
-      await expect(service.adicionarItem("categorias", "   ")).rejects.toThrow(ApiException);
+      await expect(service.adicionarItem("categorias", "   ", USUARIO_ID)).rejects.toThrow(ApiException);
     });
 
     it("rejeita item duplicado com CONFLICT, nunca duplica na lista", async () => {
       const chave = `Duplicada-${Date.now()}`;
-      await service.adicionarItem("cores", chave);
-      await expect(service.adicionarItem("cores", chave)).rejects.toThrow(ApiException);
+      await service.adicionarItem("cores", chave, USUARIO_ID);
+      await expect(service.adicionarItem("cores", chave, USUARIO_ID)).rejects.toThrow(ApiException);
 
       const configuracao = await service.obter();
       expect(configuracao.cores.filter((item) => item === chave)).toHaveLength(1);
@@ -144,25 +149,113 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
 
     it("remove item existente", async () => {
       const chave = `Remover-${Date.now()}`;
-      await service.adicionarItem("tamanhos", chave);
-      const apos = await service.removerItem("tamanhos", chave);
+      await service.adicionarItem("tamanhos", chave, USUARIO_ID);
+      const apos = await service.removerItem("tamanhos", chave, USUARIO_ID);
       expect(apos.tamanhos).not.toContain(chave);
     });
 
     it("rejeita remoção de item inexistente com NOT_FOUND", async () => {
-      await expect(service.removerItem("tamanhos", `Inexistente-${Date.now()}`)).rejects.toThrow(ApiException);
+      await expect(service.removerItem("tamanhos", `Inexistente-${Date.now()}`, USUARIO_ID)).rejects.toThrow(ApiException);
     });
 
     it("rejeita lista inválida tanto para adicionar quanto para remover", async () => {
-      await expect(service.adicionarItem("promocoes", "valor")).rejects.toThrow(ApiException);
-      await expect(service.removerItem("promocoes", "valor")).rejects.toThrow(ApiException);
+      await expect(service.adicionarItem("promocoes", "valor", USUARIO_ID)).rejects.toThrow(ApiException);
+      await expect(service.removerItem("promocoes", "valor", USUARIO_ID)).rejects.toThrow(ApiException);
     });
 
     it("listas ficam vazias novamente após remover o único item — contrato permite listas vazias", async () => {
       const chave = `Sozinho-${Date.now()}`;
-      await service.adicionarItem("formasPagamento", chave);
-      const apos = await service.removerItem("formasPagamento", chave);
+      await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+      const apos = await service.removerItem("formasPagamento", chave, USUARIO_ID);
       expect(apos.formasPagamento).not.toContain(chave);
+    });
+  });
+
+  describe("auditoria (eventos_configuracao)", () => {
+    const eventosDoAtor = () =>
+      connection.collection("eventos_configuracao").find({ usuarioId: USUARIO_AUDITORIA_ID }).sort({ criadoEm: 1 }).toArray();
+
+    beforeEach(async () => {
+      await connection.collection("eventos_configuracao").deleteMany({ usuarioId: USUARIO_AUDITORIA_ID });
+    });
+
+    it("atualizarLoja registra configuracao.loja_atualizada com o ator e só os NOMES dos campos alterados", async () => {
+      await service.atualizarLoja(lojaValida({ nome: "Base", telefone: "1", email: "a@b.com" }), USUARIO_ID);
+      await connection.collection("eventos_configuracao").deleteMany({ usuarioId: USUARIO_ID, tipo: "configuracao.loja_atualizada" });
+
+      await service.atualizarLoja(
+        lojaValida({
+          nome: "Nova Razão",
+          telefone: "1",
+          email: "a@b.com",
+          endereco: { cep: "01310-100", logradouro: "Av. Paulista", numero: "1000", complemento: "", bairro: "Bela Vista", cidade: "Campinas", estado: "SP" },
+        }),
+        USUARIO_AUDITORIA_ID,
+      );
+
+      const eventos = await eventosDoAtor();
+      expect(eventos).toHaveLength(1);
+      expect(eventos[0]!.tipo).toBe("configuracao.loja_atualizada");
+      expect(eventos[0]!.usuarioId).toBe(USUARIO_AUDITORIA_ID);
+      expect(eventos[0]!.criadoEm).toBeInstanceOf(Date);
+      expect([...(eventos[0]!.detalhes.camposAlterados as string[])].sort()).toEqual(["endereco.cidade", "nome"]);
+    });
+
+    it("o evento da loja não carrega valores nem o documento inteiro (nem e-mail, telefone, logo)", async () => {
+      await service.atualizarLoja(lojaValida({ email: "segredo-pessoal@loja.com", telefone: "11955554444", nome: "Nome Sensível" }), USUARIO_AUDITORIA_ID);
+
+      const [evento] = await eventosDoAtor();
+      expect(Object.keys(evento!.detalhes)).toEqual(["camposAlterados"]);
+      const serializado = JSON.stringify(evento);
+      for (const valor of ["segredo-pessoal@loja.com", "11955554444", "Nome Sensível", "https://exemplo.com/logo.png", "Bela Vista"]) {
+        expect(serializado).not.toContain(valor);
+      }
+    });
+
+    it("atualizarLoja sem nenhuma diferença ainda registra o evento, com camposAlterados vazio", async () => {
+      await service.atualizarLoja(lojaValida(), USUARIO_ID);
+      await connection.collection("eventos_configuracao").deleteMany({ usuarioId: USUARIO_AUDITORIA_ID });
+      await service.atualizarLoja(lojaValida(), USUARIO_AUDITORIA_ID);
+
+      const eventos = await eventosDoAtor();
+      expect(eventos).toHaveLength(1);
+      expect(eventos[0]!.detalhes.camposAlterados).toEqual([]);
+    });
+
+    it("adicionarItem registra configuracao.item_adicionado com lista, valor (já com trim) e ator", async () => {
+      const chave = `Auditada-${Date.now()}`;
+      await service.adicionarItem("categorias", `  ${chave}  `, USUARIO_AUDITORIA_ID);
+
+      const eventos = await eventosDoAtor();
+      expect(eventos).toHaveLength(1);
+      expect(eventos[0]!.tipo).toBe("configuracao.item_adicionado");
+      expect(eventos[0]!.usuarioId).toBe(USUARIO_AUDITORIA_ID);
+      expect(eventos[0]!.detalhes).toEqual({ lista: "categorias", valor: chave });
+    });
+
+    it("removerItem registra configuracao.item_removido com lista, valor e ator", async () => {
+      const chave = `AuditadaRemocao-${Date.now()}`;
+      await service.adicionarItem("cores", chave, USUARIO_ID);
+      await service.removerItem("cores", chave, USUARIO_AUDITORIA_ID);
+
+      const eventos = await eventosDoAtor();
+      expect(eventos).toHaveLength(1);
+      expect(eventos[0]!.tipo).toBe("configuracao.item_removido");
+      expect(eventos[0]!.usuarioId).toBe(USUARIO_AUDITORIA_ID);
+      expect(eventos[0]!.detalhes).toEqual({ lista: "cores", valor: chave });
+    });
+
+    it("operações que falham (lista inválida, valor vazio, duplicado, inexistente) não geram evento", async () => {
+      const chave = `SemEvento-${Date.now()}`;
+      await service.adicionarItem("tamanhos", chave, USUARIO_ID);
+
+      await expect(service.adicionarItem("promocoes", "x", USUARIO_AUDITORIA_ID)).rejects.toThrow(ApiException);
+      await expect(service.adicionarItem("tamanhos", "   ", USUARIO_AUDITORIA_ID)).rejects.toThrow(ApiException);
+      await expect(service.adicionarItem("tamanhos", chave, USUARIO_AUDITORIA_ID)).rejects.toThrow(ApiException);
+      await expect(service.removerItem("tamanhos", `Inexistente-${Date.now()}`, USUARIO_AUDITORIA_ID)).rejects.toThrow(ApiException);
+      await expect(service.removerItem("promocoes", "x", USUARIO_AUDITORIA_ID)).rejects.toThrow(ApiException);
+
+      expect(await eventosDoAtor()).toHaveLength(0);
     });
   });
 
@@ -171,7 +264,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const chave = Date.now();
       const valores = Array.from({ length: 10 }, (_, indice) => `Concorrente-${chave}-${indice}`);
 
-      const resultados = await Promise.allSettled(valores.map((valor) => service.adicionarItem("categorias", valor)));
+      const resultados = await Promise.allSettled(valores.map((valor) => service.adicionarItem("categorias", valor, USUARIO_ID)));
       expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);
 
       const final = await service.obter();
@@ -182,7 +275,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
 
     it("N adições concorrentes do MESMO valor: só uma persiste, as demais rejeitam por conflito", async () => {
       const chave = `Corrida-${Date.now()}`;
-      const resultados = await Promise.allSettled(Array.from({ length: 5 }, () => service.adicionarItem("cores", chave)));
+      const resultados = await Promise.allSettled(Array.from({ length: 5 }, () => service.adicionarItem("cores", chave, USUARIO_ID)));
 
       expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
       expect(resultados.filter((r) => r.status === "rejected")).toHaveLength(4);
