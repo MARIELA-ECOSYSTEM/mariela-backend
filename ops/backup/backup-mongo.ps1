@@ -23,7 +23,9 @@
 param(
   [string]$BackupDir = "$env:USERPROFILE\mariela-backups",
   [int]$RetentionDays = 30,
-  [int]$MinCopiasValidas = 2
+  [int]$MinCopiasValidas = 2,
+  # Idade mínima (sem nenhuma escrita) para um .tmp do backup ser considerado órfão e removido — ver "Limpeza de .tmp órfão".
+  [int]$TmpOrfaoHoras = 24
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,6 +56,13 @@ $arquivo = Join-Path $BackupDir "mariela_prod_${stamp}.archive.gz"
 # é considerado cópia válida pela retenção) e só recebe o nome definitivo depois de passar em todas as validações.
 $temporario = "$arquivo.tmp"
 
+# Colisão (mesmo minuto): o backup definitivo existente NUNCA é sobrescrito nem apagado. Detectada antes do dump,
+# nada é criado; se aparecer durante o dump, é tratada antes do Move-Item (abaixo).
+if (Test-Path -LiteralPath $arquivo) {
+  Write-Error "Já existe um backup definitivo com este nome (mesmo minuto): $arquivo. Nada foi feito; aguarde o próximo minuto."
+  exit 1
+}
+
 Write-Host "Iniciando mongodump -> $arquivo"
 & mongodump --uri="$env:MONGODB_BACKUP_URI" --gzip --archive="$temporario"
 $exitCode = $LASTEXITCODE
@@ -76,11 +85,24 @@ if ($tamanho -le 0) {
   exit 1
 }
 
-Move-Item -LiteralPath $temporario -Destination $arquivo
+# Colisão durante o dump: descarta só o .tmp desta execução, preserva o definitivo existente, sem retenção.
+if (Test-Path -LiteralPath $arquivo) {
+  Remove-Item -LiteralPath $temporario -Force -ErrorAction SilentlyContinue
+  Write-Error "Já existe um backup definitivo com este nome: $arquivo (criado durante este dump). Ele foi preservado e o temporário desta execução foi descartado; a retenção NÃO foi executada."
+  exit 1
+}
+try {
+  Move-Item -LiteralPath $temporario -Destination $arquivo -ErrorAction Stop   # sem -Force: nunca sobrescreve
+} catch {
+  Remove-Item -LiteralPath $temporario -Force -ErrorAction SilentlyContinue
+  Write-Error "Não foi possível promover o temporário para o nome definitivo ($arquivo). O temporário foi descartado e a retenção NÃO foi executada."
+  exit 1
+}
 Write-Host "Backup criado com sucesso: $arquivo ($([math]::Round($tamanho/1MB, 2)) MB)"
 
 # --- Retenção: nunca reduz o total de cópias válidas abaixo de $MinCopiasValidas ---
-$todos = @(Get-ChildItem -Path $BackupDir -Filter "mariela_prod_*.archive.gz" | Sort-Object LastWriteTime -Descending)
+# -File: só arquivos reais (uma pasta com nome parecido nunca é cópia nem candidata à remoção). Não recursivo.
+$todos = @(Get-ChildItem -Path $BackupDir -File -Filter "mariela_prod_*.archive.gz" | Sort-Object LastWriteTime -Descending)
 # Do mais antigo para o mais novo: se o mínimo de cópias barrar a remoção, sobram as mais recentes.
 $antigos = @($todos | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$RetentionDays) } | Sort-Object LastWriteTime)
 $copiasRestantes = $todos.Count
@@ -96,4 +118,22 @@ foreach ($arquivoAntigo in $antigos) {
   $copiasRestantes--
 }
 
-Write-Host "Rotina de backup concluída. Cópias atuais: $((Get-ChildItem -Path $BackupDir -Filter 'mariela_prod_*.archive.gz').Count)"
+# --- Limpeza de .tmp órfão (execução interrompida) ---
+# Só arquivos "mariela_prod_*.archive.gz.tmp" deste diretório, sem nenhuma escrita há mais de $TmpOrfaoHoras horas
+# (LastWriteTime E CreationTime), excluindo o .tmp desta execução. Antes de apagar, tenta abrir o arquivo com acesso
+# exclusivo: se outro processo (ex.: um mongodump ainda em curso) o mantém aberto, a abertura falha e o arquivo fica.
+$limiteTmp = (Get-Date).AddHours(-$TmpOrfaoHoras)
+$orfaos = @(Get-ChildItem -Path $BackupDir -File -Filter "mariela_prod_*.archive.gz.tmp" |
+  Where-Object { $_.Name -like "mariela_prod_*.archive.gz.tmp" -and $_.FullName -ne $temporario -and $_.LastWriteTime -lt $limiteTmp -and $_.CreationTime -lt $limiteTmp })
+foreach ($orfao in $orfaos) {
+  try {
+    $sonda = [System.IO.File]::Open($orfao.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    $sonda.Close()
+    Remove-Item -LiteralPath $orfao.FullName -Force -ErrorAction Stop
+    Write-Host "Removido temporário órfão (sem escrita há mais de $TmpOrfaoHoras h): $($orfao.Name)"
+  } catch {
+    Write-Host "Mantendo $($orfao.Name): em uso por outro processo ou sem permissão para remover."
+  }
+}
+
+Write-Host "Rotina de backup concluída. Cópias atuais: $((Get-ChildItem -Path $BackupDir -File -Filter 'mariela_prod_*.archive.gz').Count)"

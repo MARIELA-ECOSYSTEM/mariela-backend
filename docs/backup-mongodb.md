@@ -51,7 +51,16 @@ Script: `ops/backup/backup-mongo.ps1`.
 ### Arquivo temporário e falhas
 O dump é gravado primeiro como `mariela_prod_yyyyMMdd_HHmm.archive.gz.tmp`. Esse nome não casa com o padrão da retenção. Se o `mongodump` falhar, ou o arquivo não existir ou vier vazio, o temporário é apagado e o script termina com erro **sem rotacionar nada** — um dump parcial nunca vira "cópia válida".
 
-Casos que o script **não** trata (ver limitações): um `.tmp` deixado por uma execução interrompida (processo morto, queda de energia) nunca é limpo automaticamente; e se já existir o arquivo definitivo do mesmo minuto, o `Move-Item` falha (exit 1) sem sobrescrever o definitivo, mas deixa o `.tmp` para trás.
+**Colisão no mesmo minuto** (já existe `mariela_prod_yyyyMMdd_HHmm.archive.gz` com o nome que esta execução usaria): o backup definitivo existente **nunca é sobrescrito nem apagado**.
+- Se ele já existe ao começar, o script sai com erro (exit ≠ 0) **antes do dump**: nada é criado e o `mongodump` nem é chamado.
+- Se ele aparecer durante o dump (duas execuções concorrentes), o script descarta **só o `.tmp` desta execução**, sai com erro (exit ≠ 0) e **não executa a retenção**. O mesmo vale se a promoção do `.tmp` para o nome definitivo falhar por qualquer motivo (o `Move-Item` não usa `-Force`).
+
+**Limpeza de `.tmp` órfão** (execução interrompida: processo morto, queda de energia), executada só depois de um backup bem-sucedido, com a seguinte regra:
+- Só entram arquivos (nunca pastas) cujo nome case com `mariela_prod_*.archive.gz.tmp`, neste diretório, sem recursão. Qualquer outro `.tmp`, ou um nome com sufixo diferente (ex.: `.tmpold`), nunca é tocado.
+- O arquivo precisa estar **sem escrita e sem ter sido criado há mais de 24 horas** (`-TmpOrfaoHoras`, padrão 24; `LastWriteTime` **e** `CreationTime`). O `.tmp` da própria execução é sempre excluído.
+- Antes de apagar, o script tenta abrir o arquivo com acesso exclusivo: se outro processo (por exemplo, um `mongodump` ainda em curso) o mantém aberto, a abertura falha e o arquivo é mantido; uma falha ao remover só gera uma mensagem, sem derrubar o backup.
+- Não há limpeza quando o backup falha.
+- A proteção contra remover um dump em andamento foi validada com um gravador simulado que mantém o arquivo aberto (não com um `mongodump` real); ela pressupõe que o gravador mantém o arquivo aberto enquanto escreve, como o `mongodump` faz.
 
 ### Local de armazenamento
 O destino definido pelo operador é **`M:\Backup-sistema-mariela`** (passar sempre `-BackupDir`; o padrão do script, `%USERPROFILE%\mariela-backups`, é apenas um exemplo). Deve ser um local privado fora da infraestrutura de produção (não o mesmo ambiente Render da aplicação), idealmente com pelo menos uma segunda cópia num local privado adicional (ex.: pasta de nuvem pessoal/corporativa já em uso, sem contratar serviço novo). **A segunda cópia ainda não existe.**
@@ -83,7 +92,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<repositório>\ops\back
 ```
 
 - Restaura **sempre** contra `127.0.0.1:27017` (MongoDB local — o mesmo servidor usado em desenvolvimento, mas num banco novo), num banco descartável (`mariela_restore_test_<timestamp>`) — o script só aceita o caminho do archive como parâmetro: não aceita host remoto nem URI como destino, por segurança.
-- Namespace de origem: `marielaDB.*` (o nome do banco de produção), mapeado para `mariela_restore_test_<timestamp>.*` via `--nsFrom`/`--nsTo`. Um archive de outro banco não casa com esse namespace — sempre confirme no passo 1 do checklist que as collections esperadas apareceram.
+- Namespace de origem: `marielaDB.*` (o nome do banco de produção), mapeado para `mariela_restore_test_<timestamp>.*` via `--nsFrom`/`--nsTo`.
+- **Validação do namespace antes de qualquer escrita.** O `mongorestore` **não avisa** quando o archive é válido mas de outro banco: sai com exit 0 e "0 document(s) restored successfully" (o mesmo resumo de um archive correto vazio), e o `--nsFrom` só renomeia o que casa — o restante seria restaurado sob o **nome original** do banco de origem, fora do banco de teste (verificado com `--dryRun` local sobre uma cópia sintética do archive real, sem gravar nada). Por isso o script primeiro descompacta o começo do archive (até 1 MiB; o prelude com os namespaces vem primeiro) e procura o elemento BSON `db = "marielaDB"` — checagem binária, sem interpretar texto de log. Se o archive é um gzip legível e **não** tem esse namespace, o script sai com erro e **não chama o `mongorestore`**. Um arquivo que não é gzip legível não é julgado pelo script: o `mongorestore` o recusa sozinho (exit 1, `gzip: invalid header`, verificado com `--dryRun`).
+- A checagem só confirma a **presença** do namespace `marielaDB` no archive; ela não valida a integridade dos dados nem a compatibilidade de versão. O passo 1 do checklist (conferir que as collections esperadas apareceram) continua obrigatório.
 - **Nunca** aponta para produção. Não sobrescreve nada existente: o banco de destino é novo a cada execução, e o archive é só lido.
 
 ### Compatibilidade de versões (MongoDB 8.0.32 → 8.2.1)
@@ -162,8 +173,8 @@ Não há migração nem script de índices. Todos são criados pelo **próprio b
 
 - 30 backups diários.
 - Nunca menos de 2 cópias válidas simultâneas, mesmo que isso signifique manter um backup além dos 30 dias. A contagem desconta as remoções já feitas na mesma rotina, e, se o mínimo barrar uma remoção, ficam as cópias mais recentes.
-- O padrão considerado é `mariela_prod_*.archive.gz`, **apenas no diretório informado (não recursivo)**. Qualquer outro nome — `.tmp`, `.bak`, outras extensões, `mariela_dev_*`, a pasta histórica `marielaDB`, subpastas — é ignorado e nunca removido (comportamento verificado com um `mongodump` simulado).
-- Ressalva: a listagem não distingue arquivo de **pasta**; uma pasta chamada `mariela_prod_*.archive.gz` com mais de 30 dias seria tratada como cópia (ver limitações).
+- O padrão considerado é `mariela_prod_*.archive.gz`, **apenas arquivos reais, no diretório informado (não recursivo)**. Qualquer outro nome — `.tmp`, `.bak`, outras extensões, `mariela_dev_*`, a pasta histórica `marielaDB`, subpastas — é ignorado e nunca removido; uma **pasta** com nome parecido (vazia ou com conteúdo) não é cópia, não conta para o piso de 2 e nunca é removida (comportamento verificado com um `mongodump` simulado). Os `.tmp` do backup têm regra própria de limpeza (ver "Arquivo temporário e falhas").
+- A retenção remove primeiro os mais antigos.
 
 ## Restore periódico (não apenas o de validação inicial)
 
@@ -187,7 +198,10 @@ Pendências operacionais:
 6. Confirmar no Atlas o papel `read` do usuário de backup e a IP Access List.
 7. Confirmar no primeiro boot em produção a criação dos índices críticos.
 
-Limitações conhecidas do script (documentadas, não corrigidas — nenhuma afeta o primeiro backup de um diretório limpo):
-- A retenção não distingue pasta de arquivo: uma **pasta** `mariela_prod_*.archive.gz` com mais de 30 dias é removida se vazia; se tiver conteúdo, a remoção falha e o script termina com erro no meio da retenção (o backup novo já foi criado; a pasta e o conteúdo são preservados).
-- Um `.tmp` órfão (execução interrompida) e o `.tmp` deixado por uma colisão no mesmo minuto não são limpos automaticamente; devem ser removidos manualmente após conferir que não são um dump em andamento.
-- O `restore-test.ps1` só repassa o exit code do `mongorestore`. **Não foi verificado** como o `mongorestore` se comporta quando nenhum namespace do archive casa com `marielaDB.*` (por exemplo, um archive de outro banco); por isso o passo 1 do checklist (conferir que as collections esperadas apareceram) é obrigatório e não deve ser pulado. A mensagem final do script ainda sugere `mongosh`; use a alternativa acima.
+Endurecimentos já aplicados aos scripts (Fase 35): retenção só sobre arquivos, limpeza segura de `.tmp` órfão, colisão no mesmo minuto sem lixo temporário, validação do namespace `marielaDB` no restore e mensagem final sem `mongosh`.
+
+Limitações que permanecem (documentadas, não corrigidas):
+- O `--uri=` continua na linha de comando do `mongodump` (ver acima).
+- O `.tmp` órfão só é limpo depois de um backup bem-sucedido e só depois de 24 horas; até lá ele ocupa espaço no destino.
+- A validação de namespace do restore lê só o primeiro 1 MiB do archive descompactado e exige apenas que o namespace `marielaDB` **exista** nele. Um archive que misture `marielaDB` com **outros** bancos passaria, e os outros seriam restaurados sob o nome original. O `backup-mongo.ps1` nunca gera um archive assim (a URI define um único banco), mas o `--nsInclude "marielaDB.*"` no `mongorestore` eliminaria o risco; **recomendado, não implementado** (verificado com `--dryRun` que ele impede a restauração dos namespaces não casados).
+- O restore continua sendo a checagem de mecânica descrita acima; a compatibilidade de versão (8.0.32 → 8.2.1) e o restore de dados reais seguem pendentes.
