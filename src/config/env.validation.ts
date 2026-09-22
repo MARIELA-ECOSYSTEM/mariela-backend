@@ -1,5 +1,5 @@
 import { Type, plainToInstance } from "class-transformer";
-import { IsIn, IsInt, IsOptional, IsString, Matches, Max, Min, validateSync } from "class-validator";
+import { IsIn, IsInt, IsOptional, IsString, Matches, Max, Min, ValidateIf, validateSync } from "class-validator";
 
 enum Ambiente {
   Development = "development",
@@ -119,6 +119,36 @@ class EnvironmentVariables {
   @IsInt()
   @Min(1000)
   EVOLUTION_TIMEOUT_MS = 10000;
+
+  /**
+   * Fase 40 — storage de mídia (Cloudflare R2). Deliberadamente OPCIONAIS,
+   * como o WhatsApp: ausentes, o upload responde `STORAGE_NOT_CONFIGURED` em
+   * vez de impedir o boot. Só o formato de `R2_PUBLIC_BASE_URL` é validado
+   * (quando informada), porque ela é montada em URLs devolvidas ao cliente.
+   */
+  @IsOptional()
+  @IsString()
+  R2_ACCOUNT_ID = "";
+
+  @IsOptional()
+  @IsString()
+  R2_ACCESS_KEY_ID = "";
+
+  @IsOptional()
+  @IsString()
+  R2_SECRET_ACCESS_KEY = "";
+
+  @IsOptional()
+  @IsString()
+  R2_BUCKET_NAME = "";
+
+  @IsOptional()
+  @IsString()
+  @ValidateIf((env: EnvironmentVariables) => Boolean(env.R2_PUBLIC_BASE_URL?.trim()))
+  @Matches(/^https?:\/\/[^\s/?#]+(\/[^\s?#]*)?$/, {
+    message: "R2_PUBLIC_BASE_URL deve ser uma URL http(s) sem query string (ex.: https://midia.exemplo.com).",
+  })
+  R2_PUBLIC_BASE_URL = "";
 
   /**
    * Etapa 24 — rate limiting GLOBAL/moderado (`@nestjs/throttler`, aplicado a

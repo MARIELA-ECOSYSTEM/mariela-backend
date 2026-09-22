@@ -18,6 +18,7 @@ import { DashboardModule } from "./modules/dashboard/dashboard.module.js";
 import { EstoqueModule } from "./modules/estoque/estoque.module.js";
 import { FornecedoresModule } from "./modules/fornecedores/fornecedores.module.js";
 import { IntegracoesModule } from "./modules/integracoes/integracoes.module.js";
+import { MediaModule } from "./modules/media/media.module.js";
 import { PdvAuthModule } from "./modules/pdv-auth/pdv-auth.module.js";
 import { PdvCaixaModule } from "./modules/pdv-caixa/pdv-caixa.module.js";
 import { PdvClientesModule } from "./modules/pdv-clientes/pdv-clientes.module.js";
@@ -97,6 +98,7 @@ import { WhatsappModule } from "./modules/whatsapp/whatsapp.module.js";
     PdvProdutosModule,
     PdvVendasModule,
     WhatsappModule,
+    MediaModule,
   ],
   providers: [
     // Etapa 24 — aplica `AppThrottlerGuard` a toda rota da aplicação (ver

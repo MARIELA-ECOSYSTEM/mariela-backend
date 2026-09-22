@@ -53,6 +53,24 @@ export interface WhatsappConfig {
 }
 
 /**
+ * Fase 40 — storage de mídia (imagens/vídeos do catálogo) no Cloudflare R2
+ * (API compatível com S3). `secretAccessKey`/`accessKeyId` são credenciais:
+ * nunca lidas fora deste namespace, nunca logadas nem devolvidas por API.
+ * Tudo opcional: qualquer variável ausente só desabilita o upload
+ * (`MediaService` responde `STORAGE_NOT_CONFIGURED`), nunca impede o boot.
+ */
+export interface StorageConfig {
+  r2: {
+    accountId: string;
+    accessKeyId: string;
+    secretAccessKey: string;
+    bucketName: string;
+    /** Base pública do bucket (domínio próprio ou `pub-….r2.dev`), sem barra final. */
+    publicBaseUrl: string;
+  };
+}
+
+/**
  * Etapa 24 — só o piso GLOBAL/moderado (aplicado a toda rota via `APP_GUARD`)
  * é configurável por ambiente. Os limites específicos de login (`/auth/login`,
  * `/pdv/auth/login`) e de envio de WhatsApp são constantes de segurança fixas
@@ -71,6 +89,7 @@ export interface Configuration {
   pdvJwt: PdvJwtConfig;
   cors: CorsConfig;
   whatsapp: WhatsappConfig;
+  storage: StorageConfig;
   rateLimit: RateLimitConfig;
 }
 
@@ -113,6 +132,15 @@ export default (): Configuration => {
         apiKey: process.env["EVOLUTION_API_KEY"] ?? "",
         instanceName: process.env["EVOLUTION_INSTANCE_NAME"] ?? "mariela-whatsapp",
         timeoutMs: Number(process.env["EVOLUTION_TIMEOUT_MS"] ?? 10000),
+      },
+    },
+    storage: {
+      r2: {
+        accountId: (process.env["R2_ACCOUNT_ID"] ?? "").trim(),
+        accessKeyId: (process.env["R2_ACCESS_KEY_ID"] ?? "").trim(),
+        secretAccessKey: (process.env["R2_SECRET_ACCESS_KEY"] ?? "").trim(),
+        bucketName: (process.env["R2_BUCKET_NAME"] ?? "").trim(),
+        publicBaseUrl: (process.env["R2_PUBLIC_BASE_URL"] ?? "").trim().replace(/\/+$/, ""),
       },
     },
     rateLimit: {

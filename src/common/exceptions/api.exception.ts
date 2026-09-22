@@ -133,6 +133,15 @@ export class ApiException extends HttpException {
     });
   }
 
+  /** Storage de mídia (Cloudflare R2) sem configuração completa neste ambiente — nunca confundido com falha do provedor. */
+  static storageNotConfigured(message = "Armazenamento de mídia não configurado neste ambiente."): ApiException {
+    return new ApiException({
+      statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+      code: ERROR_CODES.STORAGE_NOT_CONFIGURED,
+      message,
+    });
+  }
+
   static whatsappTimeout(message = "Tempo esgotado ao comunicar com o provedor de WhatsApp."): ApiException {
     return new ApiException({
       statusCode: HttpStatus.GATEWAY_TIMEOUT,

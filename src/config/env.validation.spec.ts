@@ -29,6 +29,34 @@ describe("validateEnv", () => {
     expect(() => validateEnv(env)).toThrow();
   });
 
+  describe("Fase 40 — variáveis do storage R2 (opcionais)", () => {
+    it("aceita a configuração sem nenhuma variável R2 (upload apenas desabilitado)", () => {
+      expect(() => validateEnv(baseEnv())).not.toThrow();
+    });
+
+    it("aceita as 5 variáveis R2 com uma base pública https válida", () => {
+      const env = baseEnv({
+        R2_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+        R2_ACCESS_KEY_ID: "id",
+        R2_SECRET_ACCESS_KEY: "segredo",
+        R2_BUCKET_NAME: "mariela-midia",
+        R2_PUBLIC_BASE_URL: "https://midia.exemplo.com",
+      });
+      expect(validateEnv(env).R2_PUBLIC_BASE_URL).toBe("https://midia.exemplo.com");
+    });
+
+    it("aceita R2_PUBLIC_BASE_URL vazia ou só com espaços (equivale a não configurada)", () => {
+      expect(() => validateEnv(baseEnv({ R2_PUBLIC_BASE_URL: "" }))).not.toThrow();
+      expect(() => validateEnv(baseEnv({ R2_PUBLIC_BASE_URL: "   " }))).not.toThrow();
+    });
+
+    for (const invalida of ["midia.exemplo.com", "ftp://midia.exemplo.com", "https://", "https://midia.exemplo.com?x=1", "https://midia exemplo.com"]) {
+      it(`rejeita R2_PUBLIC_BASE_URL inválida: "${invalida}"`, () => {
+        expect(() => validateEnv(baseEnv({ R2_PUBLIC_BASE_URL: invalida }))).toThrow(/R2_PUBLIC_BASE_URL/);
+      });
+    }
+  });
+
   describe("Etapa 18.23 — segredos JWT vazios/whitespace", () => {
     for (const campo of ["JWT_ACCESS_SECRET", "JWT_REFRESH_SECRET", "PDV_JWT_ACCESS_SECRET", "PDV_JWT_REFRESH_SECRET"]) {
       it(`rejeita ${campo} ausente`, () => {

@@ -83,6 +83,32 @@ bun run build
 bun run start:prod
 ```
 
+## Mídia (imagens e vídeos) — Cloudflare R2
+
+O backend **não recebe arquivos**: ele só autoriza o envio. A mídia vai direto do Backoffice para um bucket do Cloudflare R2 (API S3) por uma URL pré-assinada, e o banco guarda apenas a URL pública nos campos que já existem (`foto` e `video` da variante — contrato de Produto/Variante inalterado). Nada de mídia fica no MongoDB nem no disco do servidor.
+
+**Fluxo**
+
+1. `POST /api/v1/media/presigned-upload` (só Backoffice, `ADMIN`; o token do PDV é rejeitado) com `{ fileName, contentType, kind, size, produtoId }`.
+2. O backend valida e responde `{ data: { uploadUrl, method: "PUT", headers, publicUrl, key, expiresIn } }`.
+3. O cliente faz `PUT uploadUrl` com o arquivo, enviando exatamente os `headers` devolvidos (o `Content-Length` é o `size` declarado; um tipo ou tamanho diferente invalida a assinatura).
+4. O cliente salva `publicUrl` em `foto`/`video` pelos endpoints de variante já existentes (`POST`/`PUT /produtos/:id/variantes`).
+
+**Regras (validadas no backend)**
+
+| | Imagem (`kind: "image"`) | Vídeo (`kind: "video"`) |
+|---|---|---|
+| Tipos | `image/jpeg`, `image/png`, `image/webp`, `image/gif` | `video/mp4` |
+| Tamanho máximo | 5 MB | 15 MB |
+
+A extensão de `fileName` precisa corresponder ao tipo (`.jpg`/`.jpeg`, `.png`, `.webp`, `.gif`, `.mp4`). O produto precisa existir. A chave é sempre `products/{produtoId}/{uuid}.{ext}` — o nome original nunca é usado e o cliente não informa bucket nem chave (campos extras são rejeitados com 400). A URL expira em 10 minutos.
+
+**Erros:** `400 VALIDATION_ERROR` (tipo, extensão, tamanho, corpo), `401` (sem token, token inválido ou do PDV), `404` (produto), `503 STORAGE_NOT_CONFIGURED` (variáveis R2 ausentes; a resposta cita só os nomes).
+
+**Variáveis** (todas opcionais para o boot; ver `.env.example`): `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_BASE_URL`.
+
+**Configuração necessária no bucket (feita no Cloudflare, fora do código):** leitura pública (domínio próprio ou endereço público do R2) e CORS permitindo `PUT` a partir das origens do Backoffice, com o cabeçalho `Content-Type`. Ainda não implementado (fora do escopo): remoção de arquivos órfãos, redimensionamento/thumbnails, várias mídias por variante.
+
 ## Backup e recuperação do MongoDB
 
 Produção roda no MongoDB Atlas, plano **Free (M0)** — que **não** oferece Cloud Backup/snapshots nativos (confirmado na documentação oficial da MongoDB, Fase 29-FI.1). O mecanismo em uso é `mongodump`/`mongorestore` agendado externamente, com script pronto e testado em `ops/backup/` (scripts operacionais, fora do backend — nunca uma dependência do projeto). Procedimento completo, política de retenção e checklist de validação de restore: ver [`docs/backup-mongodb.md`](docs/backup-mongodb.md).
