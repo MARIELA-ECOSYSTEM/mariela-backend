@@ -29,6 +29,41 @@ describe("validateEnv", () => {
     expect(() => validateEnv(env)).toThrow();
   });
 
+  describe("Fase 48.1-B — MONGODB_URI exige um banco explícito no path", () => {
+    it("aceita mongodb:// com banco explícito", () => {
+      expect(() => validateEnv(baseEnv({ MONGODB_URI: "mongodb://localhost:27017/marielaDB" }))).not.toThrow();
+    });
+
+    it("aceita mongodb+srv:// (Atlas) com banco explícito e query string", () => {
+      expect(() =>
+        validateEnv(baseEnv({ MONGODB_URI: "mongodb+srv://usuario:senha@cluster0.exemplo.mongodb.net/marielaDB?retryWrites=true&w=majority" })),
+      ).not.toThrow();
+    });
+
+    it("rejeita a URI padrão copiada do Atlas Connect > Drivers, SEM banco no path (cairia em 'test' silenciosamente)", () => {
+      expect(() =>
+        validateEnv(baseEnv({ MONGODB_URI: "mongodb+srv://usuario:senha@cluster0.exemplo.mongodb.net/?retryWrites=true&w=majority" })),
+      ).toThrow(/MONGODB_URI/);
+    });
+
+    it("rejeita a URI terminando só na barra, sem nome de banco", () => {
+      expect(() => validateEnv(baseEnv({ MONGODB_URI: "mongodb://localhost:27017/" }))).toThrow(/MONGODB_URI/);
+    });
+
+    it("rejeita a URI sem barra alguma após o host (nenhum path)", () => {
+      expect(() => validateEnv(baseEnv({ MONGODB_URI: "mongodb://localhost:27017" }))).toThrow(/MONGODB_URI/);
+    });
+
+    it("a mensagem de erro explica a causa (driver cairia no banco 'test')", () => {
+      try {
+        validateEnv(baseEnv({ MONGODB_URI: "mongodb://localhost:27017" }));
+        throw new Error("deveria ter lançado");
+      } catch (erro) {
+        expect((erro as Error).message).toContain("test");
+      }
+    });
+  });
+
   describe("Fase 40 — variáveis do storage R2 (opcionais)", () => {
     it("aceita a configuração sem nenhuma variável R2 (upload apenas desabilitado)", () => {
       expect(() => validateEnv(baseEnv())).not.toThrow();

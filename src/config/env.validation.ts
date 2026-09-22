@@ -34,9 +34,22 @@ class EnvironmentVariables {
   })
   API_PREFIX = "api/v1";
 
+  /**
+   * Fase 48.1-B — exige um nome de banco explícito no path da URI (ex.:
+   * `.../marielaDB?...`), não só o esquema. Sem isto, uma connection string
+   * copiada direto do "Connect > Drivers" do Atlas (que por padrão vem SEM
+   * banco no path) conecta com sucesso, mas o driver do MongoDB cai
+   * silenciosamente no banco padrão "test" — nenhum erro, nenhum aviso,
+   * só os dados aparecendo no banco errado. Mesma exigência que
+   * `ops/backup/backup-mongo.ps1` já aplica a `MONGODB_BACKUP_URI` desde a
+   * Fase 32, agora espelhada aqui para toda conexão da aplicação (API e
+   * scripts, como `seed-admin.ts`, que reutilizam este mesmo `ConfigModule`
+   * — nenhuma configuração paralela).
+   */
   @IsString()
-  @Matches(/^mongodb(\+srv)?:\/\//, {
-    message: "MONGODB_URI deve ser uma string de conexão válida do MongoDB.",
+  @Matches(/^mongodb(\+srv)?:\/\/[^/]+\/[^/?]+/, {
+    message:
+      'MONGODB_URI deve incluir o nome do banco no path (ex.: "mongodb+srv://usuario:senha@host/NOME_DO_BANCO?..."). Sem ele, o driver do MongoDB conecta silenciosamente ao banco padrão "test".',
   })
   MONGODB_URI!: string;
 
