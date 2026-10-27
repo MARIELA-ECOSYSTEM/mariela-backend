@@ -86,9 +86,9 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       expect(seqSegundo).toBe(seqPrimeiro + 1);
     });
 
-    it("calcula a margem sobre o preço de venda na criação", async () => {
+    it("calcula a margem sobre o preço de custo na criação", async () => {
       const produto = await service.criar(payloadProduto("C", { precoCusto: 50, precoVenda: 100 }), null);
-      expect(produto.margemLucro).toBe(50);
+      expect(produto.margemLucro).toBe(100); // (100-50)/50*100
     });
   });
 
@@ -216,7 +216,7 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       const criado = await service.criar(payloadProduto("F", { precoCusto: 50, precoVenda: 100 }), null);
       const atualizado = await service.atualizar(criado.id, payloadProduto("F", { precoCusto: 60, precoVenda: 120 }), null);
       expect(atualizado.precoVenda).toBe(120);
-      expect(atualizado.margemLucro).toBe(50);
+      expect(atualizado.margemLucro).toBe(100); // (120-60)/60*100
     });
 
     it("rejeita reduzir o preço de venda abaixo do preço promocional ativo", async () => {
@@ -411,7 +411,7 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       const produto = await service.criar(payloadProduto("S", { precoCusto: 50, precoVenda: 100 }), null);
       const comPromocao = await service.definirPromocao(produto.id, { ehPromocao: true, precoPromocional: 80 }, null);
       expect(comPromocao.precoPromocional).toBe(80);
-      expect(comPromocao.margemLucro).toBe(37.5); // (80-50)/80*100
+      expect(comPromocao.margemLucro).toBe(60); // (80-50)/50*100
     });
 
     it("rejeita preço promocional maior ou igual ao preço de venda", async () => {
@@ -426,7 +426,7 @@ describe("ProdutosService (integração — MongoDB real)", () => {
     // arredondada para zero: só o preço efetivo <= 0 devolve 0 (ver `precos.util.ts`).
     it("permite e calcula corretamente margem negativa (venda abaixo do custo)", async () => {
       const produto = await service.criar(payloadProduto("U", { precoCusto: 100, precoVenda: 50 }), null);
-      expect(produto.margemLucro).toBe(-100); // (50-100)/50*100
+      expect(produto.margemLucro).toBe(-50); // (50-100)/100*100
     });
 
     // Etapa 10.23 — correção 6.11.2: antes, desativar a promoção mantinha
@@ -620,5 +620,5 @@ describe("ProdutosService (integração — MongoDB real)", () => {
 });
 
 function calcularMargemEsperada(custo: number, precoEfetivoValor: number): number {
-  return Number((((precoEfetivoValor - custo) / precoEfetivoValor) * 100).toFixed(2));
+  return Number((((precoEfetivoValor - custo) / custo) * 100).toFixed(2));
 }

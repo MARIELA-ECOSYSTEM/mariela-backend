@@ -29,11 +29,18 @@ export function arredondarMoeda(valor: number): number {
 }
 
 /**
- * Margem sobre o preço EFETIVO (vigente) — decisão de negócio já aprovada:
- * `((precoEfetivo - precoCusto) / precoEfetivo) * 100`. Nunca sobre o preço
- * de custo (isso seria markup, não margem).
+ * Margem sobre o preço de CUSTO — decisão de negócio vigente (correção
+ * pós-go-live, substitui a fórmula anterior que calculava sobre o preço de
+ * venda): `((precoEfetivo - precoCusto) / precoCusto) * 100`.
+ *
+ * Exemplo: custo R$100, venda R$220 → lucro R$120 → margem 120%.
+ *
+ * `precoCusto <= 0` (zero ou inválido) devolve 0 em vez de dividir por zero
+ * (evita `Infinity`/`NaN`); `precoEfetivoValor` não é mais o divisor, então
+ * ele pode legitimamente ser 0 ou menor que o custo (resulta em margem
+ * negativa, matematicamente válida — venda abaixo do custo).
  */
 export function calcularMargem(precoCusto: number, precoEfetivoValor: number): number {
-  if (!precoEfetivoValor || precoEfetivoValor <= 0) return 0;
-  return arredondarMoeda(((precoEfetivoValor - precoCusto) / precoEfetivoValor) * 100);
+  if (!precoCusto || precoCusto <= 0) return 0;
+  return arredondarMoeda(((precoEfetivoValor - precoCusto) / precoCusto) * 100);
 }

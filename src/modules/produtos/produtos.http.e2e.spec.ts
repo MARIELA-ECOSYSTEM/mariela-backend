@@ -128,7 +128,7 @@ describe("HTTP — Produtos (integração — servidor real)", () => {
       expect(resposta.status).toBe(201);
       const corpo = (await resposta.json()) as { data: Record<string, unknown> };
       expect(corpo.data["codProduto"]).toMatch(/^PROD-\d{4}$/);
-      expect(corpo.data["margemLucro"]).toBe(50);
+      expect(corpo.data["margemLucro"]).toBe(100); // custo 50, venda 100 → (100-50)/50*100
       expect(corpo.data["quantidadeTotal"]).toBe(0);
       expect(corpo.data["variantes"]).toEqual([]);
       expect(corpo.data["id"]).toBeTruthy();
@@ -258,7 +258,7 @@ describe("HTTP — Produtos (integração — servidor real)", () => {
       expect(resposta.status).toBe(200);
       const corpo = (await resposta.json()) as { data: { precoVenda: number; margemLucro: number } };
       expect(corpo.data.precoVenda).toBe(120);
-      expect(corpo.data.margemLucro).toBe(50);
+      expect(corpo.data.margemLucro).toBe(100); // custo 60, venda 120 → (120-60)/60*100
     });
 
     it("reduzir o preço de venda abaixo da promoção ativa retorna 400 (nunca desativa a promoção silenciosamente)", async () => {
@@ -333,7 +333,7 @@ describe("HTTP — Produtos (integração — servidor real)", () => {
       const corpo = (await resposta.json()) as { data: { ehPromocao: boolean; precoPromocional: number; margemLucro: number } };
       expect(corpo.data.ehPromocao).toBe(true);
       expect(corpo.data.precoPromocional).toBe(80);
-      expect(corpo.data.margemLucro).toBe(37.5);
+      expect(corpo.data.margemLucro).toBe(60); // custo 50, promocional 80 → (80-50)/50*100
     });
 
     it("preço promocional maior ou igual ao preço de venda retorna 400", async () => {
