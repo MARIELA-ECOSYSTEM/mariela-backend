@@ -8,9 +8,11 @@ import configuration from "../../config/configuration.js";
 import { validateEnv } from "../../config/env.validation.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { CaixasService } from "../caixas/caixas.service.js";
 import type { CriarClienteDto } from "../clientes/dto/criar-cliente.dto.js";
 import { ClientesService } from "../clientes/clientes.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import type { CriarVendedorDto } from "../vendedores/dto/criar-vendedor.dto.js";
@@ -62,6 +64,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
   let service: PdvVendasService;
   let vendasService: VendasService;
   let produtosService: ProdutosService;
+  let configuracoesService: ConfiguracoesService;
   let vendedoresService: VendedoresService;
   let clientesService: ClientesService;
   let caixasService: CaixasService;
@@ -79,10 +82,14 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
     service = moduleRef.get(PdvVendasService);
     vendasService = moduleRef.get(VendasService);
     produtosService = moduleRef.get(ProdutosService);
+    configuracoesService = moduleRef.get(ConfiguracoesService);
     vendedoresService = moduleRef.get(VendedoresService);
     clientesService = moduleRef.get(ClientesService);
     caixasService = moduleRef.get(CaixasService);
     connection = moduleRef.get(getConnectionToken());
+    // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante`/`ajustarQuantidadeTamanho`.
+    await garantirItemConfiguracao(configuracoesService, "cores", "Azul");
+    await garantirItemConfiguracao(configuracoesService, "tamanhos", "M");
   });
 
   afterAll(async () => {

@@ -11,7 +11,9 @@ import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 
 /**
@@ -72,6 +74,12 @@ describe("HTTP — Estoque (integração — servidor real)", () => {
     await authService.criarAdminSeed({ nome: "HTTP Estoque", email, senha: "senha-forte-123" });
     const login = await authService.login({ usuario: email, senha: "senha-forte-123" }, { ip: null, userAgent: null });
     adminAccessToken = login.accessToken;
+
+    // Fase 54.2 — pré-requisito: toda cor/tamanho usado neste arquivo precisa
+    // existir em `configuracoes.cores`/`tamanhos`.
+    const configuracoesService = app.get(ConfiguracoesService);
+    await garantirItemConfiguracao(configuracoesService, "cores", "Preto");
+    await garantirItemConfiguracao(configuracoesService, "tamanhos", "M");
   });
 
   afterAll(async () => {

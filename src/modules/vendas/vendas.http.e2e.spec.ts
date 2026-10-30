@@ -11,10 +11,12 @@ import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { AdquirentesService } from "../adquirentes/adquirentes.service.js";
 import { CaixasService } from "../caixas/caixas.service.js";
 import { ClientesService } from "../clientes/clientes.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 import { VendasService } from "./vendas.service.js";
@@ -119,6 +121,12 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     caixasService = app.get(CaixasService);
     vendasService = app.get(VendasService);
     adquirentesService = app.get(AdquirentesService);
+
+    // Fase 54.2 — pré-requisito: toda cor/tamanho usado neste arquivo precisa
+    // existir em `configuracoes.cores`/`tamanhos`.
+    const configuracoesService = app.get(ConfiguracoesService);
+    for (const cor of ["Preto", "Rosa", "Verde"]) await garantirItemConfiguracao(configuracoesService, "cores", cor);
+    for (const tamanho of ["G", "M", "P"]) await garantirItemConfiguracao(configuracoesService, "tamanhos", tamanho);
 
     const produto = await produtosService.criar({ nome: "Produto HTTP Vendas", categoria: "Vestidos", precoCusto: 100, precoVenda: 200, ehNovidade: false }, null);
     const variante = await produtosService.adicionarVariante(produto.id, { cor: "Verde" }, null);

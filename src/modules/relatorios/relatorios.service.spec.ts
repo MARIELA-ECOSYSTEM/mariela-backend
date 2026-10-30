@@ -4,6 +4,8 @@ import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
 import { Types, type Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import type { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { RelatoriosModule } from "./relatorios.module.js";
@@ -181,6 +183,7 @@ describe("RelatoriosService (integração — MongoDB real)", () => {
   let moduleRef: TestingModule;
   let service: RelatoriosService;
   let produtosService: ProdutosService;
+  let configuracoesService: ConfiguracoesService;
   let connection: Connection;
   const idsCriados: string[] = [];
 
@@ -190,7 +193,11 @@ describe("RelatoriosService (integração — MongoDB real)", () => {
     }).compile();
     service = moduleRef.get(RelatoriosService);
     produtosService = moduleRef.get(ProdutosService);
+    configuracoesService = moduleRef.get(ConfiguracoesService);
     connection = moduleRef.get(getConnectionToken());
+    // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante`/`ajustarQuantidadeTamanho`.
+    await garantirItemConfiguracao(configuracoesService, "cores", "Azul");
+    await garantirItemConfiguracao(configuracoesService, "tamanhos", "M");
   });
 
   afterAll(async () => {

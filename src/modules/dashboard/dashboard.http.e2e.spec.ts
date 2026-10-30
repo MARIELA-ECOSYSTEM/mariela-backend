@@ -11,9 +11,11 @@ import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { CaixasService } from "../caixas/caixas.service.js";
 import { ClientesService } from "../clientes/clientes.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import { FornecedoresService } from "../fornecedores/fornecedores.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendasService } from "../vendas/vendas.service.js";
@@ -120,6 +122,10 @@ describe("HTTP — Dashboard (integração — servidor real)", () => {
       const fornecedoresService = app.get(FornecedoresService);
       const caixasService = app.get(CaixasService);
       const vendasService = app.get(VendasService);
+      const configuracoesService = app.get(ConfiguracoesService);
+      // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante`.
+      await garantirItemConfiguracao(configuracoesService, "cores", "Preto");
+      await garantirItemConfiguracao(configuracoesService, "tamanhos", "P");
 
       const fornecedor = await fornecedoresService.criar({ nome: "Fornecedor HTTP Dashboard" }, null);
       const produto = await produtosService.criar(

@@ -4,8 +4,10 @@ import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
 import type { Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { CaixasService } from "../caixas/caixas.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendasService } from "../vendas/vendas.service.js";
 import { VendasModule } from "../vendas/vendas.module.js";
@@ -397,6 +399,7 @@ describe("ClientesService.listarVendas — histórico real (Etapa 13.2, integra�
   let clientesService: ClientesService;
   let vendasService: VendasService;
   let produtosService: ProdutosService;
+  let configuracoesService: ConfiguracoesService;
   let vendedoresService: VendedoresService;
   let caixasService: CaixasService;
   let connection: Connection;
@@ -419,9 +422,13 @@ describe("ClientesService.listarVendas — histórico real (Etapa 13.2, integra�
     clientesService = moduleRef.get(ClientesService);
     vendasService = moduleRef.get(VendasService);
     produtosService = moduleRef.get(ProdutosService);
+    configuracoesService = moduleRef.get(ConfiguracoesService);
     vendedoresService = moduleRef.get(VendedoresService);
     caixasService = moduleRef.get(CaixasService);
     connection = moduleRef.get(getConnectionToken());
+    // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante`/`ajustarQuantidadeTamanho`.
+    await garantirItemConfiguracao(configuracoesService, "cores", "Azul");
+    await garantirItemConfiguracao(configuracoesService, "tamanhos", "M");
   });
 
   afterAll(async () => {

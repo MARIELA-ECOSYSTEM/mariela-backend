@@ -56,7 +56,16 @@ export class EstoqueService {
     const { produto, tamanhoId, saldoResultante } = await this.produtosService.ajustarQuantidadeTamanho(
       dto.produtoId,
       dto.varianteId,
-      { tamanhoId: dto.tamanhoId, tamanho: dto.tamanho, delta: dto.quantidade, exigirExistente: false },
+      {
+        tamanhoId: dto.tamanhoId,
+        tamanho: dto.tamanho,
+        delta: dto.quantidade,
+        exigirExistente: false,
+        // Fase 54.2 — só a entrada de estoque (único ponto onde um tamanho
+        // pode ser digitado como texto livre, criando-o na hora) exige que
+        // ele já esteja em `configuracoes.tamanhos`.
+        exigirTamanhoCadastrado: true,
+      },
     );
 
     await this.movimentacaoModel.create({

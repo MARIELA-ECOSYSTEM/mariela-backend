@@ -11,7 +11,9 @@ import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE (mesmos guards, mesmo pipeline de
@@ -94,6 +96,16 @@ describe("HTTP — Produtos (integração — servidor real)", () => {
     await authService.criarAdminSeed({ nome: "HTTP Produtos", email, senha: "senha-forte-123" });
     const login = await authService.login({ usuario: email, senha: "senha-forte-123" }, { ip: null, userAgent: null });
     adminAccessToken = login.accessToken;
+
+    // Fase 54.2 — pré-requisito: toda cor/tamanho usado neste arquivo precisa
+    // existir em `configuracoes.cores`/`tamanhos` antes de `POST /variantes`.
+    const configuracoesService = app.get(ConfiguracoesService);
+    const cores = [
+      "Azul Marinho", "Bege", "Branco", "Cinza Chumbo", "Cinza", "Dourado", "Grafite",
+      "Marrom", "Prata", "Preto", "Rosa Claro", "Rosa", "Roxo", "Turquesa", "Verde", "Vermelho",
+    ];
+    for (const cor of cores) await garantirItemConfiguracao(configuracoesService, "cores", cor);
+    for (const tamanho of ["G", "M", "P"]) await garantirItemConfiguracao(configuracoesService, "tamanhos", tamanho);
   });
 
   afterAll(async () => {

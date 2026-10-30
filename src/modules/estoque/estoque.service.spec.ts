@@ -4,7 +4,9 @@ import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
 import { Types, type Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { EstoqueModule } from "./estoque.module.js";
@@ -33,6 +35,7 @@ describe("EstoqueService (integração — MongoDB real)", () => {
   let moduleRef: TestingModule;
   let service: EstoqueService;
   let produtosService: ProdutosService;
+  let configuracoesService: ConfiguracoesService;
   let connection: Connection;
 
   beforeAll(async () => {
@@ -41,7 +44,15 @@ describe("EstoqueService (integração — MongoDB real)", () => {
     }).compile();
     service = moduleRef.get(EstoqueService);
     produtosService = moduleRef.get(ProdutosService);
+    configuracoesService = moduleRef.get(ConfiguracoesService);
     connection = moduleRef.get(getConnectionToken());
+    // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante`/`adicionarTamanho`/`service.entrada`.
+    for (const cor of ["Preto", "Azul", "Vermelho", "Amarelo", "Rosa"]) {
+      await garantirItemConfiguracao(configuracoesService, "cores", cor);
+    }
+    for (const tamanho of ["M", "G"]) {
+      await garantirItemConfiguracao(configuracoesService, "tamanhos", tamanho);
+    }
   });
 
   afterAll(async () => {
@@ -97,7 +108,7 @@ describe("EstoqueService (integração — MongoDB real)", () => {
       expect(produto.quantidadeTotal).toBe(8); // derivado: soma das variantes
     });
 
-    it("cria um tamanho novo na variante quando `tamanho` (nome) é informado em vez de `tamanhoId`", async () => {
+    it("cria um tamanho novo na variante quando `tamanho` (nome) é informado em vez de `tamanhoId`, desde que já esteja cadastrado nas configurações", async () => {
       const produto = await criarProduto();
       const variante = await produtosService.adicionarVariante(produto.id, { cor: "Azul" }, null);
       const dto: EntradaEstoqueDto = { produtoId: produto.id, varianteId: String(variante._id), tamanho: "G", quantidade: 4 };
@@ -107,6 +118,42 @@ describe("EstoqueService (integração — MongoDB real)", () => {
       expect(varianteAtualizada.tamanhos).toHaveLength(1);
       expect(varianteAtualizada.tamanhos[0]?.tamanho).toBe("G");
       expect(varianteAtualizada.tamanhos[0]?.quantidade).toBe(4);
+    });
+
+    // Fase 54.2 — a entrada de estoque não pode mais criar implicitamente um
+    // tamanho que não existe em `configuracoes.tamanhos` (seção 6: "ajustar
+    // estoque não deve criar um novo tamanho fora da lista central").
+    it("rejeita criar um tamanho novo via entrada de estoque quando ele não está cadastrado nas configurações", async () => {
+      const produto = await criarProduto();
+      const variante = await produtosService.adicionarVariante(produto.id, { cor: "Azul" }, null);
+      const tamanhoInexistente = `GGG-${Date.now()}`;
+      const dto: EntradaEstoqueDto = {
+        produtoId: produto.id,
+        varianteId: String(variante._id),
+        tamanho: tamanhoInexistente,
+        quantidade: 4,
+      };
+
+      await expect(service.entrada(dto, null)).rejects.toThrow(
+        "Este tamanho não está cadastrado nas configurações da loja. Cadastre o tamanho antes de utilizá-lo em um produto.",
+      );
+
+      const produtoFinal = await produtosService.obterPorId(produto.id);
+      const varianteFinal = produtoFinal.variantes.find((item) => String(item._id) === String(variante._id))!;
+      expect(varianteFinal.tamanhos).toHaveLength(0); // nada foi criado
+    });
+
+    it("não exige cadastro nas configurações ao somar quantidade em um tamanho JÁ existente na variante (mesmo que removido das configurações depois)", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(2);
+      // "M" já está cadastrado em configuracoes.tamanhos (beforeAll) — o
+      // ponto deste teste é confirmar que informar o NOME (não o id) de um
+      // tamanho que já existe NA VARIANTE nunca passa pela validação central,
+      // já que nenhum vínculo novo está sendo criado.
+      const dto: EntradaEstoqueDto = { produtoId, varianteId, tamanho: "M", quantidade: 3 };
+      const atualizado = await service.entrada(dto, null);
+      const variante = atualizado.variantes.find((item) => String(item._id) === varianteId)!;
+      const tamanho = variante.tamanhos.find((item) => String(item._id) === tamanhoId)!;
+      expect(tamanho.quantidade).toBe(5);
     });
 
     it("zera estoqueZeradoEm quando uma entrada tira o produto de saldo zero", async () => {

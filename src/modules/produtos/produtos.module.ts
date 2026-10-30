@@ -2,6 +2,7 @@ import { forwardRef, Module } from "@nestjs/common";
 import { MongooseModule } from "@nestjs/mongoose";
 import { CampanhasModule } from "../campanhas/campanhas.module.js";
 import { ColecoesModule } from "../colecoes/colecoes.module.js";
+import { ConfiguracoesModule } from "../configuracoes/configuracoes.module.js";
 import { FornecedoresModule } from "../fornecedores/fornecedores.module.js";
 import { SequenciasModule } from "../sequencias/sequencias.module.js";
 import { ProdutosController } from "./produtos.controller.js";
@@ -28,6 +29,12 @@ import { Produto, ProdutoSchema } from "./schemas/produto.schema.js";
     forwardRef(() => FornecedoresModule),
     forwardRef(() => ColecoesModule),
     forwardRef(() => CampanhasModule),
+    // Fase 54.2 — `ProdutosService` passa a validar cor/tamanho contra
+    // `configuracoes.cores`/`configuracoes.tamanhos` ao criar/editar
+    // variantes. `ConfiguracoesModule` já importa `ProdutosModule` (Fase
+    // 54.0, proteção de exclusão) — mesmo tipo de dependência circular
+    // genuína já resolvida acima para Fornecedores/Coleções/Campanhas.
+    forwardRef(() => ConfiguracoesModule),
   ],
   controllers: [ProdutosController],
   providers: [ProdutosService, ProdutosRepository],

@@ -4,9 +4,11 @@ import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
 import type { Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { CampanhasService } from "../campanhas/campanhas.service.js";
 import { ColecoesService } from "../colecoes/colecoes.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import { FornecedoresService } from "../fornecedores/fornecedores.service.js";
 import type { CriarProdutoDto } from "./dto/criar-produto.dto.js";
 import { ProdutosModule } from "./produtos.module.js";
@@ -41,6 +43,7 @@ describe("ProdutosService (integração — MongoDB real)", () => {
   let fornecedoresService: FornecedoresService;
   let colecoesService: ColecoesService;
   let campanhasService: CampanhasService;
+  let configuracoesService: ConfiguracoesService;
   let connection: Connection;
 
   beforeAll(async () => {
@@ -52,7 +55,18 @@ describe("ProdutosService (integração — MongoDB real)", () => {
     fornecedoresService = moduleRef.get(FornecedoresService);
     colecoesService = moduleRef.get(ColecoesService);
     campanhasService = moduleRef.get(CampanhasService);
+    configuracoesService = moduleRef.get(ConfiguracoesService);
     connection = moduleRef.get(getConnectionToken());
+    // Fase 54.2 — pré-requisito para `adicionarVariante`/`atualizarVariante`/
+    // `adicionarTamanho`: todos os valores usados neste arquivo precisam
+    // existir em `configuracoes.cores`/`tamanhos` ("!!!"/"###" não — falham
+    // antes, na validação de formato).
+    for (const cor of ["Branco", "Preto", "Verde", "Azul", "Vermelho", "Amarelo", "Azul Marinho", "Rosé"]) {
+      await garantirItemConfiguracao(configuracoesService, "cores", cor);
+    }
+    for (const tamanho of ["M", "P", "U"]) {
+      await garantirItemConfiguracao(configuracoesService, "tamanhos", tamanho);
+    }
   });
 
   afterAll(async () => {
@@ -65,6 +79,8 @@ describe("ProdutosService (integração — MongoDB real)", () => {
     await connection.collection("eventos_colecao").deleteMany({});
     await connection.collection("campanhas").deleteMany({});
     await connection.collection("eventos_campanha").deleteMany({});
+    await connection.collection("configuracoes").deleteMany({});
+    await connection.collection("eventos_configuracao").deleteMany({});
     await moduleRef.close();
   });
 
@@ -615,6 +631,131 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       expect(produto.fornecedorId).toBeNull();
       expect(produto.colecaoId).toBeNull();
       expect(produto.campanhaId).toBeNull();
+    });
+  });
+
+  describe("validação de cor/tamanho contra configuracoes (Fase 54.2)", () => {
+    it("cria variante com cor existente nas configurações", async () => {
+      const produto = await service.criar(payloadProduto("V54-1"), null);
+      const variante = await service.adicionarVariante(produto.id, { cor: "Preto" }, null);
+      expect(variante.cor).toBe("Preto");
+    });
+
+    it("rejeita criar variante com cor inexistente nas configurações, com a mensagem de negócio exata", async () => {
+      const produto = await service.criar(payloadProduto("V54-2"), null);
+      const corInexistente = `CorNuncaCadastrada-${Date.now()}`;
+      await expect(service.adicionarVariante(produto.id, { cor: corInexistente }, null)).rejects.toThrow(
+        "Esta cor não está cadastrada nas configurações da loja. Cadastre a cor antes de utilizá-la em um produto.",
+      );
+    });
+
+    it("reconhece variações de maiúsculas/minúsculas da mesma cor cadastrada", async () => {
+      const produto = await service.criar(payloadProduto("V54-3"), null);
+      // "preto" (minúsculas) deve ser aceito porque "Preto" já está cadastrado.
+      const variante = await service.adicionarVariante(produto.id, { cor: "preto" }, null);
+      expect(variante.cor).toBe("preto"); // apresentação original preservada, não reescrita para "Preto"
+    });
+
+    it("altera variante para outra cor existente nas configurações", async () => {
+      const produto = await service.criar(payloadProduto("V54-4"), null);
+      const variante = await service.adicionarVariante(produto.id, { cor: "Preto" }, null);
+      const atualizada = await service.atualizarVariante(produto.id, String(variante._id), { cor: "Verde" }, null);
+      expect(atualizada.cor).toBe("Verde");
+    });
+
+    it("rejeita alterar variante para cor inexistente nas configurações, sem modificar a variante", async () => {
+      const produto = await service.criar(payloadProduto("V54-5"), null);
+      const variante = await service.adicionarVariante(produto.id, { cor: "Preto" }, null);
+      const corInexistente = `CorNuncaCadastrada-${Date.now()}`;
+
+      await expect(
+        service.atualizarVariante(produto.id, String(variante._id), { cor: corInexistente }, null),
+      ).rejects.toThrow("Esta cor não está cadastrada nas configurações da loja. Cadastre a cor antes de utilizá-la em um produto.");
+
+      const produtoFinal = await service.obterPorId(produto.id);
+      const varianteFinal = produtoFinal.variantes.find((item) => String(item._id) === String(variante._id))!;
+      expect(varianteFinal.cor).toBe("Preto"); // nada foi alterado
+    });
+
+    it("alterar uma variante SEM mudar sua cor nunca valida contra configuracoes (evita erro por dado histórico)", async () => {
+      const produto = await service.criar(payloadProduto("V54-6"), null);
+      const corHistorica = `CorHistoricaNuncaMaisCadastrada-${Date.now()}`;
+      await configuracoesService.adicionarItem("cores", corHistorica, null);
+      const variante = await service.adicionarVariante(produto.id, { cor: corHistorica }, null);
+      // Simula dado histórico: a cor deixou de existir em `configuracoes.cores`
+      // por algum outro meio que não `removerItem` (a proteção de exclusão da
+      // Fase 54.0 bloquearia a remoção normal enquanto a variante existir —
+      // não é isso que este teste quer exercitar). Manipulação direta do
+      // Mongo só para o SETUP do teste, nunca como fluxo de produção.
+      await connection.collection("configuracoes").updateOne({}, { $pull: { cores: corHistorica, coresNormalizadas: corHistorica.toLowerCase() } });
+
+      // Editar só a foto, reenviando a MESMA cor (o DTO exige o campo) não
+      // deve falhar mesmo com a cor já fora das configurações.
+      const atualizada = await service.atualizarVariante(
+        produto.id,
+        String(variante._id),
+        { cor: corHistorica, foto: "https://cdn.mariela.com/produtos/historico.jpg" },
+        null,
+      );
+      expect(atualizada.cor).toBe(corHistorica);
+      expect(atualizada.foto).toBe("https://cdn.mariela.com/produtos/historico.jpg");
+    });
+
+    it("cria tamanho com valor existente nas configurações", async () => {
+      const produto = await service.criar(payloadProduto("V54-7"), null);
+      const variante = await service.adicionarVariante(produto.id, { cor: "Preto" }, null);
+      const atualizada = await service.adicionarTamanho(produto.id, String(variante._id), { tamanho: "M", quantidade: 1 }, null);
+      expect(atualizada.tamanhos.some((t) => t.tamanho === "M")).toBe(true);
+    });
+
+    it("rejeita adicionar tamanho inexistente nas configurações, com a mensagem de negócio exata, sem modificar a variante", async () => {
+      const produto = await service.criar(payloadProduto("V54-8"), null);
+      const variante = await service.adicionarVariante(produto.id, { cor: "Preto" }, null);
+      const tamanhoInexistente = `XGG-${Date.now()}`;
+
+      await expect(
+        service.adicionarTamanho(produto.id, String(variante._id), { tamanho: tamanhoInexistente, quantidade: 1 }, null),
+      ).rejects.toThrow("Este tamanho não está cadastrado nas configurações da loja. Cadastre o tamanho antes de utilizá-lo em um produto.");
+
+      const produtoFinal = await service.obterPorId(produto.id);
+      const varianteFinal = produtoFinal.variantes.find((item) => String(item._id) === String(variante._id))!;
+      expect(varianteFinal.tamanhos).toHaveLength(0);
+    });
+
+    it("reconhece variações de caixa e espaços do mesmo tamanho cadastrado ('p' e ' p ' reconhecidos como 'P')", async () => {
+      const produto1 = await service.criar(payloadProduto("V54-9A"), null);
+      const variante1 = await service.adicionarVariante(produto1.id, { cor: "Preto" }, null);
+      const atualizada1 = await service.adicionarTamanho(produto1.id, String(variante1._id), { tamanho: "p", quantidade: 1 }, null);
+      expect(atualizada1.tamanhos.some((t) => t.tamanho === "P")).toBe(true); // normalizarTamanho já uppercase
+
+      const produto2 = await service.criar(payloadProduto("V54-9B"), null);
+      const variante2 = await service.adicionarVariante(produto2.id, { cor: "Preto" }, null);
+      const atualizada2 = await service.adicionarTamanho(produto2.id, String(variante2._id), { tamanho: "  p  ", quantidade: 1 }, null);
+      expect(atualizada2.tamanhos.some((t) => t.tamanho === "P")).toBe(true);
+    });
+
+    it("editar a descrição do produto não exige revalidar cor/tamanho de nenhuma variante existente", async () => {
+      const produto = await service.criar(payloadProduto("V54-10"), null);
+      await service.adicionarVariante(produto.id, { cor: "Preto" }, null);
+
+      const atualizado = await service.atualizar(
+        produto.id,
+        { nome: produto.nome, descricao: "Nova descrição, sem relação com cor/tamanho", categoria: produto.categoria, precoCusto: 50, precoVenda: 100, ehNovidade: false },
+        null,
+      );
+      expect(atualizado.descricao).toBe("Nova descrição, sem relação com cor/tamanho");
+    });
+
+    it("uma falha de validação de cor/tamanho nunca cria efeito parcial no produto", async () => {
+      const produto = await service.criar(payloadProduto("V54-11"), null);
+      const antes = await service.obterPorId(produto.id);
+      expect(antes.variantes).toHaveLength(0);
+
+      await expect(service.adicionarVariante(produto.id, { cor: `Inexistente-${Date.now()}` }, null)).rejects.toThrow(ApiException);
+
+      const depois = await service.obterPorId(produto.id);
+      expect(depois.variantes).toHaveLength(0); // nenhuma variante parcial foi criada
+      expect(depois.quantidadeTotal).toBe(0);
     });
   });
 });

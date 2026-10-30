@@ -5,6 +5,7 @@ import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
 import { CampanhasRepository } from "../campanhas/campanhas.repository.js";
 import { ColecoesRepository } from "../colecoes/colecoes.repository.js";
+import { ConfiguracoesRepository } from "../configuracoes/configuracoes.repository.js";
 import { FornecedoresRepository } from "../fornecedores/fornecedores.repository.js";
 import { CHAVE_SEQUENCIA_PRODUTO, DIGITOS_CODIGO_PRODUTO, PREFIXO_CODIGO_PRODUTO } from "./produtos.constants.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
@@ -46,6 +47,9 @@ export class ProdutosService {
     @Inject(forwardRef(() => FornecedoresRepository)) private readonly fornecedoresRepository: FornecedoresRepository,
     @Inject(forwardRef(() => ColecoesRepository)) private readonly colecoesRepository: ColecoesRepository,
     @Inject(forwardRef(() => CampanhasRepository)) private readonly campanhasRepository: CampanhasRepository,
+    // Fase 54.2 — autoridade para validar se uma cor/tamanho usado por uma
+    // variante existe em `configuracoes.cores`/`configuracoes.tamanhos`.
+    @Inject(forwardRef(() => ConfiguracoesRepository)) private readonly configuracoesRepository: ConfiguracoesRepository,
   ) {}
 
   async criar(dto: CriarProdutoDto, usuarioId: string | null): Promise<ProdutoDocument> {
@@ -288,6 +292,7 @@ export class ProdutosService {
         { field: "cor", message: "A cor deve conter ao menos um caractere alfanumérico." },
       ]);
     }
+    await this.validarCorCadastrada(dto.cor);
 
     const corNormalizada = normalizarCor(dto.cor);
     const novaVariante: DadosNovaVariante = {
@@ -319,6 +324,16 @@ export class ProdutosService {
     usuarioId: string | null,
   ): Promise<Variante> {
     const corNormalizada = normalizarCor(dto.cor);
+
+    // Só valida contra `configuracoes.cores` quando a cor está REALMENTE
+    // mudando — editar foto/vídeo reenviando a mesma cor (o DTO exige o
+    // campo sempre) nunca deve falhar por causa de um dado histórico cuja
+    // cor não está mais nas configurações (Fase 54.2, seção 7).
+    const produtoAtual = await this.produtosRepository.encontrarPorIdOuFalhar(produtoId);
+    const varianteAtual = this.encontrarVarianteOuFalhar(produtoAtual, varianteId);
+    if (varianteAtual.corNormalizada !== corNormalizada) {
+      await this.validarCorCadastrada(dto.cor);
+    }
 
     const produto = await this.produtosRepository.salvarComRetentativa(produtoId, (documento) => {
       const variante = this.encontrarVarianteOuFalhar(documento, varianteId);
@@ -365,6 +380,7 @@ export class ProdutosService {
     usuarioId: string | null,
   ): Promise<Variante> {
     const tamanhoNormalizado = normalizarTamanho(dto.tamanho);
+    await this.validarTamanhoCadastrado(dto.tamanho);
 
     const produto = await this.produtosRepository.salvarComRetentativa(produtoId, (documento) => {
       const variante = this.encontrarVarianteOuFalhar(documento, varianteId);
@@ -409,12 +425,41 @@ export class ProdutosService {
     await this.registrarEvento(produtoId, varianteId, "tamanho.excluido", usuarioId, { tamanhoId });
   }
 
-  /** Usado pelo módulo Estoque (entrada/saída) — mesmo documento, mesma proteção de concorrência. */
+  /**
+   * Usado pelo módulo Estoque (entrada/saída) — mesmo documento, mesma
+   * proteção de concorrência.
+   *
+   * `exigirTamanhoCadastrado` (Fase 54.2): `POST /estoque/entrada` permite
+   * digitar um `tamanho` novo diretamente (ver `EntradaEstoqueDto` —
+   * "Informe para criar um novo tamanho na variante", recurso legítimo e
+   * documentado, não removido aqui). Quando esse tamanho ainda não existe
+   * NESTA variante, ele só pode ser criado se já estiver cadastrado em
+   * `configuracoes.tamanhos` — por isso só `EstoqueService.entrada()` passa
+   * esta flag como `true`. Os demais chamadores (restauração de estoque de
+   * venda cancelada, fixtures de teste, saída de estoque) continuam
+   * exatamente como antes — nunca passam a flag, nunca são afetados — porque
+   * eles nunca estão criando um vínculo NOVO do ponto de vista do negócio: é
+   * sempre a reafirmação de um tamanho que já existiu (histórico), não uma
+   * decisão nova de um administrador.
+   */
   async ajustarQuantidadeTamanho(
     produtoId: string,
     varianteId: string,
-    ajuste: { tamanhoId?: string; tamanho?: string; delta: number; exigirExistente: boolean },
+    ajuste: { tamanhoId?: string; tamanho?: string; delta: number; exigirExistente: boolean; exigirTamanhoCadastrado?: boolean },
   ): Promise<{ produto: ProdutoDocument; tamanhoId: string; saldoResultante: number }> {
+    if (ajuste.exigirTamanhoCadastrado && ajuste.tamanho && !ajuste.tamanhoId) {
+      const produtoAtual = await this.produtosRepository.encontrarPorIdOuFalhar(produtoId);
+      const varianteAtual = this.encontrarVarianteOuFalhar(produtoAtual, varianteId);
+      const tamanhoNormalizado = normalizarTamanho(ajuste.tamanho);
+      const jaExisteNaVariante = varianteAtual.tamanhos.some((item) => normalizarTamanho(item.tamanho) === tamanhoNormalizado);
+      // Só valida contra a lista central quando o tamanho AINDA NÃO existe
+      // nesta variante (vai ser criado agora) — somar quantidade a um
+      // tamanho que já existe nunca deve falhar por causa de dado histórico.
+      if (!jaExisteNaVariante) {
+        await this.validarTamanhoCadastrado(ajuste.tamanho);
+      }
+    }
+
     let tamanhoIdAfetado = "";
     let saldoResultante = 0;
 
@@ -503,6 +548,47 @@ export class ProdutosService {
       if (!campanha) {
         throw ApiException.validation("Dados inválidos.", [{ field: "campanhaId", message: "Campanha não encontrada." }]);
       }
+    }
+  }
+
+  /**
+   * Fase 54.2 — decisão arquitetural "Alternativa A": valida, no momento de
+   * CRIAR um novo vínculo (nova variante, cor alterada, novo tamanho), que o
+   * valor existe em `configuracoes.cores`/`configuracoes.tamanhos` —
+   * `configuracoes` é a fonte central de valores disponíveis para novas
+   * variantes. Reusa `normalizarCor`/`normalizarTamanho` já estabelecidas
+   * (nunca uma segunda regra de normalização) e compara sempre pelo valor
+   * normalizado, nunca pela string crua.
+   *
+   * Isto é proteção PRÁTICA, não uma garantia matematicamente absoluta: como
+   * não há transação multi-documento disponível (MongoDB standalone, sem
+   * replica set — mesma restrição já documentada na Fase 54.1), existe uma
+   * janela de concorrência residual entre esta leitura e a escrita da
+   * variante, caso a cor/tamanho seja excluída das configurações exatamente
+   * nesse intervalo. Documentado explicitamente, não escondido — ver auditoria
+   * da Fase 54.1 e a nota de risco residual no relatório desta fase.
+   */
+  private async validarCorCadastrada(cor: string): Promise<void> {
+    const configuracao = await this.configuracoesRepository.obter();
+    const corNormalizada = normalizarCor(cor);
+    const existe = configuracao.cores.some((item) => normalizarCor(item) === corNormalizada);
+    if (!existe) {
+      // A mensagem específica vai também no nível superior (não só em
+      // `errors[]`): o Backoffice só exibe `error.message` (mesmo padrão já
+      // validado pela proteção de exclusão da Fase 54.0 — `MENSAGEM_VINCULO`).
+      const mensagem = "Esta cor não está cadastrada nas configurações da loja. Cadastre a cor antes de utilizá-la em um produto.";
+      throw ApiException.validation(mensagem, [{ field: "cor", message: mensagem }]);
+    }
+  }
+
+  /** Mesmo papel de `validarCorCadastrada`, para tamanhos. */
+  private async validarTamanhoCadastrado(tamanho: string): Promise<void> {
+    const configuracao = await this.configuracoesRepository.obter();
+    const tamanhoNormalizado = normalizarTamanho(tamanho);
+    const existe = configuracao.tamanhos.some((item) => normalizarTamanho(item) === tamanhoNormalizado);
+    if (!existe) {
+      const mensagem = "Este tamanho não está cadastrado nas configurações da loja. Cadastre o tamanho antes de utilizá-lo em um produto.";
+      throw ApiException.validation(mensagem, [{ field: "tamanho", message: mensagem }]);
     }
   }
 

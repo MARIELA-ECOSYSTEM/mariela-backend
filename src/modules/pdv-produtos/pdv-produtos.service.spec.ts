@@ -8,6 +8,8 @@ import configuration from "../../config/configuration.js";
 import { validateEnv } from "../../config/env.validation.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { PdvProdutosModule } from "./pdv-produtos.module.js";
@@ -32,6 +34,7 @@ describe("PdvProdutosService (integração — MongoDB real)", () => {
   let moduleRef: TestingModule;
   let service: PdvProdutosService;
   let produtosService: ProdutosService;
+  let configuracoesService: ConfiguracoesService;
   let connection: Connection;
 
   beforeAll(async () => {
@@ -45,7 +48,15 @@ describe("PdvProdutosService (integração — MongoDB real)", () => {
     }).compile();
     service = moduleRef.get(PdvProdutosService);
     produtosService = moduleRef.get(ProdutosService);
+    configuracoesService = moduleRef.get(ConfiguracoesService);
     connection = moduleRef.get(getConnectionToken());
+    // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante`/`adicionarTamanho`.
+    for (const cor of ["Azul", "Bege", "Preto", "Rosa", "Verde", "Vermelho"]) {
+      await garantirItemConfiguracao(configuracoesService, "cores", cor);
+    }
+    for (const tamanho of ["G", "M", "P", "U"]) {
+      await garantirItemConfiguracao(configuracoesService, "tamanhos", tamanho);
+    }
   });
 
   afterAll(async () => {

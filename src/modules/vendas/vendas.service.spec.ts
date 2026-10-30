@@ -4,6 +4,7 @@ import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
 import { Types, type Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { AdquirentesService } from "../adquirentes/adquirentes.service.js";
 import type { CriarAdquirenteDto } from "../adquirentes/dto/criar-adquirente.dto.js";
@@ -11,6 +12,7 @@ import { CaixasService } from "../caixas/caixas.service.js";
 import { MovimentosCaixaRepository } from "../caixas/movimentos-caixa.repository.js";
 import { ClientesService } from "../clientes/clientes.service.js";
 import type { CriarClienteDto } from "../clientes/dto/criar-cliente.dto.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import type { CriarVendedorDto } from "../vendedores/dto/criar-vendedor.dto.js";
@@ -41,6 +43,7 @@ describe("VendasService (integração — MongoDB real)", () => {
   let clientesService: ClientesService;
   let caixasService: CaixasService;
   let adquirentesService: AdquirentesService;
+  let configuracoesService: ConfiguracoesService;
   let connection: Connection;
 
   beforeAll(async () => {
@@ -53,7 +56,11 @@ describe("VendasService (integração — MongoDB real)", () => {
     clientesService = moduleRef.get(ClientesService);
     caixasService = moduleRef.get(CaixasService);
     adquirentesService = moduleRef.get(AdquirentesService);
+    configuracoesService = moduleRef.get(ConfiguracoesService);
     connection = moduleRef.get(getConnectionToken());
+    // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante`/`ajustarQuantidadeTamanho`.
+    await garantirItemConfiguracao(configuracoesService, "cores", "Azul");
+    await garantirItemConfiguracao(configuracoesService, "tamanhos", "M");
   });
 
   afterAll(async () => {
