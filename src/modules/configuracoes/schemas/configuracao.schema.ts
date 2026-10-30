@@ -80,8 +80,23 @@ export class Configuracao {
   @Prop({ type: [String], default: [] })
   tamanhos!: string[];
 
+  /**
+   * Fase 54.0 — espelho de `tamanhos` só com a forma normalizada
+   * (`normalizarTamanho`, mesma função usada por `Tamanho.tamanho` em
+   * Produtos), em paralelo item-a-item. Existe SÓ para permitir a checagem de
+   * unicidade case-insensitive de forma atômica (`$ne`/`$push` num único
+   * `findOneAndUpdate`, sem ler-modificar-salvar o array inteiro) — nunca
+   * exposto na API (fora da lista explícita de `aplicarSerializacaoDeConfiguracao`).
+   */
+  @Prop({ type: [String], default: [] })
+  tamanhosNormalizados!: string[];
+
   @Prop({ type: [String], default: [] })
   cores!: string[];
+
+  /** Mesmo papel de `tamanhosNormalizados`, para `cores` (via `normalizarCor`). */
+  @Prop({ type: [String], default: [] })
+  coresNormalizadas!: string[];
 
   @Prop({ type: [String], default: [] })
   formasPagamento!: string[];

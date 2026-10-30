@@ -1,9 +1,29 @@
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model } from "mongoose";
+import { normalizarCor, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
 import { ID_CONFIGURACAO_GLOBAL, type CampoLista } from "./configuracoes.constants.js";
 import type { DadosLoja } from "./configuracoes.types.js";
 import { Configuracao, type ConfiguracaoDocument } from "./schemas/configuracao.schema.js";
+
+/**
+ * As duas listas com regra de unicidade case-insensitive (Fase 54.0) — cada
+ * uma mapeia para seu campo-espelho normalizado (ver `configuracao.schema.ts`)
+ * e a função de normalização já estabelecida para o mesmo conceito em
+ * Produtos (`Variante.corNormalizada`/`Tamanho.tamanho`), nunca uma regra
+ * nova e divergente. `categorias`/`formasPagamento` ficam de fora de
+ * propósito — não fazem parte do escopo desta fase.
+ */
+const CAMPOS_COM_NORMALIZACAO = {
+  cores: { campoNormalizado: "coresNormalizadas", normalizar: normalizarCor },
+  tamanhos: { campoNormalizado: "tamanhosNormalizados", normalizar: normalizarTamanho },
+} as const satisfies Partial<Record<CampoLista, { campoNormalizado: string; normalizar: (valor: string) => string }>>;
+
+type CampoComNormalizacao = keyof typeof CAMPOS_COM_NORMALIZACAO;
+
+function temNormalizacao(campo: CampoLista): campo is CampoComNormalizacao {
+  return campo in CAMPOS_COM_NORMALIZACAO;
+}
 
 @Injectable()
 export class ConfiguracoesRepository {
@@ -69,9 +89,53 @@ export class ConfiguracoesRepository {
    * chamador espera.
    */
   async adicionarItemLista(campo: CampoLista, valor: string): Promise<ConfiguracaoDocument | null> {
-    await this.obter();
+    const documento = await this.obter();
+
+    if (temNormalizacao(campo)) {
+      const { campoNormalizado, normalizar } = CAMPOS_COM_NORMALIZACAO[campo];
+      const valorNormalizado = normalizar(valor);
+      // Self-heal (idempotente, só ADITIVO via $addToSet — nunca sobrescreve
+      // nem remove): cobre o documento singleton já existente em produção,
+      // criado antes desta fase, cujo campo-espelho ainda não existe/está
+      // incompleto para os itens já cadastrados.
+      await this.sincronizarEspelhoNormalizado(documento, campo, campoNormalizado, normalizar);
+      return this.configuracaoModel
+        .findOneAndUpdate(
+          { _id: ID_CONFIGURACAO_GLOBAL, [campoNormalizado]: { $ne: valorNormalizado } },
+          { $push: { [campo]: valor, [campoNormalizado]: valorNormalizado } },
+          { returnDocument: "after" },
+        )
+        .exec();
+    }
+
     return this.configuracaoModel
       .findOneAndUpdate({ _id: ID_CONFIGURACAO_GLOBAL, [campo]: { $ne: valor } }, { $push: { [campo]: valor } }, { returnDocument: "after" })
+      .exec();
+  }
+
+  /**
+   * Garante que todo valor já presente em `campo` tem o correspondente
+   * normalizado em `campoNormalizado` — sem isso, um documento singleton
+   * criado antes da Fase 54.0 permitiria duplicata case-insensitive contra
+   * itens antigos (o filtro `$ne` só enxerga o que já está no espelho).
+   * `$addToSet`+`$each` é seguro sob concorrência: nunca remove, nunca
+   * sobrescreve, e rodar duas vezes com os mesmos valores não cria duplicata
+   * no próprio espelho.
+   */
+  private async sincronizarEspelhoNormalizado(
+    documento: ConfiguracaoDocument,
+    campo: CampoComNormalizacao,
+    campoNormalizado: string,
+    normalizar: (valor: string) => string,
+  ): Promise<void> {
+    const valores = documento[campo as keyof ConfiguracaoDocument] as unknown as string[];
+    const jaPresentes = new Set(
+      (documento[campoNormalizado as keyof ConfiguracaoDocument] as unknown as string[] | undefined) ?? [],
+    );
+    const faltantes = [...new Set(valores.map(normalizar))].filter((item) => !jaPresentes.has(item));
+    if (faltantes.length === 0) return;
+    await this.configuracaoModel
+      .updateOne({ _id: ID_CONFIGURACAO_GLOBAL }, { $addToSet: { [campoNormalizado]: { $each: faltantes } } })
       .exec();
   }
 
@@ -83,8 +147,16 @@ export class ConfiguracoesRepository {
    */
   async removerItemLista(campo: CampoLista, valor: string): Promise<ConfiguracaoDocument | null> {
     await this.obter();
+    const pull: Record<string, unknown> = { [campo]: valor };
+    if (temNormalizacao(campo)) {
+      const { campoNormalizado, normalizar } = CAMPOS_COM_NORMALIZACAO[campo];
+      // Puxa do espelho também; se ainda não estava sincronizado para este
+      // valor específico, o `$pull` desse campo simplesmente não casa nada
+      // (no-op seguro) — nunca lança erro.
+      pull[campoNormalizado] = normalizar(valor);
+    }
     return this.configuracaoModel
-      .findOneAndUpdate({ _id: ID_CONFIGURACAO_GLOBAL, [campo]: valor }, { $pull: { [campo]: valor } }, { returnDocument: "after" })
+      .findOneAndUpdate({ _id: ID_CONFIGURACAO_GLOBAL, [campo]: valor }, { $pull: pull }, { returnDocument: "after" })
       .exec();
   }
 }

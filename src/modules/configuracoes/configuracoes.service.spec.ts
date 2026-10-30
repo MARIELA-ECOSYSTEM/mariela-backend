@@ -5,9 +5,22 @@ import { Test, type TestingModule } from "@nestjs/testing";
 import type { Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
+import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
+import { ProdutosService } from "../produtos/produtos.service.js";
 import { ConfiguracoesModule } from "./configuracoes.module.js";
 import { ConfiguracoesService } from "./configuracoes.service.js";
 import type { AtualizarLojaDto } from "./dto/atualizar-loja.dto.js";
+
+function payloadProduto(sufixo: string, extra: Partial<CriarProdutoDto> = {}): CriarProdutoDto {
+  return {
+    nome: `Produto Config Teste ${sufixo}`,
+    categoria: "Vestidos",
+    precoCusto: 50,
+    precoVenda: 100,
+    ehNovidade: false,
+    ...extra,
+  };
+}
 
 // `ConfiguracoesController` usa `@UseGuards(JwtAuthGuard)`, que injeta
 // `JwtService` — só disponível globalmente via `AppModule` de verdade. Este
@@ -38,6 +51,7 @@ function lojaValida(extra: Partial<AtualizarLojaDto> = {}): AtualizarLojaDto {
 describe("ConfiguracoesService (integração — MongoDB real)", () => {
   let moduleRef: TestingModule;
   let service: ConfiguracoesService;
+  let produtosService: ProdutosService;
   let connection: Connection;
 
   beforeAll(async () => {
@@ -45,12 +59,17 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       imports: [mongooseModuloDeTeste(), JWT_MODULO_DE_TESTE, ConfiguracoesModule],
     }).compile();
     service = moduleRef.get(ConfiguracoesService);
+    // `ConfiguracoesModule` importa `ProdutosModule` (Fase 54.0, proteção de
+    // exclusão) — mesmo grafo de DI, reaproveitado aqui para montar os
+    // produtos/variantes de teste da seção de vínculo.
+    produtosService = moduleRef.get(ProdutosService);
     connection = moduleRef.get(getConnectionToken());
   });
 
   afterAll(async () => {
     await connection.collection("configuracoes").deleteMany({});
     await connection.collection("eventos_configuracao").deleteMany({ usuarioId: { $in: [USUARIO_ID, USUARIO_AUDITORIA_ID] } });
+    await connection.collection("produtos").deleteMany({ nome: /^Produto Config Teste / });
     await moduleRef.close();
   });
 
@@ -283,5 +302,183 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const final = await service.obter();
       expect(final.cores.filter((item) => item === chave)).toHaveLength(1);
     });
+  });
+
+  describe("unicidade case-insensitive (Fase 54.0)", () => {
+    it("cadastra 'Preto' normalmente", async () => {
+      const chave = `Preto-${Date.now()}`;
+      const resultado = await service.adicionarItem("cores", chave, USUARIO_ID);
+      expect(resultado.cores).toContain(chave);
+    });
+
+    it("rejeita cadastrar a mesma cor em minúsculas ('preto')", async () => {
+      const chave = `Preto2-${Date.now()}`;
+      await service.adicionarItem("cores", chave, USUARIO_ID);
+      await expect(service.adicionarItem("cores", chave.toLowerCase(), USUARIO_ID)).rejects.toThrow(ApiException);
+
+      const final = await service.obter();
+      // A forma ORIGINALMENTE cadastrada é preservada — nenhuma reescrita de apresentação.
+      expect(final.cores).toContain(chave);
+      expect(final.cores).not.toContain(chave.toLowerCase());
+    });
+
+    it("rejeita cadastrar a mesma cor em MAIÚSCULAS ('PRETO')", async () => {
+      const chave = `Preto3-${Date.now()}`;
+      await service.adicionarItem("cores", chave, USUARIO_ID);
+      await expect(service.adicionarItem("cores", chave.toUpperCase(), USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+
+    it("cadastra 'P' (tamanho) normalmente", async () => {
+      const chave = `P-${Date.now()}`;
+      const resultado = await service.adicionarItem("tamanhos", chave, USUARIO_ID);
+      expect(resultado.tamanhos).toContain(chave);
+    });
+
+    it("rejeita cadastrar o mesmo tamanho em minúsculas ('p')", async () => {
+      const chave = `P2-${Date.now()}`;
+      await service.adicionarItem("tamanhos", chave, USUARIO_ID);
+      await expect(service.adicionarItem("tamanhos", chave.toLowerCase(), USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+
+    it("rejeita cadastrar o mesmo tamanho com espaços excedentes ('  P2-... ')", async () => {
+      const chave = `P3-${Date.now()}`;
+      await service.adicionarItem("tamanhos", chave, USUARIO_ID);
+      await expect(service.adicionarItem("tamanhos", `   ${chave}   `, USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+
+    it(
+      "não existe operação de 'editar' cor/tamanho no backend hoje (só adicionar/remover) — " +
+        "não há como testar 'edição para nome já existente' sem inventar um endpoint fora do escopo desta fase",
+      () => {
+        expect(typeof (service as unknown as { editarItem?: unknown }).editarItem).toBe("undefined");
+      },
+    );
+
+    it("exclusão de cor sem vínculo funciona normalmente", async () => {
+      const chave = `SemVinculoCor-${Date.now()}`;
+      await service.adicionarItem("cores", chave, USUARIO_ID);
+      const resultado = await service.removerItem("cores", chave, USUARIO_ID);
+      expect(resultado.cores).not.toContain(chave);
+    });
+
+    it("exclusão de tamanho sem vínculo funciona normalmente", async () => {
+      const chave = `SemVinculoTam-${Date.now()}`;
+      await service.adicionarItem("tamanhos", chave, USUARIO_ID);
+      const resultado = await service.removerItem("tamanhos", chave, USUARIO_ID);
+      expect(resultado.tamanhos).not.toContain(chave);
+    });
+  });
+
+  describe("proteção contra exclusão com vínculo (Fase 54.0)", () => {
+    it("bloqueia a exclusão de cor usada por uma variante, com a mensagem de negócio exata, e preserva os dados", async () => {
+      const chave = `Vermelho-${Date.now()}`;
+      await service.adicionarItem("cores", chave, USUARIO_ID);
+      const produto = await produtosService.criar(payloadProduto("P1"), null);
+      await produtosService.adicionarVariante(produto.id, { cor: chave }, null);
+
+      await expect(service.removerItem("cores", chave, USUARIO_ID)).rejects.toThrow(
+        "Não foi possível excluir esta cor porque existem produtos vinculados a ela no sistema. Remova ou altere os vínculos antes de tentar novamente.",
+      );
+
+      const final = await service.obter();
+      expect(final.cores).toContain(chave); // nada foi modificado
+    });
+
+    it("bloqueia a exclusão de cor mesmo quando o caso usado na variante difere (case-insensitive)", async () => {
+      const chave = `Verde-${Date.now()}`;
+      await service.adicionarItem("cores", chave, USUARIO_ID);
+      const produto = await produtosService.criar(payloadProduto("P2"), null);
+      // Variante cadastrada com uma grafia diferente (minúsculas) da mesma cor.
+      await produtosService.adicionarVariante(produto.id, { cor: chave.toLowerCase() }, null);
+
+      await expect(service.removerItem("cores", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+
+    it("bloqueia a exclusão de tamanho usado por uma variante, com a mensagem de negócio exata, e preserva os dados", async () => {
+      const chave = `GG-${Date.now()}`;
+      const corAuxiliar = `Qualquer-${Date.now()}`;
+      await service.adicionarItem("tamanhos", chave, USUARIO_ID);
+      // Fase 54.2 — `adicionarVariante` agora exige que a cor exista em `configuracoes.cores`.
+      await service.adicionarItem("cores", corAuxiliar, USUARIO_ID);
+      const produto = await produtosService.criar(payloadProduto("P3"), null);
+      const variante = await produtosService.adicionarVariante(produto.id, { cor: corAuxiliar }, null);
+      await produtosService.adicionarTamanho(produto.id, String(variante._id), { tamanho: chave, quantidade: 1 }, null);
+
+      await expect(service.removerItem("tamanhos", chave, USUARIO_ID)).rejects.toThrow(
+        "Não foi possível excluir este tamanho porque existem produtos vinculados a ele no sistema. Remova ou altere os vínculos antes de tentar novamente.",
+      );
+
+      const final = await service.obter();
+      expect(final.tamanhos).toContain(chave);
+    });
+
+    it("uma tentativa de exclusão bloqueada não altera o produto/variante vinculados", async () => {
+      const chave = `Rosa-${Date.now()}`;
+      await service.adicionarItem("cores", chave, USUARIO_ID);
+      const produto = await produtosService.criar(payloadProduto("P4"), null);
+      const variante = await produtosService.adicionarVariante(produto.id, { cor: chave }, null);
+
+      await expect(service.removerItem("cores", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+
+      const produtoBruto = await connection.collection("produtos").findOne({ codProduto: produto.codProduto });
+      expect(produtoBruto?.["excluidoEm"]).toBeNull();
+      expect(produtoBruto?.["variantes"]).toHaveLength(1);
+      expect((produtoBruto?.["variantes"] as Array<{ _id: unknown }>)[0]?._id?.toString()).toBe(String(variante._id));
+    });
+
+    it("depois que o produto/variante é removido, a exclusão da cor passa a funcionar", async () => {
+      const chave = `Laranja-${Date.now()}`;
+      await service.adicionarItem("cores", chave, USUARIO_ID);
+      const produto = await produtosService.criar(payloadProduto("P5"), null);
+      const variante = await produtosService.adicionarVariante(produto.id, { cor: chave }, null);
+
+      await expect(service.removerItem("cores", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+
+      await produtosService.removerVariante(produto.id, String(variante._id), null);
+      const resultado = await service.removerItem("cores", chave, USUARIO_ID);
+      expect(resultado.cores).not.toContain(chave);
+    });
+
+    it(
+      "concorrência real: excluir a cor e criar uma variante que a usa ao mesmo tempo nunca deixa a " +
+        "configuração inconsistente com os produtos — ou a cor continua presente E a variante existe, " +
+        "ou a cor foi removida E nenhuma variante a usa",
+      async () => {
+        const chave = `Roxo-${Date.now()}`;
+        await service.adicionarItem("cores", chave, USUARIO_ID);
+        const produto = await produtosService.criar(payloadProduto("P6"), null);
+
+        // Duas operações concorrentes de verdade (mesmo padrão já usado pelos
+        // testes de concorrência acima neste arquivo): o próprio event
+        // loop/I-O real do MongoDB de teste decide o entrelaçamento, não o
+        // teste. Não há transação multi-documento disponível neste projeto
+        // (ver `removerItem`) — por isso a garantia vem de checar→agir→
+        // reconferir→compensar, testado aqui pelo resultado observável, não
+        // por instrumentar o entrelaçamento exato.
+        const [resultadoRemocao] = await Promise.allSettled([
+          service.removerItem("cores", chave, USUARIO_ID),
+          produtosService.adicionarVariante(produto.id, { cor: chave }, null),
+        ]);
+
+        const final = await service.obter();
+        const produtoFinal = await produtosService.obterPorId(produto.id);
+        const varianteExiste = produtoFinal.variantes.some((v) => v.cor === chave);
+        const corPresente = final.cores.includes(chave);
+
+        if (resultadoRemocao.status === "fulfilled") {
+          // Remoção venceu a corrida antes da variante existir: nada ficou vinculado.
+          expect(corPresente).toBe(false);
+          expect(varianteExiste).toBe(false);
+        } else {
+          // A variante existiu a tempo de ser vista (na checagem prévia OU na
+          // reconferência pós-remoção, com compensação): a cor nunca fica
+          // ausente enquanto uma variante a usa.
+          expect(corPresente).toBe(true);
+        }
+        // Invariante final, válido nos dois casos: nunca existe uma variante
+        // usando uma cor que não está mais cadastrada.
+        if (varianteExiste) expect(corPresente).toBe(true);
+      },
+    );
   });
 });
