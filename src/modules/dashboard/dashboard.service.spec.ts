@@ -62,6 +62,7 @@ describe("DashboardService (integração — MongoDB real)", () => {
     // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante`/`ajustarQuantidadeTamanho`.
     await garantirItemConfiguracao(configuracoesService, "cores", "Azul");
     await garantirItemConfiguracao(configuracoesService, "tamanhos", "M");
+    await garantirItemConfiguracao(configuracoesService, "categorias", "Vestidos");
   });
 
   afterAll(async () => {

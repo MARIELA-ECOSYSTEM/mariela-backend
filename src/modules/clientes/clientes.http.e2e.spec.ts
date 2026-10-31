@@ -11,8 +11,10 @@ import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { CaixasService } from "../caixas/caixas.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendasService } from "../vendas/vendas.service.js";
 import type { CriarVendedorDto } from "../vendedores/dto/criar-vendedor.dto.js";
@@ -69,6 +71,12 @@ describe("HTTP — Clientes (integração — servidor real)", () => {
     await authService.criarAdminSeed({ nome: "HTTP Clientes", email, senha: "senha-forte-123" });
     const login = await authService.login({ usuario: email, senha: "senha-forte-123" }, { ip: null, userAgent: null });
     accessToken = login.accessToken;
+    // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "categorias", "Vestidos");
+    // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante` (`criarVendaParaCliente` usa cor "Azul").
+    // Faltava neste arquivo especificamente (só `clientes.service.spec.ts` tinha sido coberto) — depender de
+    // outro arquivo registrar "Azul" por timing é uma corrida real entre specs concorrentes, não uma garantia.
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "cores", "Azul");
   });
 
   afterAll(async () => {

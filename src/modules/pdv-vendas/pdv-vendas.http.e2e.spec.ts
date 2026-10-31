@@ -12,9 +12,11 @@ import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { CaixasService } from "../caixas/caixas.service.js";
 import { ClientesService } from "../clientes/clientes.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import { PdvAuthService } from "../pdv-auth/pdv-auth.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
@@ -71,6 +73,8 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     await authService.criarAdminSeed({ nome: "HTTP PDV Vendas", email, senha: "senha-forte-123" });
     const login = await authService.login({ usuario: email, senha: "senha-forte-123" }, { ip: null, userAgent: null });
     adminAccessToken = login.accessToken;
+    // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "categorias", "Vestidos");
   });
 
   afterAll(async () => {

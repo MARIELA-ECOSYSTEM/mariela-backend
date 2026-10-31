@@ -1,22 +1,24 @@
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model } from "mongoose";
-import { normalizarCor, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
+import { normalizarCategoria, normalizarCor, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
 import { ID_CONFIGURACAO_GLOBAL, type CampoLista } from "./configuracoes.constants.js";
 import type { DadosLoja } from "./configuracoes.types.js";
 import { Configuracao, type ConfiguracaoDocument } from "./schemas/configuracao.schema.js";
 
 /**
- * As duas listas com regra de unicidade case-insensitive (Fase 54.0) — cada
- * uma mapeia para seu campo-espelho normalizado (ver `configuracao.schema.ts`)
- * e a função de normalização já estabelecida para o mesmo conceito em
- * Produtos (`Variante.corNormalizada`/`Tamanho.tamanho`), nunca uma regra
- * nova e divergente. `categorias`/`formasPagamento` ficam de fora de
- * propósito — não fazem parte do escopo desta fase.
+ * As listas com regra de unicidade case-insensitive (Fase 54.0 — `cores`/
+ * `tamanhos`; Fase 55.1 — `categorias`) — cada uma mapeia para seu
+ * campo-espelho normalizado (ver `configuracao.schema.ts`) e a função de
+ * normalização já estabelecida para o mesmo conceito em Produtos
+ * (`Variante.corNormalizada`/`Tamanho.tamanho`/`Produto.categoria`), nunca
+ * uma regra nova e divergente. `formasPagamento` fica de fora de propósito —
+ * não faz parte do escopo desta fase.
  */
 const CAMPOS_COM_NORMALIZACAO = {
   cores: { campoNormalizado: "coresNormalizadas", normalizar: normalizarCor },
   tamanhos: { campoNormalizado: "tamanhosNormalizados", normalizar: normalizarTamanho },
+  categorias: { campoNormalizado: "categoriasNormalizadas", normalizar: normalizarCategoria },
 } as const satisfies Partial<Record<CampoLista, { campoNormalizado: string; normalizar: (valor: string) => string }>>;
 
 type CampoComNormalizacao = keyof typeof CAMPOS_COM_NORMALIZACAO;

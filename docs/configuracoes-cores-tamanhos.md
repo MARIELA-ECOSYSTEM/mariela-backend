@@ -1,16 +1,19 @@
-# Cores e tamanhos: cadastro central, unicidade e vínculo com produtos
+# Cores, tamanhos e categorias: cadastro central, unicidade e vínculo com produtos
 
-> Fases 54.0, 54.1 e 54.2. Este documento descreve a arquitetura vigente —
-> não um registro histórico de decisões revisadas em cada fase.
+> Fases 54.0, 54.1, 54.2 e 55.1. Este documento descreve a arquitetura
+> vigente — não um registro histórico de decisões revisadas em cada fase.
+> `formasPagamento` permanece deliberadamente fora deste documento — não
+> tem nenhuma das proteções descritas aqui (ver auditoria da Fase 55.0).
 
 ## 1. `configuracoes` como fonte central de valores disponíveis
 
-`cores` e `tamanhos` são listas simples de string dentro do documento
-singleton `configuracoes` (`_id` fixo, uma única collection, um único
-documento — ver `configuracoes.constants.ts`). Desde a Fase 54.2, esse
-cadastro deixou de ser apenas sugestão de preenchimento para o Backoffice:
-**toda criação de um novo vínculo cor/tamanho em uma variante de produto
-exige que o valor já exista em `configuracoes.cores`/`configuracoes.tamanhos`**.
+`cores`, `tamanhos` e `categorias` são listas simples de string dentro do
+documento singleton `configuracoes` (`_id` fixo, uma única collection, um
+único documento — ver `configuracoes.constants.ts`). Desde a Fase 54.2 (cor/
+tamanho) e a Fase 55.1 (categoria), esse cadastro deixou de ser apenas
+sugestão de preenchimento para o Backoffice: **toda criação de um novo
+vínculo cor/tamanho/categoria exige que o valor já exista em
+`configuracoes.cores`/`configuracoes.tamanhos`/`configuracoes.categorias`**.
 
 Isso é verificado inteiramente no backend (`ProdutosService`) — nunca
 confiado ao frontend, mesmo que o Backoffice só ofereça ao usuário os
@@ -18,36 +21,42 @@ valores já cadastrados.
 
 ## 2. Normalização case-insensitive (única fonte, nunca duplicada)
 
-Cores e tamanhos equivalentes (`Preto`/`preto`/`PRETO`, `P`/`p`/`  P  `) são
-tratados como o mesmo valor. A normalização usa **sempre** as mesmas duas
-funções, já estabelecidas em `src/modules/produtos/utils/normalizacao.util.ts`
-antes da Fase 54.0 (usadas pela unicidade de cor dentro de uma variante):
+Cores, tamanhos e categorias equivalentes (`Preto`/`preto`/`PRETO`,
+`P`/`p`/`  P  `, `Calçados`/`calcados`) são tratados como o mesmo valor. A
+normalização usa **sempre** as mesmas três funções, em
+`src/modules/produtos/utils/normalizacao.util.ts`:
 
 - `normalizarCor`: remove diacríticos (NFD + filtro de marcas combinantes),
   `trim`, minúsculas, espaços internos colapsados.
 - `normalizarTamanho`: `trim` + maiúsculas.
+- `normalizarCategoria` (Fase 55.1): mesma regra de `normalizarCor` — texto
+  livre, nunca sigla curta como tamanho.
 
 Nenhum outro módulo implementa uma segunda versão dessas regras —
 `ConfiguracoesRepository` e `ProdutosService` importam as mesmas funções.
 
 A **apresentação original** do valor nunca é reescrita: `configuracoes.cores`/
-`tamanhos` guardam o texto exatamente como cadastrado; a forma normalizada
-vive só em campos-espelho internos (`coresNormalizadas`/`tamanhosNormalizados`,
-nunca expostos na API — fora da lista explícita de campos serializados em
-`configuracao.schema.ts`), usados apenas para a checagem atômica de
-duplicidade (`findOneAndUpdate` com `$ne`/`$push` num único comando Mongo).
+`tamanhos`/`categorias` guardam o texto exatamente como cadastrado; a forma
+normalizada vive só em campos-espelho internos (`coresNormalizadas`/
+`tamanhosNormalizados`/`categoriasNormalizadas`, nunca expostos na API — fora
+da lista explícita de campos serializados em `configuracao.schema.ts`),
+usados apenas para a checagem atômica de duplicidade (`findOneAndUpdate` com
+`$ne`/`$push` num único comando Mongo).
 
-Um documento `configuracoes` criado antes da Fase 54.0 (sem os campos-espelho)
-se autocorrige de forma idempotente e aditiva (`$addToSet`) na primeira
-chamada de cadastro após o deploy — nenhuma migração manual é necessária.
+Um documento `configuracoes` criado antes da Fase 54.0/55.1 (sem os
+campos-espelho) se autocorrige de forma idempotente e aditiva (`$addToSet`)
+na primeira chamada de cadastro após o deploy — nenhuma migração manual é
+necessária.
 
-## 3. Validação nos serviços de produtos (Fase 54.2)
+## 3. Validação nos serviços de produtos (Fase 54.2 — cor/tamanho; Fase 55.1 — categoria)
 
-`ProdutosService` valida contra `configuracoes.cores`/`tamanhos` exatamente
-nos pontos em que um vínculo **novo** está sendo criado:
+`ProdutosService` valida contra `configuracoes.cores`/`tamanhos`/`categorias`
+exatamente nos pontos em que um vínculo **novo** está sendo criado:
 
 | Operação | Quando valida |
 |---|---|
+| `criar` (produto) | Sempre — toda criação introduz a categoria. |
+| `atualizar` (produto) | Só quando a categoria está realmente mudando (comparação por valor normalizado) — editar preço/descrição/etc. reenviando a mesma categoria nunca revalida. |
 | `adicionarVariante` | Sempre — toda variante nova introduz uma cor. |
 | `atualizarVariante` | Só quando a cor está realmente mudando (comparação por valor normalizado) — editar foto/vídeo reenviando a mesma cor nunca revalida. |
 | `adicionarTamanho` | Sempre — por definição, é sempre um tamanho novo na variante. |
@@ -60,24 +69,45 @@ superior e em `errors[]` — o Backoffice só lê `error.message`:
   cor antes de utilizá-la em um produto."*
 - Tamanho: *"Este tamanho não está cadastrado nas configurações da loja.
   Cadastre o tamanho antes de utilizá-lo em um produto."*
+- Categoria: *"Esta categoria não está cadastrada nas configurações da loja.
+  Cadastre a categoria antes de utilizá-la em um produto."*
 
 Produtos com valores históricos que não existem mais em `configuracoes`
 **nunca são alterados automaticamente** — eles continuam funcionando
 normalmente (ajustar quantidade, editar outros campos) até que alguém
 explicitamente tente criar um **novo** vínculo com um valor não cadastrado.
 
-## 4. Proteção de exclusão (Fase 54.0, preservada integralmente)
+## 4. Proteção de exclusão (Fase 54.0 — cor/tamanho; Fase 55.1 — categoria)
 
-Excluir uma cor/tamanho de `configuracoes` verifica se algum produto ATIVO
-(`excluidoEm: null`) tem uma variante usando aquele valor
-(`variantes.corNormalizada` / `variantes.tamanhos.tamanho`). Se houver,
-a exclusão é bloqueada (mesmas mensagens de negócio da Fase 54.0) e **nada é
+Excluir uma cor/tamanho/categoria de `configuracoes` verifica se algum
+produto ATIVO (`excluidoEm: null`) usa aquele valor. Se houver, a exclusão é
+bloqueada (mensagem de negócio específica por lista) e **nada é
 modificado** — nem a configuração, nem o produto.
 
-Estratégia de concorrência: verificar → agir → **reconferir depois** → se um
-vínculo apareceu na janela entre as duas checagens, desfazer por compensação
-(readicionar o valor) e responder o mesmo erro. Isso estreita a janela de
-corrida, mas **não a fecha matematicamente** — ver seção 6.
+A verificação em si usa duas estratégias diferentes, por uma diferença real
+de modelo de dados entre `Variante` e `Produto`:
+
+- **Cor/tamanho**: filtro direto no Mongo contra o campo-espelho normalizado
+  já persistido em cada variante (`variantes.corNormalizada` /
+  `variantes.tamanhos.tamanho`) — `produtosRepository.listarTodosAtivos(filtro)`
+  já devolve só os produtos vinculados.
+- **Categoria** (Fase 55.1): `Produto.categoria` é um campo raiz simples,
+  **sem** campo-espelho normalizado equivalente (ao contrário de
+  `Variante.corNormalizada`, que já existia antes da Fase 54.0 para outro
+  propósito). Em vez de introduzir um campo novo em `Produto` só para este
+  uso, `existeVinculo` busca todos os produtos ativos
+  (`listarTodosAtivos()`, sem filtro) e compara `categoria` normalizada em
+  memória — mesmo padrão já usado por `ProdutosService.validarCorCadastrada`
+  para comparar contra a lista de `configuracoes`. Proporcional ao volume
+  real do sistema (ferramenta administrativa interna, baixo volume de
+  produtos cadastrados) e evita uma alteração de schema fora do escopo
+  mínimo necessário.
+
+Estratégia de concorrência (igual para as três listas): verificar → agir →
+**reconferir depois** → se um vínculo apareceu na janela entre as duas
+checagens, desfazer por compensação (readicionar o valor) e responder o
+mesmo erro. Isso estreita a janela de corrida, mas **não a fecha
+matematicamente** — ver seção 6.
 
 ## 5. Módulo de Estoque: criação implícita de tamanho (legítima, agora gated)
 
@@ -103,23 +133,24 @@ A arquitetura usa MongoDB **standalone, sem replica set, sem transações
 multi-documento** — restrição de infraestrutura já vigente em todo o
 projeto, não introduzida aqui. `configuracoes` e `produtos` são collections
 diferentes; não existe mecanismo que torne atômica, entre as duas, a
-sequência "verificar que a cor existe" → "gravar a variante", nem o inverso
-("verificar que não há vínculo" → "excluir a cor").
+sequência "verificar que o valor existe" → "gravar o produto/variante", nem
+o inverso ("verificar que não há vínculo" → "excluir o valor").
 
 **Isto não é uma garantia absoluta de integridade referencial.** Existe uma
 janela de concorrência genuína (documentada e demonstrada na auditoria da
-Fase 54.1): se a exclusão de uma cor e a criação de uma variante usando essa
-mesma cor acontecerem quase simultaneamente, é possível — em casos raros,
+Fase 54.1, e reafirmada para categoria na Fase 55.0/55.1): se a exclusão de
+uma cor/tamanho/categoria e a criação de um produto/variante usando esse
+mesmo valor acontecerem quase simultaneamente, é possível — em casos raros,
 não eliminados por nenhuma quantidade de reconferências sequenciais — que a
-configuração fique sem a cor enquanto uma variante ainda a referencia, ou
-vice-versa.
+configuração fique sem o valor enquanto um produto/variante ainda o
+referencia, ou vice-versa.
 
-Decisão explícita do projeto ("Alternativa A", Fase 54.2): aceitar esse
-risco residual, documentá-lo abertamente, e não introduzir locks
-distribuídos, transações multi-documento, soft-delete de configurações nem
-jobs de reconciliação para fechá-lo — complexidade desproporcional ao
-impacto real (ferramenta administrativa interna, baixo volume de requisições
-concorrentes, janela medida em milissegundos). Se o risco se tornar
-inaceitável no futuro, a Fase 54.1 já descreve a solução recomendada
-(soft-delete de cores/tamanhos + reconciliação assíncrona) — não
+Decisão explícita do projeto ("Alternativa A", Fase 54.2, mantida na Fase
+55.1): aceitar esse risco residual, documentá-lo abertamente, e não
+introduzir locks distribuídos, transações multi-documento, soft-delete de
+configurações nem jobs de reconciliação para fechá-lo — complexidade
+desproporcional ao impacto real (ferramenta administrativa interna, baixo
+volume de requisições concorrentes, janela medida em milissegundos). Se o
+risco se tornar inaceitável no futuro, a Fase 54.1 já descreve a solução
+recomendada (soft-delete das listas + reconciliação assíncrona) — não
 implementada, por decisão própria desta fase.

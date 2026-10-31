@@ -198,6 +198,9 @@ describe("RelatoriosService (integração — MongoDB real)", () => {
     // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante`/`ajustarQuantidadeTamanho`.
     await garantirItemConfiguracao(configuracoesService, "cores", "Azul");
     await garantirItemConfiguracao(configuracoesService, "tamanhos", "M");
+    // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
+    // Não registra "Vestidos"/"Blusas"/"Saias": são usadas só por `produtoFalso`, que nunca passa por `ProdutosService`.
+    await garantirItemConfiguracao(configuracoesService, "categorias", "CategoriaRelatorioTeste");
   });
 
   afterAll(async () => {

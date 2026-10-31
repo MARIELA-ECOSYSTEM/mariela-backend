@@ -7,6 +7,8 @@ import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import type { CriarColecaoDto } from "./dto/criar-colecao.dto.js";
 import type { ListarColecoesQueryDto } from "./dto/listar-colecoes-query.dto.js";
 import { ColecoesModule } from "./colecoes.module.js";
@@ -68,6 +70,8 @@ describe("ColecoesService (integração — MongoDB real)", () => {
     service = moduleRef.get(ColecoesService);
     produtosService = moduleRef.get(ProdutosService);
     connection = moduleRef.get(getConnectionToken());
+    // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
+    await garantirItemConfiguracao(moduleRef.get(ConfiguracoesService), "categorias", "Vestidos");
   });
 
   afterAll(async () => {

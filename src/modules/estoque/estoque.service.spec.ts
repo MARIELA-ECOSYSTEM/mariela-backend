@@ -53,6 +53,8 @@ describe("EstoqueService (integração — MongoDB real)", () => {
     for (const tamanho of ["M", "G"]) {
       await garantirItemConfiguracao(configuracoesService, "tamanhos", tamanho);
     }
+    // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
+    await garantirItemConfiguracao(configuracoesService, "categorias", "Vestidos");
   });
 
   afterAll(async () => {

@@ -18,7 +18,7 @@ import type { DefinirFotoPrincipalDto } from "./dto/definir-foto-principal.dto.j
 import type { DefinirNovidadeDto } from "./dto/definir-novidade.dto.js";
 import type { DefinirPromocaoDto } from "./dto/definir-promocao.dto.js";
 import type { ListarProdutosQueryDto } from "./dto/listar-produtos-query.dto.js";
-import { conflitoTamanhoUnico, formatarCodigoVariante, normalizarCor, normalizarSegmentoCodigo, normalizarTamanho } from "./utils/normalizacao.util.js";
+import { conflitoTamanhoUnico, formatarCodigoVariante, normalizarCategoria, normalizarCor, normalizarSegmentoCodigo, normalizarTamanho } from "./utils/normalizacao.util.js";
 import { arredondarMoeda, calcularMargem, precoEfetivo } from "./utils/precos.util.js";
 import { ProdutosRepository } from "./produtos.repository.js";
 import type { DadosNovaVariante } from "./produtos.types.js";
@@ -57,6 +57,8 @@ export class ProdutosService {
     const campanhaId = dto.campanhaId?.trim() || null;
     const fornecedorId = dto.fornecedorId?.trim() || null;
     await this.validarReferencias({ fornecedorId, colecaoId, campanhaId });
+    // Fase 55.1 — toda criação de produto introduz um vínculo novo com a categoria, igual a cor/tamanho na Fase 54.2.
+    await this.validarCategoriaCadastrada(dto.categoria);
 
     const codProduto = await this.sequenciasService.proximoCodigo(
       CHAVE_SEQUENCIA_PRODUTO,
@@ -150,6 +152,18 @@ export class ProdutosService {
     const campanhaId = dto.campanhaId?.trim() || null;
     const fornecedorId = dto.fornecedorId?.trim() || null;
     await this.validarReferencias({ fornecedorId, colecaoId, campanhaId });
+
+    // Fase 55.1 — só valida contra `configuracoes.categorias` quando a
+    // categoria está REALMENTE mudando (comparação por valor normalizado):
+    // atualizar preço/descrição/etc. reenviando a mesma categoria (o DTO
+    // exige o campo sempre) nunca deve falhar por causa de um dado histórico
+    // cuja categoria não está mais cadastrada — mesmo princípio de
+    // `atualizarVariante` para cor (Fase 54.2).
+    const categoriaNormalizada = normalizarCategoria(dto.categoria);
+    const produtoAtual = await this.produtosRepository.encontrarPorIdOuFalhar(id);
+    if (normalizarCategoria(produtoAtual.categoria) !== categoriaNormalizada) {
+      await this.validarCategoriaCadastrada(dto.categoria);
+    }
 
     const precoCusto = arredondarMoeda(dto.precoCusto);
     const precoVenda = arredondarMoeda(dto.precoVenda);
@@ -589,6 +603,18 @@ export class ProdutosService {
     if (!existe) {
       const mensagem = "Este tamanho não está cadastrado nas configurações da loja. Cadastre o tamanho antes de utilizá-lo em um produto.";
       throw ApiException.validation(mensagem, [{ field: "tamanho", message: mensagem }]);
+    }
+  }
+
+  /** Mesmo papel de `validarCorCadastrada`/`validarTamanhoCadastrado`, para a categoria do produto (Fase 55.1). */
+  private async validarCategoriaCadastrada(categoria: string): Promise<void> {
+    const configuracao = await this.configuracoesRepository.obter();
+    const categoriaNormalizada = normalizarCategoria(categoria);
+    const existe = configuracao.categorias.some((item) => normalizarCategoria(item) === categoriaNormalizada);
+    if (!existe) {
+      const mensagem =
+        "Esta categoria não está cadastrada nas configurações da loja. Cadastre a categoria antes de utilizá-la em um produto.";
+      throw ApiException.validation(mensagem, [{ field: "categoria", message: mensagem }]);
     }
   }
 

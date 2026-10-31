@@ -67,6 +67,10 @@ describe("ProdutosService (integração — MongoDB real)", () => {
     for (const tamanho of ["M", "P", "U"]) {
       await garantirItemConfiguracao(configuracoesService, "tamanhos", tamanho);
     }
+    // Fase 55.1 — mesmo pré-requisito, agora para `criar`/`atualizar` (categoria).
+    for (const categoria of ["Vestidos", "Calças"]) {
+      await garantirItemConfiguracao(configuracoesService, "categorias", categoria);
+    }
   });
 
   afterAll(async () => {
@@ -756,6 +760,123 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       const depois = await service.obterPorId(produto.id);
       expect(depois.variantes).toHaveLength(0); // nenhuma variante parcial foi criada
       expect(depois.quantidadeTotal).toBe(0);
+    });
+  });
+
+  describe("validação de categoria contra configuracoes (Fase 55.1)", () => {
+    it("cria produto com categoria existente nas configurações", async () => {
+      const produto = await service.criar(payloadProduto("CAT-1"), null);
+      expect(produto.categoria).toBe("Vestidos");
+    });
+
+    it("rejeita criar produto com categoria inexistente nas configurações, com a mensagem de negócio exata", async () => {
+      const categoriaInexistente = `CategoriaNuncaCadastrada-${Date.now()}`;
+      await expect(service.criar(payloadProduto("CAT-2", { categoria: categoriaInexistente }), null)).rejects.toThrow(
+        "Esta categoria não está cadastrada nas configurações da loja. Cadastre a categoria antes de utilizá-la em um produto.",
+      );
+    });
+
+    it("rejeita categoria com variação de escrita que NÃO corresponde a nenhuma categoria cadastrada (não é só normalização)", async () => {
+      // "Vestido" (singular) é uma PALAVRA DIFERENTE de "Vestidos" (plural) depois
+      // de normalizada — não deve ser aceita só porque é parecida/compartilha prefixo.
+      await expect(service.criar(payloadProduto("CAT-3", { categoria: "Vestido" }), null)).rejects.toThrow(
+        "Esta categoria não está cadastrada nas configurações da loja. Cadastre a categoria antes de utilizá-la em um produto.",
+      );
+    });
+
+    it("reconhece variações de maiúsculas/minúsculas/acentos/espaços da mesma categoria cadastrada", async () => {
+      const produto = await service.criar(payloadProduto("CAT-4", { categoria: "  VESTIDOS  " }), null);
+      expect(produto.categoria).toBe("VESTIDOS"); // apresentação original preservada (só trim), não reescrita para "Vestidos"
+    });
+
+    it("altera produto para outra categoria existente nas configurações", async () => {
+      const produto = await service.criar(payloadProduto("CAT-5"), null);
+      const atualizado = await service.atualizar(
+        produto.id,
+        { nome: produto.nome, descricao: "", categoria: "Calças", precoCusto: 50, precoVenda: 100, ehNovidade: false },
+        null,
+      );
+      expect(atualizado.categoria).toBe("Calças");
+    });
+
+    it("rejeita alterar produto para categoria inexistente nas configurações, sem modificar o produto", async () => {
+      const produto = await service.criar(payloadProduto("CAT-6"), null);
+      const categoriaInexistente = `CategoriaNuncaCadastrada-${Date.now()}`;
+
+      await expect(
+        service.atualizar(
+          produto.id,
+          { nome: produto.nome, descricao: "", categoria: categoriaInexistente, precoCusto: 50, precoVenda: 100, ehNovidade: false },
+          null,
+        ),
+      ).rejects.toThrow("Esta categoria não está cadastrada nas configurações da loja. Cadastre a categoria antes de utilizá-la em um produto.");
+
+      const produtoFinal = await service.obterPorId(produto.id);
+      expect(produtoFinal.categoria).toBe("Vestidos"); // nada foi alterado
+    });
+
+    it("alterar um produto SEM mudar sua categoria nunca valida contra configuracoes (evita erro por dado histórico)", async () => {
+      const categoriaHistorica = `CategoriaHistoricaNuncaMaisCadastrada-${Date.now()}`;
+      await configuracoesService.adicionarItem("categorias", categoriaHistorica, null);
+      const produto = await service.criar(payloadProduto("CAT-7", { categoria: categoriaHistorica }), null);
+      // Simula dado histórico: a categoria deixou de existir em
+      // `configuracoes.categorias` por algum outro meio que não `removerItem`
+      // (a proteção de exclusão da Fase 55.1 bloquearia a remoção normal
+      // enquanto o produto existir — não é isso que este teste quer
+      // exercitar). Manipulação direta do Mongo só para o SETUP do teste.
+      await connection
+        .collection("configuracoes")
+        .updateOne({}, { $pull: { categorias: categoriaHistorica, categoriasNormalizadas: categoriaHistorica.toLowerCase() } });
+
+      // Editar só a descrição, reenviando a MESMA categoria (o DTO exige o
+      // campo) não deve falhar mesmo com a categoria já fora das configurações.
+      const atualizado = await service.atualizar(
+        produto.id,
+        { nome: produto.nome, descricao: "Nova descrição, sem relação com categoria", categoria: categoriaHistorica, precoCusto: 50, precoVenda: 100, ehNovidade: false },
+        null,
+      );
+      expect(atualizado.categoria).toBe(categoriaHistorica);
+      expect(atualizado.descricao).toBe("Nova descrição, sem relação com categoria");
+    });
+
+    it("comparação normalizada identifica mudança efetiva: reenviar a mesma categoria com grafia diferente não revalida", async () => {
+      const categoriaHistorica = `HistoricaGrafiaDiferente-${Date.now()}`;
+      await configuracoesService.adicionarItem("categorias", categoriaHistorica, null);
+      const produto = await service.criar(payloadProduto("CAT-8", { categoria: categoriaHistorica }), null);
+      await connection
+        .collection("configuracoes")
+        .updateOne({}, { $pull: { categorias: categoriaHistorica, categoriasNormalizadas: categoriaHistorica.toLowerCase() } });
+
+      // Mesma categoria, só com espaços/caixa diferentes — normaliza para o
+      // MESMO valor já salvo, então não é uma mudança efetiva: não revalida.
+      const atualizado = await service.atualizar(
+        produto.id,
+        { nome: produto.nome, descricao: "", categoria: `  ${categoriaHistorica.toUpperCase()}  `, precoCusto: 50, precoVenda: 100, ehNovidade: false },
+        null,
+      );
+      expect(atualizado.categoria).toBe(categoriaHistorica.toUpperCase());
+    });
+
+    it("uma falha de validação de categoria nunca cria efeito parcial (produto não é criado)", async () => {
+      const categoriaInexistente = `CategoriaInexistente-${Date.now()}`;
+      await expect(service.criar(payloadProduto("CAT-9", { categoria: categoriaInexistente }), null)).rejects.toThrow(ApiException);
+
+      const total = await connection.collection("produtos").countDocuments({ nome: /^Vestido Teste CAT-9$/ });
+      expect(total).toBe(0);
+    });
+
+    it("preserva o contrato de resposta existente de criar/atualizar produto (campo 'categoria' continua string simples)", async () => {
+      const produto = await service.criar(payloadProduto("CAT-10"), null);
+      expect(typeof produto.categoria).toBe("string");
+      expect((produto as unknown as { categoriaNormalizada?: unknown }).categoriaNormalizada).toBeUndefined();
+
+      const atualizado = await service.atualizar(
+        produto.id,
+        { nome: produto.nome, descricao: "", categoria: "Calças", precoCusto: 50, precoVenda: 100, ehNovidade: false },
+        null,
+      );
+      expect(typeof atualizado.categoria).toBe("string");
+      expect((atualizado as unknown as { categoriaNormalizada?: unknown }).categoriaNormalizada).toBeUndefined();
     });
   });
 });

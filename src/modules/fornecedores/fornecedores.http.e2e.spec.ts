@@ -11,7 +11,9 @@ import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE (mesmos guards, mesmo pipeline de
@@ -64,6 +66,8 @@ describe("HTTP — Fornecedores (integração — servidor real)", () => {
     await authService.criarAdminSeed({ nome: "HTTP Fornecedores", email, senha: "senha-forte-123" });
     const login = await authService.login({ usuario: email, senha: "senha-forte-123" }, { ip: null, userAgent: null });
     accessToken = login.accessToken;
+    // Fase 55.1 — pré-requisito para `POST /produtos` (categoria passou a ser validada).
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "categorias", "Vestidos");
   });
 
   afterAll(async () => {

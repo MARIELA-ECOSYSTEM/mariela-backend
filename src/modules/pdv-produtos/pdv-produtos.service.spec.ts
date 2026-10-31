@@ -57,6 +57,7 @@ describe("PdvProdutosService (integração — MongoDB real)", () => {
     for (const tamanho of ["G", "M", "P", "U"]) {
       await garantirItemConfiguracao(configuracoesService, "tamanhos", tamanho);
     }
+    await garantirItemConfiguracao(configuracoesService, "categorias", "Vestidos");
   });
 
   afterAll(async () => {

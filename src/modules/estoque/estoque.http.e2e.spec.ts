@@ -80,6 +80,7 @@ describe("HTTP — Estoque (integração — servidor real)", () => {
     const configuracoesService = app.get(ConfiguracoesService);
     await garantirItemConfiguracao(configuracoesService, "cores", "Preto");
     await garantirItemConfiguracao(configuracoesService, "tamanhos", "M");
+    await garantirItemConfiguracao(configuracoesService, "categorias", "Vestidos");
   });
 
   afterAll(async () => {

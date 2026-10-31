@@ -126,6 +126,7 @@ describe("HTTP — Dashboard (integração — servidor real)", () => {
       // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante`.
       await garantirItemConfiguracao(configuracoesService, "cores", "Preto");
       await garantirItemConfiguracao(configuracoesService, "tamanhos", "P");
+      await garantirItemConfiguracao(configuracoesService, "categorias", "Vestidos");
 
       const fornecedor = await fornecedoresService.criar({ nome: "Fornecedor HTTP Dashboard" }, null);
       const produto = await produtosService.criar(

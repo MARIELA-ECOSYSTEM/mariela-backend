@@ -36,6 +36,14 @@ export function normalizarTamanho(tamanho: string): string {
   return tamanho.trim().toUpperCase();
 }
 
+/** Usada SÓ para comparação de unicidade de categoria — o valor exibido/salvo em `categoria` nunca é alterado. */
+export function normalizarCategoria(categoria: string): string {
+  return removerDiacriticos(categoria.normalize("NFD"))
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
 /**
  * Regra: "U" (tamanho único) não coexiste com nenhum outro tamanho na mesma
  * variante. Devolve a mensagem de erro ou `null` quando a inclusão é válida.

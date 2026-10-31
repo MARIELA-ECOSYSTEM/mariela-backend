@@ -4,6 +4,7 @@ import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
 import type { Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
@@ -75,6 +76,13 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
 
   describe("singleton", () => {
     it("obter() cria o documento na primeira chamada com defaults vazios", async () => {
+      // Isolamento (mesmo padrão já usado abaixo em "dez chamadas concorrentes a
+      // obter()"): garante um singleton realmente vazio para ESTE teste, em vez de
+      // depender de ser literalmente a primeira operação de todo o processo —
+      // premissa frágil sob execução randomizada ou com outros arquivos de teste
+      // concorrentes que também registram itens em `configuracoes` (ver Fase 55.1,
+      // revisão independente).
+      await connection.collection("configuracoes").deleteMany({});
       const configuracao = await service.obter();
       expect(configuracao.categorias).toEqual([]);
       expect(configuracao.tamanhos).toEqual([]);
@@ -370,6 +378,15 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
   });
 
   describe("proteção contra exclusão com vínculo (Fase 54.0)", () => {
+    // O describe "singleton" (acima) apaga o documento inteiro de `configuracoes`
+    // para testar a recriação do upsert — isso destrói o registro de "Vestidos"
+    // feito uma única vez no `beforeAll` global. Cada teste abaixo já re-registra
+    // sua própria cor/tamanho fresca no corpo; "categorias" precisa do mesmo
+    // tratamento aqui (Fase 55.1), já que `produtosService.criar` agora valida.
+    beforeEach(async () => {
+      await garantirItemConfiguracao(service, "categorias", "Vestidos");
+    });
+
     it("bloqueia a exclusão de cor usada por uma variante, com a mensagem de negócio exata, e preserva os dados", async () => {
       const chave = `Vermelho-${Date.now()}`;
       await service.adicionarItem("cores", chave, USUARIO_ID);
@@ -480,5 +497,152 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
         if (varianteExiste) expect(corPresente).toBe(true);
       },
     );
+  });
+
+  describe("categoria: unicidade, proteção de exclusão e campo-espelho (Fase 55.1)", () => {
+    it("cadastra uma categoria normalmente", async () => {
+      const chave = `Calcas-${Date.now()}`;
+      const resultado = await service.adicionarItem("categorias", chave, USUARIO_ID);
+      expect(resultado.categorias).toContain(chave);
+    });
+
+    it("rejeita cadastrar a mesma categoria em minúsculas", async () => {
+      const chave = `Saias-${Date.now()}`;
+      await service.adicionarItem("categorias", chave, USUARIO_ID);
+      await expect(service.adicionarItem("categorias", chave.toLowerCase(), USUARIO_ID)).rejects.toThrow(ApiException);
+
+      const final = await service.obter();
+      // A forma ORIGINALMENTE cadastrada é preservada — nenhuma reescrita de apresentação.
+      expect(final.categorias).toContain(chave);
+      expect(final.categorias).not.toContain(chave.toLowerCase());
+    });
+
+    it("rejeita cadastrar a mesma categoria em MAIÚSCULAS", async () => {
+      const chave = `Blusas-${Date.now()}`;
+      await service.adicionarItem("categorias", chave, USUARIO_ID);
+      await expect(service.adicionarItem("categorias", chave.toUpperCase(), USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+
+    it("rejeita cadastrar a mesma categoria com acentuação diferente ('Calçados' vs 'Calcados')", async () => {
+      const chave = `Calçados-${Date.now()}`;
+      await service.adicionarItem("categorias", chave, USUARIO_ID);
+      const semAcento = chave.replace("ç", "c");
+      await expect(service.adicionarItem("categorias", semAcento, USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+
+    it("rejeita cadastrar a mesma categoria com espaços periféricos excedentes", async () => {
+      const chave = `Macacoes-${Date.now()}`;
+      await service.adicionarItem("categorias", chave, USUARIO_ID);
+      await expect(service.adicionarItem("categorias", `   ${chave}   `, USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+
+    it("exclusão de categoria sem vínculo funciona normalmente", async () => {
+      const chave = `SemVinculoCategoria-${Date.now()}`;
+      await service.adicionarItem("categorias", chave, USUARIO_ID);
+      const resultado = await service.removerItem("categorias", chave, USUARIO_ID);
+      expect(resultado.categorias).not.toContain(chave);
+    });
+
+    describe("bloqueio com produto vinculado", () => {
+      // Mesmo motivo do describe "proteção contra exclusão com vínculo" acima:
+      // o describe "singleton" apaga o documento inteiro de `configuracoes`.
+      beforeEach(async () => {
+        await garantirItemConfiguracao(service, "categorias", "Vestidos");
+      });
+
+      it("bloqueia a exclusão de categoria usada por um produto ativo, com a mensagem de negócio exata, e preserva os dados", async () => {
+        const chave = `Macacao-${Date.now()}`;
+        await service.adicionarItem("categorias", chave, USUARIO_ID);
+        const produto = await produtosService.criar(payloadProduto("CAT1", { categoria: chave }), null);
+
+        await expect(service.removerItem("categorias", chave, USUARIO_ID)).rejects.toThrow(
+          "Não foi possível excluir esta categoria porque existem produtos vinculados a ela no sistema. Remova ou altere os vínculos antes de tentar novamente.",
+        );
+
+        const final = await service.obter();
+        expect(final.categorias).toContain(chave); // nada foi modificado
+
+        const produtoBruto = await connection.collection("produtos").findOne({ codProduto: produto.codProduto });
+        expect(produtoBruto?.["categoria"]).toBe(chave);
+        expect(produtoBruto?.["excluidoEm"]).toBeNull();
+      });
+
+      it("bloqueia a exclusão de categoria mesmo quando o produto usa uma grafia diferente (case/acento-insensitive)", async () => {
+        const chave = `Vestido-${Date.now()}`;
+        await service.adicionarItem("categorias", chave, USUARIO_ID);
+        await produtosService.criar(payloadProduto("CAT2", { categoria: chave.toUpperCase() }), null);
+
+        await expect(service.removerItem("categorias", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+      });
+
+      it("depois que o produto é excluído (soft-delete), a exclusão da categoria passa a funcionar", async () => {
+        const chave = `Camisa-${Date.now()}`;
+        await service.adicionarItem("categorias", chave, USUARIO_ID);
+        const produto = await produtosService.criar(payloadProduto("CAT3", { categoria: chave }), null);
+
+        await expect(service.removerItem("categorias", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+
+        await produtosService.excluir(produto.id, null);
+        const resultado = await service.removerItem("categorias", chave, USUARIO_ID);
+        expect(resultado.categorias).not.toContain(chave);
+      });
+
+      it(
+        "concorrência real: excluir a categoria e criar um produto que a usa ao mesmo tempo nunca deixa a " +
+          "configuração inconsistente com os produtos — ou a categoria continua presente E o produto existe, " +
+          "ou a categoria foi removida E nenhum produto ativo a usa",
+        async () => {
+          const chave = `Shorts-${Date.now()}`;
+          await service.adicionarItem("categorias", chave, USUARIO_ID);
+
+          const [resultadoRemocao, resultadoCriacao] = await Promise.allSettled([
+            service.removerItem("categorias", chave, USUARIO_ID),
+            produtosService.criar(payloadProduto("CAT4", { categoria: chave }), null),
+          ]);
+
+          const final = await service.obter();
+          const categoriaPresente = final.categorias.includes(chave);
+          const produtoExiste =
+            resultadoCriacao.status === "fulfilled" &&
+            (await produtosService.obterPorId(resultadoCriacao.value.id)).excluidoEm === null;
+
+          if (resultadoRemocao.status === "fulfilled") {
+            expect(categoriaPresente).toBe(false);
+          }
+          // Invariante final, válido em todos os casos: nunca existe um produto
+          // ativo usando uma categoria que não está mais cadastrada.
+          if (produtoExiste) expect(categoriaPresente).toBe(true);
+        },
+      );
+    });
+
+    it("o campo-espelho 'categoriasNormalizadas' nunca é exposto na serialização pública", async () => {
+      const chave = `EspelhoInterno-${Date.now()}`;
+      await service.adicionarItem("categorias", chave, USUARIO_ID);
+      const documento = await service.obter();
+      const serializado = documento.toJSON() as Record<string, unknown>;
+      expect(Object.keys(serializado).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "tamanhos"].sort());
+      expect(serializado["categoriasNormalizadas"]).toBeUndefined();
+    });
+
+    it("autocorrige (idempotente, aditivo) um documento antigo sem o campo-espelho 'categoriasNormalizadas'", async () => {
+      const chave = `LegadoSemEspelho-${Date.now()}`;
+      // Simula um documento criado ANTES da Fase 55.1: a categoria já existe em
+      // `categorias`, mas o espelho normalizado nunca foi populado para ela —
+      // só possível manipulando o Mongo diretamente (a API nunca permite esse
+      // estado hoje), igual ao padrão já usado para cores/tamanhos.
+      await connection.collection("configuracoes").updateOne({ _id: "global" }, { $addToSet: { categorias: chave } });
+      const antes = await connection.collection("configuracoes").findOne({ _id: "global" });
+      expect((antes?.["categoriasNormalizadas"] as string[] | undefined) ?? []).not.toContain(chave.toLowerCase());
+
+      // Qualquer adição subsequente dispara o self-heal (`sincronizarEspelhoNormalizado`).
+      await service.adicionarItem("categorias", `Gatilho-${Date.now()}`, USUARIO_ID);
+
+      const depois = await connection.collection("configuracoes").findOne({ _id: "global" });
+      expect(depois?.["categoriasNormalizadas"] as string[]).toContain(chave.toLowerCase());
+
+      // E a unicidade case-insensitive passa a valer também para o valor legado.
+      await expect(service.adicionarItem("categorias", chave.toUpperCase(), USUARIO_ID)).rejects.toThrow(ApiException);
+    });
   });
 });

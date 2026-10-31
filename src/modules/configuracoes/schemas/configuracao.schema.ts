@@ -65,6 +65,11 @@ export const DadosLojaSubSchema = SchemaFactory.createForClass(DadosLojaSub);
  * unicidade de `_id` do MongoDB garante que só existe UM documento possível
  * nesta coleção, sem precisar de um índice extra nem de uma checagem
  * "existe outro?" antes de criar.
+ *
+ * `categorias`, assim como `cores`/`tamanhos` desde a Fase 54.0/55.1, TEM
+ * enforcement contra `Produto.categoria` (unicidade case-insensitive +
+ * proteção de exclusão em uso) — só `formasPagamento` permanece
+ * deliberadamente sem enforcement (fora do escopo desta fase).
  */
 @Schema({ collection: "configuracoes", versionKey: false, timestamps: { createdAt: "criadoEm", updatedAt: "atualizadoEm" } })
 export class Configuracao {
@@ -76,6 +81,16 @@ export class Configuracao {
 
   @Prop({ type: [String], default: [] })
   categorias!: string[];
+
+  /**
+   * Fase 55.1 — espelho de `categorias` só com a forma normalizada
+   * (`normalizarCategoria`), mesmo papel de `tamanhosNormalizados`/
+   * `coresNormalizadas`: permite a checagem de unicidade case-insensitive de
+   * forma atômica (`$ne`/`$push` num único `findOneAndUpdate`) — nunca
+   * exposto na API (fora da lista explícita de `aplicarSerializacaoDeConfiguracao`).
+   */
+  @Prop({ type: [String], default: [] })
+  categoriasNormalizadas!: string[];
 
   @Prop({ type: [String], default: [] })
   tamanhos!: string[];

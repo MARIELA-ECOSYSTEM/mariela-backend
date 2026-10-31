@@ -106,6 +106,7 @@ describe("HTTP — Produtos (integração — servidor real)", () => {
     ];
     for (const cor of cores) await garantirItemConfiguracao(configuracoesService, "cores", cor);
     for (const tamanho of ["G", "M", "P"]) await garantirItemConfiguracao(configuracoesService, "tamanhos", tamanho);
+    await garantirItemConfiguracao(configuracoesService, "categorias", "Vestidos");
   });
 
   afterAll(async () => {
@@ -171,6 +172,19 @@ describe("HTTP — Produtos (integração — servidor real)", () => {
         });
         expect(resposta.status).toBe(400);
       }
+    });
+
+    it("Fase 55.1 — categoria não cadastrada em configuracoes retorna 400 com a mensagem de negócio exata", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/produtos`, {
+        method: "POST",
+        headers: jsonHeaders(adminAccessToken),
+        body: JSON.stringify(payloadProduto({ categoria: `CategoriaHttpNuncaCadastrada-${Date.now()}` })),
+      });
+      expect(resposta.status).toBe(400);
+      const corpo = (await resposta.json()) as { message: string };
+      expect(corpo.message).toBe(
+        "Esta categoria não está cadastrada nas configurações da loja. Cadastre a categoria antes de utilizá-la em um produto.",
+      );
     });
   });
 

@@ -3,7 +3,7 @@ import { InjectModel } from "@nestjs/mongoose";
 import type { Model } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
-import { normalizarCor, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
+import { normalizarCategoria, normalizarCor, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
 import { CAMPOS_LISTA, type CampoLista } from "./configuracoes.constants.js";
 import { ConfiguracoesRepository } from "./configuracoes.repository.js";
 import type { DadosLoja } from "./configuracoes.types.js";
@@ -11,16 +11,18 @@ import type { AtualizarLojaDto } from "./dto/atualizar-loja.dto.js";
 import type { ConfiguracaoDocument } from "./schemas/configuracao.schema.js";
 import { EventoConfiguracao, type EventoConfiguracaoDocument } from "./schemas/evento-configuracao.schema.js";
 
-/** As duas listas sujeitas à proteção contra exclusão com vínculo (Fase 54.0) — ver `garantirSemVinculo`. */
-const MENSAGEM_VINCULO: Record<"cores" | "tamanhos", string> = {
+/** As listas sujeitas à proteção contra exclusão com vínculo (Fase 54.0 — cores/tamanhos; Fase 55.1 — categorias). Ver `garantirSemVinculo`. */
+const MENSAGEM_VINCULO: Record<"cores" | "tamanhos" | "categorias", string> = {
   cores:
     "Não foi possível excluir esta cor porque existem produtos vinculados a ela no sistema. Remova ou altere os vínculos antes de tentar novamente.",
   tamanhos:
     "Não foi possível excluir este tamanho porque existem produtos vinculados a ele no sistema. Remova ou altere os vínculos antes de tentar novamente.",
+  categorias:
+    "Não foi possível excluir esta categoria porque existem produtos vinculados a ela no sistema. Remova ou altere os vínculos antes de tentar novamente.",
 };
 
-function ehListaProtegidaContraExclusao(campo: CampoLista): campo is "cores" | "tamanhos" {
-  return campo === "cores" || campo === "tamanhos";
+function ehListaProtegidaContraExclusao(campo: CampoLista): campo is "cores" | "tamanhos" | "categorias" {
+  return campo === "cores" || campo === "tamanhos" || campo === "categorias";
 }
 
 const NOMES_LISTA: Record<CampoLista, string> = {
@@ -146,14 +148,30 @@ export class ConfiguracoesService {
     return resultado;
   }
 
-  private async garantirSemVinculo(campo: "cores" | "tamanhos", valor: string): Promise<void> {
+  private async garantirSemVinculo(campo: "cores" | "tamanhos" | "categorias", valor: string): Promise<void> {
     if (await this.existeVinculo(campo, valor)) {
       throw ApiException.validation(MENSAGEM_VINCULO[campo], [{ field: "valor", message: MENSAGEM_VINCULO[campo] }]);
     }
   }
 
-  /** Busca produtos ativos com ao menos uma variante usando `valor` (comparação sempre normalizada, nunca a string crua). */
-  private async existeVinculo(campo: "cores" | "tamanhos", valor: string): Promise<boolean> {
+  /**
+   * Busca produtos ativos usando `valor` (comparação sempre normalizada,
+   * nunca a string crua). Cores/tamanhos filtram direto no Mongo contra o
+   * campo-espelho normalizado já persistido em `Variante` (`corNormalizada`/
+   * `tamanhos.tamanho`). Categoria não tem esse espelho em `Produto` — é
+   * campo raiz simples (`categoria: string`, sem normalização própria) — por
+   * isso a comparação normalizada acontece em memória sobre os produtos
+   * ativos, igual ao padrão já usado por `ProdutosService.validarCorCadastrada`
+   * para comparar contra a lista de configurações. Proporcional ao volume
+   * real do sistema (ferramenta administrativa interna, baixo volume) e não
+   * introduz nenhum campo novo em `Produto`.
+   */
+  private async existeVinculo(campo: "cores" | "tamanhos" | "categorias", valor: string): Promise<boolean> {
+    if (campo === "categorias") {
+      const valorNormalizado = normalizarCategoria(valor);
+      const ativos = await this.produtosRepository.listarTodosAtivos();
+      return ativos.some((produto) => normalizarCategoria(produto.categoria) === valorNormalizado);
+    }
     const filtro =
       campo === "cores"
         ? { "variantes.corNormalizada": normalizarCor(valor) }
