@@ -23,7 +23,14 @@ import { Venda, VendaSchema } from "./schemas/venda.schema.js";
     // Reutilizados pelo domínio de Vendas: preço/estoque (Produtos), snapshot
     // de identidade (Clientes/Vendedores) e lançamento financeiro (Caixa) —
     // mesmo padrão de reuso cross-módulo já estabelecido nos módulos anteriores.
-    ProdutosModule,
+    // Fase 55.3.2 — `forwardRef`: desde a Fase 55.2, `ProdutosModule →
+    // ConfiguracoesModule → VendasModule → ProdutosModule` é um ciclo de import
+    // ESM. As duas outras arestas já usam `forwardRef`; esta, direta, falhava
+    // ("Cannot access 'ProdutosModule' before initialization") sempre que o
+    // ponto de entrada carregava `ProdutosModule` antes de `VendasModule` (ex.:
+    // `fornecedores.service.spec.ts` isolado). Só adia a avaliação da
+    // referência — mesmas instâncias de providers, mesmo grafo do NestJS.
+    forwardRef(() => ProdutosModule),
     ClientesModule,
     VendedoresModule,
     // Fase 55.2 — `forwardRef`: `CaixasModule` passou a fazer parte de um

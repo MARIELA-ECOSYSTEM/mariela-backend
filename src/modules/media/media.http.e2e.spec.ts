@@ -74,6 +74,10 @@ describe("HTTP — Mídia / upload pré-assinado (integração — servidor real
     adminToken = (await authService.login({ usuario: email, senha: "senha-forte-123" }, { ip: null, userAgent: null })).accessToken;
     // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
     await garantirItemConfiguracao(app.get(ConfiguracoesService), "categorias", "Vestidos");
+    // Fase 55.3.2 — pré-requisito de `POST /produtos/:id/variantes` com cor
+    // "Azul" (validada desde a Fase 54.2). Antes só passava quando outro arquivo
+    // da suíte já tinha registrado a cor.
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "cores", "Azul");
 
     const produto = await app.get(ProdutosService).criar(
       { nome: `Produto Mídia ${Date.now()}`, categoria: "Vestidos", precoCusto: 50, precoVenda: 100, ehNovidade: false },
