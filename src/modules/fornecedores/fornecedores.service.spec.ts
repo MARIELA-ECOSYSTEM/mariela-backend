@@ -71,6 +71,11 @@ describe("FornecedoresService (integração — MongoDB real)", () => {
     service = moduleRef.get(FornecedoresService);
     produtosService = moduleRef.get(ProdutosService);
     connection = moduleRef.get(getConnectionToken());
+    // Fase 55.3.1 — pré-requisito de `adicionarVariante`/`adicionarTamanho`
+    // (cor/tamanho validados desde a Fase 54.2). Antes só passava quando outro
+    // arquivo da suíte já tinha registrado "Preto"/"M".
+    await garantirItemConfiguracao(moduleRef.get(ConfiguracoesService), "cores", "Preto");
+    await garantirItemConfiguracao(moduleRef.get(ConfiguracoesService), "tamanhos", "M");
     // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
     await garantirItemConfiguracao(moduleRef.get(ConfiguracoesService), "categorias", "Vestidos");
   });

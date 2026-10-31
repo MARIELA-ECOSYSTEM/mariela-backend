@@ -68,6 +68,11 @@ describe("HTTP — PDV Produtos (integração — servidor real)", () => {
     await authService.criarAdminSeed({ nome: "HTTP PDV Produtos", email, senha: "senha-forte-123" });
     const login = await authService.login({ usuario: email, senha: "senha-forte-123" }, { ip: null, userAgent: null });
     adminAccessToken = login.accessToken;
+    // Fase 55.3.1 — pré-requisito de `adicionarVariante`/`adicionarTamanho`
+    // (cor/tamanho validados desde a Fase 54.2). Antes só passava quando outro
+    // arquivo da suíte já tinha registrado "Azul"/"M".
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "cores", "Azul");
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "tamanhos", "M");
     // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
     await garantirItemConfiguracao(app.get(ConfiguracoesService), "categorias", "Vestidos");
   });

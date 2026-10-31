@@ -69,6 +69,10 @@ describe("HTTP — Vendedores (integração — servidor real)", () => {
     await authService.criarAdminSeed({ nome: "HTTP Vendedores", email, senha: "senha-forte-123" });
     const login = await authService.login({ usuario: email, senha: "senha-forte-123" }, { ip: null, userAgent: null });
     accessToken = login.accessToken;
+    // Fase 55.3.1 — pré-requisito de `adicionarVariante` (cor validada desde a
+    // Fase 54.2). O tamanho "M" entra por `ajustarQuantidadeTamanho` sem
+    // `exigirTamanhoCadastrado`, que não valida contra `configuracoes.tamanhos`.
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "cores", "Azul");
     // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
     await garantirItemConfiguracao(app.get(ConfiguracoesService), "categorias", "Vestidos");
     await garantirItemConfiguracao(app.get(ConfiguracoesService), "formasPagamento", "Dinheiro");
