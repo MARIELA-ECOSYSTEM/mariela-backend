@@ -847,6 +847,93 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
         await expect(service.removerItem("formasPagamento", chaveLimpa, USUARIO_ID)).rejects.toThrow(ApiException);
       });
 
+      describe("normalização completa do vínculo histórico — espaços consecutivos (Fase 55.2.1)", () => {
+        // A collation do MongoDB (usada numa primeira versão desta fase)
+        // resolve caixa/acentuação mas NUNCA colapsa espaços internos
+        // consecutivos nem remove espaços periféricos — só a comparação em
+        // memória via `normalizarFormaPagamento` (a MESMA função usada no
+        // cadastro) reconhece esses quatro testes como vínculo. Cada teste
+        // combina as QUATRO variações exigidas (acento + caixa + espaços
+        // periféricos + espaços consecutivos) no valor HISTÓRICO
+        // armazenado, nunca no valor cadastrado (que permanece limpo) —
+        // provando que a proteção funciona mesmo com dado antigo nunca
+        // normalizado, sem alterar esse dado histórico em nenhum momento.
+        // Suja de propósito: SEM acento, MAIÚSCULAS, espaços periféricos E
+        // consecutivos — as quatro variações exigidas, combinadas no MESMO
+        // valor histórico, para cada um dos quatro caminhos. Cada teste usa
+        // sua PRÓPRIA chave cadastrada (sufixo único) para não colidir com
+        // os outros três — todos exercitam a mesma função de normalização.
+        function historicaSuja(baseLimpa: string): string {
+          return `  ${baseLimpa.replace(/[ãé]/g, (c) => (c === "ã" ? "a" : "e")).toUpperCase().replace(/ /g, "   ")}  `;
+        }
+
+        it("bloqueia a exclusão com vínculo em 'vendas.formaPagamento' (campo raiz) armazenado com grafia suja", async () => {
+          const cadastrada = `Cartão de Crédito ${Date.now()}`;
+          const suja = historicaSuja(cadastrada);
+          await service.adicionarItem("formasPagamento", cadastrada, USUARIO_ID);
+          const venda = await vendaModel.create(dadosVendaMinima({ formaPagamento: suja }));
+
+          await expect(service.removerItem("formasPagamento", cadastrada, USUARIO_ID)).rejects.toThrow(ApiException);
+
+          // Confirma que o valor histórico NUNCA foi alterado/normalizado.
+          const vendaBruta = await connection.collection("vendas").findOne({ _id: venda._id });
+          expect(vendaBruta?.["formaPagamento"]).toBe(suja);
+        });
+
+        it("bloqueia a exclusão com vínculo em 'vendas.pagamentos[].forma' armazenado com grafia suja", async () => {
+          const cadastrada = `Cartão de Crédito Pagto ${Date.now()}`;
+          const suja = historicaSuja(cadastrada);
+          await service.adicionarItem("formasPagamento", cadastrada, USUARIO_ID);
+          await vendaModel.create(
+            dadosVendaMinima({
+              formaPagamento: "Pix-Base",
+              pagamentos: [{ forma: suja, valor: 100, dataPagamento: new Date(), parcelas: 1 } as never],
+            }),
+          );
+
+          await expect(service.removerItem("formasPagamento", cadastrada, USUARIO_ID)).rejects.toThrow(ApiException);
+        });
+
+        it("bloqueia a exclusão com vínculo em 'vendas.parcelas[].formaPagamento' armazenado com grafia suja", async () => {
+          const cadastrada = `Cartão de Crédito Parcela ${Date.now()}`;
+          const suja = historicaSuja(cadastrada);
+          await service.adicionarItem("formasPagamento", cadastrada, USUARIO_ID);
+          await vendaModel.create(
+            dadosVendaMinima({
+              formaPagamento: "Pix-Base",
+              parcelas: [{ numero: 1, total: 1, valor: 100, vencimento: new Date(), pagoEm: new Date(), formaPagamento: suja } as never],
+            }),
+          );
+
+          await expect(service.removerItem("formasPagamento", cadastrada, USUARIO_ID)).rejects.toThrow(ApiException);
+        });
+
+        it("bloqueia a exclusão com vínculo em 'movimentos_caixa.formaPagamento' armazenado com grafia suja", async () => {
+          const cadastrada = `Cartão de Crédito Caixa ${Date.now()}`;
+          const suja = historicaSuja(cadastrada);
+          await service.adicionarItem("formasPagamento", cadastrada, USUARIO_ID);
+          const movimento = await movimentoModel.create(dadosMovimentoMinimo({ formaPagamento: suja }));
+
+          await expect(service.removerItem("formasPagamento", cadastrada, USUARIO_ID)).rejects.toThrow(ApiException);
+
+          // `MovimentoCaixa.formaPagamento` já tem `trim: true` no schema
+          // (pré-existente, não tocado nesta fase) — o Mongoose remove os
+          // espaços PERIFÉRICOS na própria gravação; os espaços CONSECUTIVOS
+          // internos (o que de fato está sendo testado aqui) permanecem
+          // intactos, provando que o histórico não foi alterado por esta
+          // fase além do que o schema já fazia antes dela.
+          const movimentoBruto = await connection.collection("movimentos_caixa").findOne({ _id: movimento._id });
+          expect(movimentoBruto?.["formaPagamento"]).toBe(suja.trim());
+        });
+
+        it("exclusão funciona normalmente quando NENHUM registro (limpo ou sujo) usa a forma", async () => {
+          const semVinculo = `SemVinculoNormalizacao-${Date.now()}`;
+          await service.adicionarItem("formasPagamento", semVinculo, USUARIO_ID);
+          const resultado = await service.removerItem("formasPagamento", semVinculo, USUARIO_ID);
+          expect(resultado.formasPagamento).not.toContain(semVinculo);
+        });
+      });
+
       it("uma tentativa de exclusão bloqueada não altera a venda vinculada", async () => {
         const chave = `PreservaVenda-${Date.now()}`;
         await service.adicionarItem("formasPagamento", chave, USUARIO_ID);

@@ -227,12 +227,18 @@ export class VendasService {
     // acima, para o mesmo tipo de motivo).
     const dataVenda = new Date();
     const adquirentesCache = new Map<string, AdquirenteRespostaPublica>();
+    // Fase 55.2.2 — a configuração é lida UMA vez por venda (na primeira
+    // iteração, mesmo ponto da leitura anterior), nunca uma vez por
+    // pagamento: as N leituras devolviam o mesmo documento singleton dentro
+    // da mesma operação. Escopo local à chamada — nunca um cache global.
+    let formasPagamentoCadastradas: string[] | undefined;
     const pagamentos: PagamentoVenda[] = [];
     for (const pagamento of dados.pagamentos ?? []) {
       // Fase 55.2 — toda venda nova introduz um vínculo novo com cada forma
       // de pagamento informada, igual a cor/tamanho/categoria na criação de
       // produto (Fases 54.2/55.1).
-      await this.validarFormaPagamentoCadastrada(pagamento.forma);
+      formasPagamentoCadastradas ??= (await this.configuracoesRepository.obter()).formasPagamento;
+      this.exigirFormaPagamentoCadastrada(pagamento.forma, formasPagamentoCadastradas);
       const estruturado = await this.validarPagamentoEstruturado(pagamento, adquirentesCache);
       pagamentos.push({
         forma: pagamento.forma,
@@ -1456,8 +1462,13 @@ export class VendasService {
    */
   private async validarFormaPagamentoCadastrada(forma: string): Promise<void> {
     const configuracao = await this.configuracoesRepository.obter();
+    this.exigirFormaPagamentoCadastrada(forma, configuracao.formasPagamento);
+  }
+
+  /** Fase 55.2.2 — a comparação de `validarFormaPagamentoCadastrada`, contra uma lista já lida (ver `criarInterno`). */
+  private exigirFormaPagamentoCadastrada(forma: string, formasCadastradas: string[]): void {
     const formaNormalizada = normalizarFormaPagamento(forma);
-    const existe = configuracao.formasPagamento.some((item) => normalizarFormaPagamento(item) === formaNormalizada);
+    const existe = formasCadastradas.some((item) => normalizarFormaPagamento(item) === formaNormalizada);
     if (!existe) {
       const mensagem =
         "Esta forma de pagamento não está cadastrada nas configurações da loja. Cadastre a forma de pagamento antes de utilizá-la em uma operação financeira.";
