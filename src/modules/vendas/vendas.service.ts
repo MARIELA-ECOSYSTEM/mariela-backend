@@ -7,8 +7,10 @@ import { AdquirentesService, type AdquirenteRespostaPublica } from "../adquirent
 import { CaixasRepository } from "../caixas/caixas.repository.js";
 import { CaixasService } from "../caixas/caixas.service.js";
 import { ClientesRepository } from "../clientes/clientes.repository.js";
+import { ConfiguracoesRepository } from "../configuracoes/configuracoes.repository.js";
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
+import { normalizarFormaPagamento } from "../produtos/utils/normalizacao.util.js";
 import { precoEfetivo } from "../produtos/utils/precos.util.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
 import { VendedoresRepository } from "../vendedores/vendedores.repository.js";
@@ -78,6 +80,8 @@ export class VendasService {
     private readonly caixasService: CaixasService,
     private readonly sequenciasService: SequenciasService,
     private readonly adquirentesService: AdquirentesService,
+    // Fase 55.2 — validar `forma` contra `configuracoes.formasPagamento`.
+    private readonly configuracoesRepository: ConfiguracoesRepository,
     @InjectModel(EventoVenda.name) private readonly eventoModel: Model<EventoVendaDocument>,
   ) {}
 
@@ -225,6 +229,10 @@ export class VendasService {
     const adquirentesCache = new Map<string, AdquirenteRespostaPublica>();
     const pagamentos: PagamentoVenda[] = [];
     for (const pagamento of dados.pagamentos ?? []) {
+      // Fase 55.2 — toda venda nova introduz um vínculo novo com cada forma
+      // de pagamento informada, igual a cor/tamanho/categoria na criação de
+      // produto (Fases 54.2/55.1).
+      await this.validarFormaPagamentoCadastrada(pagamento.forma);
       const estruturado = await this.validarPagamentoEstruturado(pagamento, adquirentesCache);
       pagamentos.push({
         forma: pagamento.forma,
@@ -601,6 +609,16 @@ export class VendasService {
     }
 
     const forma = dto.formaPagamento?.trim() || vendaAtual.formaPagamento;
+    // Fase 55.2 — só valida contra `configuracoes.formasPagamento` quando a
+    // forma está REALMENTE mudando em relação à da venda (comparação por
+    // valor normalizado): omitir `dto.formaPagamento` (cai no fallback acima)
+    // ou reenviar a MESMA forma da venda nunca deve falhar por causa de um
+    // dado histórico cuja forma não está mais cadastrada — mesmo princípio
+    // de `atualizarVariante`/`ProdutosService.atualizar` para cor/categoria
+    // (Fases 54.2/55.1).
+    if (normalizarFormaPagamento(forma) !== normalizarFormaPagamento(vendaAtual.formaPagamento)) {
+      await this.validarFormaPagamentoCadastrada(forma);
+    }
     // Reaproveita EXATAMENTE a mesma validação de modalidade/adquirente/tarifa
     // de `criar()`/`receberPagamento()` — sem `modalidade`, devolve os nulls
     // legados (mesmo contrato de sempre), sem nenhuma lógica duplicada aqui.
@@ -771,6 +789,11 @@ export class VendasService {
         throw ApiException.conflict("Esta idempotencyKey já foi usada para um recebimento com valor diferente. Gere uma nova chave para esta operação.");
       }
     }
+
+    // Fase 55.2 — `dados.forma` é sempre um valor explicitamente informado
+    // pelo chamador para este recebimento (nunca um fallback de valor
+    // histórico, diferente de `baixarParcela`) — sempre validado.
+    await this.validarFormaPagamentoCadastrada(dados.forma);
 
     // Reaproveita EXATAMENTE a mesma validação de modalidade/adquirente/tarifa
     // da criação (Etapas 10.4/10.5) — não depende de nada específico da
@@ -1419,6 +1442,27 @@ export class VendasService {
     };
 
     return { modalidade, adquirenteId: pagamento.adquirenteId, parcelas, tarifaAplicada };
+  }
+
+  /**
+   * Fase 55.2 — valida `forma` (o rótulo configurável, nunca `modalidade` —
+   * classificação técnica fechada e independente, ver `validarPagamentoEstruturado`
+   * acima) contra `configuracoes.formasPagamento`. Mesmo padrão de
+   * `ProdutosService.validarCorCadastrada`/`validarCategoriaCadastrada`:
+   * compara sempre pelo valor normalizado, nunca pela string crua; é
+   * proteção PRÁTICA, não uma garantia matematicamente absoluta (mesma
+   * janela de concorrência já documentada e aceita nas Fases 54.1/55.0 —
+   * ver `docs/configuracoes-cores-tamanhos.md`).
+   */
+  private async validarFormaPagamentoCadastrada(forma: string): Promise<void> {
+    const configuracao = await this.configuracoesRepository.obter();
+    const formaNormalizada = normalizarFormaPagamento(forma);
+    const existe = configuracao.formasPagamento.some((item) => normalizarFormaPagamento(item) === formaNormalizada);
+    if (!existe) {
+      const mensagem =
+        "Esta forma de pagamento não está cadastrada nas configurações da loja. Cadastre a forma de pagamento antes de utilizá-la em uma operação financeira.";
+      throw ApiException.validation(mensagem, [{ field: "forma", message: mensagem }]);
+    }
   }
 
   /**

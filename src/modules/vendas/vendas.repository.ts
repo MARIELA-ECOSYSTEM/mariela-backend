@@ -3,6 +3,7 @@ import { InjectModel } from "@nestjs/mongoose";
 import { Error as MongooseErrors, isValidObjectId, Types, type Model, type PipelineStage } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, FacetOption } from "../../common/types/api-response.interface.js";
+import { normalizarFormaPagamento } from "../produtos/utils/normalizacao.util.js";
 import {
   FACETAS_VENDA,
   FAIXAS_VALOR,
@@ -113,6 +114,54 @@ export class VendasRepository {
 
   async encontrarPorIdempotencyKey(chave: string): Promise<VendaDocument | null> {
     return this.vendaModel.findOne({ idempotencyKey: chave }).exec();
+  }
+
+  /**
+   * Fase 55.2/55.2.1 — existência de vínculo de uma forma de pagamento, para
+   * a proteção de exclusão em `ConfiguracoesService`. Verifica os TRÊS
+   * campos onde `forma` pode estar gravada numa Venda (`formaPagamento` no
+   * documento raiz, `pagamentos[].forma`, `parcelas[].formaPagamento`), sem
+   * filtrar por `status` — venda cancelada continua sendo histórico (decisão
+   * de negócio da Fase 55.2).
+   *
+   * Fase 55.2.1 — CORREÇÃO: a versão anterior usava `.collation({locale:"pt",
+   * strength:1})`, que resolve caixa/acentuação mas **não** colapsa espaços
+   * periféricos/internos (confirmado empiricamente) — não reproduzia
+   * integralmente `normalizarFormaPagamento`, violando a regra de que a
+   * comparação de vínculo deve usar a MESMA normalização do cadastro. Não
+   * existe operador nativo do MongoDB que combine remoção de diacríticos com
+   * colapso de espaços consecutivos num único comando — por isso a
+   * comparação agora é feita em memória, usando EXCLUSIVAMENTE
+   * `normalizarFormaPagamento` (nunca uma segunda regra) nos dois lados.
+   *
+   * Projeção estrita: só os TRÊS campos relevantes (`formaPagamento`,
+   * `pagamentos.forma`, `parcelas.formaPagamento`) são lidos — nunca
+   * `itens`, `historico`, `cancelamentos` ou qualquer outro campo do
+   * documento. `.lean()` evita hidratar documentos Mongoose completos.
+   * Nenhum campo-espelho foi adicionado a `Venda`; nenhum documento
+   * histórico foi alterado.
+   *
+   * Custo: um full scan da collection `vendas` (sem índice dedicado — ver
+   * `docs/configuracoes-cores-tamanhos.md`, seção de custo), proporcional ao
+   * volume atual (zero vendas em produção na auditoria da Fase 55.0). Se o
+   * volume crescer a ponto de tornar isto inaceitável, a alternativa
+   * documentada é um job de reconciliação assíncrono que mantenha um
+   * campo-espelho — deliberadamente não implementado agora.
+   */
+  async existeVinculoFormaPagamento(forma: string): Promise<boolean> {
+    const valorNormalizado = normalizarFormaPagamento(forma);
+    const candidatos = await this.vendaModel
+      .find({}, { formaPagamento: 1, "pagamentos.forma": 1, "parcelas.formaPagamento": 1 })
+      .lean()
+      .exec();
+
+    return candidatos.some((venda) => {
+      if (normalizarFormaPagamento(venda.formaPagamento) === valorNormalizado) return true;
+      if ((venda.pagamentos ?? []).some((pagamento) => normalizarFormaPagamento(pagamento.forma) === valorNormalizado)) return true;
+      return (venda.parcelas ?? []).some(
+        (parcela) => parcela.formaPagamento != null && normalizarFormaPagamento(parcela.formaPagamento) === valorNormalizado,
+      );
+    });
   }
 
   /** Mesmo padrão de concorrência dos demais módulos: retry sob `VersionError` do versionamento otimista. */

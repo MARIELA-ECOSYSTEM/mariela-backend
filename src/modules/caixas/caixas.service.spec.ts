@@ -4,7 +4,9 @@ import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
 import { Types, type Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import type { ListarCaixasQueryDto } from "./dto/listar-caixas-query.dto.js";
 import type { ListarMovimentosQueryDto } from "./dto/listar-movimentos-query.dto.js";
 import { CaixasModule } from "./caixas.module.js";
@@ -62,6 +64,8 @@ describe("CaixasService (integração — MongoDB real)", () => {
     }).compile();
     service = moduleRef.get(CaixasService);
     connection = moduleRef.get(getConnectionToken());
+    // Fase 55.2 — pré-requisito para `service.registrarMovimento` (forma de pagamento passou a ser validada).
+    await garantirItemConfiguracao(moduleRef.get(ConfiguracoesService), "formasPagamento", "Dinheiro");
   });
 
   afterAll(async () => {
@@ -930,6 +934,88 @@ describe("CaixasService (integração — MongoDB real)", () => {
       // 500 + 400 (venda) + 300 (injeção) - 700 (sangria) - 200 (cancelamento) = 300
       expect(detalhe.resumo.saldoEsperado).toBe(300);
       expect(somaBruta).toBe(detalhe.resumo.saldoEsperado); // a leitura do service bate com a soma independente dos documentos crus
+      await fecharTudoQueEstiverAberto();
+    });
+  });
+
+  describe("validação de forma de pagamento contra configuracoes (Fase 55.2)", () => {
+    const MENSAGEM_FORMA_NAO_CADASTRADA =
+      "Esta forma de pagamento não está cadastrada nas configurações da loja. Cadastre a forma de pagamento antes de utilizá-la em uma operação financeira.";
+
+    async function movimentosDoCaixa(caixaId: string) {
+      return connection.collection("movimentos_caixa").find({ caixaId: new Types.ObjectId(caixaId) }).toArray();
+    }
+
+    it("registra movimentação manual com forma de pagamento existente nas configurações", async () => {
+      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const atualizado = await service.registrarMovimento(caixa.id, "entrada", { descricao: "Suprimento", valor: 50, formaPagamento: "Dinheiro" }, null);
+      expect(atualizado.movimentacoes[0]?.formaPagamento).toBe("Dinheiro");
+      await fecharTudoQueEstiverAberto();
+    });
+
+    it("rejeita movimentação manual com forma de pagamento inexistente nas configurações, com a mensagem de negócio exata", async () => {
+      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const formaInexistente = `FormaCaixaNuncaCadastrada-${Date.now()}`;
+
+      await expect(
+        service.registrarMovimento(caixa.id, "entrada", { descricao: "Suprimento", valor: 50, formaPagamento: formaInexistente }, null),
+      ).rejects.toThrow(MENSAGEM_FORMA_NAO_CADASTRADA);
+
+      await fecharTudoQueEstiverAberto();
+    });
+
+    it("reconhece variações de maiúsculas/minúsculas/acentos/espaços da mesma forma cadastrada", async () => {
+      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const atualizado = await service.registrarMovimento(
+        caixa.id,
+        "entrada",
+        { descricao: "Suprimento", valor: 50, formaPagamento: "  DINHEIRO  " }, // "Dinheiro" já está cadastrado (beforeAll)
+        null,
+      );
+      expect(atualizado.movimentacoes[0]?.formaPagamento).toBe("DINHEIRO"); // só trim é aplicado na gravação — apresentação original (maiúsculas) preservada
+      await fecharTudoQueEstiverAberto();
+    });
+
+    it("a validação acontece ANTES da gravação: nenhuma movimentação é criada quando a forma é rejeitada", async () => {
+      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const formaInexistente = `FormaAntesDaGravacao-${Date.now()}`;
+
+      await expect(
+        service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria", valor: 50, formaPagamento: formaInexistente, motivo: "Teste" }, null),
+      ).rejects.toThrow(ApiException);
+
+      const movimentos = await movimentosDoCaixa(caixa.id);
+      expect(movimentos).toHaveLength(0); // nenhum documento foi inserido, nem para depois ser revertido
+      const detalhe = await service.obterDetalhe(caixa.id);
+      expect(detalhe.resumo.saldoEsperado).toBe(0); // saldo nunca foi afetado
+
+      await fecharTudoQueEstiverAberto();
+    });
+
+    it("preserva movimentações originadas de venda (registrarMovimentoDeVenda) com forma não cadastrada — nunca revalida, confia na validação já feita pelo fluxo de Vendas", async () => {
+      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const vVenda = vendaFake();
+      const formaHistoricaNuncaCadastradaAqui = `FormaDeVendaNaoRevalidada-${Date.now()}`;
+
+      // `registrarMovimentoDeVenda` nunca valida `formaPagamento` (a validação
+      // é responsabilidade exclusiva de `VendasService`, que já rodou antes de
+      // chegar aqui no fluxo real — ver `CaixasService.validarFormaPagamentoCadastrada`,
+      // usada SÓ por `registrarMovimento`). Confirma aqui que isso continua
+      // true mesmo para uma forma que nunca foi cadastrada nesta suíte.
+      await service.registrarMovimentoDeVenda({
+        caixaId: caixa.id,
+        tipo: "venda",
+        descricao: "Venda (forma não cadastrada, mas não é revalidada aqui)",
+        referencia: vVenda.vendaCodigo,
+        ...vVenda,
+        formaPagamento: formaHistoricaNuncaCadastradaAqui,
+        valor: 100,
+        observacao: "",
+      });
+
+      const movimentos = await movimentosDoCaixa(caixa.id);
+      expect(movimentos).toHaveLength(1);
+      expect(movimentos[0]?.["formaPagamento"]).toBe(formaHistoricaNuncaCadastradaAqui);
       await fecharTudoQueEstiverAberto();
     });
   });

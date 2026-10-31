@@ -1,5 +1,6 @@
-import { Module } from "@nestjs/common";
+import { forwardRef, Module } from "@nestjs/common";
 import { MongooseModule } from "@nestjs/mongoose";
+import { ConfiguracoesModule } from "../configuracoes/configuracoes.module.js";
 import { SequenciasModule } from "../sequencias/sequencias.module.js";
 import { Venda, VendaSchema } from "../vendas/schemas/venda.schema.js";
 import { VendasRepository } from "../vendas/vendas.repository.js";
@@ -30,6 +31,13 @@ import { MovimentoCaixa, MovimentoCaixaSchema } from "./schemas/movimento-caixa.
       { name: Venda.name, schema: VendaSchema },
     ]),
     SequenciasModule,
+    // Fase 55.2 — validar `formaPagamento` contra `configuracoes.formasPagamento`
+    // em `registrarMovimento` (entrada/saída manual). `forwardRef`:
+    // `ConfiguracoesModule` importa `CaixasModule` de volta (para reusar
+    // `MovimentosCaixaRepository` na checagem de vínculo na exclusão, sem
+    // duplicar a classe) — dependência circular genuína, resolvida da forma
+    // padrão do NestJS.
+    forwardRef(() => ConfiguracoesModule),
   ],
   controllers: [CaixasController],
   providers: [CaixasService, CaixasRepository, MovimentosCaixaRepository, VendasRepository],

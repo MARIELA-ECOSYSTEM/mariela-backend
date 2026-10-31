@@ -128,6 +128,7 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     for (const cor of ["Preto", "Rosa", "Verde"]) await garantirItemConfiguracao(configuracoesService, "cores", cor);
     for (const tamanho of ["G", "M", "P"]) await garantirItemConfiguracao(configuracoesService, "tamanhos", tamanho);
     await garantirItemConfiguracao(configuracoesService, "categorias", "Vestidos");
+    for (const forma of ["Dinheiro", "PIX", "Crédito"]) await garantirItemConfiguracao(configuracoesService, "formasPagamento", forma);
 
     const produto = await produtosService.criar({ nome: "Produto HTTP Vendas", categoria: "Vestidos", precoCusto: 100, precoVenda: 200, ehNovidade: false }, null);
     const variante = await produtosService.adicionarVariante(produto.id, { cor: "Verde" }, null);

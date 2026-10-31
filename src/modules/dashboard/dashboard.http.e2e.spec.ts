@@ -127,6 +127,7 @@ describe("HTTP — Dashboard (integração — servidor real)", () => {
       await garantirItemConfiguracao(configuracoesService, "cores", "Preto");
       await garantirItemConfiguracao(configuracoesService, "tamanhos", "P");
       await garantirItemConfiguracao(configuracoesService, "categorias", "Vestidos");
+      await garantirItemConfiguracao(configuracoesService, "formasPagamento", "Dinheiro");
 
       const fornecedor = await fornecedoresService.criar({ nome: "Fornecedor HTTP Dashboard" }, null);
       const produto = await produtosService.criar(

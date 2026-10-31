@@ -71,6 +71,7 @@ describe("HTTP — Vendedores (integração — servidor real)", () => {
     accessToken = login.accessToken;
     // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
     await garantirItemConfiguracao(app.get(ConfiguracoesService), "categorias", "Vestidos");
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "formasPagamento", "Dinheiro");
   });
 
   afterAll(async () => {

@@ -91,6 +91,9 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
     await garantirItemConfiguracao(configuracoesService, "cores", "Azul");
     await garantirItemConfiguracao(configuracoesService, "tamanhos", "M");
     await garantirItemConfiguracao(configuracoesService, "categorias", "Vestidos");
+    for (const forma of ["Dinheiro", "PIX"]) {
+      await garantirItemConfiguracao(configuracoesService, "formasPagamento", forma);
+    }
   });
 
   afterAll(async () => {
@@ -567,6 +570,60 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       expect(venda.caixaId).toBe(caixa.id);
       expect(venda.caixaCodigo).toBe(caixa.codigo);
       await caixasService.fechar(caixa.id, { valorInformado: 1080 }, null);
+    });
+  });
+
+  describe("validação de forma de pagamento contra configuracoes (Fase 55.2) — herdada de VendasService", () => {
+    it("rejeita forma de pagamento inexistente nas configurações, com a mensagem de negócio exata — mesma regra de VendasService, nenhuma implementação própria no PDV", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const formaInexistente = `FormaPdvNuncaCadastrada-${Date.now()}`;
+
+      // Fase 55.2.1 — `.rejects.toThrow()` encadeado diretamente após várias
+      // operações reais de MongoDB nesta mesma suíte já era conhecido como
+      // instável (ver `esperarRejeicao`, linhas 44-50 deste arquivo, Etapa 05
+      // do PDV) — causa raiz real da falha intermitente "Operation
+      // interrupted because client was closed" relatada na Fase 55.2 (não
+      // uma questão de ciclo de módulos/conexão Mongoose, como investigado e
+      // descartado na Fase 55.2.1). Try/catch manual, mesmo padrão já
+      // estabelecido neste arquivo, evita o matcher instável.
+      let erroCapturado: unknown;
+      try {
+        await service.criar(
+          vendedor.id,
+          payloadPadrao({
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: formaInexistente, valor: 100 }],
+          }),
+        );
+      } catch (erro) {
+        erroCapturado = erro;
+      }
+      expect(erroCapturado).toBeInstanceOf(ApiException);
+      expect((erroCapturado as ApiException).message).toBe(
+        "Esta forma de pagamento não está cadastrada nas configurações da loja. Cadastre a forma de pagamento antes de utilizá-la em uma operação financeira.",
+      );
+
+      const atualizado = await produtosService.obterPorId(produto.produtoId);
+      expect(atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!.quantidade).toBe(5); // nenhum efeito parcial
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("cria venda normalmente quando a forma está cadastrada — comportamento idêntico ao de VendasService.criar", async () => {
+      const produto = await criarProdutoComEstoque(100, 5);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      const venda = await service.criar(
+        vendedor.id,
+        payloadPadrao({
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "PIX", valor: 100 }],
+        }),
+      );
+      expect(venda.pagamentos[0]!.forma).toBe("PIX");
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
     });
   });
 });

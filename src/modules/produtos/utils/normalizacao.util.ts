@@ -45,6 +45,20 @@ export function normalizarCategoria(categoria: string): string {
 }
 
 /**
+ * Usada SÓ para comparação de unicidade/vínculo de forma de pagamento — o
+ * valor exibido/salvo em `forma`/`formaPagamento` nunca é alterado. Mesmo
+ * padrão de `normalizarCor`/`normalizarCategoria`: texto livre, nunca sigla
+ * curta. Nunca compara `modalidade` (classificação técnica fechada, sem
+ * relação com esta normalização).
+ */
+export function normalizarFormaPagamento(forma: string): string {
+  return removerDiacriticos(forma.normalize("NFD"))
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+/**
  * Regra: "U" (tamanho único) não coexiste com nenhum outro tamanho na mesma
  * variante. Devolve a mensagem de erro ou `null` quando a inclusão é válida.
  */

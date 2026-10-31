@@ -75,6 +75,10 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     adminAccessToken = login.accessToken;
     // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
     await garantirItemConfiguracao(app.get(ConfiguracoesService), "categorias", "Vestidos");
+    // Fase 55.2 — pré-requisito para `VendasService.criar` (forma de pagamento passou a ser validada).
+    for (const forma of ["Dinheiro", "PIX", "Débito", "Crédito"]) {
+      await garantirItemConfiguracao(app.get(ConfiguracoesService), "formasPagamento", forma);
+    }
   });
 
   afterAll(async () => {
@@ -185,6 +189,30 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
       }),
     });
     expect(resposta.status).toBe(400);
+  });
+
+  it("Fase 55.2 — forma de pagamento não cadastrada em configuracoes retorna 400 com a mensagem de negócio exata", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    await abrirCaixaViaPdv(vendedor.accessToken);
+    const produto = await criarProdutoComEstoque(100, 5);
+
+    const resposta = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: `FormaPdvHttpNuncaCadastrada-${Date.now()}`, valor: 100 }],
+      }),
+    });
+    expect(resposta.status).toBe(400);
+    const corpo = (await resposta.json()) as { message: string };
+    expect(corpo.message).toBe(
+      "Esta forma de pagamento não está cadastrada nas configurações da loja. Cadastre a forma de pagamento antes de utilizá-la em uma operação financeira.",
+    );
+
+    await fecharCaixaAbertoSeExistir();
   });
 
   it("payload com vendedorId ou caixaId é rejeitado (400) pelo whitelist global — nunca usado como autoridade", async () => {

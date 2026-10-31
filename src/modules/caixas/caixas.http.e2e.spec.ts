@@ -11,7 +11,9 @@ import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
+import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
+import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE (mesmos guards, mesmo pipeline de
@@ -63,6 +65,8 @@ describe("HTTP — Caixas (integração — servidor real)", () => {
     await authService.criarAdminSeed({ nome: "HTTP Caixas", email, senha: "senha-forte-123" });
     const login = await authService.login({ usuario: email, senha: "senha-forte-123" }, { ip: null, userAgent: null });
     accessToken = login.accessToken;
+    // Fase 55.2 — pré-requisito para `POST /caixas/:id/entrada|saida` (forma de pagamento passou a ser validada).
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "formasPagamento", "Dinheiro");
   });
 
   afterAll(async () => {
@@ -219,6 +223,24 @@ describe("HTTP — Caixas (integração — servidor real)", () => {
     expect(consultaAnterior.status).toBe(200);
     expect(corpoConsultaAnterior.data.status).toBe("fechado");
     expect(corpoConsultaAnterior.data.fechamento.valorEsperado).toBe(-750);
+
+    await fecharTudoQueEstiverAberto();
+  });
+
+  it("Fase 55.2 — forma de pagamento não cadastrada em configuracoes retorna 400 com a mensagem de negócio exata", async () => {
+    const abertura = await fetch(`${baseUrl}/api/v1/caixas`, { method: "POST", headers: authHeaders(), body: JSON.stringify({ valorInicial: 100 }) });
+    const { data: caixa } = (await abertura.json()) as { data: { id: string } };
+
+    const resposta = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}/entrada`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ descricao: "Suprimento", valor: 50, formaPagamento: `FormaCaixaHttpNuncaCadastrada-${Date.now()}` }),
+    });
+    expect(resposta.status).toBe(400);
+    const corpo = (await resposta.json()) as { message: string };
+    expect(corpo.message).toBe(
+      "Esta forma de pagamento não está cadastrada nas configurações da loja. Cadastre a forma de pagamento antes de utilizá-la em uma operação financeira.",
+    );
 
     await fecharTudoQueEstiverAberto();
   });

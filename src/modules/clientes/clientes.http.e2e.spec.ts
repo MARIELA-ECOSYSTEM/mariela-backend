@@ -73,6 +73,7 @@ describe("HTTP — Clientes (integração — servidor real)", () => {
     accessToken = login.accessToken;
     // Fase 55.1 — pré-requisito para `produtosService.criar` (categoria passou a ser validada).
     await garantirItemConfiguracao(app.get(ConfiguracoesService), "categorias", "Vestidos");
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "formasPagamento", "Dinheiro");
     // Fase 54.2 — pré-requisito para `produtosService.adicionarVariante` (`criarVendaParaCliente` usa cor "Azul").
     // Faltava neste arquivo especificamente (só `clientes.service.spec.ts` tinha sido coberto) — depender de
     // outro arquivo registrar "Azul" por timing é uma corrida real entre specs concorrentes, não uma garantia.

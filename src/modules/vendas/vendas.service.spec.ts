@@ -62,6 +62,9 @@ describe("VendasService (integração — MongoDB real)", () => {
     await garantirItemConfiguracao(configuracoesService, "cores", "Azul");
     await garantirItemConfiguracao(configuracoesService, "tamanhos", "M");
     await garantirItemConfiguracao(configuracoesService, "categorias", "Vestidos");
+    for (const forma of ["Dinheiro", "PIX", "Débito", "Crédito", "Crédito A", "Crédito B", "Cartão", "Boleto"]) {
+      await garantirItemConfiguracao(configuracoesService, "formasPagamento", forma);
+    }
   });
 
   afterAll(async () => {
@@ -6154,6 +6157,282 @@ describe("VendasService (integração — MongoDB real)", () => {
       const produtoAtualizado = await produtosService.obterPorId(produto.produtoId);
       expect(produtoAtualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(5);
       await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+  });
+
+  describe("validação de forma de pagamento contra configuracoes (Fase 55.2)", () => {
+    const MENSAGEM_FORMA_NAO_CADASTRADA =
+      "Esta forma de pagamento não está cadastrada nas configurações da loja. Cadastre a forma de pagamento antes de utilizá-la em uma operação financeira.";
+
+    it("cria venda com forma de pagamento existente nas configurações", async () => {
+      const produto = await criarProdutoComEstoque(100, 10);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+        },
+        null,
+      );
+      expect(venda.pagamentos[0]!.forma).toBe("Dinheiro");
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("rejeita criar venda com forma de pagamento inexistente nas configurações, com a mensagem de negócio exata, sem efeito parcial", async () => {
+      const produto = await criarProdutoComEstoque(100, 10);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const formaInexistente = `FormaNuncaCadastrada-${Date.now()}`;
+
+      await expect(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: formaInexistente, valor: 100 }],
+          },
+          null,
+        ),
+      ).rejects.toThrow(MENSAGEM_FORMA_NAO_CADASTRADA);
+
+      // Nenhum efeito parcial: nem estoque baixado, nem venda criada.
+      const atualizado = await produtosService.obterPorId(produto.produtoId);
+      expect(atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!.quantidade).toBe(10);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("reconhece variações de maiúsculas/minúsculas/acentos/espaços da mesma forma cadastrada", async () => {
+      const produto = await criarProdutoComEstoque(100, 10);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "  DINHEIRO  ", valor: 100 }], // "Dinheiro" já está cadastrado (beforeAll)
+        },
+        null,
+      );
+      expect(venda.pagamentos[0]!.forma).toBe("  DINHEIRO  "); // apresentação original preservada, não reescrita
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("valida CADA forma em pagamentos[] individualmente — uma forma inexistente rejeita a venda mesmo com as demais válidas", async () => {
+      const produto = await criarProdutoComEstoque(300, 10);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const formaInexistente = `FormaArray-${Date.now()}`;
+
+      await expect(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [
+              { forma: "Dinheiro", valor: 100 },
+              { forma: formaInexistente, valor: 200 },
+            ],
+          },
+          null,
+        ),
+      ).rejects.toThrow(MENSAGEM_FORMA_NAO_CADASTRADA);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("rejeita informar uma forma inexistente em baixarParcela() (nova forma introduzida na baixa)", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+        },
+        null,
+      );
+      const parcelaId = String(venda.parcelas[0]!._id);
+      const formaInexistente = `FormaBaixa-${Date.now()}`;
+
+      await expect(service.baixarParcela(venda.id, parcelaId, { formaPagamento: formaInexistente }, null)).rejects.toThrow(
+        MENSAGEM_FORMA_NAO_CADASTRADA,
+      );
+
+      const vendaFinal = await service.obterPorId(venda.id);
+      expect(vendaFinal.parcelas[0]!.pagoEm).toBeNull(); // nada foi alterado
+      // Só a venda à vista (100) entrou no caixa — a baixa da parcela foi rejeitada, nenhum segundo movimento.
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("rejeita informar uma forma inexistente em receberPagamento() (sempre validada, nunca um fallback histórico)", async () => {
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+        },
+        null,
+      );
+      const formaInexistente = `FormaRecebimento-${Date.now()}`;
+
+      await expect(service.receberPagamento(venda.id, { forma: formaInexistente, valor: 50 }, null)).rejects.toThrow(
+        MENSAGEM_FORMA_NAO_CADASTRADA,
+      );
+
+      const vendaFinal = await service.obterPorId(venda.id);
+      expect(vendaFinal.valorPago).toBe(100); // nada foi alterado
+      // Só a venda à vista (100) entrou no caixa — o recebimento foi rejeitado, nenhum segundo movimento.
+      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+    });
+
+    it("preserva operação histórica: baixarParcela SEM informar formaPagamento nunca revalida, mesmo com a forma da venda já fora das configurações", async () => {
+      const formaHistorica = `FormaHistoricaBaixa-${Date.now()}`;
+      await configuracoesService.adicionarItem("formasPagamento", formaHistorica, null);
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: formaHistorica, valor: 100 }],
+        },
+        null,
+      );
+      // Simula dado histórico: a forma deixou de existir em
+      // `configuracoes.formasPagamento` por algum outro meio que não
+      // `removerItem` (a proteção de exclusão da Fase 55.2 bloquearia a
+      // remoção normal enquanto a venda existir).
+      await connection
+        .collection("configuracoes")
+        .updateOne({}, { $pull: { formasPagamento: formaHistorica, formasPagamentoNormalizadas: formaHistorica.toLowerCase() } });
+
+      const parcelaId = String(venda.parcelas[0]!._id);
+      // Omitir `formaPagamento` cai no fallback para `venda.formaPagamento` (a MESMA forma histórica) — nunca revalida.
+      const atualizada = await service.baixarParcela(venda.id, parcelaId, {}, null);
+      expect(atualizada.status).toBe("concluida");
+      expect(atualizada.parcelas[0]!.formaPagamento).toBe(formaHistorica);
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("reenviar em baixarParcela() a MESMA forma já registrada na venda (comparação normalizada) nunca revalida, mesmo se ela estiver fora das configurações", async () => {
+      const formaHistorica = `FormaMesmaGrafia-${Date.now()}`;
+      await configuracoesService.adicionarItem("formasPagamento", formaHistorica, null);
+      const produto = await criarProdutoComEstoque(300, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      const venda = await service.criar(
+        {
+          clienteId: cliente.id,
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: formaHistorica, valor: 100 }],
+        },
+        null,
+      );
+      await connection
+        .collection("configuracoes")
+        .updateOne({}, { $pull: { formasPagamento: formaHistorica, formasPagamentoNormalizadas: formaHistorica.toLowerCase() } });
+
+      const parcelaId = String(venda.parcelas[0]!._id);
+      // Reenvia a MESMA forma, só com grafia diferente — normaliza para o
+      // MESMO valor já salvo na venda: não é uma mudança efetiva, não revalida.
+      const atualizada = await service.baixarParcela(venda.id, parcelaId, { formaPagamento: formaHistorica.toUpperCase() }, null);
+      expect(atualizada.status).toBe("concluida");
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+
+    it("`modalidade` continua independente de `forma`: forma cadastrada + modalidade/adquirente inválidos é rejeitado pela regra de modalidade, nunca pela de forma", async () => {
+      const produto = await criarProdutoComEstoque(300, 10);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+
+      // "Crédito" está cadastrado em `configuracoes.formasPagamento` (beforeAll) — a
+      // rejeição abaixo tem que vir exclusivamente da regra de adquirente/modalidade
+      // (mensagem específica só em `errors[]`, não no `.message` top-level —
+      // comportamento pré-existente de `validarPagamentoEstruturado`, Etapa 10.4,
+      // fora do escopo desta fase; por isso aqui só confirmamos o TIPO do erro,
+      // nunca a confusão com a mensagem de forma de pagamento).
+      let erroCapturado: unknown;
+      try {
+        await service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Crédito", valor: 300, modalidade: "credito", parcelas: 1 }], // sem adquirenteId
+          },
+          null,
+        );
+      } catch (erro) {
+        erroCapturado = erro;
+      }
+      expect(erroCapturado).toBeInstanceOf(ApiException);
+      expect((erroCapturado as ApiException).message).not.toBe(MENSAGEM_FORMA_NAO_CADASTRADA);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("`modalidade` continua independente de `forma`: modalidade/adquirente válidos não dispensam a validação de forma — forma inexistente ainda é rejeitada", async () => {
+      const produto = await criarProdutoComEstoque(300, 10);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 3 }] });
+      const formaInexistente = `FormaComModalidadeValida-${Date.now()}`;
+
+      await expect(
+        service.criar(
+          {
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: formaInexistente, valor: 300, modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1 }],
+          },
+          null,
+        ),
+      ).rejects.toThrow(MENSAGEM_FORMA_NAO_CADASTRADA);
+      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+    });
+
+    it("uma venda com forma e modalidade válidas (crédito com adquirente/tarifa configurados) é criada normalmente — as duas regras convivem sem interferência", async () => {
+      const produto = await criarProdutoComEstoque(300, 10);
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const adquirente = await criarAdquirente({ tabelaTarifas: [{ modalidade: "credito", parcelas: 1, percentual: 3 }] });
+
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId: caixa.id,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+          pagamentos: [{ forma: "Crédito", valor: 300, modalidade: "credito", adquirenteId: adquirente.id, parcelas: 1 }],
+        },
+        null,
+      );
+      expect(venda.pagamentos[0]!.forma).toBe("Crédito");
+      expect(venda.pagamentos[0]!.modalidade).toBe("credito");
+      expect(venda.pagamentos[0]!.tarifaAplicada?.percentual).toBe(3);
+      // O movimento de caixa sempre usa o valor BRUTO do pagamento (300), nunca o líquido pós-tarifa.
+      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
     });
   });
 });

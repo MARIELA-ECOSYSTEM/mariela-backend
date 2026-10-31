@@ -2,6 +2,7 @@ import { Injectable, Logger, type OnModuleInit } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import { isValidObjectId, type Model } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
+import { normalizarFormaPagamento } from "../produtos/utils/normalizacao.util.js";
 import type { DadosCriarMovimento } from "./caixas.types.js";
 import { MovimentoCaixa, type MovimentoCaixaDocument } from "./schemas/movimento-caixa.schema.js";
 
@@ -140,6 +141,25 @@ export class MovimentosCaixaRepository implements OnModuleInit {
    */
   async removerPorId(id: string): Promise<void> {
     await this.movimentoModel.deleteOne({ _id: id }).exec();
+  }
+
+  /**
+   * Fase 55.2/55.2.1 — existência de vínculo de uma forma de pagamento, para
+   * a proteção de exclusão em `ConfiguracoesService`. Nunca filtra por
+   * `caixaId`/status do caixa: uma movimentação de um caixa já FECHADO
+   * continua sendo histórico financeiro (decisão de negócio da Fase 55.2,
+   * mesmo princípio de venda cancelada em `VendasRepository.existeVinculoFormaPagamento`).
+   *
+   * Fase 55.2.1 — mesma correção aplicada lá: comparação em memória usando
+   * exclusivamente `normalizarFormaPagamento` nos dois lados (reproduz
+   * integralmente a normalização do cadastro — `collation` sozinha não
+   * colapsava espaços periféricos/internos). Projeção estrita a
+   * `formaPagamento` — nenhum outro campo do movimento é lido.
+   */
+  async existeVinculoFormaPagamento(forma: string): Promise<boolean> {
+    const valorNormalizado = normalizarFormaPagamento(forma);
+    const candidatos = await this.movimentoModel.find({}, { formaPagamento: 1 }).lean().exec();
+    return candidatos.some((movimento) => normalizarFormaPagamento(movimento.formaPagamento) === valorNormalizado);
   }
 
   async listarTodosPorCaixa(caixaId: string): Promise<MovimentoCaixaDocument[]> {

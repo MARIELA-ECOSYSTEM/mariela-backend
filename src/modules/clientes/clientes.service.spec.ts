@@ -430,6 +430,7 @@ describe("ClientesService.listarVendas — histórico real (Etapa 13.2, integra�
     await garantirItemConfiguracao(configuracoesService, "cores", "Azul");
     await garantirItemConfiguracao(configuracoesService, "tamanhos", "M");
     await garantirItemConfiguracao(configuracoesService, "categorias", "Vestidos");
+    await garantirItemConfiguracao(configuracoesService, "formasPagamento", "Dinheiro");
   });
 
   afterAll(async () => {

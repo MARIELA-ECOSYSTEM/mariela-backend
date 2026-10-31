@@ -124,4 +124,4 @@ Se o MongoDB de produção migrar para auto-hospedado (ex.: dentro do próprio `
 - **Backoffice** (`/auth/*`, demais rotas sob `/api/v1`): identidade `Usuario`, guard `JwtAuthGuard` + `RolesGuard`.
 - **MARIELA PDV** (`/pdv/*`): identidade `Vendedor`, guard `PdvJwtAuthGuard` — domínio de autenticação **completamente isolado** do Backoffice (segredos JWT distintos, nunca compartilhados).
 - MongoDB via Mongoose; cada módulo de domínio registra seus próprios schemas via `MongooseModule.forFeature`.
-- Cadastro central de cores/tamanhos/categorias, unicidade case-insensitive, validação nos fluxos de Produtos/Estoque e o risco residual de concorrência (sem transações multi-documento, por decisão arquitetural): ver [`docs/configuracoes-cores-tamanhos.md`](docs/configuracoes-cores-tamanhos.md).
+- Cadastro central de cores/tamanhos/categorias/formas de pagamento, unicidade case-insensitive, validação nos fluxos de Produtos/Estoque/Vendas/Caixa e o risco residual de concorrência (sem transações multi-documento, por decisão arquitetural): ver [`docs/configuracoes-cores-tamanhos.md`](docs/configuracoes-cores-tamanhos.md).

@@ -1,9 +1,11 @@
-import { Injectable } from "@nestjs/common";
+import { forwardRef, Inject, Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
+import { MovimentosCaixaRepository } from "../caixas/movimentos-caixa.repository.js";
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
-import { normalizarCategoria, normalizarCor, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
+import { normalizarCategoria, normalizarCor, normalizarFormaPagamento, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
+import { VendasRepository } from "../vendas/vendas.repository.js";
 import { CAMPOS_LISTA, type CampoLista } from "./configuracoes.constants.js";
 import { ConfiguracoesRepository } from "./configuracoes.repository.js";
 import type { DadosLoja } from "./configuracoes.types.js";
@@ -11,18 +13,22 @@ import type { AtualizarLojaDto } from "./dto/atualizar-loja.dto.js";
 import type { ConfiguracaoDocument } from "./schemas/configuracao.schema.js";
 import { EventoConfiguracao, type EventoConfiguracaoDocument } from "./schemas/evento-configuracao.schema.js";
 
-/** As listas sujeitas à proteção contra exclusão com vínculo (Fase 54.0 — cores/tamanhos; Fase 55.1 — categorias). Ver `garantirSemVinculo`. */
-const MENSAGEM_VINCULO: Record<"cores" | "tamanhos" | "categorias", string> = {
+type ListaProtegidaContraExclusao = "cores" | "tamanhos" | "categorias" | "formasPagamento";
+
+/** As listas sujeitas à proteção contra exclusão com vínculo (Fase 54.0 — cores/tamanhos; Fase 55.1 — categorias; Fase 55.2 — formas de pagamento). Ver `garantirSemVinculo`. */
+const MENSAGEM_VINCULO: Record<ListaProtegidaContraExclusao, string> = {
   cores:
     "Não foi possível excluir esta cor porque existem produtos vinculados a ela no sistema. Remova ou altere os vínculos antes de tentar novamente.",
   tamanhos:
     "Não foi possível excluir este tamanho porque existem produtos vinculados a ele no sistema. Remova ou altere os vínculos antes de tentar novamente.",
   categorias:
     "Não foi possível excluir esta categoria porque existem produtos vinculados a ela no sistema. Remova ou altere os vínculos antes de tentar novamente.",
+  formasPagamento:
+    "Não foi possível excluir esta forma de pagamento porque existem vendas ou movimentações financeiras vinculadas a ela. Verifique os vínculos antes de tentar novamente.",
 };
 
-function ehListaProtegidaContraExclusao(campo: CampoLista): campo is "cores" | "tamanhos" | "categorias" {
-  return campo === "cores" || campo === "tamanhos" || campo === "categorias";
+function ehListaProtegidaContraExclusao(campo: CampoLista): campo is ListaProtegidaContraExclusao {
+  return campo === "cores" || campo === "tamanhos" || campo === "categorias" || campo === "formasPagamento";
 }
 
 const NOMES_LISTA: Record<CampoLista, string> = {
@@ -59,6 +65,15 @@ export class ConfiguracoesService {
   constructor(
     private readonly configuracoesRepository: ConfiguracoesRepository,
     private readonly produtosRepository: ProdutosRepository,
+    // Fase 55.2 — checagem de vínculo antes de excluir forma de pagamento.
+    // Reusa as instâncias singleton JÁ exportadas por `VendasModule`/
+    // `CaixasModule` (ver `ConfiguracoesModule`) — nunca uma segunda
+    // implementação de consulta, nunca uma segunda instância do repository.
+    // `forwardRef` aqui (não em `VendasService`/`CaixasService` ao injetar
+    // `ConfiguracoesRepository`) — mesma assimetria já estabelecida entre
+    // `ConfiguracoesService`/`ProdutosService` desde a Fase 54.2.
+    @Inject(forwardRef(() => VendasRepository)) private readonly vendasRepository: VendasRepository,
+    @Inject(forwardRef(() => MovimentosCaixaRepository)) private readonly movimentosCaixaRepository: MovimentosCaixaRepository,
     @InjectModel(EventoConfiguracao.name) private readonly eventoModel: Model<EventoConfiguracaoDocument>,
   ) {}
 
@@ -148,29 +163,49 @@ export class ConfiguracoesService {
     return resultado;
   }
 
-  private async garantirSemVinculo(campo: "cores" | "tamanhos" | "categorias", valor: string): Promise<void> {
+  private async garantirSemVinculo(campo: ListaProtegidaContraExclusao, valor: string): Promise<void> {
     if (await this.existeVinculo(campo, valor)) {
       throw ApiException.validation(MENSAGEM_VINCULO[campo], [{ field: "valor", message: MENSAGEM_VINCULO[campo] }]);
     }
   }
 
   /**
-   * Busca produtos ativos usando `valor` (comparação sempre normalizada,
-   * nunca a string crua). Cores/tamanhos filtram direto no Mongo contra o
-   * campo-espelho normalizado já persistido em `Variante` (`corNormalizada`/
-   * `tamanhos.tamanho`). Categoria não tem esse espelho em `Produto` — é
-   * campo raiz simples (`categoria: string`, sem normalização própria) — por
-   * isso a comparação normalizada acontece em memória sobre os produtos
-   * ativos, igual ao padrão já usado por `ProdutosService.validarCorCadastrada`
-   * para comparar contra a lista de configurações. Proporcional ao volume
-   * real do sistema (ferramenta administrativa interna, baixo volume) e não
-   * introduz nenhum campo novo em `Produto`.
+   * Busca produtos/vendas/movimentos usando `valor` (comparação sempre
+   * normalizada, nunca a string crua). Três estratégias diferentes, cada
+   * uma proporcional ao modelo de dados real do campo vinculado:
+   *
+   * - Cores/tamanhos: filtro direto no Mongo contra o campo-espelho
+   *   normalizado já persistido em `Variante` (`corNormalizada`/
+   *   `tamanhos.tamanho`).
+   * - Categoria: campo raiz simples em `Produto`, sem espelho — comparação
+   *   normalizada em memória sobre os produtos ativos (Fase 55.1; ver
+   *   `docs/configuracoes-cores-tamanhos.md`).
+   * - Forma de pagamento (Fase 55.2; estratégia de comparação corrigida na
+   *   Fase 55.2.1): delega a duas consultas dedicadas, uma por collection
+   *   (`VendasRepository.existeVinculoFormaPagamento`/
+   *   `MovimentosCaixaRepository.existeVinculoFormaPagamento`). Cada uma
+   *   projeta SÓ os campos de forma de pagamento relevantes (nunca
+   *   itens/pagamentos inteiros, histórico, variantes) e compara em memória
+   *   com `normalizarFormaPagamento` nos dois lados — a mesma normalização
+   *   exata do cadastro (collation do MongoDB, usada numa primeira versão,
+   *   resolve caixa/acento mas não colapsa espaços periféricos/internos,
+   *   violando essa exigência). Nenhum campo-espelho nos documentos
+   *   financeiros; nenhuma alteração de formato histórico. Ver a
+   *   documentação para o custo (full scan proporcional ao volume atual) e o
+   *   risco residual de concorrência entre coleções.
    */
-  private async existeVinculo(campo: "cores" | "tamanhos" | "categorias", valor: string): Promise<boolean> {
+  private async existeVinculo(campo: ListaProtegidaContraExclusao, valor: string): Promise<boolean> {
     if (campo === "categorias") {
       const valorNormalizado = normalizarCategoria(valor);
       const ativos = await this.produtosRepository.listarTodosAtivos();
       return ativos.some((produto) => normalizarCategoria(produto.categoria) === valorNormalizado);
+    }
+    if (campo === "formasPagamento") {
+      const [naVendas, nosMovimentos] = await Promise.all([
+        this.vendasRepository.existeVinculoFormaPagamento(valor),
+        this.movimentosCaixaRepository.existeVinculoFormaPagamento(valor),
+      ]);
+      return naVendas || nosMovimentos;
     }
     const filtro =
       campo === "cores"

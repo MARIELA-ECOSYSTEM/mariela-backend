@@ -3,6 +3,8 @@ import { InjectModel } from "@nestjs/mongoose";
 import type { Model, Types } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
+import { ConfiguracoesRepository } from "../configuracoes/configuracoes.repository.js";
+import { normalizarFormaPagamento } from "../produtos/utils/normalizacao.util.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
 import type { VendaDocument } from "../vendas/schemas/venda.schema.js";
 import { VendasRepository } from "../vendas/vendas.repository.js";
@@ -113,6 +115,9 @@ export class CaixasService {
     private readonly movimentosRepository: MovimentosCaixaRepository,
     private readonly vendasRepository: VendasRepository,
     private readonly sequenciasService: SequenciasService,
+    // Fase 55.2 — validar `formaPagamento` contra `configuracoes.formasPagamento`
+    // em movimentações manuais (`registrarMovimento`).
+    private readonly configuracoesRepository: ConfiguracoesRepository,
     @InjectModel(EventoCaixa.name) private readonly eventoModel: Model<EventoCaixaDocument>,
   ) {}
 
@@ -382,6 +387,13 @@ export class CaixasService {
     const caixa = await this.caixasRepository.encontrarPorIdOuFalhar(caixaId);
     this.exigirAberto(caixa);
 
+    // Fase 55.2 — antes de qualquer gravação: toda movimentação manual
+    // introduz um vínculo novo com a forma de pagamento informada (nunca um
+    // valor histórico herdado, diferente de `registrarMovimentoDeVenda`, que
+    // só repassa uma forma já validada pelo fluxo de Vendas — ver seção 6.3
+    // do relatório da Fase 55.2).
+    await this.validarFormaPagamentoCadastrada(dto.formaPagamento);
+
     const valor = arredondar(dto.valor);
     const motivo = tipo === "sangria" ? (dto as SaidaCaixaDto).motivo.trim() : null;
 
@@ -511,6 +523,29 @@ export class CaixasService {
   private exigirAberto(caixa: CaixaDocument): void {
     if (caixa.status === "fechado") {
       throw ApiException.validation("Este caixa está fechado e é imutável. Registre o ajuste em um novo caixa.");
+    }
+  }
+
+  /**
+   * Fase 55.2 — mesmo papel/mesma mensagem de
+   * `VendasService.validarFormaPagamentoCadastrada` (ver lá a justificativa
+   * de não compartilhar a implementação entre os dois serviços — mesmo
+   * princípio já aplicado a `validarCorCadastrada`/`validarTamanhoCadastrado`/
+   * `validarCategoriaCadastrada`, nunca unificadas numa função genérica
+   * única). Usada SÓ por `registrarMovimento` (entrada/saída manual) — nunca
+   * por `registrarMovimentoDeVenda`, que sempre repassa uma forma já
+   * validada pelo fluxo de Vendas (confirmado pelos 4 chamadores reais em
+   * `VendasService`, todos usando `pagamento.forma`/`atual.formaPagamento`
+   * de um documento já persistido).
+   */
+  private async validarFormaPagamentoCadastrada(forma: string): Promise<void> {
+    const configuracao = await this.configuracoesRepository.obter();
+    const formaNormalizada = normalizarFormaPagamento(forma);
+    const existe = configuracao.formasPagamento.some((item) => normalizarFormaPagamento(item) === formaNormalizada);
+    if (!existe) {
+      const mensagem =
+        "Esta forma de pagamento não está cadastrada nas configurações da loja. Cadastre a forma de pagamento antes de utilizá-la em uma operação financeira.";
+      throw ApiException.validation(mensagem, [{ field: "formaPagamento", message: mensagem }]);
     }
   }
 

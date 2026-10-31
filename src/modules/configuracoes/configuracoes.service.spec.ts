@@ -1,16 +1,52 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { JwtModule } from "@nestjs/jwt";
-import { getConnectionToken } from "@nestjs/mongoose";
+import { getConnectionToken, getModelToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import type { Connection } from "mongoose";
+import { Types, type Connection, type Model } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
+import { MovimentoCaixa, type MovimentoCaixaDocument } from "../caixas/schemas/movimento-caixa.schema.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
+import { Venda, type VendaDocument } from "../vendas/schemas/venda.schema.js";
 import { ConfiguracoesModule } from "./configuracoes.module.js";
 import { ConfiguracoesService } from "./configuracoes.service.js";
 import type { AtualizarLojaDto } from "./dto/atualizar-loja.dto.js";
+
+let contadorVenda = 0;
+/** Documento MÍNIMO válido de Venda, inserido via o próprio Model do Mongoose (defaults do schema aplicados) — usado SÓ para testar os vínculos de forma de pagamento, nunca para exercitar regra de negócio de Vendas (isso é feito em `vendas.service.spec.ts`). */
+function dadosVendaMinima(extra: Partial<Venda> = {}): Partial<Venda> {
+  contadorVenda += 1;
+  const sufixo = `${Date.now()}-${contadorVenda}`;
+  return {
+    codigo: `VENDA-CONFIG-TESTE-${sufixo}`,
+    numero: `9${String(contadorVenda).padStart(5, "0")}`,
+    dataVenda: new Date(),
+    clienteNome: "Consumidor final",
+    vendedorId: "000000000000000000000001",
+    vendedorNome: "Vendedora Teste",
+    totalItens: 1,
+    valorBruto: 100,
+    valorFinal: 100,
+    formaPagamento: "SemVinculoFormaPagamento",
+    ...extra,
+  } as Partial<Venda>;
+}
+
+function dadosMovimentoMinimo(extra: Partial<MovimentoCaixa> = {}): Partial<MovimentoCaixa> {
+  return {
+    caixaId: new Types.ObjectId(),
+    dataHora: new Date(),
+    tipo: "injecao",
+    origem: "manual",
+    descricao: "Movimento de teste (vínculo de forma de pagamento)",
+    formaPagamento: "SemVinculoFormaPagamento",
+    valor: 10,
+    sentido: "entrada",
+    ...extra,
+  } as Partial<MovimentoCaixa>;
+}
 
 function payloadProduto(sufixo: string, extra: Partial<CriarProdutoDto> = {}): CriarProdutoDto {
   return {
@@ -54,6 +90,8 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
   let service: ConfiguracoesService;
   let produtosService: ProdutosService;
   let connection: Connection;
+  let vendaModel: Model<VendaDocument>;
+  let movimentoModel: Model<MovimentoCaixaDocument>;
 
   beforeAll(async () => {
     moduleRef = await Test.createTestingModule({
@@ -65,12 +103,22 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
     // produtos/variantes de teste da seção de vínculo.
     produtosService = moduleRef.get(ProdutosService);
     connection = moduleRef.get(getConnectionToken());
+    // Fase 55.2 — `ConfiguracoesModule` registra os próprios bindings dos
+    // models `Venda`/`MovimentoCaixa` (ver o módulo) só para a checagem de
+    // vínculo; reaproveitados aqui para montar os documentos mínimos de
+    // teste da seção de formaPagamento, sem precisar importar
+    // `VendasModule`/`CaixasModule` completos (que arrastariam Produtos/
+    // Clientes/Vendedores/Adquirentes só para inserir um documento simples).
+    vendaModel = moduleRef.get(getModelToken(Venda.name));
+    movimentoModel = moduleRef.get(getModelToken(MovimentoCaixa.name));
   });
 
   afterAll(async () => {
     await connection.collection("configuracoes").deleteMany({});
     await connection.collection("eventos_configuracao").deleteMany({ usuarioId: { $in: [USUARIO_ID, USUARIO_AUDITORIA_ID] } });
     await connection.collection("produtos").deleteMany({ nome: /^Produto Config Teste / });
+    await connection.collection("vendas").deleteMany({ codigo: /^VENDA-CONFIG-TESTE-/ });
+    await connection.collection("movimentos_caixa").deleteMany({ descricao: "Movimento de teste (vínculo de forma de pagamento)" });
     await moduleRef.close();
   });
 
@@ -643,6 +691,218 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
 
       // E a unicidade case-insensitive passa a valer também para o valor legado.
       await expect(service.adicionarItem("categorias", chave.toUpperCase(), USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+  });
+
+  describe("forma de pagamento: unicidade, proteção de exclusão e campo-espelho (Fase 55.2)", () => {
+    it("cadastra uma forma de pagamento normalmente", async () => {
+      const chave = `Vale-${Date.now()}`;
+      const resultado = await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+      expect(resultado.formasPagamento).toContain(chave);
+    });
+
+    it("rejeita cadastrar a mesma forma em minúsculas", async () => {
+      const chave = `Transferencia-${Date.now()}`;
+      await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+      await expect(service.adicionarItem("formasPagamento", chave.toLowerCase(), USUARIO_ID)).rejects.toThrow(ApiException);
+
+      const final = await service.obter();
+      expect(final.formasPagamento).toContain(chave);
+      expect(final.formasPagamento).not.toContain(chave.toLowerCase());
+    });
+
+    it("rejeita cadastrar a mesma forma em MAIÚSCULAS", async () => {
+      const chave = `Cheque-${Date.now()}`;
+      await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+      await expect(service.adicionarItem("formasPagamento", chave.toUpperCase(), USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+
+    it("rejeita cadastrar a mesma forma com acentuação diferente ('Débito Á vista' vs 'Debito A vista')", async () => {
+      const chave = `DebitoAVista-${Date.now()}-Á`;
+      await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+      const semAcento = chave.replace("Á", "A");
+      await expect(service.adicionarItem("formasPagamento", semAcento, USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+
+    it("rejeita cadastrar a mesma forma com espaços periféricos excedentes", async () => {
+      const chave = `Fiado-${Date.now()}`;
+      await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+      await expect(service.adicionarItem("formasPagamento", `   ${chave}   `, USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+
+    it("exclusão de forma de pagamento sem vínculo funciona normalmente", async () => {
+      const chave = `SemVinculoForma-${Date.now()}`;
+      await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+      const resultado = await service.removerItem("formasPagamento", chave, USUARIO_ID);
+      expect(resultado.formasPagamento).not.toContain(chave);
+    });
+
+    it("o campo-espelho 'formasPagamentoNormalizadas' nunca é exposto na serialização pública", async () => {
+      const chave = `EspelhoFormaInterno-${Date.now()}`;
+      await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+      const documento = await service.obter();
+      const serializado = documento.toJSON() as Record<string, unknown>;
+      expect(Object.keys(serializado).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "tamanhos"].sort());
+      expect(serializado["formasPagamentoNormalizadas"]).toBeUndefined();
+    });
+
+    it("autocorrige (idempotente, aditivo) um documento antigo sem o campo-espelho 'formasPagamentoNormalizadas'", async () => {
+      const chave = `LegadoFormaSemEspelho-${Date.now()}`;
+      await connection.collection("configuracoes").updateOne({ _id: "global" }, { $addToSet: { formasPagamento: chave } });
+      const antes = await connection.collection("configuracoes").findOne({ _id: "global" });
+      expect((antes?.["formasPagamentoNormalizadas"] as string[] | undefined) ?? []).not.toContain(chave.toLowerCase());
+
+      await service.adicionarItem("formasPagamento", `GatilhoForma-${Date.now()}`, USUARIO_ID);
+
+      const depois = await connection.collection("configuracoes").findOne({ _id: "global" });
+      expect(depois?.["formasPagamentoNormalizadas"] as string[]).toContain(chave.toLowerCase());
+      await expect(service.adicionarItem("formasPagamento", chave.toUpperCase(), USUARIO_ID)).rejects.toThrow(ApiException);
+    });
+
+    describe("bloqueio com vínculo histórico (vendas e movimentos de caixa)", () => {
+      // Mesmo motivo do describe "proteção contra exclusão com vínculo" (cor)
+      // e do describe de categoria acima: o describe "singleton" apaga o
+      // documento inteiro de `configuracoes` mid-suite.
+      beforeEach(async () => {
+        await garantirItemConfiguracao(service, "formasPagamento", "Pix-Base");
+      });
+
+      it("bloqueia a exclusão de forma vinculada a 'vendas.formaPagamento' (campo raiz), com a mensagem de negócio exata, e preserva os dados", async () => {
+        const chave = `VendaRaiz-${Date.now()}`;
+        await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+        const venda = await vendaModel.create(dadosVendaMinima({ formaPagamento: chave }));
+
+        await expect(service.removerItem("formasPagamento", chave, USUARIO_ID)).rejects.toThrow(
+          "Não foi possível excluir esta forma de pagamento porque existem vendas ou movimentações financeiras vinculadas a ela. Verifique os vínculos antes de tentar novamente.",
+        );
+
+        const final = await service.obter();
+        expect(final.formasPagamento).toContain(chave); // nada foi modificado
+        const vendaBruta = await connection.collection("vendas").findOne({ _id: venda._id });
+        expect(vendaBruta?.["formaPagamento"]).toBe(chave);
+      });
+
+      it("bloqueia a exclusão de forma vinculada a 'vendas.pagamentos[].forma'", async () => {
+        const chave = `PagamentoArray-${Date.now()}`;
+        await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+        await vendaModel.create(
+          dadosVendaMinima({
+            formaPagamento: "Pix-Base",
+            pagamentos: [{ forma: chave, valor: 100, dataPagamento: new Date(), parcelas: 1 } as never],
+          }),
+        );
+
+        await expect(service.removerItem("formasPagamento", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+      });
+
+      it("bloqueia a exclusão de forma vinculada a 'vendas.parcelas[].formaPagamento'", async () => {
+        const chave = `ParcelaArray-${Date.now()}`;
+        await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+        await vendaModel.create(
+          dadosVendaMinima({
+            formaPagamento: "Pix-Base",
+            parcelas: [{ numero: 1, total: 1, valor: 100, vencimento: new Date(), pagoEm: new Date(), formaPagamento: chave } as never],
+          }),
+        );
+
+        await expect(service.removerItem("formasPagamento", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+      });
+
+      it("bloqueia a exclusão de forma vinculada a 'movimentos_caixa.formaPagamento'", async () => {
+        const chave = `MovimentoCaixa-${Date.now()}`;
+        await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+        await movimentoModel.create(dadosMovimentoMinimo({ formaPagamento: chave }));
+
+        await expect(service.removerItem("formasPagamento", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+      });
+
+      it("bloqueia a exclusão mesmo quando a venda está CANCELADA — venda cancelada também é histórico", async () => {
+        const chave = `VendaCancelada-${Date.now()}`;
+        await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+        await vendaModel.create(dadosVendaMinima({ formaPagamento: chave, status: "cancelada" }));
+
+        await expect(service.removerItem("formasPagamento", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+      });
+
+      it("bloqueia a exclusão mesmo quando o movimento pertence a um caixa já FECHADO — não há exclusão lógica para ignorar histórico", async () => {
+        const chave = `CaixaFechado-${Date.now()}`;
+        await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+        // `MovimentoCaixa` nunca referencia o status do Caixa (é histórico
+        // imutável por natureza, independente do caixa estar aberto ou
+        // fechado) — `caixaId` aqui aponta para um ObjectId que não
+        // corresponde a nenhum documento de `caixas`, de propósito: a
+        // checagem de vínculo nunca precisa (nem deve) resolver o Caixa para
+        // decidir se bloqueia a exclusão.
+        await movimentoModel.create(dadosMovimentoMinimo({ formaPagamento: chave, caixaId: new Types.ObjectId() }));
+
+        await expect(service.removerItem("formasPagamento", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+      });
+
+      it("reconhece vínculo mesmo com grafia diferente (caixa/acento/espaços) do valor cadastrado", async () => {
+        const chave = `  Crediario-${Date.now()}  `;
+        const chaveLimpa = chave.trim();
+        await service.adicionarItem("formasPagamento", chaveLimpa, USUARIO_ID);
+        await vendaModel.create(dadosVendaMinima({ formaPagamento: chaveLimpa.toUpperCase() }));
+
+        await expect(service.removerItem("formasPagamento", chaveLimpa, USUARIO_ID)).rejects.toThrow(ApiException);
+      });
+
+      it("uma tentativa de exclusão bloqueada não altera a venda vinculada", async () => {
+        const chave = `PreservaVenda-${Date.now()}`;
+        await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+        const venda = await vendaModel.create(dadosVendaMinima({ formaPagamento: chave }));
+
+        await expect(service.removerItem("formasPagamento", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+
+        const vendaFinal = await connection.collection("vendas").findOne({ _id: venda._id });
+        expect(vendaFinal?.["formaPagamento"]).toBe(chave);
+        expect(vendaFinal?.["status"]).toBe(venda.status);
+      });
+
+      it("depois que a venda vinculada é removida (compensação de teste), a exclusão da forma passa a funcionar", async () => {
+        const chave = `LiberaDepois-${Date.now()}`;
+        await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+        const venda = await vendaModel.create(dadosVendaMinima({ formaPagamento: chave }));
+
+        await expect(service.removerItem("formasPagamento", chave, USUARIO_ID)).rejects.toThrow(ApiException);
+
+        // Não existe exclusão lógica de venda no domínio real (decisão da
+        // Fase 55.2) — este `deleteOne` é só para provar, isoladamente, que
+        // `existeVinculo` reflete corretamente a AUSÊNCIA de vínculo quando
+        // ele de fato não existe mais, nunca para simular um fluxo de
+        // produção real.
+        await vendaModel.deleteOne({ _id: venda._id });
+        const resultado = await service.removerItem("formasPagamento", chave, USUARIO_ID);
+        expect(resultado.formasPagamento).not.toContain(chave);
+      });
+
+      it(
+        "concorrência real: excluir a forma e criar uma venda que a usa ao mesmo tempo nunca deixa a " +
+          "configuração inconsistente — ou a forma continua presente E a venda existe, ou a forma foi " +
+          "removida E nenhuma venda a usa",
+        async () => {
+          const chave = `ConcorrenciaForma-${Date.now()}`;
+          await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+
+          const [resultadoRemocao, resultadoCriacao] = await Promise.allSettled([
+            service.removerItem("formasPagamento", chave, USUARIO_ID),
+            vendaModel.create(dadosVendaMinima({ formaPagamento: chave })),
+          ]);
+
+          const final = await service.obter();
+          const formaPresente = final.formasPagamento.includes(chave);
+
+          if (resultadoRemocao.status === "fulfilled") {
+            expect(formaPresente).toBe(false);
+          }
+          if (resultadoCriacao.status === "fulfilled") {
+            // A venda foi persistida a tempo de ser vista (na checagem prévia
+            // OU na reconferência pós-remoção, com compensação): a forma
+            // nunca fica ausente enquanto uma venda ainda a referencia.
+            expect(formaPresente).toBe(true);
+          }
+        },
+      );
     });
   });
 });

@@ -66,10 +66,14 @@ export const DadosLojaSubSchema = SchemaFactory.createForClass(DadosLojaSub);
  * nesta coleção, sem precisar de um índice extra nem de uma checagem
  * "existe outro?" antes de criar.
  *
- * `categorias`, assim como `cores`/`tamanhos` desde a Fase 54.0/55.1, TEM
- * enforcement contra `Produto.categoria` (unicidade case-insensitive +
- * proteção de exclusão em uso) — só `formasPagamento` permanece
- * deliberadamente sem enforcement (fora do escopo desta fase).
+ * As quatro listas TÊM enforcement (unicidade case-insensitive + proteção de
+ * exclusão em uso): `cores`/`tamanhos` desde a Fase 54.0 contra
+ * `Variante.cor`/`Variante.tamanho`; `categorias` desde a Fase 55.1 contra
+ * `Produto.categoria`; `formasPagamento` desde a Fase 55.2 contra
+ * `Venda.formaPagamento`/`pagamentos[].forma`/`parcelas[].formaPagamento` e
+ * `MovimentoCaixa.formaPagamento` — nunca contra `modalidade` (classificação
+ * técnica fechada, independente desta configuração; ver
+ * `docs/configuracoes-cores-tamanhos.md`).
  */
 @Schema({ collection: "configuracoes", versionKey: false, timestamps: { createdAt: "criadoEm", updatedAt: "atualizadoEm" } })
 export class Configuracao {
@@ -115,6 +119,16 @@ export class Configuracao {
 
   @Prop({ type: [String], default: [] })
   formasPagamento!: string[];
+
+  /**
+   * Fase 55.2 — espelho de `formasPagamento` só com a forma normalizada
+   * (`normalizarFormaPagamento`), mesmo papel de `tamanhosNormalizados`/
+   * `coresNormalizadas`/`categoriasNormalizadas`: permite a checagem de
+   * unicidade case-insensitive de forma atômica — nunca exposto na API (fora
+   * da lista explícita de `aplicarSerializacaoDeConfiguracao`).
+   */
+  @Prop({ type: [String], default: [] })
+  formasPagamentoNormalizadas!: string[];
 
   criadoEm!: Date;
   atualizadoEm!: Date;
