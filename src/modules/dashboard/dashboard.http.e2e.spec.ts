@@ -76,7 +76,7 @@ describe("HTTP — Dashboard (integração — servidor real)", () => {
     accessToken = login.accessToken;
   });
 
-  afterAll(async () => {
+  async function limparDadosDeDominio(): Promise<void> {
     await connection.collection("vendas").deleteMany({});
     await connection.collection("eventos_venda").deleteMany({});
     await connection.collection("produtos").deleteMany({});
@@ -90,7 +90,12 @@ describe("HTTP — Dashboard (integração — servidor real)", () => {
     await connection.collection("caixas").deleteMany({});
     await connection.collection("movimentos_caixa").deleteMany({});
     await connection.collection("eventos_caixa").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "fornecedor", "caixa", "usuario"] } });
+    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "fornecedor", "caixa"] } });
+  }
+
+  afterAll(async () => {
+    await limparDadosDeDominio();
+    await connection.collection("sequencias").deleteMany({ _id: "usuario" });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});
@@ -152,6 +157,12 @@ describe("HTTP — Dashboard (integração — servidor real)", () => {
         null,
       );
       await caixasService.fechar(caixa.id, { valorInformado: 500 + valorVenda }, null);
+    });
+
+    // Fase 55.4 — o grupo remove o que semeou: com `--randomize`, o teste
+    // "banco vazio" (fora deste grupo) podia rodar depois dele e ver estes dados.
+    afterAll(async () => {
+      await limparDadosDeDominio();
     });
 
     it("GET /api/v1/dashboard/resumo reflete a venda, o estoque, o cliente, o fornecedor e o vendedor seedados", async () => {

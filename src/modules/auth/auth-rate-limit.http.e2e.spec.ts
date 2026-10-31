@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { ValidationPipe } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { getConnectionToken } from "@nestjs/mongoose";
@@ -20,25 +20,28 @@ import { AuthService } from "./auth.service.js";
  * throttle em memória — as chamadas desta suíte nunca afetam nem são
  * afetadas pelas de outro arquivo.
  *
- * As contagens abaixo são cumulativas de propósito (todos os `it()` deste
- * describe compartilham o MESMO balde de throttle — mesma rota, mesmo IP
- * 127.0.0.1): projetadas para nunca ultrapassar `AUTH_LOGIN_THROTTLE_LIMITE`
- * até o ponto em que o excesso é intencional. Ver o cenário de reset de
- * janela genérico em `app-throttler.guard.http.e2e.spec.ts` — não repetido
- * aqui (janela de produção é 10s; esperar isso aqui só deixaria a suíte mais
- * lenta sem provar nada além do que o mecanismo isolado já prova).
+ * Fase 55.4 — cada `it()` sobe sua PRÓPRIA instância do app (`beforeEach`):
+ * o balde de throttle (mesma rota, mesmo IP 127.0.0.1) vive no
+ * `ThrottlerStorageService` em memória de cada instância, então todo teste
+ * começa com o balde zerado e nunca depende da contagem deixada por outro
+ * (antes as contagens eram cumulativas entre os `it()` e quebravam com
+ * `--randomize`). `app.close()` cancela os timers de expiração do storage.
+ * Ver o cenário de reset de janela genérico em
+ * `app-throttler.guard.http.e2e.spec.ts` — não repetido aqui (janela de
+ * produção é 10s; esperar isso aqui só deixaria a suíte mais lenta sem
+ * provar nada além do que o mecanismo isolado já prova).
  */
 describe("HTTP — Auth: rate limiting de POST /auth/login (Etapa 24)", () => {
   let app: NestExpressApplication;
   let baseUrl: string;
   let connection: Connection;
-  let email: string;
+  const email = `teste.http.auth-rate-limit.${Date.now()}@mariela.dev`;
 
   function jsonHeaders(): Record<string, string> {
     return { "content-type": "application/json" };
   }
 
-  beforeAll(async () => {
+  beforeEach(async () => {
     process.env["MONGODB_URI"] = MONGODB_URI_TESTE;
     app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: false });
 
@@ -56,11 +59,10 @@ describe("HTTP — Auth: rate limiting de POST /auth/login (Etapa 24)", () => {
     connection = app.get(getConnectionToken());
 
     const authService = app.get(AuthService);
-    email = `teste.http.auth-rate-limit.${Date.now()}@mariela.dev`;
     await authService.criarAdminSeed({ nome: "Rate Limit Auth", email, senha: "senha-forte-123" });
   });
 
-  afterAll(async () => {
+  afterEach(async () => {
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});
@@ -107,24 +109,29 @@ describe("HTTP — Auth: rate limiting de POST /auth/login (Etapa 24)", () => {
     }
   });
 
-  it(`a requisição que ultrapassa o limite (${AUTH_LOGIN_THROTTLE_LIMITE} por janela) retorna 429`, async () => {
-    // Cumulativo: 3 + 3 já enviadas acima = 6. Faltam 4 para completar o
-    // limite de ${AUTH_LOGIN_THROTTLE_LIMITE} (todas ainda devem funcionar,
-    // 401), e a próxima (a 11ª no total) deve ser bloqueada.
-    const faltamParaOLimite = AUTH_LOGIN_THROTTLE_LIMITE - 6;
-    for (let indice = 0; indice < faltamParaOLimite; indice += 1) {
+  /** Balde zerado (app novo): as `AUTH_LOGIN_THROTTLE_LIMITE` primeiras passam (401), a seguinte é bloqueada (429). */
+  async function esgotarBaldeDeLogin(): Promise<Response> {
+    for (let indice = 0; indice < AUTH_LOGIN_THROTTLE_LIMITE; indice += 1) {
       const resposta = await tentarLoginComSenhaErrada();
       expect(resposta.status).toBe(401);
     }
-
     const bloqueada = await tentarLoginComSenhaErrada();
     expect(bloqueada.status).toBe(429);
+    return bloqueada;
+  }
+
+  it(`a requisição que ultrapassa o limite (${AUTH_LOGIN_THROTTLE_LIMITE} por janela) retorna 429`, async () => {
+    // A partir do balde zerado deste teste: ${AUTH_LOGIN_THROTTLE_LIMITE}
+    // tentativas ainda funcionam (401) e a próxima (a 11ª) é bloqueada.
+    const bloqueada = await esgotarBaldeDeLogin();
     const corpo = (await bloqueada.json()) as { statusCode: number; code: string; message: string };
     expect(corpo.statusCode).toBe(429);
     expect(corpo.code).toBe("TOO_MANY_REQUESTS");
   });
 
   it("regressão: com o balde de /auth/login esgotado, outra rota (JWT/roles) continua funcionando normalmente", async () => {
+    await esgotarBaldeDeLogin();
+
     // Prova que o throttle é POR ROTA (`AuthController-login-default`), não
     // um bloqueio geral do IP: mesmo com /auth/login bloqueada acima, um
     // login via SERVICE direto (não passa pela rota throttled) + GET /auth/me

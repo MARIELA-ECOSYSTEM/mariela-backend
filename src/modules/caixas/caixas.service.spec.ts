@@ -578,10 +578,18 @@ describe("CaixasService (integração — MongoDB real)", () => {
       const caixaMaior = await service.abrir({ valorInicial: 500 }, null);
       await service.fechar(caixaMaior.id, { valorInformado: 500 }, null);
 
-      const desc = await service.listar(
-        queryCaixasPadrao({ busca: undefined, ordenarPor: "saldo", ordem: "desc", status: ["fechado"], limit: 100 }),
-      );
-      const codigos = desc.data.map((item) => item.codigo);
+      // Fase 55.4 — percorre TODAS as páginas: com `--randomize`, outros testes
+      // deste arquivo já podiam ter fechado caixas suficientes para empurrar o
+      // de saldo 50 para fora da primeira página (indexOf === -1).
+      const codigos: string[] = [];
+      for (let page = 1, totalPages = 1; page <= totalPages; page += 1) {
+        const desc = await service.listar(
+          queryCaixasPadrao({ busca: undefined, ordenarPor: "saldo", ordem: "desc", status: ["fechado"], page, limit: 100 }),
+        );
+        codigos.push(...desc.data.map((item) => item.codigo));
+        totalPages = desc.meta.totalPages ?? page;
+      }
+      expect(codigos.indexOf(caixaMenor.codigo)).toBeGreaterThan(-1);
       expect(codigos.indexOf(caixaMaior.codigo)).toBeLessThan(codigos.indexOf(caixaMenor.codigo));
     });
   });

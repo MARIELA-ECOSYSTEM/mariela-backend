@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { ValidationPipe } from "@nestjs/common";
 import { getConnectionToken } from "@nestjs/mongoose";
 import type { NestExpressApplication } from "@nestjs/platform-express";
@@ -26,6 +26,11 @@ import type { StatusWhatsapp } from "./whatsapp.types.js";
  * de forma direta, não apenas inferida por status HTTP, que o provider NUNCA
  * é chamado quando a requisição é bloqueada pelo guard (que roda ANTES do
  * handler/service, por garantia do próprio Nest).
+ *
+ * Fase 55.4 — um app (e um dublê) por `it()` (`beforeEach`): balde de
+ * throttle zerado em cada teste, mesmo racional de
+ * `auth-rate-limit.http.e2e.spec.ts`. Quem precisa do balde esgotado o
+ * esgota no próprio teste.
  */
 class WhatsappProviderDeTeste implements WhatsappProvider {
   chamadasEnviarTexto: { telefone: string; mensagem: string }[] = [];
@@ -63,7 +68,7 @@ describe("HTTP — WhatsApp: rate limiting de POST /integracoes/whatsapp/mensage
     return { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) };
   }
 
-  beforeAll(async () => {
+  beforeEach(async () => {
     process.env["MONGODB_URI"] = MONGODB_URI_TESTE;
     providerDeTeste = new WhatsappProviderDeTeste();
 
@@ -97,7 +102,7 @@ describe("HTTP — WhatsApp: rate limiting de POST /integracoes/whatsapp/mensage
     clienteId = cliente.id;
   });
 
-  afterAll(async () => {
+  afterEach(async () => {
     await connection.collection("clientes").deleteMany({});
     await connection.collection("eventos_cliente").deleteMany({});
     await connection.collection("sequencias").deleteMany({ _id: { $in: ["cliente", "usuario"] } });
@@ -122,27 +127,33 @@ describe("HTTP — WhatsApp: rate limiting de POST /integracoes/whatsapp/mensage
     expect(providerDeTeste.chamadasEnviarTexto.length).toBe(chamadasAntes + 1);
   });
 
-  it(`o limite (${WHATSAPP_SEND_THROTTLE_LIMITE} por janela) é respeitado: excesso retorna 429`, async () => {
-    // 1 chamada já feita acima. Completa até o limite (todas devem
-    // funcionar), depois a próxima deve ser bloqueada.
-    const faltamParaOLimite = WHATSAPP_SEND_THROTTLE_LIMITE - 1;
-    for (let indice = 0; indice < faltamParaOLimite; indice += 1) {
+  /** Balde zerado (app novo): as `WHATSAPP_SEND_THROTTLE_LIMITE` primeiras chegam ao provider (200), a seguinte é bloqueada (429). */
+  async function esgotarBaldeDeEnvio(): Promise<Response> {
+    for (let indice = 0; indice < WHATSAPP_SEND_THROTTLE_LIMITE; indice += 1) {
       const resposta = await enviarMensagem();
       expect(resposta.status).toBe(200);
     }
-
+    expect(providerDeTeste.chamadasEnviarTexto.length).toBe(WHATSAPP_SEND_THROTTLE_LIMITE);
     const bloqueada = await enviarMensagem();
     expect(bloqueada.status).toBe(429);
+    return bloqueada;
+  }
+
+  it(`o limite (${WHATSAPP_SEND_THROTTLE_LIMITE} por janela) é respeitado: excesso retorna 429`, async () => {
+    // A partir do balde zerado deste teste: completa o limite (todas devem
+    // funcionar), depois a próxima deve ser bloqueada.
+    const bloqueada = await esgotarBaldeDeEnvio();
     const corpo = (await bloqueada.json()) as { statusCode: number; code: string };
     expect(corpo.statusCode).toBe(429);
     expect(corpo.code).toBe("TOO_MANY_REQUESTS");
   });
 
   it("o provider NÃO é chamado quando a requisição é bloqueada pelo rate limit", async () => {
+    await esgotarBaldeDeEnvio();
     const chamadasAntesDoBloqueio = providerDeTeste.chamadasEnviarTexto.length;
 
-    // Neste ponto o balde já está no limite (teste anterior) — qualquer nova
-    // chamada deve ser bloqueada SEM incrementar o contador do dublê.
+    // Balde esgotado acima — qualquer nova chamada deve ser bloqueada SEM
+    // incrementar o contador do dublê.
     const bloqueada = await enviarMensagem();
     expect(bloqueada.status).toBe(429);
     expect(providerDeTeste.chamadasEnviarTexto.length).toBe(chamadasAntesDoBloqueio);
@@ -155,6 +166,8 @@ describe("HTTP — WhatsApp: rate limiting de POST /integracoes/whatsapp/mensage
   });
 
   it("regressão: com o balde de envio esgotado, outra rota do módulo (status) continua funcionando normalmente", async () => {
+    await esgotarBaldeDeEnvio();
+
     const resposta = await fetch(`${baseUrl}/api/v1/integracoes/whatsapp/status`, {
       headers: jsonHeaders(adminAccessToken),
     });

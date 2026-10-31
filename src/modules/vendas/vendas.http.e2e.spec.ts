@@ -37,7 +37,6 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
   let vendaId: string;
   let vendaCodigo: string;
   let parcelaId: string;
-  let caixaId: string;
   let contadorTelefone = 0;
   let produtosService: ProdutosService;
   let vendedoresService: VendedoresService;
@@ -138,7 +137,6 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     // exige clienteId desde a Etapa 10.7 (venda fiada nunca para Consumidor final).
     const cliente = await clientesService.criar({ nome: "Cliente HTTP Vendas", telefone: telefoneUnico() }, null);
     const caixa = await caixasService.abrir({ valorInicial: 500, observacao: "" }, null);
-    caixaId = caixa.id;
 
     const venda = await vendasService.criar(
       {
@@ -235,8 +233,28 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     expect(resposta.status).toBe(404);
   });
 
+  // Fase 55.4 — os testes que ALTERAM uma venda (baixa, cancelamento) ou
+  // dependem de um estado específico dela criam a própria venda, em vez de
+  // mutar a seedada em `beforeAll` — com `--randomize` a ordem entre eles
+  // mudava e cada um via um estado diferente. A venda seedada nunca é
+  // alterada (continua `em_pagamento`). O caixa aberto é compartilhado entre
+  // os testes: valores medidos como diferença antes/depois (mesmo padrão dos
+  // demais testes de caixa deste arquivo).
+  async function totaisDoCaixa(id: string): Promise<{ totalVendas: number; recebimentos: number }> {
+    const detalheCaixa = await fetch(`${baseUrl}/api/v1/caixas/${id}`, { headers: authHeaders() });
+    const corpoCaixa = (await detalheCaixa.json()) as { data: { resumo: { totalVendas: number; recebimentos: number } } };
+    return corpoCaixa.data.resumo;
+  }
+
   it("POST /api/v1/vendas/:id/parcelas/:parcelaId/baixa quita a parcela e reflete no caixa", async () => {
-    const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/parcelas/${parcelaId}/baixa`, {
+    // O caixa aberto nem sempre é o seedado: o teste da Etapa 10.14 fecha o
+    // original e abre outro. Mede no caixa ATUAL, o mesmo que o helper usa.
+    const caixaAtual = await caixasService.obterAtual();
+    if (!caixaAtual) throw new Error("Nenhum caixa aberto — o seed de beforeAll deveria manter um aberto.");
+    const antesDaVenda = await totaisDoCaixa(caixaAtual.id);
+    const { venda, caixa } = await criarVendaFiadaViaHttpSetup(200, 100); // pago 100 no ato, parcela = 100
+    expect(caixa.id).toBe(caixaAtual.id);
+    const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/parcelas/${String(venda.parcelas[0]!._id)}/baixa`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ formaPagamento: "PIX", idempotencyKey: `baixa-parcela-http-${Date.now()}` }),
@@ -248,14 +266,22 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
 
     // Etapa 18.2 — a baixa de parcela é `tipo: "venda"` no Caixa (não existe
     // mais "recebimento" como categoria distinta), somada em `resumo.totalVendas`.
-    const detalheCaixa = await fetch(`${baseUrl}/api/v1/caixas/${caixaId}`, { headers: authHeaders() });
-    const corpoCaixa = (await detalheCaixa.json()) as { data: { resumo: { totalVendas: number; recebimentos: number } } };
-    expect(corpoCaixa.data.resumo.totalVendas).toBe(200); // 100 do ato + 100 da baixa da parcela
-    expect(corpoCaixa.data.resumo.recebimentos).toBe(0);
+    const depois = await totaisDoCaixa(caixaAtual.id);
+    expect(depois.totalVendas - antesDaVenda.totalVendas).toBe(200); // 100 do ato + 100 da baixa da parcela
+    expect(depois.recebimentos).toBe(0);
   });
 
   it("POST .../parcelas/:parcelaId/baixa numa parcela já paga retorna 400", async () => {
-    const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/parcelas/${parcelaId}/baixa`, {
+    const { venda } = await criarVendaFiadaViaHttpSetup(200, 100);
+    const urlBaixa = `${baseUrl}/api/v1/vendas/${venda.id}/parcelas/${String(venda.parcelas[0]!._id)}/baixa`;
+    const primeira = await fetch(urlBaixa, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ idempotencyKey: `baixa-parcela-http-primeira-${Date.now()}` }),
+    });
+    expect(primeira.status).toBe(201);
+
+    const resposta = await fetch(urlBaixa, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ idempotencyKey: `baixa-parcela-http-ja-paga-${Date.now()}` }),
@@ -328,7 +354,8 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
   });
 
   it("POST /api/v1/vendas/:id/cancelamento cancela a venda e devolve o estoque", async () => {
-    const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/cancelamento`, {
+    const { venda } = await criarVendaFiadaViaHttpSetup(200, 100);
+    const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ tipo: "integral", motivo: "Cancelamento de teste HTTP" }),
@@ -711,14 +738,21 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     });
 
     it("venda já CANCELADA continua rejeitando baixa de parcela (400) — mesma proteção já confirmada para recebimentos/cancelamento", async () => {
-      // Reutiliza a venda seedada em beforeAll: já foi baixada (linha ~207) e
-      // depois cancelada (linha ~296) mais cedo neste arquivo — permanece
-      // "cancelada" pelo resto da suíte.
-      const detalhe = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}`, { headers: authHeaders() });
+      // Fase 55.4 — venda própria, cancelada aqui (antes dependia de outros
+      // testes terem cancelado a venda seedada mais cedo no arquivo).
+      const { venda } = await criarVendaFiadaViaHttpSetup(200, 100);
+      const cancelamento = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ tipo: "integral", motivo: "Cancelamento para teste de baixa" }),
+      });
+      expect(cancelamento.status).toBe(201);
+
+      const detalhe = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}`, { headers: authHeaders() });
       const corpoDetalhe = (await detalhe.json()) as { data: { status: string } };
       expect(corpoDetalhe.data.status).toBe("cancelada");
 
-      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/parcelas/${parcelaId}/baixa`, {
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/parcelas/${String(venda.parcelas[0]!._id)}/baixa`, {
         method: "POST",
         headers: authHeaders(),
         body: JSON.stringify({}),

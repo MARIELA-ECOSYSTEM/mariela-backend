@@ -35,6 +35,29 @@ describe("HTTP — Caixas (integração — servidor real)", () => {
     await connection.collection("caixas").updateMany({ status: "aberto" }, { $set: { status: "fechado" } });
   }
 
+  /**
+   * Fase 55.4 — abre e fecha um caixa via HTTP e devolve seu código. Para os
+   * testes de consulta que antes dependiam de caixas criados por OUTROS
+   * testes do arquivo (com `--randomize` podiam rodar primeiro, sem nenhum).
+   */
+  async function abrirEFecharCaixaViaHttp(): Promise<string> {
+    await fecharTudoQueEstiverAberto();
+    const abertura = await fetch(`${baseUrl}/api/v1/caixas`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ valorInicial: 10 }),
+    });
+    expect(abertura.status).toBe(201);
+    const { data } = (await abertura.json()) as { data: { id: string; codigo: string } };
+    const fechamento = await fetch(`${baseUrl}/api/v1/caixas/${data.id}/fechamento`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ valorInformado: 10 }),
+    });
+    expect(fechamento.status).toBe(201);
+    return data.codigo;
+  }
+
   beforeAll(async () => {
     process.env["MONGODB_URI"] = MONGODB_URI_TESTE;
     app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: false });
@@ -310,8 +333,7 @@ describe("HTTP — Caixas (integração — servidor real)", () => {
   });
 
   it("GET /api/v1/caixas com paginação e busca encontra o caixa pelo código", async () => {
-    const caixas = await connection.collection("caixas").find().sort({ criadoEm: -1 }).limit(1).toArray();
-    const codigo = caixas[0]?.["codigo"] as string;
+    const codigo = await abrirEFecharCaixaViaHttp();
     const listagem = await fetch(`${baseUrl}/api/v1/caixas?busca=${encodeURIComponent(codigo)}&page=1&limit=20`, {
       headers: authHeaders(),
     });
@@ -327,6 +349,7 @@ describe("HTTP — Caixas (integração — servidor real)", () => {
   });
 
   it("GET /api/v1/caixas/estatisticas retorna as contagens agregadas", async () => {
+    await abrirEFecharCaixaViaHttp();
     const resposta = await fetch(`${baseUrl}/api/v1/caixas/estatisticas`, { headers: authHeaders() });
     const corpo = (await resposta.json()) as { data: { caixasFechados: number; recebimentosHoje: number } };
     expect(resposta.status).toBe(200);
@@ -376,6 +399,7 @@ describe("HTTP — Caixas (integração — servidor real)", () => {
     });
 
     it("array completo mantém o formato aninhado abertura/fechamento esperado pelo caixasApi.listar() do Backoffice", async () => {
+      await abrirEFecharCaixaViaHttp();
       const resposta = await fetch(`${baseUrl}/api/v1/caixas`, { headers: authHeaders() });
       const corpo = (await resposta.json()) as { data: Record<string, unknown>[] };
       const primeiro = corpo.data[0]!;

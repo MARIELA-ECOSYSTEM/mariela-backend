@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { ValidationPipe } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { getConnectionToken } from "@nestjs/mongoose";
@@ -25,6 +25,9 @@ import { PdvAuthService } from "./pdv-auth.service.js";
  * falhas por `IP+código` (5 falhas/15min) — reusar o mesmo vendedor
  * acabaria disparando aquele mecanismo antes do novo throttle por IP desta
  * etapa, misturando as duas camadas no mesmo teste.
+ *
+ * Fase 55.4 — um app por `it()` (`beforeEach`): balde de throttle zerado em
+ * cada teste, mesmo racional de `auth-rate-limit.http.e2e.spec.ts`.
  */
 describe("HTTP — PDV Auth: rate limiting de POST /pdv/auth/login (Etapa 24)", () => {
   let app: NestExpressApplication;
@@ -41,7 +44,7 @@ describe("HTTP — PDV Auth: rate limiting de POST /pdv/auth/login (Etapa 24)", 
     return `1199${String(contadorTelefone).padStart(6, "0")}`;
   }
 
-  beforeAll(async () => {
+  beforeEach(async () => {
     process.env["MONGODB_URI"] = MONGODB_URI_TESTE;
     app = await NestFactory.create<NestExpressApplication>(AppModule, { logger: false });
 
@@ -59,7 +62,7 @@ describe("HTTP — PDV Auth: rate limiting de POST /pdv/auth/login (Etapa 24)", 
     connection = app.get(getConnectionToken());
   });
 
-  afterAll(async () => {
+  afterEach(async () => {
     await connection.collection("vendedores").deleteMany({});
     await connection.collection("eventos_vendedor").deleteMany({});
     await connection.collection("vendedor_refresh_tokens").deleteMany({});
@@ -98,22 +101,47 @@ describe("HTTP — PDV Auth: rate limiting de POST /pdv/auth/login (Etapa 24)", 
     }
   });
 
-  it(`a requisição que ultrapassa o limite (${PDV_AUTH_LOGIN_THROTTLE_LIMITE} por janela) retorna 429`, async () => {
-    // Cumulativo: 3 + 3 já enviadas acima = 6.
-    const faltamParaOLimite = PDV_AUTH_LOGIN_THROTTLE_LIMITE - 6;
-    for (let indice = 0; indice < faltamParaOLimite; indice += 1) {
-      const resposta = await tentarLoginComSenhaErrada();
+  /**
+   * Balde zerado (app novo): as `PDV_AUTH_LOGIN_THROTTLE_LIMITE` primeiras
+   * passam (401), a seguinte é bloqueada (429). Os vendedores (um por
+   * tentativa, ver comentário do arquivo) são criados em paralelo antes —
+   * só as requisições HTTP precisam ser sequenciais para o throttle; criar
+   * 11 vendedores em série (hash de senha cada) deixava o teste a ~4s do
+   * timeout padrão de 5s.
+   */
+  async function esgotarBaldeDeLogin(): Promise<Response> {
+    const vendedoresService = app.get(VendedoresService);
+    const vendedores = await Promise.all(
+      Array.from({ length: PDV_AUTH_LOGIN_THROTTLE_LIMITE + 1 }, () =>
+        vendedoresService.criar({ nome: "Vendedora Rate Limit", telefone: telefoneUnico(), ativo: true, senha: "senha123" }, null),
+      ),
+    );
+    const tentar = (codigo: string) =>
+      fetch(`${baseUrl}/api/v1/pdv/auth/login`, {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify({ codigo, senha: "senha-errada" }),
+      });
+
+    for (const vendedor of vendedores.slice(0, PDV_AUTH_LOGIN_THROTTLE_LIMITE)) {
+      const resposta = await tentar(vendedor.codigo);
       expect(resposta.status).toBe(401);
     }
-
-    const bloqueada = await tentarLoginComSenhaErrada();
+    const bloqueada = await tentar(vendedores[PDV_AUTH_LOGIN_THROTTLE_LIMITE]!.codigo);
     expect(bloqueada.status).toBe(429);
+    return bloqueada;
+  }
+
+  it(`a requisição que ultrapassa o limite (${PDV_AUTH_LOGIN_THROTTLE_LIMITE} por janela) retorna 429`, async () => {
+    const bloqueada = await esgotarBaldeDeLogin();
     const corpo = (await bloqueada.json()) as { statusCode: number; code: string; message: string };
     expect(corpo.statusCode).toBe(429);
     expect(corpo.code).toBe("TOO_MANY_REQUESTS");
   });
 
   it("regressão: com o balde de /pdv/auth/login esgotado, outra rota (JWT do PDV) continua funcionando normalmente", async () => {
+    await esgotarBaldeDeLogin();
+
     const vendedoresService = app.get(VendedoresService);
     const pdvAuthService = app.get(PdvAuthService);
     const vendedor = await vendedoresService.criar(

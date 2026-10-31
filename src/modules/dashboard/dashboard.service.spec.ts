@@ -66,7 +66,7 @@ describe("DashboardService (integração — MongoDB real)", () => {
     await garantirItemConfiguracao(configuracoesService, "formasPagamento", "Dinheiro");
   });
 
-  afterAll(async () => {
+  async function limparDadosDeDominio(): Promise<void> {
     await connection.collection("vendas").deleteMany({});
     await connection.collection("eventos_venda").deleteMany({});
     await connection.collection("produtos").deleteMany({});
@@ -83,6 +83,10 @@ describe("DashboardService (integração — MongoDB real)", () => {
     await connection.collection("sequencias").deleteMany({
       _id: { $in: ["venda", "produto", "vendedor", "cliente", "fornecedor", "caixa"] },
     });
+  }
+
+  afterAll(async () => {
+    await limparDadosDeDominio();
     await moduleRef.close();
   });
 
@@ -144,6 +148,15 @@ describe("DashboardService (integração — MongoDB real)", () => {
   }
 
   describe("ausência de dados", () => {
+    // Fase 55.4 — os demais testes criam vendas/produtos/clientes e só limpam
+    // no `afterAll`; com `--randomize` este grupo podia rodar depois deles.
+    // Estabelece a própria pré-condição (banco vazio). Seguro: o Bun roda cada
+    // `describe` como unidade contígua, então só apaga dados de grupos já
+    // encerrados, e cada teste dos outros grupos cria seus próprios dados.
+    beforeAll(async () => {
+      await limparDadosDeDominio();
+    });
+
     it("com o banco de teste vazio, todos os indicadores nascem zerados sem divisão por zero", async () => {
       const resumo = await dashboardService.resumo();
       expect(resumo.demonstracao).toBe(false);
