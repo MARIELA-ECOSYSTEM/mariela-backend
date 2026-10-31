@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { JwtModule } from "@nestjs/jwt";
-import { getConnectionToken } from "@nestjs/mongoose";
+import { getConnectionToken, getModelToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import { Types, type Connection } from "mongoose";
+import { Types, type Connection, type Model } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
@@ -10,7 +10,10 @@ import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js"
 import type { ListarCaixasQueryDto } from "./dto/listar-caixas-query.dto.js";
 import type { ListarMovimentosQueryDto } from "./dto/listar-movimentos-query.dto.js";
 import { CaixasModule } from "./caixas.module.js";
+import { SENTIDO_POR_TIPO, type TipoMovimentacaoCaixa } from "./caixas.constants.js";
 import { CaixasService } from "./caixas.service.js";
+import { MovimentosCaixaRepository, ordenacaoPorDataHora } from "./movimentos-caixa.repository.js";
+import { MovimentoCaixa, type MovimentoCaixaDocument } from "./schemas/movimento-caixa.schema.js";
 
 const JWT_MODULO_DE_TESTE = JwtModule.register({
   global: true,
@@ -508,6 +511,167 @@ describe("CaixasService (integração — MongoDB real)", () => {
       expect(apenasSangrias.data).toHaveLength(1);
       expect(apenasSangrias.data[0]?.tipo).toBe("sangria");
       await fecharTudoQueEstiverAberto();
+    });
+  });
+
+  /**
+   * Fase 55.6 — empates de `dataHora` (resolução de milissegundo; uma venda
+   * com vários pagamentos grava vários movimentos em sequência). O serviço
+   * sempre grava `new Date()`, por isso a fixture insere direto pelo model
+   * (com validação do schema) para controlar `dataHora` e `_id`. Os `_id` são
+   * gerados em ordem crescente e inseridos numa permutação determinística NÃO
+   * monotônica (passo 7 módulo n): nem a ordem de inserção nem a física do
+   * índice coincidem com a de `_id` em nenhuma direção de varredura, então a
+   * ordem esperada só bate se o desempate for de fato por `_id`. (Inserir em
+   * ordem simplesmente invertida não serve: a varredura do índice nos dois
+   * sentidos reproduz a ordem de `_id` por coincidência.)
+   * Data no passado: não interfere nas estatísticas "do dia" de outros testes.
+   */
+  describe("ordenação determinística com empates de dataHora (Fase 55.6)", () => {
+    type Fixture = { caixaId: string; asc: string[]; tipoPorId: Map<string, TipoMovimentacaoCaixa> };
+
+    const TIPOS_FIXTURE: TipoMovimentacaoCaixa[] = ["injecao", "sangria", "venda", "cancelamento", "injecao"];
+
+    /** `grupos` instantes distintos × `porGrupo` movimentos com a MESMA `dataHora` em cada um. */
+    async function criarMovimentosEmpatados(grupos: number, porGrupo: number): Promise<Fixture> {
+      await fecharTudoQueEstiverAberto();
+      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      await fecharTudoQueEstiverAberto();
+
+      const movimentoModel = moduleRef.get<Model<MovimentoCaixaDocument>>(getModelToken(MovimentoCaixa.name));
+      const documentos: Record<string, unknown>[] = [];
+      for (let grupo = 0; grupo < grupos; grupo += 1) {
+        const dataHora = new Date(Date.UTC(2025, 0, 15, 12, 0, grupo));
+        for (let indice = 0; indice < porGrupo; indice += 1) {
+          const tipo = TIPOS_FIXTURE[(grupo * porGrupo + indice) % TIPOS_FIXTURE.length]!;
+          documentos.push({
+            _id: new Types.ObjectId(),
+            caixaId: new Types.ObjectId(caixa.id),
+            dataHora,
+            tipo,
+            origem: tipo === "venda" || tipo === "cancelamento" ? tipo : "manual",
+            descricao: `Empate ${grupo}-${indice}`,
+            formaPagamento: "Dinheiro",
+            valor: 1,
+            sentido: SENTIDO_POR_TIPO[tipo],
+          });
+        }
+      }
+      // Gerados em ordem crescente de `_id` (dentro de cada `dataHora`) = ordem `asc` esperada.
+      const asc = documentos.map((documento) => String(documento["_id"]));
+      const tipoPorId = new Map(documentos.map((documento) => [String(documento["_id"]), documento["tipo"] as TipoMovimentacaoCaixa]));
+      // Passo 7 é coprimo com os tamanhos usados (15 e 200), então percorre todos os índices.
+      const ordemDeInsercao = documentos.map((_, indice) => documentos[(indice * 7) % documentos.length]!);
+      expect(new Set(ordemDeInsercao).size).toBe(documentos.length);
+      await movimentoModel.insertMany(ordemDeInsercao); // `ordered` (padrão): grava na ordem do array
+      return { caixaId: caixa.id, asc, tipoPorId };
+    }
+
+    async function removerFixture(fixture: Fixture): Promise<void> {
+      await connection.collection("movimentos_caixa").deleteMany({ caixaId: new Types.ObjectId(fixture.caixaId) });
+    }
+
+    /** Percorre todas as páginas de `listarMovimentos` e devolve os ids na ordem recebida. */
+    async function paginarTudo(caixaId: string, extra: Partial<ListarMovimentosQueryDto>): Promise<string[]> {
+      const ids: string[] = [];
+      for (let page = 1, totalPages = 1; page <= totalPages; page += 1) {
+        const resultado = await service.listarMovimentos(caixaId, queryMovimentosPadrao({ ...extra, page }));
+        ids.push(...resultado.data.map((movimento) => String(movimento._id)));
+        totalPages = resultado.meta.totalPages ?? page;
+      }
+      return ids;
+    }
+
+    it("sem paginação: asc segue dataHora e, no empate, _id crescente; desc é exatamente o inverso", async () => {
+      const fixture = await criarMovimentosEmpatados(3, 5);
+      try {
+        const asc = await service.listarMovimentos(fixture.caixaId, queryMovimentosPadrao({ ordem: "asc" }), false);
+        expect(asc.data.map((movimento) => String(movimento._id))).toEqual(fixture.asc);
+
+        const desc = await service.listarMovimentos(fixture.caixaId, queryMovimentosPadrao({ ordem: "desc" }), false);
+        expect(desc.data.map((movimento) => String(movimento._id))).toEqual([...fixture.asc].reverse());
+      } finally {
+        await removerFixture(fixture);
+      }
+    });
+
+    it("paginado sem filtro de tipo: empates na fronteira entre páginas nunca duplicam nem omitem registros", async () => {
+      const fixture = await criarMovimentosEmpatados(3, 5); // grupos de 5 empatados
+      try {
+        // limit 2/4/7 cortam DENTRO de um grupo empatado; 5 coincide com a fronteira dos grupos.
+        for (const limit of [2, 4, 5, 7]) {
+          for (const ordem of ["asc", "desc"] as const) {
+            const esperado = ordem === "asc" ? fixture.asc : [...fixture.asc].reverse();
+            const ids = await paginarTudo(fixture.caixaId, { ordem, limit });
+            expect(new Set(ids).size).toBe(ids.length); // sem duplicados
+            expect(ids).toEqual(esperado); // sem omitidos, na ordem exata
+          }
+        }
+      } finally {
+        await removerFixture(fixture);
+      }
+    });
+
+    it("paginado com filtro de tipo: mesma ordem composta, sem duplicados nem omitidos", async () => {
+      const fixture = await criarMovimentosEmpatados(3, 5);
+      try {
+        const tipos: TipoMovimentacaoCaixa[] = ["injecao", "sangria"];
+        const filtradoAsc = fixture.asc.filter((id) => tipos.includes(fixture.tipoPorId.get(id)!));
+        expect(filtradoAsc.length).toBeGreaterThan(3); // a fixture precisa produzir mais de uma página
+        for (const ordem of ["asc", "desc"] as const) {
+          const esperado = ordem === "asc" ? filtradoAsc : [...filtradoAsc].reverse();
+          const ids = await paginarTudo(fixture.caixaId, { ordem, limit: 3, tipo: tipos });
+          expect(new Set(ids).size).toBe(ids.length);
+          expect(ids).toEqual(esperado);
+        }
+      } finally {
+        await removerFixture(fixture);
+      }
+    });
+
+    it("recentesPorCaixa: o top-N cortando um grupo empatado inclui exatamente os de maior (dataHora, _id)", async () => {
+      const fixture = await criarMovimentosEmpatados(3, 5);
+      try {
+        const repositorio = moduleRef.get(MovimentosCaixaRepository);
+        // N = 7 → os 5 do instante mais recente + os 2 de maior _id do instante anterior.
+        const recentes = await repositorio.recentesPorCaixa(fixture.caixaId, 7);
+        expect(recentes.map((movimento) => String(movimento._id))).toEqual([...fixture.asc].reverse().slice(0, 7));
+      } finally {
+        await removerFixture(fixture);
+      }
+    });
+
+    it("com o plano alternativo forçado (índice { caixaId, tipo } + SORT em memória), a ordenação composta pagina sem duplicar nem omitir", async () => {
+      // Reproduz o cenário da auditoria da Fase 55.5 independentemente do plano
+      // que o MongoDB escolheria sozinho: o `hint` força o índice de `tipo`, que
+      // não entrega `dataHora` ordenada, então o MongoDB ordena em memória.
+      const fixture = await criarMovimentosEmpatados(4, 50);
+      try {
+        const movimentoModel = moduleRef.get<Model<MovimentoCaixaDocument>>(getModelToken(MovimentoCaixa.name));
+        const tipos: TipoMovimentacaoCaixa[] = ["injecao", "venda", "sangria"];
+        const filtro = { caixaId: new Types.ObjectId(fixture.caixaId), tipo: { $in: tipos } };
+        const hint = { caixaId: 1, tipo: 1 };
+
+        const plano = (await movimentoModel.find(filtro).sort(ordenacaoPorDataHora(-1)).hint(hint).skip(10).limit(10).explain("queryPlanner")) as unknown;
+        const planoVencedor = JSON.stringify((plano as { queryPlanner: { winningPlan: unknown } }).queryPlanner.winningPlan);
+        expect(planoVencedor).toContain('"SORT"'); // o plano alternativo está mesmo em uso
+        expect(planoVencedor).toContain("caixaId_1_tipo_1");
+
+        const filtradoAsc = fixture.asc.filter((id) => tipos.includes(fixture.tipoPorId.get(id)!));
+        for (const limit of [7, 10, 13]) {
+          for (const direcao of [1, -1] as const) {
+            const ids: string[] = [];
+            for (let skip = 0; skip < filtradoAsc.length; skip += limit) {
+              const pagina = await movimentoModel.find(filtro).sort(ordenacaoPorDataHora(direcao)).hint(hint).skip(skip).limit(limit).lean().exec();
+              ids.push(...pagina.map((movimento) => String(movimento._id)));
+            }
+            expect(new Set(ids).size).toBe(ids.length);
+            expect(ids).toEqual(direcao === 1 ? filtradoAsc : [...filtradoAsc].reverse());
+          }
+        }
+      } finally {
+        await removerFixture(fixture);
+      }
     });
   });
 

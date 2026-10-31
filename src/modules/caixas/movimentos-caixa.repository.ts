@@ -18,6 +18,20 @@ export interface ListaMovimentosResultado {
   total: number;
 }
 
+/**
+ * Fase 55.6 — ordenação das listagens de movimentos: `dataHora` como critério
+ * principal e `_id` como desempate, na MESMA direção. `dataHora` tem resolução
+ * de milissegundo e uma venda com vários pagamentos grava vários movimentos em
+ * sequência, então empates são reais. Sem o desempate, a ordem deles depende
+ * do plano de consulta: com o índice `{ caixaId, dataHora }` sai na ordem do
+ * índice, mas se o planner escolher `{ caixaId, tipo }` + SORT em memória
+ * (filtro por `tipo`), `skip`/`limit` duplica e omite registros entre páginas
+ * (reproduzido na auditoria da Fase 55.5). O `ObjectId` cresce com a criação.
+ */
+export function ordenacaoPorDataHora(direcao: 1 | -1): { dataHora: 1 | -1; _id: 1 | -1 } {
+  return { dataHora: direcao, _id: direcao };
+}
+
 /** Resultado de `create()` com uma chave de idempotência: diz se foi uma criação nova ou um replay. */
 export interface ResultadoCriarMovimento {
   movimento: MovimentoCaixaDocument;
@@ -194,7 +208,7 @@ export class MovimentosCaixaRepository implements OnModuleInit {
     if (params.tipo.length > 0) filtro["tipo"] = { $in: params.tipo };
 
     const direcao = params.ordem === "asc" ? 1 : -1;
-    let consulta = this.movimentoModel.find(filtro).sort({ dataHora: direcao });
+    let consulta = this.movimentoModel.find(filtro).sort(ordenacaoPorDataHora(direcao));
     if (paginar) {
       const skip = (params.page - 1) * params.limit;
       consulta = consulta.skip(skip).limit(params.limit);
@@ -206,7 +220,7 @@ export class MovimentosCaixaRepository implements OnModuleInit {
   }
 
   async recentesPorCaixa(caixaId: string, quantidade: number): Promise<MovimentoCaixaDocument[]> {
-    return this.movimentoModel.find({ caixaId }).sort({ dataHora: -1 }).limit(quantidade).exec();
+    return this.movimentoModel.find({ caixaId }).sort(ordenacaoPorDataHora(-1)).limit(quantidade).exec();
   }
 
   /**
