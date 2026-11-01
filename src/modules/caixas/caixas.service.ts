@@ -42,7 +42,7 @@ import type { FechamentoCaixaDto } from "./dto/fechamento-caixa.dto.js";
 import type { ListarCaixasQueryDto } from "./dto/listar-caixas-query.dto.js";
 import type { ListarMovimentosQueryDto } from "./dto/listar-movimentos-query.dto.js";
 import { EventoCaixa, type EventoCaixaDocument } from "./schemas/evento-caixa.schema.js";
-import type { CaixaDocument } from "./schemas/caixa.schema.js";
+import type { Caixa, CaixaDocument } from "./schemas/caixa.schema.js";
 import type { MovimentoCaixaDocument } from "./schemas/movimento-caixa.schema.js";
 import type { ResumoCaixaCalculado, VendaResumoDoCaixa } from "./caixas.types.js";
 import { MOVIMENTOS_RECENTES_NO_DETALHE } from "./caixas.constants.js";
@@ -138,6 +138,16 @@ function compararCodigoCaixa(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/**
+ * Ordem-base dos caixas (decisão de domínio, Fases 55.7/55.7.1): `dataAbertura`
+ * DESC → número do código DESC. É o desempate dos critérios financeiros de
+ * `listar()` e a ordem de `listarTodos()`. Feita em memória de propósito: um
+ * `sort` do MongoDB por `codigo` seria textual (`"CAIXA-10000" < "CAIXA-9999"`).
+ */
+function compararCaixaMaisRecentePrimeiro(a: Pick<Caixa, "dataAbertura" | "codigo">, b: Pick<Caixa, "dataAbertura" | "codigo">): number {
+  return b.dataAbertura.getTime() - a.dataAbertura.getTime() || compararCodigoCaixa(b.codigo, a.codigo);
+}
+
 @Injectable()
 export class CaixasService {
   constructor(
@@ -231,6 +241,11 @@ export class CaixasService {
    * NENHUM parâmetro espera de volta a base INTEIRA de caixas (histórico
    * completo, não só os ativos — Caixa não tem soft delete), num array
    * simples, nunca truncada pelo `limit` padrão de `listar()`.
+   *
+   * Fase 55.7.1 — ordem-base determinística (`compararCaixaMaisRecentePrimeiro`)
+   * em vez da ordem natural do MongoDB: o Backoffice reordena no cliente com
+   * `sort` estável, então nos empates dos critérios financeiros esta ordem é
+   * preservada — o mesmo desempate de `listar()`.
    */
   async listarTodos(): Promise<CaixaRespostaPublica[]> {
     const [caixas, movimentos] = await Promise.all([
@@ -246,9 +261,11 @@ export class CaixasService {
       movimentosPorCaixa.set(chave, lista);
     }
 
-    return caixas.map((documento) =>
-      this.paraRespostaPublica(documento as CaixaDocument & { id: string }, this.calcularResumo(movimentosPorCaixa.get(documento.id) ?? [], documento.valorInicial)),
-    );
+    return [...caixas]
+      .sort(compararCaixaMaisRecentePrimeiro)
+      .map((documento) =>
+        this.paraRespostaPublica(documento as CaixaDocument & { id: string }, this.calcularResumo(movimentosPorCaixa.get(documento.id) ?? [], documento.valorInicial)),
+      );
   }
 
   async obterDetalhe(id: string): Promise<CaixaDetalheResposta> {
@@ -671,8 +688,7 @@ export class CaixasService {
   private ordenarItens(itens: CaixaComResumo[], campo: OrdenarCaixaPor, ordem: Ordem): CaixaComResumo[] {
     const fator = ordem === "desc" ? -1 : 1;
     const copia = [...itens];
-    const maisRecentePrimeiro = (a: CaixaComResumo, b: CaixaComResumo) =>
-      b.documento.dataAbertura.getTime() - a.documento.dataAbertura.getTime() || compararCodigoCaixa(b.documento.codigo, a.documento.codigo);
+    const maisRecentePrimeiro = (a: CaixaComResumo, b: CaixaComResumo) => compararCaixaMaisRecentePrimeiro(a.documento, b.documento);
     switch (campo) {
       case "faturamento":
         return copia.sort(

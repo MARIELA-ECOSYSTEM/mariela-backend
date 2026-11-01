@@ -836,6 +836,70 @@ describe("CaixasService (integração — MongoDB real)", () => {
       }
     });
 
+    /**
+     * Fase 55.7.1 — `listarTodos()` (contrato legado de `GET /caixas` sem
+     * parâmetros, usado pelo Backoffice) com a ordem-base `dataAbertura` DESC
+     * → número do código DESC. A fixture é inserida na ordem INVERSA da
+     * esperada: como a ordem natural do MongoDB é a de inserção, a
+     * implementação anterior (sem ordenação) devolveria exatamente o oposto.
+     */
+    describe("listarTodos() — ordem-base determinística (Fase 55.7.1)", () => {
+      // Inserção: mais antigo primeiro (ordem natural = esta).
+      const DEFINICOES: DefinicaoCaixa[] = [
+        { codigo: "CAIXA-10001", dataAbertura: D0, vendas: [70] },
+        { codigo: "LEGADO-X", dataAbertura: D1 },
+        { codigo: "CAIXA-9999", dataAbertura: D1, diferenca: -5 },
+        { codigo: "CAIXA-10000", dataAbertura: D1, vendas: [30, 20] },
+        { codigo: "CAIXA-9998", dataAbertura: D2, valorInicial: 250 },
+        { codigo: "CAIXA-20001", dataAbertura: D3, status: "aberto" },
+      ];
+      const DA_FIXTURE = DEFINICOES.map((definicao) => definicao.codigo);
+      // D3 (aberto) → D2 → D1: 10000, 9999 (numérico: 10000 > 9999), LEGADO-X (inválido fica depois dos válidos no DESC) → D0.
+      const ESPERADO = ["CAIXA-20001", "CAIXA-9998", "CAIXA-10000", "CAIXA-9999", "LEGADO-X", "CAIXA-10001"];
+
+      it("mais recente primeiro; mesma data pelo número do código DESC (CAIXA-10000 antes de CAIXA-9999); código inválido consistente com o comparador; aberto e fechados presentes", async () => {
+        const limpar = await criarCaixasFixture(DEFINICOES);
+        try {
+          const todos = await service.listarTodos();
+          const codigos = todos.map((caixa) => caixa.codigo);
+          expect(ordemDaFixture(codigos, DA_FIXTURE)).toEqual(ESPERADO);
+          expect(ordemDaFixture(codigos, DA_FIXTURE)).not.toEqual(DA_FIXTURE); // ≠ ordem de inserção (natural)
+
+          const porCodigo = new Map(todos.map((caixa) => [caixa.codigo, caixa]));
+          expect(porCodigo.get("CAIXA-20001")?.status).toBe("aberto");
+          expect(porCodigo.get("CAIXA-20001")?.fechamento).toBeNull();
+          for (const codigo of DA_FIXTURE.filter((item) => item !== "CAIXA-20001")) {
+            expect(porCodigo.get(codigo)?.status).toBe("fechado");
+          }
+        } finally {
+          await limpar();
+        }
+      });
+
+      it("só a ordem muda: cada item é idêntico ao do mesmo caixa em listar(), e chamadas repetidas devolvem exatamente a mesma sequência", async () => {
+        const limpar = await criarCaixasFixture(DEFINICOES);
+        try {
+          const primeira = await service.listarTodos();
+          const daFixtureEmTodos = primeira.filter((caixa) => DA_FIXTURE.includes(caixa.codigo));
+          expect(daFixtureEmTodos).toHaveLength(DA_FIXTURE.length);
+
+          const paginado = await service.listar(queryCaixasPadrao({ ordenarPor: "data", ordem: "desc", limit: 100 }));
+          const porCodigoEmListar = new Map(paginado.data.map((caixa) => [caixa.codigo, caixa]));
+          for (const caixa of daFixtureEmTodos) {
+            expect(caixa).toEqual(porCodigoEmListar.get(caixa.codigo)!); // mesmo conteúdo (resumo, abertura, fechamento…)
+          }
+          // Resumo derivado dos movimentos preservado (não só a ordem): 30 + 20 em vendas.
+          expect(daFixtureEmTodos.find((caixa) => caixa.codigo === "CAIXA-10000")?.resumo.totalVendas).toBe(50);
+
+          for (let repeticao = 0; repeticao < 3; repeticao += 1) {
+            expect(await service.listarTodos()).toEqual(primeira);
+          }
+        } finally {
+          await limpar();
+        }
+      });
+    });
+
     it("códigos fora do formato nunca viram 0: ficam antes dos válidos (como os mais antigos) e se ordenam entre si pela string", async () => {
       const limpar = await criarCaixasFixture([
         { codigo: "CAIXA-0002", dataAbertura: D1 },
