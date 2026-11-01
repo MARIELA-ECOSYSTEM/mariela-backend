@@ -13,6 +13,7 @@ import { CaixasModule } from "./caixas.module.js";
 import { SENTIDO_POR_TIPO, type TipoMovimentacaoCaixa } from "./caixas.constants.js";
 import { CaixasService } from "./caixas.service.js";
 import { MovimentosCaixaRepository, ordenacaoPorDataHora } from "./movimentos-caixa.repository.js";
+import { Caixa, type CaixaDocument } from "./schemas/caixa.schema.js";
 import { MovimentoCaixa, type MovimentoCaixaDocument } from "./schemas/movimento-caixa.schema.js";
 
 const JWT_MODULO_DE_TESTE = JwtModule.register({
@@ -671,6 +672,194 @@ describe("CaixasService (integração — MongoDB real)", () => {
         }
       } finally {
         await removerFixture(fixture);
+      }
+    });
+  });
+
+  /**
+   * Fase 55.7 — ordem total dos caixas. A fixture grava direto pelos models
+   * (com validação do schema) para controlar `dataAbertura`, `codigo`, status
+   * e diferença — o serviço sempre usa `new Date()` e a sequência. Códigos
+   * altos (≥ 9994) nunca colidem com os gerados pela sequência neste arquivo.
+   * As asserções olham a ordem RELATIVA dos caixas da fixture na resposta
+   * pública completa de `listar()` (como a ordem é total, ela não depende de
+   * outros caixas). O `beforeAll` remove caixas/movimentos de grupos já
+   * encerrados (o Bun roda cada `describe` como unidade contígua; cada teste
+   * dos outros grupos cria seus próprios dados) só para manter a paginação com
+   * `limit` pequeno barata — `listar()` carrega todos os caixas e movimentos.
+   */
+  describe("ordenação determinística dos caixas (Fase 55.7)", () => {
+    beforeAll(async () => {
+      await connection.collection("movimentos_caixa").deleteMany({});
+      await connection.collection("caixas").deleteMany({});
+    });
+
+    type DefinicaoCaixa = {
+      codigo: string;
+      dataAbertura: Date;
+      status?: "aberto" | "fechado";
+      valorInicial?: number;
+      diferenca?: number;
+      vendas?: number[]; // um movimento de venda (com vendaId próprio) por valor
+    };
+
+    async function criarCaixasFixture(definicoes: DefinicaoCaixa[]): Promise<() => Promise<void>> {
+      await fecharTudoQueEstiverAberto(); // o índice único parcial só permite um caixa aberto
+      const caixaModel = moduleRef.get<Model<CaixaDocument>>(getModelToken(Caixa.name));
+      const movimentoModel = moduleRef.get<Model<MovimentoCaixaDocument>>(getModelToken(MovimentoCaixa.name));
+      const ids: Types.ObjectId[] = [];
+      for (const definicao of definicoes) {
+        const aberto = definicao.status === "aberto";
+        const caixa = await caixaModel.create({
+          codigo: definicao.codigo,
+          status: definicao.status ?? "fechado",
+          valorInicial: definicao.valorInicial ?? 100,
+          dataAbertura: definicao.dataAbertura,
+          dataFechamento: aberto ? null : definicao.dataAbertura,
+          valorInformado: aberto ? null : 0,
+          valorEsperado: aberto ? null : 0,
+          diferenca: aberto ? null : (definicao.diferenca ?? 0),
+        });
+        ids.push(caixa._id);
+        for (const valor of definicao.vendas ?? []) {
+          await movimentoModel.create({
+            caixaId: caixa._id,
+            dataHora: definicao.dataAbertura,
+            tipo: "venda",
+            origem: "venda",
+            descricao: "Venda fixture",
+            vendaId: new Types.ObjectId().toString(),
+            vendaCodigo: "VENDA-FIXTURE",
+            formaPagamento: "Dinheiro",
+            valor,
+            sentido: SENTIDO_POR_TIPO.venda,
+          });
+        }
+      }
+      return async () => {
+        await connection.collection("movimentos_caixa").deleteMany({ caixaId: { $in: ids } });
+        await connection.collection("caixas").deleteMany({ _id: { $in: ids } });
+      };
+    }
+
+    /** Percorre todas as páginas de `listar()`: códigos na ordem recebida e o `meta.total` informado. */
+    async function paginarCaixas(extra: Partial<ListarCaixasQueryDto>): Promise<{ codigos: string[]; total: number }> {
+      const codigos: string[] = [];
+      let total: number | undefined;
+      for (let page = 1, totalPages = 1; page <= totalPages; page += 1) {
+        const resultado = await service.listar(queryCaixasPadrao({ ...extra, page }));
+        codigos.push(...resultado.data.map((caixa) => caixa.codigo));
+        totalPages = resultado.meta.totalPages ?? page;
+        total ??= resultado.meta.total;
+      }
+      if (total === undefined) throw new Error("listar() não informou meta.total");
+      return { codigos, total };
+    }
+
+    async function listarTodosOsCodigos(extra: Partial<ListarCaixasQueryDto>): Promise<string[]> {
+      return (await paginarCaixas(extra)).codigos;
+    }
+
+    function ordemDaFixture(codigos: string[], daFixture: string[]): string[] {
+      return codigos.filter((codigo) => daFixture.includes(codigo));
+    }
+
+    const D0 = new Date(Date.UTC(2024, 2, 10, 9, 0, 0));
+    const D1 = new Date(Date.UTC(2024, 2, 11, 9, 0, 0));
+    const D2 = new Date(Date.UTC(2024, 2, 12, 9, 0, 0));
+    const D3 = new Date(Date.UTC(2024, 2, 13, 9, 0, 0));
+
+    it("os cinco critérios, asc e desc: empate por dataAbertura DESC e depois pelo número do código (CAIXA-10000 depois de CAIXA-9999), com aberto/fechado empatando na diferença", async () => {
+      // F, D, B, A e C empatam em saldo (150), vendas (1), faturamento (50) e
+      // diferença (0 — F está ABERTO, diferença null tratada como 0). A e B
+      // empatam também em dataAbertura (D1): só o número do código decide.
+      // E é maior em todos os critérios.
+      const limpar = await criarCaixasFixture([
+        { codigo: "CAIXA-9999", dataAbertura: D1, vendas: [50] }, // A
+        { codigo: "CAIXA-10000", dataAbertura: D1, vendas: [50] }, // B
+        { codigo: "CAIXA-10001", dataAbertura: D0, vendas: [50] }, // C
+        { codigo: "CAIXA-9998", dataAbertura: D2, vendas: [50] }, // D
+        { codigo: "CAIXA-20000", dataAbertura: D0, valorInicial: 500, diferenca: -30, vendas: [100, 100] }, // E
+        { codigo: "CAIXA-20001", dataAbertura: D3, status: "aberto", vendas: [50] }, // F
+      ]);
+      try {
+        const daFixture = ["CAIXA-9999", "CAIXA-10000", "CAIXA-10001", "CAIXA-9998", "CAIXA-20000", "CAIXA-20001"];
+        // Entre empatados: o mais recente primeiro, em QUALQUER direção → F, D, B (10000), A (9999), C.
+        const empatados = ["CAIXA-20001", "CAIXA-9998", "CAIXA-10000", "CAIXA-9999", "CAIXA-10001"];
+        for (const ordenarPor of ["saldo", "vendas", "faturamento", "diferenca"] as const) {
+          expect(ordemDaFixture(await listarTodosOsCodigos({ ordenarPor, ordem: "asc", limit: 100 }), daFixture)).toEqual([...empatados, "CAIXA-20000"]);
+          expect(ordemDaFixture(await listarTodosOsCodigos({ ordenarPor, ordem: "desc", limit: 100 }), daFixture)).toEqual(["CAIXA-20000", ...empatados]);
+        }
+        // data: dataAbertura e número do código, ambos na direção pedida.
+        const dataAsc = ["CAIXA-10001", "CAIXA-20000", "CAIXA-9999", "CAIXA-10000", "CAIXA-9998", "CAIXA-20001"];
+        expect(ordemDaFixture(await listarTodosOsCodigos({ ordenarPor: "data", ordem: "asc", limit: 100 }), daFixture)).toEqual(dataAsc);
+        expect(ordemDaFixture(await listarTodosOsCodigos({ ordenarPor: "data", ordem: "desc", limit: 100 }), daFixture)).toEqual([...dataAsc].reverse());
+      } finally {
+        await limpar();
+      }
+    });
+
+    it("paginação com empates na fronteira entre páginas: sem duplicados, sem omitidos, mesma ordem entre requisições", async () => {
+      // 12 caixas empatados em saldo/vendas/faturamento/diferença, em 3 datas
+      // com 4 caixas cada. O grupo do meio (9998, 9999, 10000, 10001) mistura
+      // 4 e 5 dígitos na MESMA data: só a comparação numérica do código acerta.
+      const definicoes: DefinicaoCaixa[] = Array.from({ length: 12 }, (_, indice) => ({
+        codigo: `CAIXA-${9994 + indice}`,
+        dataAbertura: [D0, D1, D2][Math.floor(indice / 4)]!,
+      }));
+      const limpar = await criarCaixasFixture(definicoes);
+      try {
+        const daFixture = definicoes.map((definicao) => definicao.codigo);
+        // Mais recente primeiro; na mesma data, maior número primeiro.
+        const esperadoEmpate = [...definicoes]
+          .sort((a, b) => b.dataAbertura.getTime() - a.dataAbertura.getTime() || Number(b.codigo.slice(6)) - Number(a.codigo.slice(6)))
+          .map((definicao) => definicao.codigo);
+        for (const limit of [3, 5, 7]) {
+          for (const ordenarPor of ["saldo", "vendas", "faturamento", "diferenca", "data"] as const) {
+            for (const ordem of ["asc", "desc"] as const) {
+              const { codigos, total } = await paginarCaixas({ ordenarPor, ordem, limit });
+              expect(new Set(codigos).size).toBe(codigos.length); // nenhum duplicado em toda a listagem
+              expect(codigos.length).toBe(total); // nenhum omitido
+              const daFixtureNaOrdem = ordemDaFixture(codigos, daFixture);
+              if (ordenarPor === "data") {
+                const dataAsc = [...esperadoEmpate].reverse();
+                expect(daFixtureNaOrdem).toEqual(ordem === "asc" ? dataAsc : esperadoEmpate);
+              } else {
+                expect(daFixtureNaOrdem).toEqual(esperadoEmpate);
+              }
+              if (limit === 5) expect(await listarTodosOsCodigos({ ordenarPor, ordem, limit })).toEqual(codigos); // estável entre requisições
+            }
+          }
+        }
+      } finally {
+        await limpar();
+      }
+    });
+
+    it("códigos fora do formato nunca viram 0: ficam antes dos válidos (como os mais antigos) e se ordenam entre si pela string", async () => {
+      const limpar = await criarCaixasFixture([
+        { codigo: "CAIXA-0002", dataAbertura: D1 },
+        { codigo: "LEGADO-B", dataAbertura: D1 },
+        { codigo: "CAIXA-0010", dataAbertura: D1 },
+        { codigo: "LEGADO-A", dataAbertura: D1 },
+      ]);
+      try {
+        const daFixture = ["CAIXA-0002", "LEGADO-B", "CAIXA-0010", "LEGADO-A"];
+        expect(ordemDaFixture(await listarTodosOsCodigos({ ordenarPor: "data", ordem: "asc", limit: 100 }), daFixture)).toEqual([
+          "LEGADO-A",
+          "LEGADO-B",
+          "CAIXA-0002",
+          "CAIXA-0010",
+        ]);
+        // Critério financeiro empatado: código DESC → válidos (maior número primeiro), depois inválidos.
+        expect(ordemDaFixture(await listarTodosOsCodigos({ ordenarPor: "saldo", ordem: "asc", limit: 100 }), daFixture)).toEqual([
+          "CAIXA-0010",
+          "CAIXA-0002",
+          "LEGADO-B",
+          "LEGADO-A",
+        ]);
+      } finally {
+        await limpar();
       }
     });
   });

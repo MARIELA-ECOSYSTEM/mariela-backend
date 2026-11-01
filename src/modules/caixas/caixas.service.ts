@@ -108,6 +108,36 @@ export interface ResultadoListaCaixas {
   facets: ApiFacets;
 }
 
+const PADRAO_CODIGO_CAIXA = new RegExp(`^${PREFIXO_CODIGO_CAIXA}-(\\d+)$`);
+
+/**
+ * Fase 55.7 — compara códigos de caixa (`CAIXA-0001`) em ordem crescente pelo
+ * NÚMERO sequencial, nunca pela string inteira: o `padStart` tem 4 dígitos,
+ * então `"CAIXA-10000" < "CAIXA-9999"` como string. A comparação é feita sobre
+ * os dígitos (sem zeros à esquerda: mais dígitos = maior; mesmo tamanho =
+ * lexicográfica), sem `Number()` — nunca perde precisão.
+ *
+ * Código fora do formato (nunca gerado pelo sistema, mas possível em dado
+ * importado/legado) nunca vira 0 silenciosamente: fica explicitamente ANTES
+ * de qualquer código válido (como o "mais antigo"), e códigos inválidos entre
+ * si se ordenam pela string inteira. `codigo` é único, então o resultado é
+ * sempre uma ordem total.
+ */
+function compararCodigoCaixa(a: string, b: string): number {
+  const numeroA = PADRAO_CODIGO_CAIXA.exec(a)?.[1]?.replace(/^0+(?=\d)/, "");
+  const numeroB = PADRAO_CODIGO_CAIXA.exec(b)?.[1]?.replace(/^0+(?=\d)/, "");
+  if (numeroA !== undefined && numeroB !== undefined) {
+    if (numeroA.length !== numeroB.length) return numeroA.length - numeroB.length;
+    if (numeroA !== numeroB) return numeroA < numeroB ? -1 : 1;
+  } else if (numeroA !== undefined) {
+    return 1;
+  } else if (numeroB !== undefined) {
+    return -1;
+  }
+  // Mesmo número com zeros à esquerda diferentes, ou dois códigos inválidos.
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 @Injectable()
 export class CaixasService {
   constructor(
@@ -629,21 +659,41 @@ export class CaixasService {
     };
   }
 
+  /**
+   * Fase 55.7 — ordem TOTAL e determinística. Antes, empates no critério
+   * principal (frequentes: todos os caixas sem vendas, todas as diferenças 0)
+   * ficavam na ordem natural do MongoDB, que não segue a direção pedida.
+   * Critérios financeiros (saldo/vendas/faturamento/diferença): principal na
+   * direção pedida → `dataAbertura` DESC → número do código DESC (decisão de
+   * domínio: entre empatados, o mais recente primeiro, em qualquer direção).
+   * `data`: `dataAbertura` → número do código, ambos na direção pedida.
+   */
   private ordenarItens(itens: CaixaComResumo[], campo: OrdenarCaixaPor, ordem: Ordem): CaixaComResumo[] {
     const fator = ordem === "desc" ? -1 : 1;
     const copia = [...itens];
+    const maisRecentePrimeiro = (a: CaixaComResumo, b: CaixaComResumo) =>
+      b.documento.dataAbertura.getTime() - a.documento.dataAbertura.getTime() || compararCodigoCaixa(b.documento.codigo, a.documento.codigo);
     switch (campo) {
       case "faturamento":
-        return copia.sort((a, b) => ((a.resumo.totalVendas + a.resumo.recebimentos) - (b.resumo.totalVendas + b.resumo.recebimentos)) * fator);
+        return copia.sort(
+          (a, b) =>
+            ((a.resumo.totalVendas + a.resumo.recebimentos) - (b.resumo.totalVendas + b.resumo.recebimentos)) * fator || maisRecentePrimeiro(a, b),
+        );
       case "saldo":
-        return copia.sort((a, b) => (a.resumo.saldoEsperado - b.resumo.saldoEsperado) * fator);
+        return copia.sort((a, b) => (a.resumo.saldoEsperado - b.resumo.saldoEsperado) * fator || maisRecentePrimeiro(a, b));
       case "diferenca":
-        return copia.sort((a, b) => (Math.abs(a.documento.diferenca ?? 0) - Math.abs(b.documento.diferenca ?? 0)) * fator);
+        return copia.sort(
+          (a, b) => (Math.abs(a.documento.diferenca ?? 0) - Math.abs(b.documento.diferenca ?? 0)) * fator || maisRecentePrimeiro(a, b),
+        );
       case "vendas":
-        return copia.sort((a, b) => (a.resumo.quantidadeVendas - b.resumo.quantidadeVendas) * fator);
+        return copia.sort((a, b) => (a.resumo.quantidadeVendas - b.resumo.quantidadeVendas) * fator || maisRecentePrimeiro(a, b));
       case "data":
       default:
-        return copia.sort((a, b) => (a.documento.dataAbertura.getTime() - b.documento.dataAbertura.getTime()) * fator);
+        return copia.sort(
+          (a, b) =>
+            (a.documento.dataAbertura.getTime() - b.documento.dataAbertura.getTime() || compararCodigoCaixa(a.documento.codigo, b.documento.codigo)) *
+            fator,
+        );
     }
   }
 
