@@ -1,4 +1,5 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it as itBun } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken, getModelToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
@@ -42,6 +43,64 @@ function queryMovimentosPadrao(extra: Partial<ListarMovimentosQueryDto> = {}): L
 }
 
 /**
+ * Fase 56.1 — isolamento por teste. No timeout o Bun marca o teste como falho
+ * mas NÃO cancela a Promise do corpo: ela continua rodando enquanto o runner
+ * passa aos testes seguintes. Antes, um teste "zumbi" (ex.: os laços de 25
+ * rodadas D/E/F) continuava abrindo caixas e, com a limpeza global
+ * (`updateMany({ status: "aberto" })`), fechava caixas de OUTROS testes —
+ * a cascata observada na Fase 55.8.
+ *
+ * Agora cada teste roda com um `ContextoDeTeste` próprio, propagado por
+ * `AsyncLocalStorage` pelas continuações assíncronas do próprio corpo: um
+ * zumbi continua enxergando o SEU contexto (já cancelado), nunca o do teste
+ * seguinte.
+ * - `abrirCaixaDoTeste` registra o id e recusa abrir se o contexto foi cancelado;
+ * - `fecharCaixasDoTeste` fecha só os caixas registrados no contexto (por id);
+ * - laços consultam `exigirNaoCancelado()` a cada rodada;
+ * - o `afterEach` (`encerrarContexto`) cancela, AGUARDA o corpo terminar (no
+ *   máximo a rodada em andamento) e remove só os recursos daquele contexto.
+ */
+type ContextoDeTeste = { cancelado: boolean; caixasIds: Set<string>; execucao: Promise<unknown> | null };
+
+const armazenamentoDoContexto = new AsyncLocalStorage<ContextoDeTeste>();
+let contextoEmExecucao: ContextoDeTeste | null = null;
+
+class TesteCancelado extends Error {
+  constructor() {
+    super("Teste cancelado: nenhuma nova operação é iniciada depois do afterEach.");
+  }
+}
+
+function novoContexto(): ContextoDeTeste {
+  return { cancelado: false, caixasIds: new Set(), execucao: null };
+}
+
+function contextoAtual(): ContextoDeTeste {
+  const contexto = armazenamentoDoContexto.getStore();
+  if (!contexto) throw new Error("Helper de caixa usado fora de um teste isolado.");
+  return contexto;
+}
+
+function exigirNaoCancelado(): void {
+  if (contextoAtual().cancelado) throw new TesteCancelado();
+}
+
+function executarNoContexto<T>(contexto: ContextoDeTeste, corpo: () => Promise<T>): Promise<T> {
+  const execucao = armazenamentoDoContexto.run(contexto, corpo);
+  contexto.execucao = execucao;
+  return execucao;
+}
+
+/** `it` deste arquivo: cada teste ganha um `ContextoDeTeste` próprio, encerrado pelo `afterEach`. */
+function it(nome: string, corpo: () => Promise<void>): void {
+  itBun(nome, async () => {
+    const contexto = novoContexto();
+    contextoEmExecucao = contexto;
+    await executarNoContexto(contexto, corpo);
+  });
+}
+
+/**
  * Etapa 18.2 — Caixa Geral da Loja: sem vínculo de vendedor, 4 tipos de
  * movimento (`injecao`/`sangria`/`venda`/`cancelamento`), saldo negativo
  * permitido. `service.registrarMovimento`/`registrarMovimentoDeVenda`
@@ -74,47 +133,99 @@ describe("CaixasService (integração — MongoDB real)", () => {
   });
 
   afterAll(async () => {
-    await connection.collection("caixas").deleteMany({});
-    await connection.collection("movimentos_caixa").deleteMany({});
-    await connection.collection("eventos_caixa").deleteMany({});
-    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: "caixa" });
-    await moduleRef.close();
+    try {
+      // Fase 56.1 — o afterEach de cada teste já removeu o que ele criou: nada
+      // de caixas/movimentos/eventos pode ter sobrado (prova de não acúmulo).
+      expect(await connection.collection("caixas").countDocuments({})).toBe(0);
+      expect(await connection.collection("movimentos_caixa").countDocuments({})).toBe(0);
+      expect(await connection.collection("eventos_caixa").countDocuments({})).toBe(0);
+    } finally {
+      await connection.collection("caixas").deleteMany({});
+      await connection.collection("movimentos_caixa").deleteMany({});
+      await connection.collection("eventos_caixa").deleteMany({});
+      await connection.collection<Sequencia>("sequencias").deleteMany({ _id: "caixa" });
+      await moduleRef.close();
+    }
   });
 
-  /** Sempre fecha qualquer caixa aberto ao final de um teste — o índice único parcial só permite um por vez. */
-  async function fecharTudoQueEstiverAberto(): Promise<void> {
-    await connection.collection("caixas").updateMany({ status: "aberto" }, { $set: { status: "fechado" } });
+  /** Abre pelo serviço real e registra o id no contexto do teste; recusa abrir se o contexto foi cancelado. */
+  async function abrirCaixaDoTeste(dto: Parameters<CaixasService["abrir"]>[0], autorId: string | null) {
+    const contexto = contextoAtual();
+    if (contexto.cancelado) throw new TesteCancelado();
+    const caixa = await service.abrir(dto, autorId);
+    contexto.caixasIds.add(caixa.id);
+    return caixa;
   }
+
+  function idsDoContexto(contexto: ContextoDeTeste): Types.ObjectId[] {
+    return [...contexto.caixasIds].map((id) => new Types.ObjectId(id));
+  }
+
+  /**
+   * Fecha SÓ os caixas abertos por este teste — o índice único parcial só
+   * permite um aberto por vez. Idempotente: ignora os já fechados/removidos.
+   * (Substitui a antiga `fecharTudoQueEstiverAberto`, global.)
+   */
+  async function fecharCaixasDoTeste(contexto: ContextoDeTeste = contextoAtual()): Promise<void> {
+    if (contexto.caixasIds.size === 0) return;
+    await connection.collection("caixas").updateMany({ _id: { $in: idsDoContexto(contexto) }, status: "aberto" }, { $set: { status: "fechado" } });
+  }
+
+  /** Remove caixas, movimentos e eventos criados por este contexto — nunca os de outro. Idempotente. */
+  async function removerRecursosDoContexto(contexto: ContextoDeTeste): Promise<void> {
+    if (contexto.caixasIds.size === 0) return;
+    const ids = idsDoContexto(contexto);
+    await connection.collection("movimentos_caixa").deleteMany({ caixaId: { $in: ids } });
+    await connection.collection("eventos_caixa").deleteMany({ caixaId: { $in: ids } });
+    await connection.collection("caixas").deleteMany({ _id: { $in: ids } });
+  }
+
+  /**
+   * Caminho do `afterEach`: cancela (laços param na próxima checagem e
+   * `abrirCaixaDoTeste` passa a recusar), AGUARDA o corpo terminar — inclusive
+   * um corpo que o runner já abandonou por timeout — e só então limpa.
+   */
+  async function encerrarContexto(contexto: ContextoDeTeste): Promise<void> {
+    contexto.cancelado = true;
+    if (contexto.execucao) await Promise.allSettled([contexto.execucao]);
+    await removerRecursosDoContexto(contexto);
+  }
+
+  afterEach(async () => {
+    const contexto = contextoEmExecucao;
+    contextoEmExecucao = null;
+    if (contexto) await encerrarContexto(contexto);
+  });
 
   describe("abertura, código e concorrência", () => {
     it("abre um caixa com código sequencial e resumo zerado além do valor inicial", async () => {
-      const caixa = await service.abrir({ valorInicial: 200 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 200 }, null);
       expect(caixa.codigo).toMatch(/^CAIXA-\d{4}$/);
       expect(caixa.resumo.valorAbertura).toBe(200);
       expect(caixa.resumo.saldoEsperado).toBe(200);
       expect(caixa.resumo.quantidadeMovimentacoes).toBe(0);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("Caixa não tem vínculo de vendedor: responsavelId enviado é aceito (compat de payload) mas totalmente ignorado", async () => {
-      const caixa = await service.abrir({ valorInicial: 100, responsavelId: "65f1a2b3c4d5e6f7a8b9c0d1" }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100, responsavelId: "65f1a2b3c4d5e6f7a8b9c0d1" }, null);
       // Nunca lança, mesmo com um id que não corresponde a nenhum vendedor real —
       // a diferença central desta etapa: o Caixa não valida/persiste isso mais.
       expect(caixa.abertura.responsavelNome).toBe("Loja");
       expect(caixa.abertura.responsavelId).toBeNull();
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("rejeita abrir um segundo caixa enquanto o primeiro está aberto", async () => {
-      await service.abrir({ valorInicial: 100 }, null);
-      await expect(service.abrir({ valorInicial: 50 }, null)).rejects.toThrow(ApiException);
-      await fecharTudoQueEstiverAberto();
+      await abrirCaixaDoTeste({ valorInicial: 100 }, null);
+      await expect(abrirCaixaDoTeste({ valorInicial: 50 }, null)).rejects.toThrow(ApiException);
+      await fecharCaixasDoTeste();
     });
 
     it("duas aberturas concorrentes: só UMA vence, garantido pelo índice único parcial (não por checagem de aplicação)", async () => {
       const resultados = await Promise.allSettled([
-        service.abrir({ valorInicial: 100 }, null),
-        service.abrir({ valorInicial: 200 }, null),
+        abrirCaixaDoTeste({ valorInicial: 100 }, null),
+        abrirCaixaDoTeste({ valorInicial: 200 }, null),
       ]);
 
       const sucesso = resultados.filter((r) => r.status === "fulfilled");
@@ -124,20 +235,20 @@ describe("CaixasService (integração — MongoDB real)", () => {
 
       const abertos = await connection.collection("caixas").countDocuments({ status: "aberto" });
       expect(abertos).toBe(1);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("registra o evento caixa.aberto com o usuário autenticado", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, "admin-teste-1");
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, "admin-teste-1");
       const eventos = await connection.collection("eventos_caixa").find({ tipo: "caixa.aberto" }).toArray();
       expect(eventos.some((item) => String(item["caixaId"]) === caixa.id && item["usuarioId"] === "admin-teste-1")).toBe(true);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
   });
 
   describe("injeção (entrada manual)", () => {
     it("injeção aumenta o saldo esperado", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const atualizado = await service.registrarMovimento(
         caixa.id,
         "entrada",
@@ -147,20 +258,20 @@ describe("CaixasService (integração — MongoDB real)", () => {
       expect(atualizado.resumo.entradasManuais).toBe(50);
       expect(atualizado.resumo.saldoEsperado).toBe(150);
       expect(atualizado.movimentacoes[0]?.tipo).toBe("injecao");
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("rejeita valor zero/negativo (validado no DTO, não neste teste — aqui confirmamos que o service não reintroduz limite de saldo)", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const atualizado = await service.registrarMovimento(caixa.id, "entrada", { descricao: "Ajuste", valor: 200, formaPagamento: "Dinheiro" }, null);
       expect(atualizado.resumo.saldoEsperado).toBe(200);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
   });
 
   describe("sangria (saída manual) — saldo negativo permitido", () => {
     it("sangria reduz o saldo esperado e exige motivo", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const atualizado = await service.registrarMovimento(
         caixa.id,
         "saida",
@@ -170,11 +281,11 @@ describe("CaixasService (integração — MongoDB real)", () => {
       expect(atualizado.resumo.saidasManuais).toBe(30);
       expect(atualizado.resumo.saldoEsperado).toBe(70);
       expect(atualizado.movimentacoes[0]?.tipo).toBe("sangria");
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("sangria MAIOR que o saldo disponível É PERMITIDA — saldo fica negativo", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const atualizado = await service.registrarMovimento(
         caixa.id,
         "saida",
@@ -182,19 +293,19 @@ describe("CaixasService (integração — MongoDB real)", () => {
         null,
       );
       expect(atualizado.resumo.saldoEsperado).toBe(-400);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("sangrias sucessivas podem levar o saldo cada vez mais negativo, sem bloqueio", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria 1", valor: 100, formaPagamento: "Dinheiro", motivo: "Teste" }, null);
       const atualizado = await service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria 2", valor: 200, formaPagamento: "Dinheiro", motivo: "Teste" }, null);
       expect(atualizado.resumo.saldoEsperado).toBe(-200);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("rejeita movimentação em caixa fechado", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.fechar(caixa.id, { valorInformado: 100 }, null);
       await expect(
         service.registrarMovimento(caixa.id, "entrada", { descricao: "Tarde demais", valor: 10, formaPagamento: "Dinheiro" }, null),
@@ -202,7 +313,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
     });
 
     it("idempotencyKey repetida devolve o mesmo movimento em vez de duplicar", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const chave = `teste-idem-${Date.now()}`;
       await service.registrarMovimento(caixa.id, "entrada", { descricao: "Ajuste", valor: 20, formaPagamento: "Dinheiro", idempotencyKey: chave }, null);
       const repetido = await service.registrarMovimento(
@@ -213,13 +324,13 @@ describe("CaixasService (integração — MongoDB real)", () => {
       );
       expect(repetido.resumo.entradasManuais).toBe(20);
       expect(repetido.resumo.quantidadeMovimentacoes).toBe(1);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
   });
 
   describe("venda e cancelamento (integração com Vendas via registrarMovimentoDeVenda)", () => {
     it("venda registra tipo=venda vinculado à venda, aumenta o saldo", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const { vendaId, vendaCodigo } = vendaFake();
       await service.registrarMovimentoDeVenda({
         caixaId: caixa.id,
@@ -237,11 +348,11 @@ describe("CaixasService (integração — MongoDB real)", () => {
       expect(detalhe.resumo.saldoEsperado).toBe(250);
       expect(detalhe.movimentacoes[0]?.tipo).toBe("venda");
       expect(detalhe.movimentacoes[0]?.vendaId).toBe(vendaId);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("múltiplos pagamentos da MESMA venda geram movimentos VENDA distintos, todos somados no saldo", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const { vendaId, vendaCodigo } = vendaFake();
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Parcela 1", referencia: vendaCodigo, vendaId, vendaCodigo, formaPagamento: "Dinheiro", valor: 200, observacao: "" });
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Parcela 2", referencia: vendaCodigo, vendaId, vendaCodigo, formaPagamento: "Dinheiro", valor: 300, observacao: "" });
@@ -251,11 +362,11 @@ describe("CaixasService (integração — MongoDB real)", () => {
       expect(detalhe.resumo.saldoEsperado).toBe(500);
       expect(detalhe.resumo.quantidadeVendas).toBe(1); // uma única venda, dois movimentos
       expect(detalhe.movimentacoes).toHaveLength(2);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("cancelamento (total ou parcial) registra tipo=cancelamento, sentido saída, vinculado à venda", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const { vendaId, vendaCodigo } = vendaFake();
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Venda", referencia: vendaCodigo, vendaId, vendaCodigo, formaPagamento: "Dinheiro", valor: 200, observacao: "" });
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "cancelamento", descricao: "Cancelamento", referencia: vendaCodigo, vendaId, vendaCodigo, formaPagamento: "Dinheiro", valor: 200, observacao: "Cliente desistiu" });
@@ -265,11 +376,11 @@ describe("CaixasService (integração — MongoDB real)", () => {
       expect(detalhe.resumo.saldoEsperado).toBe(0);
       const cancelamento = detalhe.movimentacoes.find((m) => m.tipo === "cancelamento");
       expect(cancelamento?.vendaId).toBe(vendaId);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("cancelamento pode deixar o saldo negativo (nunca bloqueado por falta de cobertura)", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const { vendaId, vendaCodigo } = vendaFake();
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Venda", referencia: vendaCodigo, vendaId, vendaCodigo, formaPagamento: "Dinheiro", valor: 200, observacao: "" });
       // Sangria "leva embora" o dinheiro da venda antes do cancelamento chegar.
@@ -278,11 +389,11 @@ describe("CaixasService (integração — MongoDB real)", () => {
 
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.resumo.saldoEsperado).toBe(-200);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("movimento original da venda permanece intacto após o cancelamento (nunca editado/apagado)", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const { vendaId, vendaCodigo } = vendaFake();
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Venda original", referencia: vendaCodigo, vendaId, vendaCodigo, formaPagamento: "Dinheiro", valor: 200, observacao: "" });
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "cancelamento", descricao: "Cancelamento", referencia: vendaCodigo, vendaId, vendaCodigo, formaPagamento: "Dinheiro", valor: 200, observacao: "Devolução" });
@@ -292,11 +403,11 @@ describe("CaixasService (integração — MongoDB real)", () => {
       const original = detalhe.movimentacoes.find((m) => m.tipo === "venda");
       expect(original?.descricao).toBe("Venda original");
       expect(original?.valor).toBe(200);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("rejeita registrar venda/cancelamento em caixa fechado", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       await service.fechar(caixa.id, { valorInformado: 0 }, null);
       const { vendaId, vendaCodigo } = vendaFake();
       await expect(
@@ -307,33 +418,33 @@ describe("CaixasService (integração — MongoDB real)", () => {
 
   describe("fechamento", () => {
     it("caixa conferido (sem diferença) não exige observação", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const fechado = await service.fechar(caixa.id, { valorInformado: 100 }, null);
       expect(fechado.status).toBe("fechado");
       expect(fechado.fechamento?.diferenca).toBe(0);
     });
 
     it("exige observação quando há diferença de caixa", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await expect(service.fechar(caixa.id, { valorInformado: 90 }, null)).rejects.toThrow(ApiException);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("registra sobra/falta corretamente com observação", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const fechado = await service.fechar(caixa.id, { valorInformado: 120, observacao: "Sobrou dinheiro" }, null);
       expect(fechado.fechamento?.diferenca).toBe(20);
     });
 
     it("fecha caixa com saldo esperado ZERO", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const fechado = await service.fechar(caixa.id, { valorInformado: 0 }, null);
       expect(fechado.status).toBe("fechado");
       expect(fechado.fechamento?.valorEsperado).toBe(0);
     });
 
     it("fecha caixa com saldo esperado NEGATIVO — sem bloqueio, snapshot reflete o negativo", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria grande", valor: 300, formaPagamento: "Dinheiro", motivo: "Teste" }, null);
       const fechado = await service.fechar(caixa.id, { valorInformado: -200, observacao: "Conferido negativo" }, null);
       expect(fechado.status).toBe("fechado");
@@ -347,7 +458,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
     // informar 50 no fechamento produz diferença POSITIVA de 50 (sobra),
     // nunca "diferenca: 0" nem um esperado recalculado a partir do informado.
     it("Etapa 18.4 — exemplo do enunciado: esperado=0 (200 +200 -400), informado=50 → diferença=+50", async () => {
-      const caixa = await service.abrir({ valorInicial: 200 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 200 }, null);
       const { vendaId, vendaCodigo } = vendaFake();
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Venda", referencia: vendaCodigo, vendaId, vendaCodigo, formaPagamento: "Dinheiro", valor: 200, observacao: "" });
       await service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria", valor: 400, formaPagamento: "Dinheiro", motivo: "Teste 18.4" }, null);
@@ -359,7 +470,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
       expect(fechado.fechamento?.valorEsperado).toBe(0);
       expect(fechado.fechamento?.valorInformado).toBe(50);
       expect(fechado.fechamento?.diferenca).toBe(50);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     // Etapa 18.4, seção 5 — segundo exemplo do enunciado: inicial 200, venda
@@ -367,7 +478,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
     // Informando 0 no fechamento, diferença = 0 - (-200) = +200 — nunca capada
     // nem tratada como "diferenca: 0" só porque o esperado é negativo.
     it("Etapa 18.4 — exemplo do enunciado: esperado=-200 (200 +200 -400 -200), informado=0 → diferença=+200", async () => {
-      const caixa = await service.abrir({ valorInicial: 200 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 200 }, null);
       const { vendaId, vendaCodigo } = vendaFake();
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Venda", referencia: vendaCodigo, vendaId, vendaCodigo, formaPagamento: "Dinheiro", valor: 200, observacao: "" });
       await service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria", valor: 400, formaPagamento: "Dinheiro", motivo: "Teste 18.4" }, null);
@@ -380,17 +491,17 @@ describe("CaixasService (integração — MongoDB real)", () => {
       expect(fechado.fechamento?.valorEsperado).toBe(-200);
       expect(fechado.fechamento?.valorInformado).toBe(0);
       expect(fechado.fechamento?.diferenca).toBe(200);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("rejeita fechar um caixa já fechado (checagem de estado sequencial)", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.fechar(caixa.id, { valorInformado: 100 }, null);
       await expect(service.fechar(caixa.id, { valorInformado: 100 }, null)).rejects.toThrow(ApiException);
     });
 
     it("duas chamadas de fechamento concorrentes: só UMA fecha, a outra é rejeitada pela guarda atômica (não pela checagem de estado)", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const resultados = await Promise.allSettled([
         service.fechar(caixa.id, { valorInformado: 100 }, null),
         service.fechar(caixa.id, { valorInformado: 100 }, null),
@@ -406,11 +517,11 @@ describe("CaixasService (integração — MongoDB real)", () => {
     });
 
     it("libera abrir um novo caixa depois do anterior ser fechado, SEM herdar o saldo negativo do anterior", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria grande", valor: 300, formaPagamento: "Dinheiro", motivo: "Teste" }, null);
       await service.fechar(caixa.id, { valorInformado: -200, observacao: "Negativo" }, null);
 
-      const novo = await service.abrir({ valorInicial: 50 }, null);
+      const novo = await abrirCaixaDoTeste({ valorInicial: 50 }, null);
       expect(novo.codigo).not.toBe(caixa.codigo);
       expect(novo.resumo.valorAbertura).toBe(50);
       expect(novo.resumo.saldoEsperado).toBe(50); // não herda o -200 do caixa anterior
@@ -418,22 +529,22 @@ describe("CaixasService (integração — MongoDB real)", () => {
       const anterior = await service.obterDetalhe(caixa.id);
       expect(anterior.status).toBe("fechado");
       expect(anterior.fechamento?.valorEsperado).toBe(-200); // permanece consultável
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
   });
 
   describe("consulta: atual, detalhe, estatísticas", () => {
     it("obterAtual devolve null quando nenhum caixa está aberto", async () => {
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
       const atual = await service.obterAtual();
       expect(atual).toBeNull();
     });
 
     it("obterAtual devolve o caixa aberto com resumo calculado", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const atual = await service.obterAtual();
       expect(atual?.id).toBe(caixa.id);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("obterDetalhe lança NOT_FOUND para um caixa inexistente", async () => {
@@ -441,17 +552,17 @@ describe("CaixasService (integração — MongoDB real)", () => {
     });
 
     it("obterDetalhe: vendas vinculadas ficam vazias quando a venda referenciada não existe de verdade (consulta real, nunca inventa dado)", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const { vendaId, vendaCodigo } = vendaFake(); // id no formato ObjectId, mas sem documento em `vendas`
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Venda", referencia: vendaCodigo, vendaId, vendaCodigo, formaPagamento: "Dinheiro", valor: 100, observacao: "" });
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.vendas).toEqual([]); // consulta real: vendaId não existe em `vendas`, então não aparece
       expect(detalhe.recebimentos).toEqual([]); // conceito retirado do domínio — sempre vazio
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("obterDetalhe: nunca lança/quebra quando vendaId não tem formato de ObjectId válido (defensivo)", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       await service.registrarMovimentoDeVenda({
         caixaId: caixa.id,
         tipo: "venda",
@@ -465,17 +576,17 @@ describe("CaixasService (integração — MongoDB real)", () => {
       });
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.vendas).toEqual([]);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("estatisticas soma entradas/saídas do dia e caixasAbertos/Fechados", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.registrarMovimento(caixa.id, "entrada", { descricao: "Ajuste", valor: 40, formaPagamento: "Dinheiro" }, null);
       const stats = await service.estatisticas();
       expect(stats.caixasAbertos).toBeGreaterThanOrEqual(1);
       expect(stats.entradasHoje).toBeGreaterThanOrEqual(40);
       expect(stats.recebimentosHoje).toBe(0); // conceito retirado do domínio
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
   });
 
@@ -483,7 +594,8 @@ describe("CaixasService (integração — MongoDB real)", () => {
     it("listarTodos() devolve todos os caixas, sem truncar por um limite padrão", async () => {
       const prefixo = `Full${Date.now()}`;
       for (let indice = 0; indice < 25; indice += 1) {
-        const caixa = await service.abrir({ valorInicial: 10 }, null);
+        exigirNaoCancelado();
+        const caixa = await abrirCaixaDoTeste({ valorInicial: 10 }, null);
         await service.fechar(caixa.id, { valorInformado: 10 }, null);
         void prefixo; // apenas para manter o padrão de nomeação dos outros módulos; caixas não têm campo "nome" para filtrar por prefixo.
       }
@@ -494,25 +606,26 @@ describe("CaixasService (integração — MongoDB real)", () => {
 
   describe("movimentações paginadas", () => {
     it("pagina o histórico de movimentações de um caixa", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       for (let indice = 0; indice < 5; indice += 1) {
+        exigirNaoCancelado();
         await service.registrarMovimento(caixa.id, "entrada", { descricao: `Ajuste ${indice}`, valor: 10, formaPagamento: "Dinheiro" }, null);
       }
       const primeira = await service.listarMovimentos(caixa.id, queryMovimentosPadrao({ limit: 2, page: 1 }));
       expect(primeira.data).toHaveLength(2);
       expect(primeira.meta.total).toBe(5);
       expect(primeira.meta.totalPages).toBe(3);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("filtra movimentações por tipo", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.registrarMovimento(caixa.id, "entrada", { descricao: "Entrada", valor: 10, formaPagamento: "Dinheiro" }, null);
       await service.registrarMovimento(caixa.id, "saida", { descricao: "Saída", valor: 5, formaPagamento: "Dinheiro", motivo: "Teste" }, null);
       const apenasSangrias = await service.listarMovimentos(caixa.id, queryMovimentosPadrao({ tipo: ["sangria"] }));
       expect(apenasSangrias.data).toHaveLength(1);
       expect(apenasSangrias.data[0]?.tipo).toBe("sangria");
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
   });
 
@@ -536,9 +649,9 @@ describe("CaixasService (integração — MongoDB real)", () => {
 
     /** `grupos` instantes distintos × `porGrupo` movimentos com a MESMA `dataHora` em cada um. */
     async function criarMovimentosEmpatados(grupos: number, porGrupo: number): Promise<Fixture> {
-      await fecharTudoQueEstiverAberto();
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
+      await fecharCaixasDoTeste();
 
       const movimentoModel = moduleRef.get<Model<MovimentoCaixaDocument>>(getModelToken(MovimentoCaixa.name));
       const documentos: Record<string, unknown>[] = [];
@@ -705,7 +818,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
     };
 
     async function criarCaixasFixture(definicoes: DefinicaoCaixa[]): Promise<() => Promise<void>> {
-      await fecharTudoQueEstiverAberto(); // o índice único parcial só permite um caixa aberto
+      await fecharCaixasDoTeste(); // o índice único parcial só permite um caixa aberto
       const caixaModel = moduleRef.get<Model<CaixaDocument>>(getModelToken(Caixa.name));
       const movimentoModel = moduleRef.get<Model<MovimentoCaixaDocument>>(getModelToken(MovimentoCaixa.name));
       const ids: Types.ObjectId[] = [];
@@ -931,9 +1044,10 @@ describe("CaixasService (integração — MongoDB real)", () => {
 
   describe("movimentações — contrato duplo (Etapa 20.01A)", () => {
     it("paginado=false devolve TODO o histórico, sem truncar pelo limite padrão (50)", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const quantidade = 55;
       for (let indice = 0; indice < quantidade; indice += 1) {
+        exigirNaoCancelado();
         await service.registrarMovimento(caixa.id, "entrada", { descricao: `Ajuste ${indice}`, valor: 1, formaPagamento: "Dinheiro" }, null);
       }
 
@@ -942,12 +1056,13 @@ describe("CaixasService (integração — MongoDB real)", () => {
       expect(todos.meta.total).toBe(quantidade);
       expect(todos.meta.limit).toBe(quantidade);
       expect(todos.meta.totalPages).toBe(1);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("paginado=true (default) continua truncando pelo limit informado", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       for (let indice = 0; indice < 5; indice += 1) {
+        exigirNaoCancelado();
         await service.registrarMovimento(caixa.id, "entrada", { descricao: `Ajuste ${indice}`, valor: 1, formaPagamento: "Dinheiro" }, null);
       }
 
@@ -955,20 +1070,20 @@ describe("CaixasService (integração — MongoDB real)", () => {
       expect(pagina.data).toHaveLength(2);
       expect(pagina.meta.total).toBe(5);
       expect(pagina.meta.totalPages).toBe(3);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
   });
 
   describe("listagem: busca, paginação, ordenação e facetas", () => {
     it("busca por código do caixa encontra o registro", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const resultado = await service.listar(queryCaixasPadrao({ busca: caixa.codigo }));
       expect(resultado.data).toHaveLength(1);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("filtro status=fechado só retorna caixas fechados", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.fechar(caixa.id, { valorInformado: 100 }, null);
       const resultado = await service.listar(queryCaixasPadrao({ busca: caixa.codigo, status: ["fechado"] }));
       expect(resultado.data).toHaveLength(1);
@@ -976,24 +1091,24 @@ describe("CaixasService (integração — MongoDB real)", () => {
     });
 
     it("filtro diferenca=sobra só retorna caixas fechados com sobra", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.fechar(caixa.id, { valorInformado: 130, observacao: "Sobra" }, null);
       const resultado = await service.listar(queryCaixasPadrao({ busca: caixa.codigo, diferenca: ["sobra"] }));
       expect(resultado.data).toHaveLength(1);
     });
 
     it("facets não têm mais grupo 'responsavel' (Caixa não tem vínculo de vendedor)", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const resultado = await service.listar(queryCaixasPadrao({ busca: caixa.codigo }));
       expect(resultado.facets["responsavel"]).toBeUndefined();
       expect(resultado.facets["status"]).toBeTruthy();
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("ordena por saldo (asc/desc)", async () => {
-      const caixaMenor = await service.abrir({ valorInicial: 50 }, null);
+      const caixaMenor = await abrirCaixaDoTeste({ valorInicial: 50 }, null);
       await service.fechar(caixaMenor.id, { valorInformado: 50 }, null);
-      const caixaMaior = await service.abrir({ valorInicial: 500 }, null);
+      const caixaMaior = await abrirCaixaDoTeste({ valorInicial: 500 }, null);
       await service.fechar(caixaMaior.id, { valorInformado: 500 }, null);
 
       // Fase 55.4 — percorre TODAS as páginas: com `--randomize`, outros testes
@@ -1028,7 +1143,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
     // tempo de leitura — ver `calcularResumo`), então não há "lost update"
     // possível aqui por construção. Este teste confirma isso na prática.
     it("C. 10 sangrias concorrentes de 50 a partir de saldo=100: todas persistem, saldo final = -400", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
 
       const resultados = await Promise.allSettled(
         Array.from({ length: 10 }, (_, indice) =>
@@ -1043,7 +1158,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
 
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.resumo.saldoEsperado).toBe(-400);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     // Teste D — movimento manual concorrente com fechamento. A corrida real
@@ -1056,7 +1171,8 @@ describe("CaixasService (integração — MongoDB real)", () => {
     // NENHUM movimento órfão foi deixado para trás. Nunca os dois ao mesmo tempo.
     it("D. injeção concorrente com fechamento: nunca fica um movimento órfão associado a um caixa fechado", async () => {
       for (let rodada = 0; rodada < 25; rodada += 1) {
-        const caixa = await service.abrir({ valorInicial: 100 }, null);
+        exigirNaoCancelado();
+        const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
         try {
           // `observacao` sempre enviada: a injeção pode ou não ter sido
           // contabilizada antes de `fechar()` ler os movimentos (depende de
@@ -1081,7 +1197,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
           // Rede de segurança: garante que uma falha de asserção numa rodada
           // não deixe um caixa aberto vazando para a rodada seguinte (ou para
           // os próximos testes do arquivo, que dependem de "no máximo 1 aberto").
-          await fecharTudoQueEstiverAberto();
+          await fecharCaixasDoTeste();
         }
       }
     });
@@ -1091,7 +1207,8 @@ describe("CaixasService (integração — MongoDB real)", () => {
     // diretamente, sem depender de uma Venda real persistida.
     it("E. venda concorrente com fechamento: nunca fica um movimento de venda órfão em caixa fechado", async () => {
       for (let rodada = 0; rodada < 25; rodada += 1) {
-        const caixa = await service.abrir({ valorInicial: 0 }, null);
+        exigirNaoCancelado();
+        const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
         try {
           const vendaId = new Types.ObjectId().toString();
           const vendaCodigo = `VENDA-D-${rodada}`;
@@ -1111,15 +1228,21 @@ describe("CaixasService (integração — MongoDB real)", () => {
             expect(movimentos.filter((m) => m["tipo"] === "venda")).toHaveLength(0);
           }
         } finally {
-          await fecharTudoQueEstiverAberto();
+          await fecharCaixasDoTeste();
         }
       }
+      // Fase 56.1 — nenhuma rodada deixa caixa aberto: os 25 deste teste estão
+      // fechados e não há caixa aberto residual no sistema (o afterEach do teste
+      // anterior já aguardou e limpou o que ele criou).
+      expect(contextoAtual().caixasIds.size).toBe(25);
+      expect(await connection.collection("caixas").countDocuments({ status: "aberto" })).toBe(0);
     });
 
     // Teste F — mesmo princípio do E, para cancelamento.
     it("F. cancelamento concorrente com fechamento: nunca fica um movimento de cancelamento órfão em caixa fechado", async () => {
       for (let rodada = 0; rodada < 25; rodada += 1) {
-        const caixa = await service.abrir({ valorInicial: 200 }, null);
+        exigirNaoCancelado();
+        const caixa = await abrirCaixaDoTeste({ valorInicial: 200 }, null);
         try {
           const vendaId = new Types.ObjectId().toString();
           const vendaCodigo = `VENDA-F-${rodada}`;
@@ -1139,7 +1262,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
             expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(0);
           }
         } finally {
-          await fecharTudoQueEstiverAberto();
+          await fecharCaixasDoTeste();
         }
       }
     });
@@ -1150,7 +1273,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
     // isoladamente). 5 chamadas simultâneas da MESMA operação (mesma
     // idempotencyKey) — exatamente 1 movimento, nunca 5.
     it("G. idempotência 5x no nível do service: 5 chamadas concorrentes da mesma injeção geram exatamente 1 movimento", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const chave = `idem-5x-${Date.now()}`;
 
       const resultados = await Promise.allSettled(
@@ -1165,7 +1288,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
 
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.resumo.saldoEsperado).toBe(100); // nunca 500 (5×100)
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     // Teste H — idempotência após troca de caixa: a MESMA chave, reutilizada
@@ -1174,12 +1297,12 @@ describe("CaixasService (integração — MongoDB real)", () => {
     // desde a Etapa 10.13 (índice GLOBAL, nunca por caixa), agora confirmado
     // também para o novo domínio de 4 tipos.
     it("H. idempotência global sobrevive à troca de caixa: mesma chave em caixa diferente nunca duplica", async () => {
-      const caixaA = await service.abrir({ valorInicial: 0 }, null);
+      const caixaA = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const chave = `idem-troca-caixa-${Date.now()}`;
 
       await service.registrarMovimento(caixaA.id, "entrada", { descricao: "Injeção original", valor: 100, formaPagamento: "Dinheiro", idempotencyKey: chave }, null);
       await service.fechar(caixaA.id, { valorInformado: 100 }, null);
-      const caixaB = await service.abrir({ valorInicial: 0 }, null);
+      const caixaB = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
 
       // Retry da MESMA operação, agora com o caixa ATUAL sendo B — a chave é
       // global, então o resultado é o movimento original (ainda em A),
@@ -1192,13 +1315,13 @@ describe("CaixasService (integração — MongoDB real)", () => {
       expect(String(movimentoUnico?.["caixaId"])).toBe(caixaA.id); // permanece no caixa ORIGINAL, nunca migra para B
       expect(retry.resumo.quantidadeMovimentacoes).toBe(0); // caixa B nunca recebeu o movimento
 
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     // Teste I — operações diferentes (chaves diferentes) nunca são
     // confundidas entre si, mesmo lançadas concorrentemente.
     it("I. operações diferentes com chaves diferentes são sempre independentes, mesmo concorrentes", async () => {
-      const caixa = await service.abrir({ valorInicial: 500 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 500 }, null);
       const vendaA = new Types.ObjectId().toString();
       const vendaB = new Types.ObjectId().toString();
       const cancelamentoA = new Types.ObjectId().toString();
@@ -1218,7 +1341,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
       const detalhe = await service.obterDetalhe(caixa.id);
       // 500 + (100 venda A) + (200 venda B) + (30 injeção) - (50 cancelamento) = 780
       expect(detalhe.resumo.saldoEsperado).toBe(780);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
   });
 
@@ -1238,58 +1361,58 @@ describe("CaixasService (integração — MongoDB real)", () => {
     }
 
     it("somente valor inicial (nenhum movimento): saldoEsperado = valorInicial", async () => {
-      const caixa = await service.abrir({ valorInicial: 437.5 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 437.5 }, null);
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.resumo.quantidadeMovimentacoes).toBe(0);
       expect(detalhe.resumo.saldoEsperado).toBe(437.5);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("somente injeções: saldoEsperado = valorInicial + soma das injeções", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.registrarMovimento(caixa.id, "entrada", { descricao: "Injeção 1", valor: 50, formaPagamento: "Dinheiro" }, null);
       await service.registrarMovimento(caixa.id, "entrada", { descricao: "Injeção 2", valor: 75, formaPagamento: "Dinheiro" }, null);
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.resumo.saldoEsperado).toBe(225); // 100 + 50 + 75
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("somente vendas: saldoEsperado = valorInicial + soma das vendas", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const v1 = vendaFake();
       const v2 = vendaFake();
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Venda 1", referencia: v1.vendaCodigo, ...v1, formaPagamento: "Dinheiro", valor: 250, observacao: "" });
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Venda 2", referencia: v2.vendaCodigo, ...v2, formaPagamento: "PIX", valor: 150, observacao: "" });
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.resumo.saldoEsperado).toBe(400); // 0 + 250 + 150
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("somente sangrias: saldoEsperado = valorInicial - soma das sangrias (pode ficar negativo)", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria 1", valor: 60, formaPagamento: "Dinheiro", motivo: "Teste" }, null);
       await service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria 2", valor: 90, formaPagamento: "Dinheiro", motivo: "Teste" }, null);
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.resumo.saldoEsperado).toBe(-50); // 100 - 60 - 90
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("somente cancelamentos: saldoEsperado = valorInicial - soma dos cancelamentos (pode ficar negativo)", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       const v1 = vendaFake();
       await service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "cancelamento", descricao: "Cancelamento", referencia: v1.vendaCodigo, ...v1, formaPagamento: "Dinheiro", valor: 180, observacao: "Devolução" });
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.resumo.saldoEsperado).toBe(-80); // 100 - 180
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("saldo exatamente zero por composição (não é o caso trivial de nenhum movimento)", async () => {
-      const caixa = await service.abrir({ valorInicial: 100 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
       await service.registrarMovimento(caixa.id, "entrada", { descricao: "Injeção", valor: 50, formaPagamento: "Dinheiro" }, null);
       await service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria", valor: 150, formaPagamento: "Dinheiro", motivo: "Teste" }, null);
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.resumo.saldoEsperado).toBe(0); // 100 + 50 - 150
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     // Sequência do enunciado (seção 9): Inicial +500, Injeção +300, Venda
@@ -1298,7 +1421,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
     // diretamente de `movimentos_caixa` (via `obterDetalhe`/`calcularResumo`),
     // nunca de um valor acumulado incrementalmente em memória pelo teste.
     it("sequência mista completa do enunciado: 500+300+250+150-700+400-200+100-500 = 300", async () => {
-      const caixa = await service.abrir({ valorInicial: 500 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 500 }, null);
       const vA = vendaFake();
       const vB = vendaFake();
       const vC = vendaFake();
@@ -1324,23 +1447,24 @@ describe("CaixasService (integração — MongoDB real)", () => {
       // não é um artefato de uma fórmula errada coincidentemente simétrica.
       const somaBruta = movimentos.reduce((total, m) => total + (m["sentido"] === "entrada" ? Number(m["valor"]) : -Number(m["valor"])), 500);
       expect(somaBruta).toBe(300);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("múltiplas operações idênticas (mesmo tipo/valor/forma) contam cada uma independentemente, nunca deduplicadas por coincidência de valor", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       for (let i = 0; i < 4; i += 1) {
+        exigirNaoCancelado();
         await service.registrarMovimento(caixa.id, "entrada", { descricao: `Injeção repetida ${i}`, valor: 25, formaPagamento: "Dinheiro" }, null);
       }
       const movimentos = await movimentosDoCaixa(caixa.id);
       expect(movimentos).toHaveLength(4); // 4 documentos distintos, nenhum idempotencyKey em comum
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.resumo.saldoEsperado).toBe(100); // 4 × 25, nunca colapsado em 1
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("operações concorrentes de tipos diferentes: saldo final reconcilia exatamente com a soma dos movimentos persistidos, independentemente da ordem de chegada", async () => {
-      const caixa = await service.abrir({ valorInicial: 500 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 500 }, null);
       const vVenda = vendaFake();
       const vCancelamento = vendaFake();
 
@@ -1360,7 +1484,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
       // 500 + 400 (venda) + 300 (injeção) - 700 (sangria) - 200 (cancelamento) = 300
       expect(detalhe.resumo.saldoEsperado).toBe(300);
       expect(somaBruta).toBe(detalhe.resumo.saldoEsperado); // a leitura do service bate com a soma independente dos documentos crus
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
   });
 
@@ -1373,25 +1497,25 @@ describe("CaixasService (integração — MongoDB real)", () => {
     }
 
     it("registra movimentação manual com forma de pagamento existente nas configurações", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const atualizado = await service.registrarMovimento(caixa.id, "entrada", { descricao: "Suprimento", valor: 50, formaPagamento: "Dinheiro" }, null);
       expect(atualizado.movimentacoes[0]?.formaPagamento).toBe("Dinheiro");
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("rejeita movimentação manual com forma de pagamento inexistente nas configurações, com a mensagem de negócio exata", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const formaInexistente = `FormaCaixaNuncaCadastrada-${Date.now()}`;
 
       await expect(
         service.registrarMovimento(caixa.id, "entrada", { descricao: "Suprimento", valor: 50, formaPagamento: formaInexistente }, null),
       ).rejects.toThrow(MENSAGEM_FORMA_NAO_CADASTRADA);
 
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("reconhece variações de maiúsculas/minúsculas/acentos/espaços da mesma forma cadastrada", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const atualizado = await service.registrarMovimento(
         caixa.id,
         "entrada",
@@ -1399,11 +1523,11 @@ describe("CaixasService (integração — MongoDB real)", () => {
         null,
       );
       expect(atualizado.movimentacoes[0]?.formaPagamento).toBe("DINHEIRO"); // só trim é aplicado na gravação — apresentação original (maiúsculas) preservada
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("a validação acontece ANTES da gravação: nenhuma movimentação é criada quando a forma é rejeitada", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const formaInexistente = `FormaAntesDaGravacao-${Date.now()}`;
 
       await expect(
@@ -1415,11 +1539,11 @@ describe("CaixasService (integração — MongoDB real)", () => {
       const detalhe = await service.obterDetalhe(caixa.id);
       expect(detalhe.resumo.saldoEsperado).toBe(0); // saldo nunca foi afetado
 
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
     });
 
     it("preserva movimentações originadas de venda (registrarMovimentoDeVenda) com forma não cadastrada — nunca revalida, confia na validação já feita pelo fluxo de Vendas", async () => {
-      const caixa = await service.abrir({ valorInicial: 0 }, null);
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
       const vVenda = vendaFake();
       const formaHistoricaNuncaCadastradaAqui = `FormaDeVendaNaoRevalidada-${Date.now()}`;
 
@@ -1442,7 +1566,109 @@ describe("CaixasService (integração — MongoDB real)", () => {
       const movimentos = await movimentosDoCaixa(caixa.id);
       expect(movimentos).toHaveLength(1);
       expect(movimentos[0]?.["formaPagamento"]).toBe(formaHistoricaNuncaCadastradaAqui);
-      await fecharTudoQueEstiverAberto();
+      await fecharCaixasDoTeste();
+    });
+  });
+
+  /**
+   * Fase 56.1 — o próprio mecanismo de isolamento, verificado pelo estado
+   * observável no banco. Cada cenário usa contextos explícitos
+   * (`executarNoContexto`) e o MESMO `encerrarContexto` do `afterEach`.
+   */
+  describe("isolamento por teste (Fase 56.1)", () => {
+    async function caixaNoBanco(id: string) {
+      return connection.collection("caixas").findOne({ _id: new Types.ObjectId(id) });
+    }
+
+    async function quantidadeDeMovimentos(id: string): Promise<number> {
+      return connection.collection("movimentos_caixa").countDocuments({ caixaId: new Types.ObjectId(id) });
+    }
+
+    async function abrirComMovimento(valorInicial: number, fecharAoFim: boolean): Promise<string> {
+      const caixa = await abrirCaixaDoTeste({ valorInicial }, null);
+      await service.registrarMovimento(caixa.id, "entrada", { descricao: "Movimento de isolamento", valor: 5, formaPagamento: "Dinheiro" }, null);
+      if (fecharAoFim) await fecharCaixasDoTeste();
+      return caixa.id;
+    }
+
+    it("A. a limpeza de um contexto não altera o caixa aberto nem as movimentações de outro contexto", async () => {
+      const contextoA = novoContexto();
+      const contextoB = novoContexto();
+      // Só um caixa aberto por vez no sistema: A abre, movimenta e fecha; B abre e fica ABERTO.
+      const caixaA = await executarNoContexto(contextoA, () => abrirComMovimento(10, true));
+      const caixaB = await executarNoContexto(contextoB, () => abrirComMovimento(20, false));
+
+      // A "limpeza do corpo" de A com o caixa de B aberto: a antiga limpeza
+      // global (`updateMany({ status: "aberto" })`) fecharia o caixa de B aqui.
+      await executarNoContexto(contextoA, () => fecharCaixasDoTeste());
+      expect((await caixaNoBanco(caixaB))?.["status"]).toBe("aberto");
+
+      await encerrarContexto(contextoA);
+
+      expect(await caixaNoBanco(caixaA)).toBeNull();
+      expect(await quantidadeDeMovimentos(caixaA)).toBe(0);
+      expect((await caixaNoBanco(caixaB))?.["status"]).toBe("aberto");
+      expect(await quantidadeDeMovimentos(caixaB)).toBe(1);
+
+      await encerrarContexto(contextoB);
+      expect(await caixaNoBanco(caixaB)).toBeNull();
+    });
+
+    it("B. cancelamento: nenhuma rodada nova começa depois do sinal, e a rodada em andamento termina com segurança", async () => {
+      const contexto = novoContexto();
+      const rodadasIniciadas: number[] = [];
+      const execucao = executarNoContexto(contexto, async () => {
+        for (let rodada = 0; rodada < 25; rodada += 1) {
+          exigirNaoCancelado();
+          rodadasIniciadas.push(rodada);
+          const caixa = await abrirCaixaDoTeste({ valorInicial: 0 }, null);
+          // Sinal ativado no meio da rodada 2, com operações ainda por executar
+          // (o que o afterEach faz quando o runner abandona um teste por timeout).
+          if (rodada === 2) contexto.cancelado = true;
+          try {
+            await Promise.allSettled([
+              service.registrarMovimento(caixa.id, "entrada", { descricao: `Rodada ${rodada}`, valor: 1, formaPagamento: "Dinheiro" }, null),
+              service.fechar(caixa.id, { valorInformado: 0, observacao: "Teste de cancelamento" }, null),
+            ]);
+          } finally {
+            await fecharCaixasDoTeste();
+          }
+        }
+      });
+
+      await expect(execucao).rejects.toThrow(TesteCancelado);
+      expect(rodadasIniciadas).toEqual([0, 1, 2]); // nenhuma rodada 3+
+      expect(contexto.caixasIds.size).toBe(3);
+      // A rodada 2 (já iniciada) completou e fechou o seu caixa: nada aberto ficou para trás.
+      const ids = [...contexto.caixasIds].map((id) => new Types.ObjectId(id));
+      expect(await connection.collection("caixas").countDocuments({ _id: { $in: ids }, status: "aberto" })).toBe(0);
+      // Depois do cancelamento, abrir pelo contexto é recusado.
+      await expect(executarNoContexto(contexto, () => abrirCaixaDoTeste({ valorInicial: 0 }, null))).rejects.toThrow(TesteCancelado);
+
+      await encerrarContexto(contexto);
+      expect(await connection.collection("caixas").countDocuments({ _id: { $in: ids } })).toBe(0);
+    });
+
+    it("C. um teste que falha antes da limpeza do corpo tem só os SEUS recursos recuperados", async () => {
+      const contextoOutro = novoContexto();
+      const caixaOutro = await executarNoContexto(contextoOutro, () => abrirComMovimento(30, true));
+
+      const contextoFalho = novoContexto();
+      let caixaFalho = "";
+      const execucao = executarNoContexto(contextoFalho, async () => {
+        caixaFalho = (await abrirCaixaDoTeste({ valorInicial: 40 }, null)).id;
+        throw new Error("falha simulada antes da limpeza do corpo");
+      });
+      await expect(execucao).rejects.toThrow("falha simulada antes da limpeza do corpo");
+      expect((await caixaNoBanco(caixaFalho))?.["status"]).toBe("aberto"); // a limpeza do corpo nunca rodou
+
+      await encerrarContexto(contextoFalho); // mesmo caminho do afterEach
+
+      expect(await caixaNoBanco(caixaFalho)).toBeNull();
+      expect((await caixaNoBanco(caixaOutro))?.["status"]).toBe("fechado");
+      expect(await quantidadeDeMovimentos(caixaOutro)).toBe(1);
+
+      await encerrarContexto(contextoOutro);
     });
   });
 });
