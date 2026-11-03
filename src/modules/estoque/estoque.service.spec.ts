@@ -13,6 +13,7 @@ import { EstoqueModule } from "./estoque.module.js";
 import { EstoqueService } from "./estoque.service.js";
 import type { EntradaEstoqueDto } from "./dto/entrada-estoque.dto.js";
 import type { SaidaEstoqueDto } from "./dto/saida-estoque.dto.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 // `ProdutosController` (importado transitivamente via `EstoqueModule` →
 // `ProdutosModule`) usa `@UseGuards(JwtAuthGuard)`, que injeta `JwtService` —
@@ -61,7 +62,7 @@ describe("EstoqueService (integração — MongoDB real)", () => {
     await connection.collection("produtos").deleteMany({});
     await connection.collection("eventos_produto").deleteMany({});
     await connection.collection("movimentacoes_estoque").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["produto"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["produto"] } });
     await moduleRef.close();
   });
 

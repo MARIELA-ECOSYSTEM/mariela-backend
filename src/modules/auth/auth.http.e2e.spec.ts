@@ -12,6 +12,7 @@ import { ResponseInterceptor } from "../../common/interceptors/response.intercep
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "./auth.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Diferente de `auth.service.spec.ts` (chama o service diretamente), este
@@ -63,7 +64,7 @@ describe("HTTP — autenticação e proteção de rotas (integração — servid
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: "usuario" });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: "usuario" });
     await app.close();
   });
 

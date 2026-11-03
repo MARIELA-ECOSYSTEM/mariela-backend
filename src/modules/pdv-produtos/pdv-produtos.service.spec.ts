@@ -14,6 +14,7 @@ import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { PdvProdutosModule } from "./pdv-produtos.module.js";
 import { PdvProdutosService } from "./pdv-produtos.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 // `ProdutosController`/`VendedoresController` (importados transitivamente)
 // usam `JwtAuthGuard` do ADMIN via `@UseGuards`, que precisa de um
@@ -63,7 +64,7 @@ describe("PdvProdutosService (integração — MongoDB real)", () => {
   afterAll(async () => {
     await connection.collection("produtos").deleteMany({});
     await connection.collection("eventos_produto").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["produto"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["produto"] } });
     await moduleRef.close();
   });
 

@@ -6,6 +6,7 @@ import { AppModule } from "../../app.module.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "./auth.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 const contextoTeste = { ip: "127.0.0.1", userAgent: "bun-test" };
 
@@ -33,7 +34,7 @@ describe("AuthService (integração — MongoDB real)", () => {
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: "usuario" });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: "usuario" });
     await moduleRef.close();
   });
 
@@ -48,7 +49,7 @@ describe("AuthService (integração — MongoDB real)", () => {
       expect(resultado.usuario.nome).toBe("Admin A");
       expect(resultado.usuario.tipo).toBe("ADMIN");
       expect(resultado.usuario.ativo).toBe(true);
-      expect((resultado.usuario as Record<string, unknown>)["senhaHash"]).toBeUndefined();
+      expect(Reflect.get(resultado.usuario, "senhaHash")).toBeUndefined();
     });
 
     it("não duplica ao rodar de novo com o mesmo e-mail (idempotente)", async () => {
@@ -378,7 +379,7 @@ describe("AuthService (integração — MongoDB real)", () => {
       const criado = await service.criarAdminSeed({ nome: "Me", email, senha: "senha-correta-123" });
       const usuario = await service.me(criado.usuario.id);
       expect(usuario.email).toBe(email);
-      expect((usuario as Record<string, unknown>)["senhaHash"]).toBeUndefined();
+      expect(Reflect.get(usuario, "senhaHash")).toBeUndefined();
     });
 
     it("lança NOT_FOUND para um id inexistente", async () => {

@@ -13,6 +13,7 @@ import { VendedoresService } from "../vendedores/vendedores.service.js";
 import { PdvAuthModule } from "./pdv-auth.module.js";
 import { PdvAuthRepository } from "./pdv-auth.repository.js";
 import { PdvAuthService } from "./pdv-auth.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 let contador = 0;
 function sufixo(): string {
@@ -58,7 +59,7 @@ describe("PdvAuthService (integração — MongoDB real)", () => {
     await connection.collection("eventos_vendedor").deleteMany({});
     await connection.collection("vendedor_refresh_tokens").deleteMany({});
     await connection.collection("eventos_pdv_auth").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["vendedor"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["vendedor"] } });
     await moduleRef.close();
   });
 

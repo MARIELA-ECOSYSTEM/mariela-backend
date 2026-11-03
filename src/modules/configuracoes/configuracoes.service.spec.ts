@@ -9,14 +9,25 @@ import { ApiException } from "../../common/exceptions/api.exception.js";
 import { MovimentoCaixa, type MovimentoCaixaDocument } from "../caixas/schemas/movimento-caixa.schema.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
-import { Venda, type VendaDocument } from "../vendas/schemas/venda.schema.js";
+import { Venda, type PagamentoVenda, type ParcelaVenda, type VendaDocument } from "../vendas/schemas/venda.schema.js";
 import { ConfiguracoesModule } from "./configuracoes.module.js";
 import { ConfiguracoesService } from "./configuracoes.service.js";
 import type { AtualizarLojaDto } from "./dto/atualizar-loja.dto.js";
+import type { Configuracao } from "./schemas/configuracao.schema.js";
 
 let contadorVenda = 0;
 /** Documento MÍNIMO válido de Venda, inserido via o próprio Model do Mongoose (defaults do schema aplicados) — usado SÓ para testar os vínculos de forma de pagamento, nunca para exercitar regra de negócio de Vendas (isso é feito em `vendas.service.spec.ts`). */
-function dadosVendaMinima(extra: Partial<Venda> = {}): Partial<Venda> {
+/**
+ * Fase 55.9 — formato de ENTRADA da fixture (o que `Model.create` grava), não o
+ * tipo hidratado: em `Venda`, `pagamentos`/`parcelas` são `DocumentArray`, mas
+ * a fixture passa objetos simples (antes forçados com `as never`).
+ */
+type DadosVendaFixture = Omit<Partial<Venda>, "pagamentos" | "parcelas"> & {
+  pagamentos?: Partial<PagamentoVenda>[];
+  parcelas?: Partial<ParcelaVenda>[];
+};
+
+function dadosVendaMinima(extra: DadosVendaFixture = {}): DadosVendaFixture {
   contadorVenda += 1;
   const sufixo = `${Date.now()}-${contadorVenda}`;
   return {
@@ -31,7 +42,7 @@ function dadosVendaMinima(extra: Partial<Venda> = {}): Partial<Venda> {
     valorFinal: 100,
     formaPagamento: "SemVinculoFormaPagamento",
     ...extra,
-  } as Partial<Venda>;
+  };
 }
 
 function dadosMovimentoMinimo(extra: Partial<MovimentoCaixa> = {}): Partial<MovimentoCaixa> {
@@ -114,7 +125,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
   });
 
   afterAll(async () => {
-    await connection.collection("configuracoes").deleteMany({});
+    await connection.collection<Configuracao>("configuracoes").deleteMany({});
     await connection.collection("eventos_configuracao").deleteMany({ usuarioId: { $in: [USUARIO_ID, USUARIO_AUDITORIA_ID] } });
     await connection.collection("produtos").deleteMany({ nome: /^Produto Config Teste / });
     await connection.collection("vendas").deleteMany({ codigo: /^VENDA-CONFIG-TESTE-/ });
@@ -130,7 +141,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       // premissa frágil sob execução randomizada ou com outros arquivos de teste
       // concorrentes que também registram itens em `configuracoes` (ver Fase 55.1,
       // revisão independente).
-      await connection.collection("configuracoes").deleteMany({});
+      await connection.collection<Configuracao>("configuracoes").deleteMany({});
       const configuracao = await service.obter();
       expect(configuracao.categorias).toEqual([]);
       expect(configuracao.tamanhos).toEqual([]);
@@ -138,7 +149,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       expect(configuracao.formasPagamento).toEqual([]);
       expect(configuracao.loja.nome).toBe("");
 
-      const total = await connection.collection("configuracoes").countDocuments({});
+      const total = await connection.collection<Configuracao>("configuracoes").countDocuments({});
       expect(total).toBe(1); // nunca mais de um documento
     });
 
@@ -147,14 +158,14 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const segunda = await service.obter();
       expect(String(primeira._id)).toBe(String(segunda._id));
 
-      const total = await connection.collection("configuracoes").countDocuments({});
+      const total = await connection.collection<Configuracao>("configuracoes").countDocuments({});
       expect(total).toBe(1);
     });
 
     it("dez chamadas concorrentes a obter() nunca criam mais de um documento", async () => {
-      await connection.collection("configuracoes").deleteMany({});
+      await connection.collection<Configuracao>("configuracoes").deleteMany({});
       await Promise.all(Array.from({ length: 10 }, () => service.obter()));
-      const total = await connection.collection("configuracoes").countDocuments({});
+      const total = await connection.collection<Configuracao>("configuracoes").countDocuments({});
       expect(total).toBe(1);
     });
   });
@@ -181,7 +192,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const segunda = await service.atualizarLoja(lojaValida({ nome: "Segunda" }), USUARIO_ID);
       expect(segunda.loja.nome).toBe("Segunda");
 
-      const total = await connection.collection("configuracoes").countDocuments({});
+      const total = await connection.collection<Configuracao>("configuracoes").countDocuments({});
       expect(total).toBe(1);
     });
   });
@@ -668,9 +679,9 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const chave = `EspelhoInterno-${Date.now()}`;
       await service.adicionarItem("categorias", chave, USUARIO_ID);
       const documento = await service.obter();
-      const serializado = documento.toJSON() as Record<string, unknown>;
+      const serializado: object = documento.toJSON();
       expect(Object.keys(serializado).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "tamanhos"].sort());
-      expect(serializado["categoriasNormalizadas"]).toBeUndefined();
+      expect(Reflect.get(serializado, "categoriasNormalizadas")).toBeUndefined();
     });
 
     it("autocorrige (idempotente, aditivo) um documento antigo sem o campo-espelho 'categoriasNormalizadas'", async () => {
@@ -679,14 +690,14 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       // `categorias`, mas o espelho normalizado nunca foi populado para ela —
       // só possível manipulando o Mongo diretamente (a API nunca permite esse
       // estado hoje), igual ao padrão já usado para cores/tamanhos.
-      await connection.collection("configuracoes").updateOne({ _id: "global" }, { $addToSet: { categorias: chave } });
-      const antes = await connection.collection("configuracoes").findOne({ _id: "global" });
+      await connection.collection<Configuracao>("configuracoes").updateOne({ _id: "global" }, { $addToSet: { categorias: chave } });
+      const antes = await connection.collection<Configuracao>("configuracoes").findOne({ _id: "global" });
       expect((antes?.["categoriasNormalizadas"] as string[] | undefined) ?? []).not.toContain(chave.toLowerCase());
 
       // Qualquer adição subsequente dispara o self-heal (`sincronizarEspelhoNormalizado`).
       await service.adicionarItem("categorias", `Gatilho-${Date.now()}`, USUARIO_ID);
 
-      const depois = await connection.collection("configuracoes").findOne({ _id: "global" });
+      const depois = await connection.collection<Configuracao>("configuracoes").findOne({ _id: "global" });
       expect(depois?.["categoriasNormalizadas"] as string[]).toContain(chave.toLowerCase());
 
       // E a unicidade case-insensitive passa a valer também para o valor legado.
@@ -741,20 +752,20 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const chave = `EspelhoFormaInterno-${Date.now()}`;
       await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
       const documento = await service.obter();
-      const serializado = documento.toJSON() as Record<string, unknown>;
+      const serializado: object = documento.toJSON();
       expect(Object.keys(serializado).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "tamanhos"].sort());
-      expect(serializado["formasPagamentoNormalizadas"]).toBeUndefined();
+      expect(Reflect.get(serializado, "formasPagamentoNormalizadas")).toBeUndefined();
     });
 
     it("autocorrige (idempotente, aditivo) um documento antigo sem o campo-espelho 'formasPagamentoNormalizadas'", async () => {
       const chave = `LegadoFormaSemEspelho-${Date.now()}`;
-      await connection.collection("configuracoes").updateOne({ _id: "global" }, { $addToSet: { formasPagamento: chave } });
-      const antes = await connection.collection("configuracoes").findOne({ _id: "global" });
+      await connection.collection<Configuracao>("configuracoes").updateOne({ _id: "global" }, { $addToSet: { formasPagamento: chave } });
+      const antes = await connection.collection<Configuracao>("configuracoes").findOne({ _id: "global" });
       expect((antes?.["formasPagamentoNormalizadas"] as string[] | undefined) ?? []).not.toContain(chave.toLowerCase());
 
       await service.adicionarItem("formasPagamento", `GatilhoForma-${Date.now()}`, USUARIO_ID);
 
-      const depois = await connection.collection("configuracoes").findOne({ _id: "global" });
+      const depois = await connection.collection<Configuracao>("configuracoes").findOne({ _id: "global" });
       expect(depois?.["formasPagamentoNormalizadas"] as string[]).toContain(chave.toLowerCase());
       await expect(service.adicionarItem("formasPagamento", chave.toUpperCase(), USUARIO_ID)).rejects.toThrow(ApiException);
     });
@@ -788,7 +799,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
         await vendaModel.create(
           dadosVendaMinima({
             formaPagamento: "Pix-Base",
-            pagamentos: [{ forma: chave, valor: 100, dataPagamento: new Date(), parcelas: 1 } as never],
+            pagamentos: [{ forma: chave, valor: 100, dataPagamento: new Date(), parcelas: 1 }],
           }),
         );
 
@@ -801,7 +812,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
         await vendaModel.create(
           dadosVendaMinima({
             formaPagamento: "Pix-Base",
-            parcelas: [{ numero: 1, total: 1, valor: 100, vencimento: new Date(), pagoEm: new Date(), formaPagamento: chave } as never],
+            parcelas: [{ numero: 1, total: 1, valor: 100, vencimento: new Date(), pagoEm: new Date(), formaPagamento: chave }],
           }),
         );
 
@@ -887,7 +898,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
           await vendaModel.create(
             dadosVendaMinima({
               formaPagamento: "Pix-Base",
-              pagamentos: [{ forma: suja, valor: 100, dataPagamento: new Date(), parcelas: 1 } as never],
+              pagamentos: [{ forma: suja, valor: 100, dataPagamento: new Date(), parcelas: 1 }],
             }),
           );
 
@@ -901,7 +912,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
           await vendaModel.create(
             dadosVendaMinima({
               formaPagamento: "Pix-Base",
-              parcelas: [{ numero: 1, total: 1, valor: 100, vencimento: new Date(), pagoEm: new Date(), formaPagamento: suja } as never],
+              parcelas: [{ numero: 1, total: 1, valor: 100, vencimento: new Date(), pagoEm: new Date(), formaPagamento: suja }],
             }),
           );
 

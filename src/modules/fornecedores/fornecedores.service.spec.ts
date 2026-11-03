@@ -13,6 +13,7 @@ import type { CriarFornecedorDto } from "./dto/criar-fornecedor.dto.js";
 import type { ListarFornecedoresQueryDto } from "./dto/listar-fornecedores-query.dto.js";
 import { FornecedoresModule } from "./fornecedores.module.js";
 import { FornecedoresService } from "./fornecedores.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 // `FornecedoresController` usa `@UseGuards(JwtAuthGuard)`, que injeta
 // `JwtService` — só disponível globalmente via `AppModule` de verdade. Este
@@ -83,7 +84,7 @@ describe("FornecedoresService (integração — MongoDB real)", () => {
   afterAll(async () => {
     await connection.collection("fornecedores").deleteMany({});
     await connection.collection("produtos").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["fornecedor", "produto"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["fornecedor", "produto"] } });
     await connection.collection("eventos_fornecedor").deleteMany({});
     await moduleRef.close();
   });

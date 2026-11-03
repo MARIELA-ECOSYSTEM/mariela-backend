@@ -11,6 +11,7 @@ import type { CriarClienteDto } from "../clientes/dto/criar-cliente.dto.js";
 import { ClientesService } from "../clientes/clientes.service.js";
 import { PdvClientesModule } from "./pdv-clientes.module.js";
 import { PdvClientesService } from "./pdv-clientes.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 // `ClientesController`/`VendedoresController` (importados transitivamente)
 // usam `JwtAuthGuard` do ADMIN via `@UseGuards`, que precisa de um
@@ -55,7 +56,7 @@ describe("PdvClientesService (integração — MongoDB real)", () => {
   afterAll(async () => {
     await connection.collection("clientes").deleteMany({});
     await connection.collection("eventos_cliente").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["cliente"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["cliente"] } });
     await moduleRef.close();
   });
 

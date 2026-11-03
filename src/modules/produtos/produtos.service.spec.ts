@@ -14,6 +14,8 @@ import type { CriarProdutoDto } from "./dto/criar-produto.dto.js";
 import { ProdutosModule } from "./produtos.module.js";
 import { ProdutosRepository } from "./produtos.repository.js";
 import { ProdutosService } from "./produtos.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
+import type { Configuracao } from "../configuracoes/schemas/configuracao.schema.js";
 
 // `ProdutosController` usa `@UseGuards(JwtAuthGuard)`, que injeta `JwtService`
 // — só disponível globalmente via `AppModule` de verdade. Este teste foca no
@@ -75,7 +77,7 @@ describe("ProdutosService (integração — MongoDB real)", () => {
 
   afterAll(async () => {
     await connection.collection("produtos").deleteMany({});
-    await connection.collection("sequencias").deleteMany({});
+    await connection.collection<Sequencia>("sequencias").deleteMany({});
     await connection.collection("eventos_produto").deleteMany({});
     await connection.collection("fornecedores").deleteMany({});
     await connection.collection("eventos_fornecedor").deleteMany({});
@@ -83,7 +85,7 @@ describe("ProdutosService (integração — MongoDB real)", () => {
     await connection.collection("eventos_colecao").deleteMany({});
     await connection.collection("campanhas").deleteMany({});
     await connection.collection("eventos_campanha").deleteMany({});
-    await connection.collection("configuracoes").deleteMany({});
+    await connection.collection<Configuracao>("configuracoes").deleteMany({});
     await connection.collection("eventos_configuracao").deleteMany({});
     await moduleRef.close();
   });
@@ -691,7 +693,7 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       // Fase 54.0 bloquearia a remoção normal enquanto a variante existir —
       // não é isso que este teste quer exercitar). Manipulação direta do
       // Mongo só para o SETUP do teste, nunca como fluxo de produção.
-      await connection.collection("configuracoes").updateOne({}, { $pull: { cores: corHistorica, coresNormalizadas: corHistorica.toLowerCase() } });
+      await connection.collection<Configuracao>("configuracoes").updateOne({}, { $pull: { cores: corHistorica, coresNormalizadas: corHistorica.toLowerCase() } });
 
       // Editar só a foto, reenviando a MESMA cor (o DTO exige o campo) não
       // deve falhar mesmo com a cor já fora das configurações.
@@ -825,7 +827,7 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       // enquanto o produto existir — não é isso que este teste quer
       // exercitar). Manipulação direta do Mongo só para o SETUP do teste.
       await connection
-        .collection("configuracoes")
+        .collection<Configuracao>("configuracoes")
         .updateOne({}, { $pull: { categorias: categoriaHistorica, categoriasNormalizadas: categoriaHistorica.toLowerCase() } });
 
       // Editar só a descrição, reenviando a MESMA categoria (o DTO exige o
@@ -844,7 +846,7 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       await configuracoesService.adicionarItem("categorias", categoriaHistorica, null);
       const produto = await service.criar(payloadProduto("CAT-8", { categoria: categoriaHistorica }), null);
       await connection
-        .collection("configuracoes")
+        .collection<Configuracao>("configuracoes")
         .updateOne({}, { $pull: { categorias: categoriaHistorica, categoriasNormalizadas: categoriaHistorica.toLowerCase() } });
 
       // Mesma categoria, só com espaços/caixa diferentes — normaliza para o

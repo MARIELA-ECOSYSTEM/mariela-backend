@@ -21,6 +21,7 @@ import { VendasService } from "../vendas/vendas.service.js";
 import { PdvVendasModule } from "./pdv-vendas.module.js";
 import { PdvVendasService } from "./pdv-vendas.service.js";
 import type { CriarVendaPdvDto } from "./dto/criar-venda-pdv.dto.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 // `VendedoresController`/`ProdutosController`/`CaixasController` (importados
 // transitivamente) usam `JwtAuthGuard` do ADMIN via `@UseGuards`, que precisa
@@ -108,7 +109,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
     await connection.collection("caixas").deleteMany({});
     await connection.collection("movimentos_caixa").deleteMany({});
     await connection.collection("eventos_caixa").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "caixa"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "caixa"] } });
     await moduleRef.close();
   });
 
@@ -329,7 +330,9 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
         vendedor.id,
         payloadPadrao({
           itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
-          descontoVenda: 10,
+          // Fase 55.9 — o service recebe o DTO já transformado (o `number` legado
+          // vira `{ tipo: "valor", valor }` no `@Transform` de `CriarVendaPdvDto`).
+          descontoVenda: { tipo: "valor", valor: 10 },
           pagamentos: [{ forma: "Dinheiro", valor: 90 }],
         }),
       );
@@ -347,7 +350,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       await esperarRejeicao(
         service.criar(
           vendedor.id,
-          payloadPadrao({ itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }], descontoVenda: 1000, pagamentos: [] }),
+          payloadPadrao({ itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }], descontoVenda: { tipo: "valor", valor: 1000 }, pagamentos: [] }),
         ),
       );
       await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);

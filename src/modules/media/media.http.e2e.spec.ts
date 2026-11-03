@@ -15,6 +15,7 @@ import { AuthService } from "../auth/auth.service.js";
 import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 const MB = 1024 * 1024;
 const BASE_PUBLICA = "https://midia.exemplo.com";
@@ -96,7 +97,7 @@ describe("HTTP — Mídia / upload pré-assinado (integração — servidor real
     await connection.collection("eventos_vendedor").deleteMany({});
     await connection.collection("vendedor_refresh_tokens").deleteMany({});
     await connection.collection("eventos_pdv_auth").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["produto", "vendedor", "usuario"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["produto", "vendedor", "usuario"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});

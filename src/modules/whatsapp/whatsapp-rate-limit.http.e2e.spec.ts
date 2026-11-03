@@ -15,6 +15,7 @@ import { ClientesService } from "../clientes/clientes.service.js";
 import type { WhatsappProvider } from "./providers/whatsapp-provider.interface.js";
 import { WHATSAPP_PROVIDER, WHATSAPP_SEND_THROTTLE_LIMITE } from "./whatsapp.constants.js";
 import type { StatusWhatsapp } from "./whatsapp.types.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Etapa 24 — rate limiting de `POST /integracoes/whatsapp/mensagens`. Mesmo
@@ -105,7 +106,7 @@ describe("HTTP — WhatsApp: rate limiting de POST /integracoes/whatsapp/mensage
   afterEach(async () => {
     await connection.collection("clientes").deleteMany({});
     await connection.collection("eventos_cliente").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["cliente", "usuario"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["cliente", "usuario"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});

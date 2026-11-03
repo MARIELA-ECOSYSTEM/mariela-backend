@@ -13,6 +13,7 @@ import { validationExceptionFactory } from "../../common/pipes/validation-except
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE (mesmos guards, mesmo pipeline de
@@ -74,7 +75,7 @@ describe("HTTP — Adquirentes (integração — servidor real)", () => {
     await connection.collection("eventos_vendedor").deleteMany({});
     await connection.collection("vendedor_refresh_tokens").deleteMany({});
     await connection.collection("eventos_pdv_auth").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["vendedor", "usuario"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["vendedor", "usuario"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});

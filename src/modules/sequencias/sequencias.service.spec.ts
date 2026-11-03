@@ -5,6 +5,7 @@ import type { Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { SequenciasModule } from "./sequencias.module.js";
 import { SequenciasService } from "./sequencias.service.js";
+import type { Sequencia } from "./schemas/sequencia.schema.js";
 
 /**
  * Prova que a geração de código é segura sob concorrência: `findOneAndUpdate`
@@ -24,7 +25,7 @@ describe("SequenciasService (integração — MongoDB real)", () => {
   });
 
   afterAll(async () => {
-    await connection.collection("sequencias").deleteMany({});
+    await connection.collection<Sequencia>("sequencias").deleteMany({});
     await moduleRef.close();
   });
 

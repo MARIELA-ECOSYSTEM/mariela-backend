@@ -22,6 +22,8 @@ import type { ListarVendasQueryDto } from "./dto/listar-vendas-query.dto.js";
 import { VendasModule } from "./vendas.module.js";
 import { VendasRepository } from "./vendas.repository.js";
 import { VendasService } from "./vendas.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
+import type { Configuracao } from "../configuracoes/schemas/configuracao.schema.js";
 
 const JWT_MODULO_DE_TESTE = JwtModule.register({
   global: true,
@@ -81,7 +83,7 @@ describe("VendasService (integração — MongoDB real)", () => {
     await connection.collection("eventos_caixa").deleteMany({});
     await connection.collection("adquirentes").deleteMany({});
     await connection.collection("eventos_adquirente").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "caixa"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "caixa"] } });
     await moduleRef.close();
   });
 
@@ -2322,7 +2324,6 @@ describe("VendasService (integração — MongoDB real)", () => {
 
     it("L. concorrência real: duas chamadas concorrentes registrando o MESMO pagamento (mesma idempotencyKey) resultam em exatamente 1 movimento", async () => {
       const produto = await criarProdutoComEstoque(100, 5);
-      const vendedor = await criarVendedor();
       const caixa = await abrirCaixa();
       const chaveMovimento = `venda-concorrencia-caixa-${Date.now()}:pagamento:0`;
 
@@ -2341,8 +2342,6 @@ describe("VendasService (integração — MongoDB real)", () => {
           vendaCodigo: "VENDA-FAKE",
           formaPagamento: "Dinheiro",
           valor: 100,
-          responsavelId: null,
-          responsavelNome: vendedor.nome,
           observacao: "",
           idempotencyKey: chaveMovimento,
         });
@@ -6322,7 +6321,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // `removerItem` (a proteção de exclusão da Fase 55.2 bloquearia a
       // remoção normal enquanto a venda existir).
       await connection
-        .collection("configuracoes")
+        .collection<Configuracao>("configuracoes")
         .updateOne({}, { $pull: { formasPagamento: formaHistorica, formasPagamentoNormalizadas: formaHistorica.toLowerCase() } });
 
       const parcelaId = String(venda.parcelas[0]!._id);
@@ -6351,7 +6350,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         null,
       );
       await connection
-        .collection("configuracoes")
+        .collection<Configuracao>("configuracoes")
         .updateOne({}, { $pull: { formasPagamento: formaHistorica, formasPagamentoNormalizadas: formaHistorica.toLowerCase() } });
 
       const parcelaId = String(venda.parcelas[0]!._id);

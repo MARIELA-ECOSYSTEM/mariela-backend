@@ -13,6 +13,7 @@ import type { CriarCampanhaDto } from "./dto/criar-campanha.dto.js";
 import type { ListarCampanhasQueryDto } from "./dto/listar-campanhas-query.dto.js";
 import { CampanhasModule } from "./campanhas.module.js";
 import { CampanhasService } from "./campanhas.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 // `CampanhasController` usa `@UseGuards(JwtAuthGuard)`, que injeta `JwtService`
 // — só disponível globalmente via `AppModule` de verdade. Este teste foca no
@@ -77,7 +78,7 @@ describe("CampanhasService (integração — MongoDB real)", () => {
   afterAll(async () => {
     await connection.collection("campanhas").deleteMany({});
     await connection.collection("produtos").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["campanha", "produto"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["campanha", "produto"] } });
     await connection.collection("eventos_campanha").deleteMany({});
     await moduleRef.close();
   });

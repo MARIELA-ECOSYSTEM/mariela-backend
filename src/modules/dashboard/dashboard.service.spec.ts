@@ -21,6 +21,7 @@ import { VendedoresService } from "../vendedores/vendedores.service.js";
 import { DashboardModule } from "./dashboard.module.js";
 import { DashboardService } from "./dashboard.service.js";
 import { chaveMes } from "./dashboard.util.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 const JWT_MODULO_DE_TESTE = JwtModule.register({
   global: true,
@@ -80,7 +81,7 @@ describe("DashboardService (integração — MongoDB real)", () => {
     await connection.collection("caixas").deleteMany({});
     await connection.collection("movimentos_caixa").deleteMany({});
     await connection.collection("eventos_caixa").deleteMany({});
-    await connection.collection("sequencias").deleteMany({
+    await connection.collection<Sequencia>("sequencias").deleteMany({
       _id: { $in: ["venda", "produto", "vendedor", "cliente", "fornecedor", "caixa"] },
     });
   }

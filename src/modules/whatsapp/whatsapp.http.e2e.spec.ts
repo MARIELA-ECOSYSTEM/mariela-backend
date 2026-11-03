@@ -16,6 +16,7 @@ import { ClientesService } from "../clientes/clientes.service.js";
 import type { WhatsappProvider } from "./providers/whatsapp-provider.interface.js";
 import { WHATSAPP_PROVIDER } from "./whatsapp.constants.js";
 import type { StatusWhatsapp } from "./whatsapp.types.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE (mesmos guards, mesmo pipeline de
@@ -100,7 +101,7 @@ describe("HTTP — Integrações/WhatsApp (integração — servidor real, provi
   afterAll(async () => {
     await connection.collection("clientes").deleteMany({});
     await connection.collection("eventos_cliente").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["cliente", "usuario"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["cliente", "usuario"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});

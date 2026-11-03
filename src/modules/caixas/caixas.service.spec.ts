@@ -15,6 +15,7 @@ import { CaixasService } from "./caixas.service.js";
 import { MovimentosCaixaRepository, ordenacaoPorDataHora } from "./movimentos-caixa.repository.js";
 import { Caixa, type CaixaDocument } from "./schemas/caixa.schema.js";
 import { MovimentoCaixa, type MovimentoCaixaDocument } from "./schemas/movimento-caixa.schema.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 const JWT_MODULO_DE_TESTE = JwtModule.register({
   global: true,
@@ -76,7 +77,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
     await connection.collection("caixas").deleteMany({});
     await connection.collection("movimentos_caixa").deleteMany({});
     await connection.collection("eventos_caixa").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: "caixa" });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: "caixa" });
     await moduleRef.close();
   });
 
@@ -1206,7 +1207,7 @@ describe("CaixasService (integração — MongoDB real)", () => {
         service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Venda A", referencia: "VENDA-A", vendaId: vendaA, vendaCodigo: "VENDA-A", formaPagamento: "Dinheiro", valor: 100, observacao: "", idempotencyKey: `${vendaA}:pagamento:0` }),
         service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "venda", descricao: "Venda B", referencia: "VENDA-B", vendaId: vendaB, vendaCodigo: "VENDA-B", formaPagamento: "PIX", valor: 200, observacao: "", idempotencyKey: `${vendaB}:pagamento:0` }),
         service.registrarMovimentoDeVenda({ caixaId: caixa.id, tipo: "cancelamento", descricao: "Cancelamento A", referencia: "VENDA-A", vendaId: cancelamentoA, vendaCodigo: "VENDA-A", formaPagamento: "Dinheiro", valor: 50, observacao: "Teste I", idempotencyKey: `${cancelamentoA}:cancelamento:0` }),
-        service.registrarMovimento(caixa.id, "entrada", { descricao: "Pagamento manual A", valor: 30, formaPagamento: "Dinheiro", idempotencyKey: "pagamento-manual-A" }),
+        service.registrarMovimento(caixa.id, "entrada", { descricao: "Pagamento manual A", valor: 30, formaPagamento: "Dinheiro", idempotencyKey: "pagamento-manual-A" }, null),
       ]);
 
       expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);

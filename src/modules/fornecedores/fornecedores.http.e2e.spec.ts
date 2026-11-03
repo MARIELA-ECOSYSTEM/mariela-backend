@@ -14,6 +14,7 @@ import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE (mesmos guards, mesmo pipeline de
@@ -74,7 +75,7 @@ describe("HTTP — Fornecedores (integração — servidor real)", () => {
     await connection.collection("fornecedores").deleteMany({});
     await connection.collection("produtos").deleteMany({});
     await connection.collection("eventos_fornecedor").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["fornecedor", "produto", "usuario"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["fornecedor", "produto", "usuario"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});

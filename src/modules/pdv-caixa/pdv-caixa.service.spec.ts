@@ -13,6 +13,7 @@ import type { CriarVendedorDto } from "../vendedores/dto/criar-vendedor.dto.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 import { PdvCaixaModule } from "./pdv-caixa.module.js";
 import { PdvCaixaService } from "./pdv-caixa.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 let contador = 0;
 function sufixo(): string {
@@ -57,7 +58,7 @@ describe("PdvCaixaService (integração — MongoDB real)", () => {
     await connection.collection("eventos_caixa").deleteMany({});
     await connection.collection("vendedores").deleteMany({});
     await connection.collection("eventos_vendedor").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["caixa", "vendedor"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["caixa", "vendedor"] } });
     await moduleRef.close();
   });
 

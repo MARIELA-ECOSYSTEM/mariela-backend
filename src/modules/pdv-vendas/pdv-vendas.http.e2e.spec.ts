@@ -20,6 +20,7 @@ import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js"
 import { PdvAuthService } from "../pdv-auth/pdv-auth.service.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE contra o banco de teste isolado
@@ -102,7 +103,7 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     await connection.collection("eventos_caixa").deleteMany({});
     await connection.collection("adquirentes").deleteMany({});
     await connection.collection("eventos_adquirente").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "caixa", "usuario"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "caixa", "usuario"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});

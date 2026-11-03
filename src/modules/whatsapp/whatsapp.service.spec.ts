@@ -13,6 +13,7 @@ import { WHATSAPP_PROVIDER } from "./whatsapp.constants.js";
 import { WhatsappModule } from "./whatsapp.module.js";
 import { WhatsappService } from "./whatsapp.service.js";
 import type { StatusWhatsapp } from "./whatsapp.types.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Nunca chama a Evolution API de verdade: o provider real
@@ -79,7 +80,7 @@ describe("WhatsappService (integração — MongoDB real, provider falso)", () =
     await connection.collection("eventos_fornecedor").deleteMany({});
     await connection.collection("vendedores").deleteMany({});
     await connection.collection("eventos_vendedor").deleteMany({});
-    await connection.collection("sequencias").deleteMany({});
+    await connection.collection<Sequencia>("sequencias").deleteMany({});
     await moduleRef.close();
   });
 

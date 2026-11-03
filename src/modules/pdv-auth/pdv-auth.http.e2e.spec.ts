@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { ValidationPipe } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
-import { JwtService } from "@nestjs/jwt";
+import { JwtService, type JwtSignOptions } from "@nestjs/jwt";
 import { getConnectionToken } from "@nestjs/mongoose";
 import type { NestExpressApplication } from "@nestjs/platform-express";
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
@@ -15,6 +15,7 @@ import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 import type { PdvJwtPayload, ResultadoAutenticacaoPdv, VendedorPublicoPdv } from "./pdv-auth.types.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE (mesmos guards, mesmo pipeline de exceções,
@@ -79,7 +80,7 @@ describe("HTTP — PDV Auth (integração — servidor real)", () => {
     await connection.collection("eventos_vendedor").deleteMany({});
     await connection.collection("vendedor_refresh_tokens").deleteMany({});
     await connection.collection("eventos_pdv_auth").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["vendedor", "usuario"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["vendedor", "usuario"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});
@@ -101,7 +102,7 @@ describe("HTTP — PDV Auth (integração — servidor real)", () => {
    * equivalente ao que `PdvAuthService.emitirTokens` geraria, sem a
    * complexidade de extrair o `JwtService` escopado do módulo via `app.select`.
    */
-  async function assinarTokenPdv(payload: PdvJwtPayload, expiresIn?: string | number): Promise<string> {
+  async function assinarTokenPdv(payload: PdvJwtPayload, expiresIn?: JwtSignOptions["expiresIn"]): Promise<string> {
     const jwtServicePdv = new JwtService({ secret: process.env["PDV_JWT_ACCESS_SECRET"]! });
     return jwtServicePdv.signAsync(payload, expiresIn !== undefined ? { expiresIn } : undefined);
   }

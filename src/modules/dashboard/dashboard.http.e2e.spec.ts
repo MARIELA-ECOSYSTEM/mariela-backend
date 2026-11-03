@@ -22,6 +22,7 @@ import { VendasService } from "../vendas/vendas.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 import { chaveMes } from "./dashboard.util.js";
 import type { ResumoDashboard } from "./dashboard.types.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE contra o banco de teste isolado
@@ -90,12 +91,12 @@ describe("HTTP — Dashboard (integração — servidor real)", () => {
     await connection.collection("caixas").deleteMany({});
     await connection.collection("movimentos_caixa").deleteMany({});
     await connection.collection("eventos_caixa").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "fornecedor", "caixa"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "cliente", "fornecedor", "caixa"] } });
   }
 
   afterAll(async () => {
     await limparDadosDeDominio();
-    await connection.collection("sequencias").deleteMany({ _id: "usuario" });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: "usuario" });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});

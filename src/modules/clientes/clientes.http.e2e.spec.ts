@@ -19,6 +19,7 @@ import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendasService } from "../vendas/vendas.service.js";
 import type { CriarVendedorDto } from "../vendedores/dto/criar-vendedor.dto.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE (mesmos guards, mesmo pipeline de
@@ -92,7 +93,7 @@ describe("HTTP — Clientes (integração — servidor real)", () => {
     await connection.collection("caixas").deleteMany({});
     await connection.collection("movimentos_caixa").deleteMany({});
     await connection.collection("eventos_caixa").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["cliente", "usuario", "venda", "produto", "vendedor", "caixa"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["cliente", "usuario", "venda", "produto", "vendedor", "caixa"] } });
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});

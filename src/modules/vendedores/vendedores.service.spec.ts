@@ -15,6 +15,7 @@ import type { CriarVendedorDto } from "./dto/criar-vendedor.dto.js";
 import type { ListarVendedoresQueryDto } from "./dto/listar-vendedores-query.dto.js";
 import { VendedoresModule } from "./vendedores.module.js";
 import { VendedoresService } from "./vendedores.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 // `VendedoresController` usa `@UseGuards(JwtAuthGuard)`, que injeta `JwtService`
 // — só disponível globalmente via `AppModule` de verdade. Este teste foca no
@@ -74,7 +75,7 @@ describe("VendedoresService (integração — MongoDB real)", () => {
 
   afterAll(async () => {
     await connection.collection("vendedores").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: "vendedor" });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: "vendedor" });
     await connection.collection("eventos_vendedor").deleteMany({});
     await moduleRef.close();
   });
@@ -468,7 +469,7 @@ describe("VendedoresService.listarVendas — histórico real (Etapa 17.2, integr
     await connection.collection("caixas").deleteMany({});
     await connection.collection("movimentos_caixa").deleteMany({});
     await connection.collection("eventos_caixa").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "caixa"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["venda", "produto", "vendedor", "caixa"] } });
     await moduleRef.close();
   });
 
@@ -518,9 +519,9 @@ describe("VendedoresService.listarVendas — histórico real (Etapa 17.2, integr
     expect(resumo.valorFinal).toBe(venda.valorFinal);
     expect(resumo.status).toBe(venda.status);
     // Nunca expõe detalhe pesado/interno no resumo.
-    expect((resumo as Record<string, unknown>)["itens"]).toBeUndefined();
-    expect((resumo as Record<string, unknown>)["pagamentos"]).toBeUndefined();
-    expect((resumo as Record<string, unknown>)["idempotencyKey"]).toBeUndefined();
+    expect(Reflect.get(resumo, "itens")).toBeUndefined();
+    expect(Reflect.get(resumo, "pagamentos")).toBeUndefined();
+    expect(Reflect.get(resumo, "idempotencyKey")).toBeUndefined();
   });
 
   it("vendedor com MÚLTIPLAS vendas: todas aparecem, e meta.total reflete a quantidade correta", async () => {

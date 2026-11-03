@@ -13,6 +13,7 @@ import type { CriarColecaoDto } from "./dto/criar-colecao.dto.js";
 import type { ListarColecoesQueryDto } from "./dto/listar-colecoes-query.dto.js";
 import { ColecoesModule } from "./colecoes.module.js";
 import { ColecoesService } from "./colecoes.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 // `ColecoesController` usa `@UseGuards(JwtAuthGuard)`, que injeta `JwtService`
 // — só disponível globalmente via `AppModule` de verdade. Este teste foca no
@@ -77,7 +78,7 @@ describe("ColecoesService (integração — MongoDB real)", () => {
   afterAll(async () => {
     await connection.collection("colecoes").deleteMany({});
     await connection.collection("produtos").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: { $in: ["colecao", "produto"] } });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: { $in: ["colecao", "produto"] } });
     await connection.collection("eventos_colecao").deleteMany({});
     await moduleRef.close();
   });

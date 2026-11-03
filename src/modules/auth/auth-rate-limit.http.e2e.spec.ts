@@ -12,6 +12,7 @@ import { validationExceptionFactory } from "../../common/pipes/validation-except
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AUTH_LOGIN_THROTTLE_LIMITE } from "./auth.constants.js";
 import { AuthService } from "./auth.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Etapa 24 — rate limiting de `POST /auth/login`. App próprio (nunca
@@ -66,7 +67,7 @@ describe("HTTP — Auth: rate limiting de POST /auth/login (Etapa 24)", () => {
     await connection.collection("usuarios").deleteMany({});
     await connection.collection("refresh_tokens").deleteMany({});
     await connection.collection("eventos_auth").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: "usuario" });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: "usuario" });
     await app.close();
   });
 

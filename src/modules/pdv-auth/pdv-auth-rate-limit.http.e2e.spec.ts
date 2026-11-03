@@ -13,6 +13,7 @@ import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 import { PDV_AUTH_LOGIN_THROTTLE_LIMITE } from "./pdv-auth.constants.js";
 import { PdvAuthService } from "./pdv-auth.service.js";
+import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
 /**
  * Etapa 24 — rate limiting de `POST /pdv/auth/login`. Mesmo racional de
@@ -67,7 +68,7 @@ describe("HTTP — PDV Auth: rate limiting de POST /pdv/auth/login (Etapa 24)", 
     await connection.collection("eventos_vendedor").deleteMany({});
     await connection.collection("vendedor_refresh_tokens").deleteMany({});
     await connection.collection("eventos_pdv_auth").deleteMany({});
-    await connection.collection("sequencias").deleteMany({ _id: "vendedor" });
+    await connection.collection<Sequencia>("sequencias").deleteMany({ _id: "vendedor" });
     await app.close();
   });
 
