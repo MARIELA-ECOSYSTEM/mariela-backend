@@ -21,10 +21,10 @@ import type { ListarProdutosQueryDto } from "./dto/listar-produtos-query.dto.js"
 import { conflitoTamanhoUnico, formatarCodigoVariante, normalizarCategoria, normalizarCor, normalizarSegmentoCodigo, normalizarTamanho } from "./utils/normalizacao.util.js";
 import { arredondarMoeda, calcularMargem, precoEfetivo } from "./utils/precos.util.js";
 import { ProdutosRepository } from "./produtos.repository.js";
-import type { DadosNovaVariante } from "./produtos.types.js";
+import type { DadosNovaVariante, VarianteSubdocumento } from "./produtos.types.js";
 import { EventoProduto, type EventoProdutoDocument } from "./schemas/evento-produto.schema.js";
 import type { ProdutoDocument } from "./schemas/produto.schema.js";
-import type { Variante, VarianteDocument } from "./schemas/variante.schema.js";
+import type { VarianteDocument } from "./schemas/variante.schema.js";
 import type { SelecaoFacetas } from "./produtos-filtros.util.js";
 
 export interface ResultadoListaProdutos {
@@ -275,7 +275,7 @@ export class ProdutosService {
     return produto;
   }
 
-  async adicionarVariante(produtoId: string, dto: CriarVarianteDto, usuarioId: string | null): Promise<Variante> {
+  async adicionarVariante(produtoId: string, dto: CriarVarianteDto, usuarioId: string | null): Promise<VarianteSubdocumento> {
     // Confirma a existência do produto ANTES de tudo, só para reportar 404 vs.
     // "cor duplicada" corretamente — a inserção em si é atômica (ver repository).
     const produtoAtual = await this.produtosRepository.encontrarPorIdOuFalhar(produtoId);
@@ -336,7 +336,7 @@ export class ProdutosService {
     varianteId: string,
     dto: AtualizarVarianteDto,
     usuarioId: string | null,
-  ): Promise<Variante> {
+  ): Promise<VarianteDocument> {
     const corNormalizada = normalizarCor(dto.cor);
 
     // Só valida contra `configuracoes.cores` quando a cor está REALMENTE
@@ -392,7 +392,7 @@ export class ProdutosService {
     varianteId: string,
     dto: AdicionarTamanhoDto,
     usuarioId: string | null,
-  ): Promise<Variante> {
+  ): Promise<VarianteDocument> {
     const tamanhoNormalizado = normalizarTamanho(dto.tamanho);
     await this.validarTamanhoCadastrado(dto.tamanho);
 

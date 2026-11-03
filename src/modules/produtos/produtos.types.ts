@@ -5,6 +5,9 @@
  * artificiais no service só para satisfazer o tipo de subdocumento do Mongoose.
  */
 
+import type { Types } from "mongoose";
+import type { Variante } from "./schemas/variante.schema.js";
+
 export interface DadosCriarProduto {
   codProduto: string;
   nome: string;
@@ -35,3 +38,11 @@ export interface DadosNovaVariante {
   video: string | null;
   tamanhos: [];
 }
+
+/**
+ * Fase 55.8 — tipo de RETORNO (não de entrada): o elemento exato de
+ * `Produto.variantes` (`Types.DocumentArray<Variante>`), um subdocumento com
+ * `_id`. Não é `VarianteDocument` (`HydratedDocument<Variante>`), que declara
+ * `__v` — subdocumentos não têm `__v`, então atribuir um ao outro exigiria cast.
+ */
+export type VarianteSubdocumento = Types.Subdocument<Types.ObjectId, unknown, Variante> & Variante;
