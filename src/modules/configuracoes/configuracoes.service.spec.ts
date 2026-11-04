@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { Logger } from "@nestjs/common";
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken, getModelToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import { Types, type Connection, type Model } from "mongoose";
+import { mongo, Types, type Connection, type Model } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { liberarTudo, novoPonto, type PontoDeParada } from "../../test-utils/barreira.util.js";
@@ -1416,6 +1417,466 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
           await limparCenario(cenario, vendaId);
         }
       });
+    });
+  });
+
+  /**
+   * Fase 56.4.1 — compensação robusta da remoção (`removerItemProtegido`).
+   *
+   * Falhas do MongoDB são INJETADAS por espiões que lançam o erro real do
+   * driver (`mongo.MongoNetworkError`) ANTES de chamar o método original (nada
+   * gravado) ou DEPOIS (gravado, confirmação perdida) — nenhuma persistência é
+   * simulada. O vínculo "na janela" é o mesmo da Fase 56.2: uma variante cuja
+   * cor já foi validada é gravada logo depois do `$pull`, antes da rechecagem.
+   * Todos os cenários conferem o documento CRU (lista e espelho).
+   */
+  describe("compensação robusta da remoção (Fase 56.4.1)", () => {
+    const MENSAGEM_VINCULO_COR =
+      "Não foi possível excluir esta cor porque existem produtos vinculados a ela no sistema. Remova ou altere os vínculos antes de tentar novamente.";
+    let repositorio: ConfiguracoesRepository;
+    let produtosRepositorio: ProdutosRepository;
+    let contador = 0;
+
+    beforeAll(() => {
+      repositorio = moduleRef.get(ConfiguracoesRepository, { strict: false });
+      produtosRepositorio = moduleRef.get(ProdutosRepository, { strict: false });
+    });
+
+    beforeEach(async () => {
+      await garantirItemConfiguracao(service, "categorias", "Vestidos");
+    });
+
+    function falhaDeRede(): Error {
+      return new mongo.MongoNetworkError("falha de rede simulada (teste da Fase 56.4.1)");
+    }
+
+    function capturarErro(promessa: Promise<unknown>): Promise<unknown> {
+      return promessa.then(
+        () => null,
+        (erro: unknown) => erro,
+      );
+    }
+
+    /** Cor nova entre duas vizinhas — `[..., antes, chave, depois]` — para conferir a posição. */
+    async function corComVizinhas(rotulo: string) {
+      contador += 1;
+      const base = `Comp${rotulo}-${Date.now()}-${contador}`;
+      const chave = `${base}-Alvo`;
+      await service.adicionarItem("cores", `${base}-Antes`, USUARIO_ID);
+      await service.adicionarItem("cores", chave, USUARIO_ID);
+      await service.adicionarItem("cores", `${base}-Depois`, USUARIO_ID);
+      return { chave, antes: `${base}-Antes`, depois: `${base}-Depois` };
+    }
+
+    async function coresCruas() {
+      const documento = await connection.collection<Configuracao>("configuracoes").findOne({ _id: "global" });
+      return { lista: documento?.cores ?? [], espelho: documento?.coresNormalizadas ?? [] };
+    }
+
+    /** Quantas vezes o item aparece na lista (por equivalente normalizado) e no espelho, e o índice do valor exato. */
+    async function representacao(valor: string) {
+      const { lista, espelho } = await coresCruas();
+      const normalizado = normalizarCor(valor);
+      return {
+        naLista: lista.filter((item) => normalizarCor(item) === normalizado).length,
+        noEspelho: espelho.filter((item) => item === normalizado).length,
+        indice: lista.indexOf(valor),
+      };
+    }
+
+    /**
+     * Inicia `adicionarVariante` com a cor (validada como cadastrada) e pausa
+     * antes da gravação. `gravar()` libera e espera a variante ser gravada —
+     * chamado DEPOIS do `$pull` (ver `aposPull`), cria o vínculo na janela.
+     */
+    async function vinculoPendente(chave: string) {
+      const produto = await produtosService.criar(payloadProduto(`COMP-${chave}`), null);
+      const pausa = novoPonto();
+      const original = produtosRepositorio.adicionarVarianteAtomico.bind(produtosRepositorio);
+      const espiao = spyOn(produtosRepositorio, "adicionarVarianteAtomico").mockImplementation(async (produtoId, variante) => {
+        pausa.chegou.liberar();
+        await pausa.liberacao.promessa;
+        return original(produtoId, variante);
+      });
+      const inclusao = produtosService.adicionarVariante(produto.id, { cor: chave }, null);
+      inclusao.catch(() => undefined); // se o teste falhar antes de `gravar()`, a rejeição não fica sem tratamento
+      await pausa.chegou.promessa;
+      espiao.mockRestore(); // a chamada pendente segue no próprio closure
+      return {
+        gravar: async () => {
+          pausa.liberacao.liberar();
+          await inclusao;
+        },
+        liberar: () => liberarTudo(pausa),
+      };
+    }
+
+    /** `removerItemLista` real; logo depois do `$pull` (antes da rechecagem) roda `acao`. */
+    function aposPull(acao: () => Promise<void>) {
+      const original = repositorio.removerItemLista.bind(repositorio);
+      return spyOn(repositorio, "removerItemLista").mockImplementation(async (campo, valor) => {
+        const resultado = await original(campo, valor);
+        await acao();
+        return resultado;
+      });
+    }
+
+    /** `falhas[i]` decide a i-ésima chamada de `restaurarItemLista`: "antes" (lança sem gravar), "depois" (grava e lança) ou normal. */
+    function restauracaoComFalhas(falhas: ("antes" | "depois")[]) {
+      const original = repositorio.restaurarItemLista.bind(repositorio);
+      let chamadas = 0;
+      const espiao = spyOn(repositorio, "restaurarItemLista").mockImplementation(async (campo, valor, posicao) => {
+        const falha = falhas[chamadas];
+        chamadas += 1;
+        if (falha === "antes") throw falhaDeRede();
+        const resultado = await original(campo, valor, posicao);
+        if (falha === "depois") throw falhaDeRede();
+        return resultado;
+      });
+      return { espiao, chamadas: () => chamadas };
+    }
+
+    /** `listarTodosAtivos` (consulta de vínculo de cor) com falha injetada nas chamadas indicadas (1 = checagem inicial). */
+    function consultaDeVinculoComFalhas(falhas: Map<number, () => Error>) {
+      const original = produtosRepositorio.listarTodosAtivos.bind(produtosRepositorio);
+      let chamadas = 0;
+      const espiao = spyOn(produtosRepositorio, "listarTodosAtivos").mockImplementation(async (filtro) => {
+        chamadas += 1;
+        const falha = falhas.get(chamadas);
+        if (falha) throw falha();
+        return original(filtro);
+      });
+      return { espiao, chamadas: () => chamadas };
+    }
+
+    function silenciarLogs() {
+      return {
+        erro: spyOn(Logger.prototype, "error").mockImplementation(() => undefined),
+        aviso: spyOn(Logger.prototype, "warn").mockImplementation(() => undefined),
+      };
+    }
+
+    it("1. falha transitória na 1ª restauração e sucesso na 2ª: erro de negócio 400, item de volta na posição original", async () => {
+      const { chave, antes, depois } = await corComVizinhas("T1");
+      const { indice } = await representacao(chave);
+      const vinculo = await vinculoPendente(chave);
+      const remocao = aposPull(vinculo.gravar);
+      const restauracao = restauracaoComFalhas(["antes"]);
+      try {
+        const erro = await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+        expect(erro).toBeInstanceOf(ApiException);
+        expect(erro instanceof ApiException ? erro.getStatus() : null).toBe(400);
+        expect(erro).toMatchObject({ code: "VALIDATION_ERROR", message: MENSAGEM_VINCULO_COR, errors: [{ field: "valor", message: MENSAGEM_VINCULO_COR }] });
+        expect(restauracao.chamadas()).toBe(2);
+        expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+        expect((await coresCruas()).lista.slice(indice - 1, indice + 2)).toEqual([antes, chave, depois]);
+      } finally {
+        vinculo.liberar();
+        remocao.mockRestore();
+        restauracao.espiao.mockRestore();
+      }
+    });
+
+    it("2. falha persistente nas 3 tentativas: HTTP 500 (erro não-ApiException), log contextual completo, nenhum estado inventado", async () => {
+      const { chave } = await corComVizinhas("T2");
+      const vinculo = await vinculoPendente(chave);
+      const remocao = aposPull(vinculo.gravar);
+      const restauracao = restauracaoComFalhas(["antes", "antes", "antes"]);
+      const logs = silenciarLogs();
+      try {
+        const erro = await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+        expect(erro).toBeInstanceOf(Error);
+        expect(erro).not.toBeInstanceOf(ApiException); // o filtro global responde 500 INTERNAL_ERROR
+        expect(erro instanceof Error ? erro.message : "").toBe(`Falha ao restaurar "${chave}" na lista de cores após a remoção.`);
+        expect(erro instanceof Error ? erro.cause : null).toBeInstanceOf(mongo.MongoNetworkError);
+        expect(restauracao.chamadas()).toBe(3);
+        expect(logs.erro).toHaveBeenCalledTimes(1);
+        const mensagem = String(logs.erro.mock.calls[0]?.[0]);
+        expect(mensagem).toMatch(/operacao=[0-9a-f-]{36} /);
+        expect(mensagem).toContain(`lista=cores valor=${JSON.stringify(chave)} normalizado=${JSON.stringify(normalizarCor(chave))}`);
+        expect(mensagem).toContain("tentativas=3 motivo=vínculo encontrado na rechecagem");
+        expect(mensagem).toContain("erroCompensacao=MongoNetworkError: falha de rede simulada");
+        // Estado real (inconsistência que agora fica registrada em log, não escondida):
+        expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+      } finally {
+        vinculo.liberar();
+        remocao.mockRestore();
+        restauracao.espiao.mockRestore();
+        logs.erro.mockRestore();
+        logs.aviso.mockRestore();
+      }
+    });
+
+    it("3. restauração repetida não duplica: confirmação perdida na 1ª escrita → a 2ª relê e reconhece 'já presente'; chamada extra também", async () => {
+      const { chave } = await corComVizinhas("T3");
+      const { indice } = await representacao(chave);
+      const vinculo = await vinculoPendente(chave);
+      const remocao = aposPull(vinculo.gravar);
+      const restauracao = restauracaoComFalhas(["depois"]);
+      try {
+        const erro = await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+        expect(erro).toMatchObject({ code: "VALIDATION_ERROR", message: MENSAGEM_VINCULO_COR });
+        expect(restauracao.chamadas()).toBe(2);
+        expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+      } finally {
+        vinculo.liberar();
+        remocao.mockRestore();
+        restauracao.espiao.mockRestore();
+      }
+      expect(await repositorio.restaurarItemLista("cores", chave, 0)).toBe("ja_presente");
+      expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+    });
+
+    it("4. lista e espelho consistentes depois da compensação: o item e as vizinhas aparecem exatamente uma vez em cada um", async () => {
+      const { chave, antes, depois } = await corComVizinhas("T4");
+      const vinculo = await vinculoPendente(chave);
+      const remocao = aposPull(vinculo.gravar);
+      try {
+        expect(await capturarErro(service.removerItem("cores", chave, USUARIO_ID))).toMatchObject({ message: MENSAGEM_VINCULO_COR });
+      } finally {
+        vinculo.liberar();
+        remocao.mockRestore();
+      }
+      for (const valor of [antes, chave, depois]) {
+        expect(await representacao(valor)).toMatchObject({ naLista: 1, noEspelho: 1 });
+      }
+    });
+
+    it("5. item ausente na lista mas presente no espelho: a restauração insere na lista (na posição) sem duplicar o espelho", async () => {
+      const { chave } = await corComVizinhas("T5");
+      const { indice } = await representacao(chave);
+      await connection.collection<Configuracao>("configuracoes").updateOne({ _id: "global" }, { $pull: { cores: chave } });
+      expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 1, indice: -1 });
+
+      expect(await repositorio.restaurarItemLista("cores", chave, indice)).toBe("restaurado");
+      expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+    });
+
+    it("6. item presente na lista mas ausente no espelho: só o espelho é completado, a lista não muda", async () => {
+      const { chave } = await corComVizinhas("T6");
+      const { indice } = await representacao(chave);
+      await connection.collection<Configuracao>("configuracoes").updateOne({ _id: "global" }, { $pull: { coresNormalizadas: normalizarCor(chave) } });
+      const listaAntes = (await coresCruas()).lista;
+      expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 0, indice });
+
+      expect(await repositorio.restaurarItemLista("cores", chave, indice)).toBe("espelho_reparado");
+      expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+      expect((await coresCruas()).lista).toEqual(listaAntes);
+    });
+
+    it("7. item presente com grafia diferente e normalizado equivalente: nunca insere a outra grafia (caixa, acento, espaços)", async () => {
+      contador += 1;
+      const gravado = `Azul  Céu Comp${Date.now()}-${contador}`; // espaço duplo e acento, como foi cadastrado
+      const pedido = gravado.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "").replace(/\s+/g, " ");
+      expect(normalizarCor(pedido)).toBe(normalizarCor(gravado));
+      await service.adicionarItem("cores", gravado, USUARIO_ID);
+      const listaAntes = (await coresCruas()).lista;
+
+      expect(await repositorio.restaurarItemLista("cores", pedido, 0)).toBe("ja_presente");
+      expect((await coresCruas()).lista).toEqual(listaAntes);
+      expect(await representacao(pedido)).toMatchObject({ naLista: 1, noEspelho: 1, indice: -1 });
+
+      // Mesmo com o espelho faltando, só o espelho é reparado — a outra grafia continua fora.
+      await connection.collection<Configuracao>("configuracoes").updateOne({ _id: "global" }, { $pull: { coresNormalizadas: normalizarCor(gravado) } });
+      expect(await repositorio.restaurarItemLista("cores", pedido, 0)).toBe("espelho_reparado");
+      expect((await coresCruas()).lista).toEqual(listaAntes);
+      expect(await representacao(pedido)).toMatchObject({ naLista: 1, noEspelho: 1, indice: -1 });
+    });
+
+    it("8. inclusão concorrente do mesmo item com outra grafia ENTRE a leitura e a escrita da restauração: conflito, releitura, uma única entrada", async () => {
+      const { chave } = await corComVizinhas("T8");
+      const outraGrafia = chave.toUpperCase();
+      const vinculo = await vinculoPendente(chave);
+      const remocao = aposPull(vinculo.gravar);
+      const restaurarOriginal = repositorio.restaurarItemLista.bind(repositorio);
+      const lerOriginal = repositorio.lerEstadoLista.bind(repositorio);
+      const resultados: string[] = [];
+      let dentroDaRestauracao = false;
+      let inclusaoFeita = false;
+      const espiaoRestaurar = spyOn(repositorio, "restaurarItemLista").mockImplementation(async (campo, valor, posicao) => {
+        dentroDaRestauracao = true;
+        try {
+          const resultado = await restaurarOriginal(campo, valor, posicao);
+          resultados.push(resultado);
+          return resultado;
+        } finally {
+          dentroDaRestauracao = false;
+        }
+      });
+      const espiaoLer = spyOn(repositorio, "lerEstadoLista").mockImplementation(async (campo) => {
+        const estado = await lerOriginal(campo);
+        if (dentroDaRestauracao && !inclusaoFeita) {
+          inclusaoFeita = true;
+          await service.adicionarItem("cores", outraGrafia, USUARIO_ID); // escrita concorrente REAL depois da leitura da restauração
+        }
+        return estado;
+      });
+      try {
+        const erro = await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+        expect(erro).toMatchObject({ code: "VALIDATION_ERROR", message: MENSAGEM_VINCULO_COR });
+        expect(resultados).toEqual(["conflito", "ja_presente"]);
+        const final = await representacao(chave);
+        expect(final).toMatchObject({ naLista: 1, noEspelho: 1, indice: -1 }); // só a grafia concorrente
+        expect((await coresCruas()).lista.filter((item) => item === outraGrafia)).toHaveLength(1);
+      } finally {
+        vinculo.liberar();
+        remocao.mockRestore();
+        espiaoRestaurar.mockRestore();
+        espiaoLer.mockRestore();
+      }
+    });
+
+    it("9. posição: compensação normal devolve o item ao lugar; posição fora do intervalo (lista mudou) é limitada, nunca inválida", async () => {
+      const { chave, antes, depois } = await corComVizinhas("T9");
+      const { indice } = await representacao(chave);
+      const vinculo = await vinculoPendente(chave);
+      const remocao = aposPull(vinculo.gravar);
+      try {
+        await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+      } finally {
+        vinculo.liberar();
+        remocao.mockRestore();
+      }
+      expect((await coresCruas()).lista.slice(indice - 1, indice + 2)).toEqual([antes, chave, depois]);
+
+      const colecao = connection.collection<Configuracao>("configuracoes");
+      await colecao.updateOne({ _id: "global" }, { $pull: { cores: chave, coresNormalizadas: normalizarCor(chave) } });
+      expect(await repositorio.restaurarItemLista("cores", chave, 1_000_000)).toBe("restaurado");
+      const depoisDoFim = await coresCruas();
+      expect(depoisDoFim.lista.indexOf(chave)).toBe(depoisDoFim.lista.length - 1);
+
+      await colecao.updateOne({ _id: "global" }, { $pull: { cores: chave, coresNormalizadas: normalizarCor(chave) } });
+      expect(await repositorio.restaurarItemLista("cores", chave, -5)).toBe("restaurado");
+      expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice: 0 });
+    });
+
+    it("10. falha transitória na 2ª checagem: a consulta é repetida e, sem vínculo, a remoção conclui normalmente", async () => {
+      const { chave } = await corComVizinhas("T10");
+      const consulta = consultaDeVinculoComFalhas(new Map([[2, falhaDeRede]]));
+      try {
+        const resultado = await service.removerItem("cores", chave, USUARIO_ID);
+        expect(resultado.cores).not.toContain(chave);
+        expect(consulta.chamadas()).toBe(3); // inicial + rechecagem que falhou + rechecagem repetida
+        expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+      } finally {
+        consulta.espiao.mockRestore();
+      }
+    });
+
+    it("11. falha permanente na 2ª checagem: não repete, restaura o item (mesma posição) e propaga o erro original (HTTP 500)", async () => {
+      const { chave } = await corComVizinhas("T11");
+      const { indice } = await representacao(chave);
+      const falhaPermanente = new Error("falha permanente simulada na rechecagem");
+      const consulta = consultaDeVinculoComFalhas(new Map([[2, () => falhaPermanente]]));
+      const logs = silenciarLogs();
+      try {
+        const erro = await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+        expect(erro).toBe(falhaPermanente); // nunca convertida em "sem vínculo"
+        expect(consulta.chamadas()).toBe(2);
+        expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+        expect(logs.aviso).toHaveBeenCalledTimes(1);
+        expect(String(logs.aviso.mock.calls[0]?.[0])).toContain(`lista=cores valor=${JSON.stringify(chave)} erroOriginal=Error: falha permanente simulada na rechecagem`);
+      } finally {
+        consulta.espiao.mockRestore();
+        logs.erro.mockRestore();
+        logs.aviso.mockRestore();
+      }
+    });
+
+    it("11b. falha transitória esgotada na 2ª checagem (3 tentativas): também restaura e propaga o erro original", async () => {
+      const { chave } = await corComVizinhas("T11b");
+      const { indice } = await representacao(chave);
+      const consulta = consultaDeVinculoComFalhas(new Map([[2, falhaDeRede], [3, falhaDeRede], [4, falhaDeRede]]));
+      const logs = silenciarLogs();
+      try {
+        const erro = await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+        expect(erro).toBeInstanceOf(mongo.MongoNetworkError);
+        expect(consulta.chamadas()).toBe(4); // inicial + 3 tentativas da rechecagem
+        expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+      } finally {
+        consulta.espiao.mockRestore();
+        logs.erro.mockRestore();
+        logs.aviso.mockRestore();
+      }
+    });
+
+    describe("12. falha ambígua durante o $pull (reconciliação pelo estado persistido)", () => {
+      /** `removerItemLista` cuja 1ª chamada falha com erro de rede — `aplicar` decide se o `$pull` chega a ser gravado antes da falha. */
+      function remocaoComFalhaAmbigua(aplicar: boolean, depoisDeAplicar: () => Promise<void> = async () => undefined) {
+        const original = repositorio.removerItemLista.bind(repositorio);
+        let chamadas = 0;
+        const espiao = spyOn(repositorio, "removerItemLista").mockImplementation(async (campo, valor) => {
+          chamadas += 1;
+          if (chamadas > 1) return original(campo, valor);
+          if (aplicar) {
+            await original(campo, valor);
+            await depoisDeAplicar();
+          }
+          throw falhaDeRede();
+        });
+        return { espiao, chamadas: () => chamadas };
+      }
+
+      it("12a. $pull aplicado e confirmação perdida, sem vínculo: reconhece a remoção sem repetir e conclui com sucesso", async () => {
+        const { chave } = await corComVizinhas("T12a");
+        const remocao = remocaoComFalhaAmbigua(true);
+        try {
+          const resultado = await service.removerItem("cores", chave, USUARIO_ID);
+          expect(resultado.cores).not.toContain(chave);
+          expect(remocao.chamadas()).toBe(1);
+          expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+          const eventos = await connection.collection("eventos_configuracao").countDocuments({ tipo: "configuracao.item_removido", "detalhes.valor": chave });
+          expect(eventos).toBe(1);
+        } finally {
+          remocao.espiao.mockRestore();
+        }
+      });
+
+      it("12b. $pull aplicado e confirmação perdida, com vínculo gravado na janela: reconcilia, recheca, restaura e responde 400", async () => {
+        const { chave } = await corComVizinhas("T12b");
+        const { indice } = await representacao(chave);
+        const vinculo = await vinculoPendente(chave);
+        const remocao = remocaoComFalhaAmbigua(true, vinculo.gravar);
+        try {
+          const erro = await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+          expect(erro).toMatchObject({ code: "VALIDATION_ERROR", message: MENSAGEM_VINCULO_COR });
+          expect(remocao.chamadas()).toBe(1);
+          expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+        } finally {
+          vinculo.liberar();
+          remocao.espiao.mockRestore();
+        }
+      });
+
+      it("12c. falha ANTES de gravar: o estado mostra o item ainda presente, então o $pull é repetido e a remoção conclui", async () => {
+        const { chave } = await corComVizinhas("T12c");
+        const remocao = remocaoComFalhaAmbigua(false);
+        try {
+          const resultado = await service.removerItem("cores", chave, USUARIO_ID);
+          expect(resultado.cores).not.toContain(chave);
+          expect(remocao.chamadas()).toBe(2);
+          expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+        } finally {
+          remocao.espiao.mockRestore();
+        }
+      });
+    });
+
+    it("13. contratos preservados: vínculo na checagem inicial (400, nada gravado) e item inexistente (404) com as mensagens de sempre", async () => {
+      const { chave } = await corComVizinhas("T13");
+      const { indice } = await representacao(chave);
+      const produto = await produtosService.criar(payloadProduto(`COMP-T13-${chave}`), null);
+      await produtosService.adicionarVariante(produto.id, { cor: chave }, null);
+
+      const erroVinculo = await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+      expect(erroVinculo instanceof ApiException ? erroVinculo.getStatus() : null).toBe(400);
+      expect(erroVinculo).toMatchObject({ code: "VALIDATION_ERROR", message: MENSAGEM_VINCULO_COR, errors: [{ field: "valor", message: MENSAGEM_VINCULO_COR }] });
+      expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+
+      const inexistente = `Inexistente-${chave}`;
+      const erroNaoEncontrado = await capturarErro(service.removerItem("cores", inexistente, USUARIO_ID));
+      expect(erroNaoEncontrado instanceof ApiException ? erroNaoEncontrado.getStatus() : null).toBe(404);
+      expect(erroNaoEncontrado).toMatchObject({ code: "NOT_FOUND", message: `"${inexistente}" não existe na lista de cores.`, errors: [] });
     });
   });
 });

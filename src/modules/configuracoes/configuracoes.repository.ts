@@ -22,10 +22,52 @@ const CAMPOS_COM_NORMALIZACAO = {
   formasPagamento: { campoNormalizado: "formasPagamentoNormalizadas", normalizar: normalizarFormaPagamento },
 } as const satisfies Partial<Record<CampoLista, { campoNormalizado: string; normalizar: (valor: string) => string }>>;
 
-type CampoComNormalizacao = keyof typeof CAMPOS_COM_NORMALIZACAO;
+export type CampoComNormalizacao = keyof typeof CAMPOS_COM_NORMALIZACAO;
 
 function temNormalizacao(campo: CampoLista): campo is CampoComNormalizacao {
   return campo in CAMPOS_COM_NORMALIZACAO;
+}
+
+/** Fase 56.4.1 — valor normalizado com a MESMA função do espelho da lista (usado em logs e conferências). */
+export function normalizarItemLista(campo: CampoComNormalizacao, valor: string): string {
+  return CAMPOS_COM_NORMALIZACAO[campo].normalizar(valor);
+}
+
+/**
+ * Fase 56.4.1 — lista e espelho exatamente como estão no documento CRU (sem
+ * os defaults do Mongoose): `null` = campo ausente no documento (singleton
+ * legado, anterior ao espelho).
+ */
+export interface EstadoListaPersistido {
+  lista: string[] | null;
+  espelho: string[] | null;
+}
+
+/**
+ * Resultado de UMA tentativa de `restaurarItemLista`:
+ * - `restaurado`: o item voltou à lista (e ao espelho, se faltava);
+ * - `espelho_reparado`: a lista já tinha um equivalente normalizado, só o espelho foi completado;
+ * - `ja_presente`: lista e espelho já representavam o item — nada a gravar;
+ * - `conflito`: o documento mudou entre a leitura e a escrita — nada foi gravado, reler e tentar de novo.
+ */
+export type ResultadoRestauracao = "restaurado" | "espelho_reparado" | "ja_presente" | "conflito";
+
+function ehTexto(valor: unknown): valor is string {
+  return typeof valor === "string";
+}
+
+function comoListaPersistida(valor: unknown, campo: string): string[] | null {
+  if (valor === undefined) return null;
+  if (Array.isArray(valor)) {
+    const itens: unknown[] = valor;
+    if (itens.every(ehTexto)) return itens;
+  }
+  throw new Error(`Formato inesperado do campo "${campo}" no documento de configuração.`);
+}
+
+/** Filtro de igualdade EXATA (mesmos elementos, mesma ordem) — ou ausência do campo. */
+function igualdadeExata(valor: string[] | null): string[] | { $exists: false } {
+  return valor === null ? { $exists: false } : valor;
 }
 
 @Injectable()
@@ -161,5 +203,90 @@ export class ConfiguracoesRepository {
     return this.configuracaoModel
       .findOneAndUpdate({ _id: ID_CONFIGURACAO_GLOBAL, [campo]: valor }, { $pull: pull }, { returnDocument: "after" })
       .exec();
+  }
+
+  /** Fase 56.4.1 — leitura CRUA (`lean`) só da lista e do seu espelho; `null` se o singleton não existe. */
+  async lerEstadoLista(campo: CampoComNormalizacao): Promise<EstadoListaPersistido | null> {
+    const { campoNormalizado } = CAMPOS_COM_NORMALIZACAO[campo];
+    const documento = await this.configuracaoModel
+      .findById(ID_CONFIGURACAO_GLOBAL, { [campo]: 1, [campoNormalizado]: 1 })
+      .lean<Record<string, unknown>>()
+      .exec();
+    if (!documento) return null;
+    return {
+      lista: comoListaPersistida(documento[campo], campo),
+      espelho: comoListaPersistida(documento[campoNormalizado], campoNormalizado),
+    };
+  }
+
+  /** Índice de `valor` (comparação EXATA, a mesma do filtro de `removerItemLista`) ou `null` se não está na lista. */
+  async posicaoDoItem(campo: CampoComNormalizacao, valor: string): Promise<number | null> {
+    const indice = (await this.lerEstadoLista(campo))?.lista?.indexOf(valor) ?? -1;
+    return indice >= 0 ? indice : null;
+  }
+
+  /** `valor` EXATO na lista — usado para reconciliar um `$pull` de resultado desconhecido. */
+  async contemItemExato(campo: CampoComNormalizacao, valor: string): Promise<boolean> {
+    return (await this.lerEstadoLista(campo))?.lista?.includes(valor) ?? false;
+  }
+
+  /** O item está corretamente representado: um equivalente NORMALIZADO na lista E o normalizado no espelho. */
+  async itemRepresentado(campo: CampoComNormalizacao, valor: string): Promise<boolean> {
+    const { normalizar } = CAMPOS_COM_NORMALIZACAO[campo];
+    const normalizado = normalizar(valor);
+    const estado = await this.lerEstadoLista(campo);
+    return Boolean(estado?.lista?.some((item) => normalizar(item) === normalizado) && estado.espelho?.includes(normalizado));
+  }
+
+  /**
+   * Fase 56.4.1 — restaura `valor` removido por `removerItemLista` (compensação),
+   * em UMA tentativa atômica e idempotente.
+   *
+   * Por que não um único `$push` com `[espelho]: { $ne: normalizado }`: a
+   * unicidade da lista é por valor NORMALIZADO (acentos, caixa, espaços), e
+   * nenhum operador do MongoDB reproduz `normalizar*` dentro de um filtro — o
+   * `$ne` sobre o espelho não distingue "espelho com o valor mas lista sem
+   * equivalente" de "lista com equivalente mas espelho sem o valor".
+   *
+   * Estratégia (compare-and-set num único documento, sem transação):
+   * 1. lê lista e espelho CRUS;
+   * 2. decide em memória, com o normalizador real da lista: se já existe um
+   *    equivalente normalizado na lista, não insere (nunca duplica por
+   *    grafia); senão insere `valor` em `posicao` (limitada a `[0, tamanho]`;
+   *    `null` = fim). O espelho ganha o normalizado só se faltar;
+   * 3. grava lista e espelho num ÚNICO `updateOne` cujo filtro exige que os
+   *    dois arrays estejam EXATAMENTE como foram lidos (igualdade de array é
+   *    nativa do MongoDB). Se qualquer escrita concorrente mudou um deles
+   *    (ex.: uma inclusão do mesmo item com outra grafia), nada é gravado e o
+   *    resultado é `conflito` — quem chama relê e tenta de novo.
+   *
+   * Idempotente: cada tentativa parte do estado persistido, então repetir
+   * depois de uma escrita aplicada (inclusive com confirmação perdida) devolve
+   * `ja_presente`, nunca duplica.
+   */
+  async restaurarItemLista(campo: CampoComNormalizacao, valor: string, posicao: number | null): Promise<ResultadoRestauracao> {
+    const { campoNormalizado, normalizar } = CAMPOS_COM_NORMALIZACAO[campo];
+    const normalizado = normalizar(valor);
+    const lido = await this.lerEstadoLista(campo);
+    if (!lido) return "conflito";
+
+    const listaAtual = lido.lista ?? [];
+    const espelhoAtual = lido.espelho ?? [];
+    const listaTemEquivalente = listaAtual.some((item) => normalizar(item) === normalizado);
+    const espelhoTemNormalizado = espelhoAtual.includes(normalizado);
+    if (listaTemEquivalente && espelhoTemNormalizado) return "ja_presente";
+
+    const indice = posicao === null ? listaAtual.length : Math.min(Math.max(posicao, 0), listaAtual.length);
+    const novaLista = listaTemEquivalente ? listaAtual : [...listaAtual.slice(0, indice), valor, ...listaAtual.slice(indice)];
+    const novoEspelho = espelhoTemNormalizado ? espelhoAtual : [...espelhoAtual, normalizado];
+
+    const { matchedCount } = await this.configuracaoModel
+      .updateOne(
+        { _id: ID_CONFIGURACAO_GLOBAL, [campo]: igualdadeExata(lido.lista), [campoNormalizado]: igualdadeExata(lido.espelho) },
+        { $set: { [campo]: novaLista, [campoNormalizado]: novoEspelho } },
+      )
+      .exec();
+    if (matchedCount === 0) return "conflito";
+    return listaTemEquivalente ? "espelho_reparado" : "restaurado";
   }
 }
