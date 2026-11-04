@@ -13,7 +13,7 @@ import { MovimentoCaixa, type MovimentoCaixaDocument } from "../caixas/schemas/m
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
-import { normalizarCor, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
+import { normalizarCor, normalizarFormaPagamento, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
 import { Venda, type PagamentoVenda, type ParcelaVenda, type VendaDocument } from "../vendas/schemas/venda.schema.js";
 import { VendasService } from "../vendas/vendas.service.js";
@@ -22,7 +22,7 @@ import { ConfiguracoesModule } from "./configuracoes.module.js";
 import { ConfiguracoesRepository } from "./configuracoes.repository.js";
 import { ConfiguracoesService } from "./configuracoes.service.js";
 import type { AtualizarLojaDto } from "./dto/atualizar-loja.dto.js";
-import type { Configuracao } from "./schemas/configuracao.schema.js";
+import type { Configuracao, ConfiguracaoDocument } from "./schemas/configuracao.schema.js";
 
 let contadorVenda = 0;
 /** Documento MÍNIMO válido de Venda, inserido via o próprio Model do Mongoose (defaults do schema aplicados) — usado SÓ para testar os vínculos de forma de pagamento, nunca para exercitar regra de negócio de Vendas (isso é feito em `vendas.service.spec.ts`). */
@@ -1043,12 +1043,15 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
    * sempre liberadas e os spies restaurados em `finally`.
    */
   describe("concorrência determinística — exclusão × criação de vínculo (Fase 56.2)", () => {
-    /** Exclusão: pausa DEPOIS do `$pull` (checagem inicial já feita) e ANTES da rechecagem. */
+    /**
+     * Exclusão: pausa DEPOIS do `$pull` (checagem inicial já feita) e ANTES da rechecagem.
+     * (Fase 56.4.2: o `$pull` das listas protegidas é `removerItemComPendencia`.)
+     */
     function pausarExclusaoAntesDaRechecagem(ponto: PontoDeParada) {
       const repositorio = moduleRef.get(ConfiguracoesRepository, { strict: false });
-      const original = repositorio.removerItemLista.bind(repositorio);
-      return spyOn(repositorio, "removerItemLista").mockImplementation(async (campo, valor) => {
-        const resultado = await original(campo, valor);
+      const original = repositorio.removerItemComPendencia.bind(repositorio);
+      return spyOn(repositorio, "removerItemComPendencia").mockImplementation(async (campo, valor, dados) => {
+        const resultado = await original(campo, valor, dados);
         ponto.chegou.liberar();
         await ponto.liberacao.promessa;
         return resultado;
@@ -1511,11 +1514,11 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       };
     }
 
-    /** `removerItemLista` real; logo depois do `$pull` (antes da rechecagem) roda `acao`. */
+    /** `$pull` real (Fase 56.4.2: `removerItemComPendencia`); logo depois dele (antes da rechecagem) roda `acao`. */
     function aposPull(acao: () => Promise<void>) {
-      const original = repositorio.removerItemLista.bind(repositorio);
-      return spyOn(repositorio, "removerItemLista").mockImplementation(async (campo, valor) => {
-        const resultado = await original(campo, valor);
+      const original = repositorio.removerItemComPendencia.bind(repositorio);
+      return spyOn(repositorio, "removerItemComPendencia").mockImplementation(async (campo, valor, dados) => {
+        const resultado = await original(campo, valor, dados);
         await acao();
         return resultado;
       });
@@ -1525,11 +1528,11 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
     function restauracaoComFalhas(falhas: ("antes" | "depois")[]) {
       const original = repositorio.restaurarItemLista.bind(repositorio);
       let chamadas = 0;
-      const espiao = spyOn(repositorio, "restaurarItemLista").mockImplementation(async (campo, valor, posicao) => {
+      const espiao = spyOn(repositorio, "restaurarItemLista").mockImplementation(async (campo, valor, posicao, opId) => {
         const falha = falhas[chamadas];
         chamadas += 1;
         if (falha === "antes") throw falhaDeRede();
-        const resultado = await original(campo, valor, posicao);
+        const resultado = await original(campo, valor, posicao, opId);
         if (falha === "depois") throw falhaDeRede();
         return resultado;
       });
@@ -1623,7 +1626,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
         remocao.mockRestore();
         restauracao.espiao.mockRestore();
       }
-      expect(await repositorio.restaurarItemLista("cores", chave, 0)).toBe("ja_presente");
+      expect(await repositorio.restaurarItemLista("cores", chave, 0, null)).toBe("ja_presente");
       expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
     });
 
@@ -1648,7 +1651,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       await connection.collection<Configuracao>("configuracoes").updateOne({ _id: "global" }, { $pull: { cores: chave } });
       expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 1, indice: -1 });
 
-      expect(await repositorio.restaurarItemLista("cores", chave, indice)).toBe("restaurado");
+      expect(await repositorio.restaurarItemLista("cores", chave, indice, null)).toBe("restaurado");
       expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
     });
 
@@ -1659,7 +1662,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const listaAntes = (await coresCruas()).lista;
       expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 0, indice });
 
-      expect(await repositorio.restaurarItemLista("cores", chave, indice)).toBe("espelho_reparado");
+      expect(await repositorio.restaurarItemLista("cores", chave, indice, null)).toBe("espelho_reparado");
       expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
       expect((await coresCruas()).lista).toEqual(listaAntes);
     });
@@ -1672,13 +1675,13 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       await service.adicionarItem("cores", gravado, USUARIO_ID);
       const listaAntes = (await coresCruas()).lista;
 
-      expect(await repositorio.restaurarItemLista("cores", pedido, 0)).toBe("ja_presente");
+      expect(await repositorio.restaurarItemLista("cores", pedido, 0, null)).toBe("ja_presente");
       expect((await coresCruas()).lista).toEqual(listaAntes);
       expect(await representacao(pedido)).toMatchObject({ naLista: 1, noEspelho: 1, indice: -1 });
 
       // Mesmo com o espelho faltando, só o espelho é reparado — a outra grafia continua fora.
       await connection.collection<Configuracao>("configuracoes").updateOne({ _id: "global" }, { $pull: { coresNormalizadas: normalizarCor(gravado) } });
-      expect(await repositorio.restaurarItemLista("cores", pedido, 0)).toBe("espelho_reparado");
+      expect(await repositorio.restaurarItemLista("cores", pedido, 0, null)).toBe("espelho_reparado");
       expect((await coresCruas()).lista).toEqual(listaAntes);
       expect(await representacao(pedido)).toMatchObject({ naLista: 1, noEspelho: 1, indice: -1 });
     });
@@ -1693,10 +1696,10 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const resultados: string[] = [];
       let dentroDaRestauracao = false;
       let inclusaoFeita = false;
-      const espiaoRestaurar = spyOn(repositorio, "restaurarItemLista").mockImplementation(async (campo, valor, posicao) => {
+      const espiaoRestaurar = spyOn(repositorio, "restaurarItemLista").mockImplementation(async (campo, valor, posicao, opId) => {
         dentroDaRestauracao = true;
         try {
-          const resultado = await restaurarOriginal(campo, valor, posicao);
+          const resultado = await restaurarOriginal(campo, valor, posicao, opId);
           resultados.push(resultado);
           return resultado;
         } finally {
@@ -1741,12 +1744,12 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
 
       const colecao = connection.collection<Configuracao>("configuracoes");
       await colecao.updateOne({ _id: "global" }, { $pull: { cores: chave, coresNormalizadas: normalizarCor(chave) } });
-      expect(await repositorio.restaurarItemLista("cores", chave, 1_000_000)).toBe("restaurado");
+      expect(await repositorio.restaurarItemLista("cores", chave, 1_000_000, null)).toBe("restaurado");
       const depoisDoFim = await coresCruas();
       expect(depoisDoFim.lista.indexOf(chave)).toBe(depoisDoFim.lista.length - 1);
 
       await colecao.updateOne({ _id: "global" }, { $pull: { cores: chave, coresNormalizadas: normalizarCor(chave) } });
-      expect(await repositorio.restaurarItemLista("cores", chave, -5)).toBe("restaurado");
+      expect(await repositorio.restaurarItemLista("cores", chave, -5, null)).toBe("restaurado");
       expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice: 0 });
     });
 
@@ -1801,15 +1804,15 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
     });
 
     describe("12. falha ambígua durante o $pull (reconciliação pelo estado persistido)", () => {
-      /** `removerItemLista` cuja 1ª chamada falha com erro de rede — `aplicar` decide se o `$pull` chega a ser gravado antes da falha. */
+      /** `$pull` (Fase 56.4.2: `removerItemComPendencia`) cuja 1ª chamada falha com erro de rede — `aplicar` decide se ele chega a ser gravado antes da falha. */
       function remocaoComFalhaAmbigua(aplicar: boolean, depoisDeAplicar: () => Promise<void> = async () => undefined) {
-        const original = repositorio.removerItemLista.bind(repositorio);
+        const original = repositorio.removerItemComPendencia.bind(repositorio);
         let chamadas = 0;
-        const espiao = spyOn(repositorio, "removerItemLista").mockImplementation(async (campo, valor) => {
+        const espiao = spyOn(repositorio, "removerItemComPendencia").mockImplementation(async (campo, valor, dados) => {
           chamadas += 1;
-          if (chamadas > 1) return original(campo, valor);
+          if (chamadas > 1) return original(campo, valor, dados);
           if (aplicar) {
-            await original(campo, valor);
+            await original(campo, valor, dados);
             await depoisDeAplicar();
           }
           throw falhaDeRede();
@@ -1877,6 +1880,565 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const erroNaoEncontrado = await capturarErro(service.removerItem("cores", inexistente, USUARIO_ID));
       expect(erroNaoEncontrado instanceof ApiException ? erroNaoEncontrado.getStatus() : null).toBe(404);
       expect(erroNaoEncontrado).toMatchObject({ code: "NOT_FOUND", message: `"${inexistente}" não existe na lista de cores.`, errors: [] });
+    });
+  });
+
+  /**
+   * Fase 56.4.2 — intenção durável (`remocoesPendentes`) e
+   * `processarRemocoesPendentes`.
+   *
+   * "Processo interrompido" = espião que deixa a remoção REAL ser gravada e
+   * então lança um erro não-transitório: nada do fluxo depois do `$pull`
+   * roda (rechecagem, restauração, encerramento), exatamente o estado que uma
+   * queda deixaria no banco. Falhas do MongoDB continuam sendo erros reais do
+   * driver; nenhuma persistência é simulada. Antes de cada teste as
+   * pendências do singleton de TESTE são zeradas, para cada processamento
+   * enxergar só as pendências do próprio teste.
+   */
+  describe("intenção durável — remocoesPendentes (Fase 56.4.2)", () => {
+    let repositorio: ConfiguracoesRepository;
+    let produtosRepositorio: ProdutosRepository;
+    let modeloConfiguracao: Model<ConfiguracaoDocument>;
+    let contador = 0;
+    const colecaoConfiguracoes = () => connection.collection<Configuracao>("configuracoes");
+
+    beforeAll(() => {
+      repositorio = moduleRef.get(ConfiguracoesRepository, { strict: false });
+      produtosRepositorio = moduleRef.get(ProdutosRepository, { strict: false });
+      modeloConfiguracao = moduleRef.get(getModelToken("Configuracao"), { strict: false });
+    });
+
+    beforeEach(async () => {
+      await garantirItemConfiguracao(service, "categorias", "Vestidos");
+      await colecaoConfiguracoes().updateOne({ _id: "global" }, { $set: { remocoesPendentes: [] } });
+    });
+
+    function falhaDeRede(): Error {
+      return new mongo.MongoNetworkError("falha de rede simulada (teste da Fase 56.4.2)");
+    }
+
+    function capturarErro(promessa: Promise<unknown>): Promise<unknown> {
+      return promessa.then(
+        () => null,
+        (erro: unknown) => erro,
+      );
+    }
+
+    function silenciarLogs() {
+      return {
+        erro: spyOn(Logger.prototype, "error").mockImplementation(() => undefined),
+        aviso: spyOn(Logger.prototype, "warn").mockImplementation(() => undefined),
+        restaurar() {
+          this.erro.mockRestore();
+          this.aviso.mockRestore();
+        },
+      };
+    }
+
+    async function corComVizinhas(rotulo: string) {
+      contador += 1;
+      const base = `Pend${rotulo}-${Date.now()}-${contador}`;
+      const chave = `${base}-Alvo`;
+      await service.adicionarItem("cores", `${base}-Antes`, USUARIO_ID);
+      await service.adicionarItem("cores", chave, USUARIO_ID);
+      await service.adicionarItem("cores", `${base}-Depois`, USUARIO_ID);
+      return { chave, antes: `${base}-Antes`, depois: `${base}-Depois` };
+    }
+
+    async function documentoCru() {
+      return colecaoConfiguracoes().findOne({ _id: "global" });
+    }
+
+    async function representacao(valor: string) {
+      const documento = await documentoCru();
+      const lista = documento?.cores ?? [];
+      const normalizado = normalizarCor(valor);
+      return {
+        naLista: lista.filter((item) => normalizarCor(item) === normalizado).length,
+        noEspelho: (documento?.coresNormalizadas ?? []).filter((item) => item === normalizado).length,
+        indice: lista.indexOf(valor),
+      };
+    }
+
+    async function pendenciasDe(valor: string) {
+      return ((await documentoCru())?.remocoesPendentes ?? []).filter((pendencia) => pendencia.valor === valor);
+    }
+
+    /** Variante validada (cor cadastrada) e pausada antes da gravação; `gravar()` a grava — usado DEPOIS do `$pull`. */
+    async function vinculoPendente(chave: string) {
+      const produto = await produtosService.criar(payloadProduto(`PEND-${chave}`), null);
+      const pausa = novoPonto();
+      const original = produtosRepositorio.adicionarVarianteAtomico.bind(produtosRepositorio);
+      const espiao = spyOn(produtosRepositorio, "adicionarVarianteAtomico").mockImplementation(async (produtoId, variante) => {
+        pausa.chegou.liberar();
+        await pausa.liberacao.promessa;
+        return original(produtoId, variante);
+      });
+      const inclusao = produtosService.adicionarVariante(produto.id, { cor: chave }, null);
+      inclusao.catch(() => undefined);
+      await pausa.chegou.promessa;
+      espiao.mockRestore();
+      return {
+        produtoId: produto.id,
+        gravar: async () => {
+          pausa.liberacao.liberar();
+          await inclusao;
+        },
+        liberar: () => liberarTudo(pausa),
+      };
+    }
+
+    /**
+     * "Processo interrompido": a remoção real (lista + espelho + pendência) é
+     * gravada, `aposGravar` roda (ex.: o vínculo concorrente) e então o fluxo
+     * para com um erro NÃO transitório — nada depois do `$pull` acontece.
+     */
+    function interromperAposRemocao(aposGravar: () => Promise<void> = async () => undefined) {
+      const original = repositorio.removerItemComPendencia.bind(repositorio);
+      const documentosGravados: (ConfiguracaoDocument | null)[] = [];
+      const espiao = spyOn(repositorio, "removerItemComPendencia").mockImplementation(async (campo, valor, dados) => {
+        documentosGravados.push(await original(campo, valor, dados));
+        await aposGravar();
+        throw new Error("processo interrompido (simulado)");
+      });
+      return { espiao, documentosGravados };
+    }
+
+    /** Remove `chave` deixando a pendência no documento (processo interrompido); devolve a pendência gravada. */
+    async function pendenciaInterrompida(chave: string, aposGravar?: () => Promise<void>) {
+      const interrupcao = interromperAposRemocao(aposGravar);
+      try {
+        const erro = await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+        expect(erro instanceof Error ? erro.message : null).toBe("processo interrompido (simulado)");
+      } finally {
+        interrupcao.espiao.mockRestore();
+      }
+      const [pendencia] = await pendenciasDe(chave);
+      if (!pendencia) throw new Error(`A remoção interrompida de "${chave}" não deixou pendência.`);
+      return { pendencia, documentosGravados: interrupcao.documentosGravados };
+    }
+
+    function desfechoDe(resultado: { processadas: { opId: string; desfecho: string }[] }, opId: string) {
+      return resultado.processadas.filter((item) => item.opId === opId).map((item) => item.desfecho);
+    }
+
+    it("1. a remoção grava a pendência e tira lista e espelho na MESMA escrita; concluída normalmente, a pendência é encerrada", async () => {
+      const { chave } = await corComVizinhas("T1");
+      const { indice } = await representacao(chave);
+      const { pendencia, documentosGravados } = await pendenciaInterrompida(chave);
+
+      // Imagem "depois" de UM único findOneAndUpdate: as três mudanças juntas.
+      expect(documentosGravados).toHaveLength(1);
+      const gravado = documentosGravados[0];
+      expect(gravado?.cores).not.toContain(chave);
+      expect(gravado?.coresNormalizadas).not.toContain(normalizarCor(chave));
+      expect(gravado?.remocoesPendentes.map((item) => item.opId)).toContain(pendencia.opId);
+
+      expect(pendencia).toEqual({ opId: expect.stringMatching(/^[0-9a-f-]{36}$/), lista: "cores", valor: chave, normalizado: normalizarCor(chave), posicao: indice, em: expect.any(Date) });
+      expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+
+      const outra = await corComVizinhas("T1b");
+      expect((await service.removerItem("cores", outra.chave, USUARIO_ID)).cores).not.toContain(outra.chave);
+      expect(await pendenciasDe(outra.chave)).toEqual([]);
+      expect(await representacao(outra.chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+    });
+
+    it("2. falha ANTES da escrita: nenhuma pendência, lista e espelho intactos", async () => {
+      const { chave } = await corComVizinhas("T2");
+      const { indice } = await representacao(chave);
+      const falha = new Error("falha antes da escrita (simulada)");
+      const espiao = spyOn(repositorio, "removerItemComPendencia").mockImplementation(async () => {
+        throw falha;
+      });
+      try {
+        expect(await capturarErro(service.removerItem("cores", chave, USUARIO_ID))).toBe(falha);
+      } finally {
+        espiao.mockRestore();
+      }
+      expect(await pendenciasDe(chave)).toEqual([]);
+      expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+    });
+
+    it("3. confirmação perdida depois da escrita: a pendência (opId) identifica a escrita desta operação, que segue sem repetir o $pull", async () => {
+      const { chave } = await corComVizinhas("T3");
+      const original = repositorio.removerItemComPendencia.bind(repositorio);
+      let chamadas = 0;
+      const espiaoRemocao = spyOn(repositorio, "removerItemComPendencia").mockImplementation(async (campo, valor, dados) => {
+        chamadas += 1;
+        const resultado = await original(campo, valor, dados);
+        if (chamadas === 1) throw falhaDeRede();
+        return resultado;
+      });
+      const consultaOriginal = repositorio.pendenciaExiste.bind(repositorio);
+      const consultas: boolean[] = [];
+      const espiaoConsulta = spyOn(repositorio, "pendenciaExiste").mockImplementation(async (opId) => {
+        const existe = await consultaOriginal(opId);
+        consultas.push(existe);
+        return existe;
+      });
+      try {
+        expect((await service.removerItem("cores", chave, USUARIO_ID)).cores).not.toContain(chave);
+        expect(chamadas).toBe(1);
+        expect(consultas).toEqual([true]);
+        expect(await pendenciasDe(chave)).toEqual([]); // encerrada depois da rechecagem sem vínculo
+        expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+      } finally {
+        espiaoRemocao.mockRestore();
+        espiaoConsulta.mockRestore();
+      }
+    });
+
+    it("4. pendência com vínculo: o processamento restaura na posição original e encerra a pendência NA MESMA escrita; o produto não muda", async () => {
+      const { chave, antes, depois } = await corComVizinhas("T4");
+      const { indice } = await representacao(chave);
+      const vinculo = await vinculoPendente(chave);
+      try {
+        const { pendencia } = await pendenciaInterrompida(chave, vinculo.gravar);
+        expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+        const produtoAntes = await connection.collection("produtos").findOne({ _id: new Types.ObjectId(vinculo.produtoId) });
+
+        const escritas = spyOn(modeloConfiguracao, "updateOne");
+        let resultado: Awaited<ReturnType<ConfiguracoesService["processarRemocoesPendentes"]>>;
+        try {
+          resultado = await service.processarRemocoesPendentes();
+          expect(escritas).toHaveBeenCalledTimes(1);
+          expect(escritas.mock.calls[0]?.[0]).toMatchObject({ "remocoesPendentes.opId": pendencia.opId });
+          expect(escritas.mock.calls[0]?.[1]).toMatchObject({ $set: { cores: expect.any(Array) }, $pull: { remocoesPendentes: { opId: pendencia.opId } } });
+        } finally {
+          escritas.mockRestore();
+        }
+        expect(resultado.processadas).toEqual([{ opId: pendencia.opId, lista: "cores", valor: chave, desfecho: "restaurada" }]);
+        expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+        expect((await documentoCru())?.cores.slice(indice - 1, indice + 2)).toEqual([antes, chave, depois]);
+        expect(await pendenciasDe(chave)).toEqual([]);
+        expect(await connection.collection("produtos").findOne({ _id: new Types.ObjectId(vinculo.produtoId) })).toEqual(produtoAntes);
+      } finally {
+        vinculo.liberar();
+      }
+    });
+
+    it("5. pendência sem vínculo: o processamento mantém o item removido e encerra a pendência", async () => {
+      const { chave } = await corComVizinhas("T5");
+      const { pendencia } = await pendenciaInterrompida(chave);
+
+      const resultado = await service.processarRemocoesPendentes();
+      expect(resultado.processadas).toEqual([{ opId: pendencia.opId, lista: "cores", valor: chave, desfecho: "finalizada" }]);
+      expect(await pendenciasDe(chave)).toEqual([]);
+      expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+    });
+
+    it("6. falha na consulta de vínculos: pendência intacta (nunca 'sem vínculo'), item continua fora, log contextual", async () => {
+      const { chave } = await corComVizinhas("T6");
+      const { pendencia } = await pendenciaInterrompida(chave);
+      const espiao = spyOn(produtosRepositorio, "listarTodosAtivos").mockImplementation(async () => {
+        throw new Error("falha permanente simulada na consulta de vínculos");
+      });
+      const logs = silenciarLogs();
+      try {
+        const resultado = await service.processarRemocoesPendentes();
+        expect(desfechoDe(resultado, pendencia.opId)).toEqual(["mantida_falha_consulta"]);
+        expect(await pendenciasDe(chave)).toEqual([pendencia]);
+        expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+        expect(logs.erro).toHaveBeenCalledTimes(1);
+        expect(String(logs.erro.mock.calls[0]?.[0])).toContain(`operacao=${pendencia.opId} lista=cores valor=${JSON.stringify(chave)}`);
+      } finally {
+        espiao.mockRestore();
+        logs.restaurar();
+      }
+    });
+
+    it("7. falha na restauração: pendência intacta, item continua fora, log contextual — depois, sem a falha, a restauração conclui", async () => {
+      const { chave } = await corComVizinhas("T7");
+      const { indice } = await representacao(chave);
+      const vinculo = await vinculoPendente(chave);
+      try {
+        const { pendencia } = await pendenciaInterrompida(chave, vinculo.gravar);
+        const espiao = spyOn(repositorio, "restaurarItemLista").mockImplementation(async () => {
+          throw new Error("falha permanente simulada na restauração");
+        });
+        const logs = silenciarLogs();
+        try {
+          const resultado = await service.processarRemocoesPendentes();
+          expect(desfechoDe(resultado, pendencia.opId)).toEqual(["mantida_falha_restauracao"]);
+          expect(await pendenciasDe(chave)).toEqual([pendencia]);
+          expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+          expect(String(logs.erro.mock.calls[0]?.[0])).toContain(`operacao=${pendencia.opId}`);
+        } finally {
+          espiao.mockRestore();
+          logs.restaurar();
+        }
+        expect(desfechoDe(await service.processarRemocoesPendentes(), pendencia.opId)).toEqual(["restaurada"]);
+        expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+      } finally {
+        vinculo.liberar();
+      }
+    });
+
+    it("7b. restauração que falha DURANTE a requisição: HTTP 500 e a pendência fica no documento (não se perde mais) para o processamento", async () => {
+      const { chave } = await corComVizinhas("T7b");
+      const { indice } = await representacao(chave);
+      const vinculo = await vinculoPendente(chave);
+      const original = repositorio.removerItemComPendencia.bind(repositorio);
+      const espiaoRemocao = spyOn(repositorio, "removerItemComPendencia").mockImplementation(async (campo, valor, dados) => {
+        const resultado = await original(campo, valor, dados);
+        await vinculo.gravar();
+        return resultado;
+      });
+      const espiaoRestauracao = spyOn(repositorio, "restaurarItemLista").mockImplementation(async () => {
+        throw falhaDeRede();
+      });
+      const logs = silenciarLogs();
+      try {
+        const erro = await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+        expect(erro).not.toBeInstanceOf(ApiException);
+        expect(erro instanceof Error ? erro.message : "").toBe(`Falha ao restaurar "${chave}" na lista de cores após a remoção.`);
+        expect(String(logs.erro.mock.calls[0]?.[0])).toContain("a pendência fica no documento para processamento posterior");
+        expect(await pendenciasDe(chave)).toHaveLength(1);
+      } finally {
+        vinculo.liberar();
+        espiaoRemocao.mockRestore();
+        espiaoRestauracao.mockRestore();
+        logs.restaurar();
+      }
+      const [pendencia] = await pendenciasDe(chave);
+      expect(desfechoDe(await service.processarRemocoesPendentes(), pendencia?.opId ?? "")).toEqual(["restaurada"]);
+      expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+      expect(await pendenciasDe(chave)).toEqual([]);
+    });
+
+    it("8. reprocessar não duplica: pendência já concluída some do processamento; item já recadastrado à mão não é duplicado", async () => {
+      const { chave } = await corComVizinhas("T8");
+      const vinculo = await vinculoPendente(chave);
+      try {
+        const { pendencia } = await pendenciaInterrompida(chave, vinculo.gravar);
+        await service.adicionarItem("cores", chave, USUARIO_ID); // recadastrado manualmente antes do processamento
+        const posicaoRecadastrada = (await representacao(chave)).indice;
+
+        expect(desfechoDe(await service.processarRemocoesPendentes(), pendencia.opId)).toEqual(["restaurada"]);
+        expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice: posicaoRecadastrada });
+        expect(await pendenciasDe(chave)).toEqual([]);
+
+        expect((await service.processarRemocoesPendentes()).processadas).toEqual([]);
+        expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice: posicaoRecadastrada });
+      } finally {
+        vinculo.liberar();
+      }
+    });
+
+    it("9. duas execuções concorrentes da mesma pendência: uma restaura e encerra, a outra reconhece 'já concluída' sem escrever", async () => {
+      const { chave } = await corComVizinhas("T9");
+      const { indice } = await representacao(chave);
+      const vinculo = await vinculoPendente(chave);
+      try {
+        const { pendencia } = await pendenciaInterrompida(chave, vinculo.gravar);
+        const pausa = novoPonto();
+        const original = produtosRepositorio.listarTodosAtivos.bind(produtosRepositorio);
+        let pausou = false;
+        const espiao = spyOn(produtosRepositorio, "listarTodosAtivos").mockImplementation(async (filtro) => {
+          const resultado = await original(filtro);
+          if (!pausou && filtro?.["variantes.corNormalizada"] === normalizarCor(chave)) {
+            pausou = true; // execução A: consultou os vínculos e para antes de restaurar
+            pausa.chegou.liberar();
+            await pausa.liberacao.promessa;
+          }
+          return resultado;
+        });
+        try {
+          const execucaoA = service.processarRemocoesPendentes();
+          await pausa.chegou.promessa;
+          const resultadoB = await service.processarRemocoesPendentes(); // B roda inteira enquanto A está parada
+          pausa.liberacao.liberar();
+          const resultadoA = await execucaoA;
+
+          expect(desfechoDe(resultadoB, pendencia.opId)).toEqual(["restaurada"]);
+          expect(desfechoDe(resultadoA, pendencia.opId)).toEqual(["ja_concluida"]);
+          expect(await representacao(chave)).toEqual({ naLista: 1, noEspelho: 1, indice });
+          expect(await pendenciasDe(chave)).toEqual([]);
+        } finally {
+          liberarTudo(pausa);
+          espiao.mockRestore();
+        }
+      } finally {
+        vinculo.liberar();
+      }
+    });
+
+    it("10. duas pendências distintas no mesmo processamento: uma restaurada (com vínculo), outra finalizada (sem vínculo)", async () => {
+      const comVinculo = await corComVizinhas("T10a");
+      const semVinculo = await corComVizinhas("T10b");
+      const indiceComVinculo = (await representacao(comVinculo.chave)).indice;
+      const vinculo = await vinculoPendente(comVinculo.chave);
+      try {
+        const primeira = await pendenciaInterrompida(comVinculo.chave, vinculo.gravar);
+        const segunda = await pendenciaInterrompida(semVinculo.chave);
+
+        const resultado = await service.processarRemocoesPendentes();
+        expect(resultado.processadas).toEqual([
+          { opId: primeira.pendencia.opId, lista: "cores", valor: comVinculo.chave, desfecho: "restaurada" },
+          { opId: segunda.pendencia.opId, lista: "cores", valor: semVinculo.chave, desfecho: "finalizada" },
+        ]);
+        expect(await representacao(comVinculo.chave)).toMatchObject({ naLista: 1, noEspelho: 1 });
+        expect(await representacao(semVinculo.chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+        expect((await documentoCru())?.remocoesPendentes).toEqual([]);
+        expect(indiceComVinculo).toBeGreaterThan(0);
+      } finally {
+        vinculo.liberar();
+      }
+    });
+
+    it("11. alteração concorrente na lista durante a recuperação: conflito, releitura, restauração sem sobrescrever o item de terceiros", async () => {
+      const { chave } = await corComVizinhas("T11");
+      const vinculo = await vinculoPendente(chave);
+      const terceiro = `Terceiro-${chave}`;
+      try {
+        const { pendencia } = await pendenciaInterrompida(chave, vinculo.gravar);
+        const restaurarOriginal = repositorio.restaurarItemLista.bind(repositorio);
+        const lerOriginal = repositorio.lerEstadoLista.bind(repositorio);
+        const resultados: string[] = [];
+        let dentroDaRestauracao = false;
+        let alterou = false;
+        const espiaoRestaurar = spyOn(repositorio, "restaurarItemLista").mockImplementation(async (campo, valor, posicao, opId) => {
+          dentroDaRestauracao = true;
+          try {
+            const resultado = await restaurarOriginal(campo, valor, posicao, opId);
+            resultados.push(resultado);
+            return resultado;
+          } finally {
+            dentroDaRestauracao = false;
+          }
+        });
+        const espiaoLer = spyOn(repositorio, "lerEstadoLista").mockImplementation(async (campo) => {
+          const estado = await lerOriginal(campo);
+          if (dentroDaRestauracao && !alterou) {
+            alterou = true;
+            await service.adicionarItem("cores", terceiro, USUARIO_ID); // escrita de terceiros entre a leitura e a escrita
+          }
+          return estado;
+        });
+        try {
+          expect(desfechoDe(await service.processarRemocoesPendentes(), pendencia.opId)).toEqual(["restaurada"]);
+          expect(resultados).toEqual(["conflito", "restaurado"]);
+          expect(await representacao(chave)).toMatchObject({ naLista: 1, noEspelho: 1 });
+          expect(await representacao(terceiro)).toMatchObject({ naLista: 1, noEspelho: 1 });
+          expect(await pendenciasDe(chave)).toEqual([]);
+        } finally {
+          espiaoRestaurar.mockRestore();
+          espiaoLer.mockRestore();
+        }
+      } finally {
+        vinculo.liberar();
+      }
+    });
+
+    it("12. posição: item deslocado entre a leitura e a escrita → a remoção relê e a pendência registra a posição REAL, usada na restauração", async () => {
+      const { chave, antes, depois } = await corComVizinhas("T12");
+      const vinculo = await vinculoPendente(chave);
+      const original = repositorio.removerItemComPendencia.bind(repositorio);
+      const posicoesTentadas: (number | null)[] = [];
+      const espiao = spyOn(repositorio, "removerItemComPendencia").mockImplementation(async (campo, valor, dados) => {
+        posicoesTentadas.push(dados.posicao);
+        if (posicoesTentadas.length === 1) {
+          // Escrita concorrente: um item novo no início da lista desloca todos os índices.
+          await colecaoConfiguracoes().updateOne({ _id: "global" }, { $push: { cores: { $each: [`Inicio-${chave}`], $position: 0 }, coresNormalizadas: normalizarCor(`Inicio-${chave}`) } });
+          return original(campo, valor, dados);
+        }
+        await original(campo, valor, dados);
+        await vinculo.gravar();
+        throw new Error("processo interrompido (simulado)");
+      });
+      try {
+        await capturarErro(service.removerItem("cores", chave, USUARIO_ID));
+      } finally {
+        espiao.mockRestore();
+        vinculo.liberar();
+      }
+      expect(posicoesTentadas).toHaveLength(2);
+      const [pendencia] = await pendenciasDe(chave);
+      expect(pendencia?.posicao).toBe((posicoesTentadas[0] ?? -10) + 1);
+      expect(pendencia?.posicao).toBe(posicoesTentadas[1] ?? null);
+
+      expect(desfechoDe(await service.processarRemocoesPendentes(), pendencia?.opId ?? "")).toEqual(["restaurada"]);
+      const lista = (await documentoCru())?.cores ?? [];
+      expect(lista.indexOf(chave)).toBe(pendencia?.posicao ?? -1);
+      expect(lista.slice(lista.indexOf(chave) - 1, lista.indexOf(chave) + 2)).toEqual([antes, chave, depois]);
+    });
+
+    it("13 e 16. forma de pagamento com venda e movimento gravados na janela: espelho íntegro e registros financeiros intactos", async () => {
+      contador += 1;
+      const forma = `Forma Pend ${Date.now()}-${contador}`;
+      await service.adicionarItem("formasPagamento", forma, USUARIO_ID);
+      const original = repositorio.removerItemComPendencia.bind(repositorio);
+      const criados: { vendaId?: Types.ObjectId; movimentoId?: Types.ObjectId } = {};
+      const espiao = spyOn(repositorio, "removerItemComPendencia").mockImplementation(async (campo, valor, dados) => {
+        await original(campo, valor, dados);
+        criados.vendaId = (await vendaModel.create(dadosVendaMinima({ formaPagamento: forma })))._id;
+        criados.movimentoId = (await movimentoModel.create(dadosMovimentoMinimo({ formaPagamento: forma })))._id;
+        throw new Error("processo interrompido (simulado)");
+      });
+      try {
+        await capturarErro(service.removerItem("formasPagamento", forma, USUARIO_ID));
+      } finally {
+        espiao.mockRestore();
+      }
+      const vendaAntes = await connection.collection("vendas").findOne({ _id: criados.vendaId });
+      const movimentoAntes = await connection.collection("movimentos_caixa").findOne({ _id: criados.movimentoId });
+      expect(vendaAntes).not.toBeNull();
+      expect(movimentoAntes).not.toBeNull();
+      const pendencia = ((await documentoCru())?.remocoesPendentes ?? []).find((item) => item.valor === forma);
+      expect(pendencia?.lista).toBe("formasPagamento");
+
+      expect(desfechoDe(await service.processarRemocoesPendentes(), pendencia?.opId ?? "")).toEqual(["restaurada"]);
+      const documento = await documentoCru();
+      expect(documento?.formasPagamento.filter((item) => item === forma)).toHaveLength(1);
+      expect(documento?.formasPagamentoNormalizadas.filter((item) => item === normalizarFormaPagamento(forma))).toHaveLength(1);
+      expect(documento?.remocoesPendentes).toEqual([]);
+      expect(await connection.collection("vendas").findOne({ _id: criados.vendaId })).toEqual(vendaAntes);
+      expect(await connection.collection("movimentos_caixa").findOne({ _id: criados.movimentoId })).toEqual(movimentoAntes);
+    });
+
+    it("14. documento legado sem o campo: o processamento não grava nada (o campo continua ausente) e a remoção funciona normalmente", async () => {
+      await colecaoConfiguracoes().updateOne({ _id: "global" }, { $unset: { remocoesPendentes: "" } });
+      expect(await documentoCru()).not.toHaveProperty("remocoesPendentes");
+
+      expect(await service.processarRemocoesPendentes()).toEqual({ processadas: [], malformadas: [] });
+      expect(await documentoCru()).not.toHaveProperty("remocoesPendentes");
+
+      const { chave } = await corComVizinhas("T14");
+      expect((await service.removerItem("cores", chave, USUARIO_ID)).cores).not.toContain(chave);
+      expect(await representacao(chave)).toEqual({ naLista: 0, noEspelho: 0, indice: -1 });
+      expect((await documentoCru())?.remocoesPendentes).toEqual([]); // criado pelo $push e já encerrado
+    });
+
+    it("15. a serialização da configuração não expõe remocoesPendentes nem os espelhos", async () => {
+      const { chave } = await corComVizinhas("T15");
+      await pendenciaInterrompida(chave);
+      const serializado: Record<string, unknown> = JSON.parse(JSON.stringify(await service.obter()));
+      expect(Object.keys(serializado).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "tamanhos"]);
+    });
+
+    it("pendência malformada: reportada e registrada em log, NUNCA apagada; as válidas continuam sendo processadas", async () => {
+      const { chave } = await corComVizinhas("TMal");
+      const { pendencia } = await pendenciaInterrompida(chave);
+      const opIdMalformada = `malformada-${Date.now()}`;
+      // Visão CRUA do documento (entradas fora do formato do schema são justamente o que este teste grava).
+      const colecaoCrua = connection.collection<{ _id: string; remocoesPendentes?: unknown[] }>("configuracoes");
+      await colecaoCrua.updateOne({ _id: "global" }, { $push: { remocoesPendentes: { $each: [{ opId: opIdMalformada, lista: "inexistente", valor: 42 }, { semOpId: true }] } } });
+      const logs = silenciarLogs();
+      try {
+        const resultado = await service.processarRemocoesPendentes();
+        expect(resultado.processadas).toEqual([{ opId: pendencia.opId, lista: "cores", valor: chave, desfecho: "finalizada" }]);
+        expect(resultado.malformadas).toEqual([
+          { indice: 1, opId: opIdMalformada, motivo: "lista ausente ou desconhecida" },
+          { indice: 2, opId: null, motivo: "opId ausente ou inválido" },
+        ]);
+        expect(logs.erro).toHaveBeenCalledTimes(2);
+        expect(String(logs.erro.mock.calls[0]?.[0])).toContain(`opId=${opIdMalformada} motivo=lista ausente ou desconhecida`);
+        const restantes = (await colecaoCrua.findOne({ _id: "global" }))?.remocoesPendentes;
+        expect(restantes).toEqual([{ opId: opIdMalformada, lista: "inexistente", valor: 42 }, { semOpId: true }]); // intactas
+      } finally {
+        logs.restaurar();
+        await colecaoConfiguracoes().updateOne({ _id: "global" }, { $set: { remocoesPendentes: [] } });
+      }
     });
   });
 });

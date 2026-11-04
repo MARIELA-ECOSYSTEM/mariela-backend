@@ -1,5 +1,6 @@
 import { Prop, Schema, SchemaFactory } from "@nestjs/mongoose";
 import type { HydratedDocument, Schema as MongooseSchema } from "mongoose";
+import { CAMPOS_LISTA, type CampoLista } from "../configuracoes.constants.js";
 
 /** Subdocumento embutido — nunca uma collection própria (`_id: false`, mesmo padrão de `TarifaAplicada` em Vendas). */
 @Schema({ _id: false })
@@ -49,6 +50,40 @@ export class DadosLojaSub {
   endereco!: EnderecoLojaSub;
 }
 export const DadosLojaSubSchema = SchemaFactory.createForClass(DadosLojaSub);
+
+/**
+ * Fase 56.4.2 — intenção DURÁVEL de uma remoção de item de lista ainda não
+ * concluída. Gravada na MESMA operação atômica do `$pull` (ver
+ * `ConfiguracoesRepository.removerItemComPendencia`) e encerrada na MESMA
+ * operação que finaliza ou restaura o item — se o processo cair no meio, a
+ * pendência fica no documento para `ConfiguracoesService.processarRemocoesPendentes`.
+ * Interna: nunca exposta na API (fora da lista explícita de `aplicarSerializacaoDeConfiguracao`).
+ */
+@Schema({ _id: false })
+export class RemocaoPendente {
+  /** Identificador único da operação (UUID). */
+  @Prop({ type: String, required: true })
+  opId!: string;
+
+  @Prop({ type: String, required: true, enum: CAMPOS_LISTA })
+  lista!: CampoLista;
+
+  /** Valor EXATO removido da lista (o que é restaurado, se houver vínculo). */
+  @Prop({ type: String, required: true })
+  valor!: string;
+
+  /** `valor` pelo normalizador da lista no momento da remoção (diagnóstico). */
+  @Prop({ type: String, required: true })
+  normalizado!: string;
+
+  /** Índice do item na lista no momento da remoção; `null` quando desconhecido. */
+  @Prop({ type: Number, min: 0, default: null })
+  posicao!: number | null;
+
+  @Prop({ type: Date, required: true })
+  em!: Date;
+}
+export const RemocaoPendenteSchema = SchemaFactory.createForClass(RemocaoPendente);
 
 /**
  * Configuração ADMINISTRATIVA global e única da loja (Etapa 11.2) — contrato
@@ -129,6 +164,14 @@ export class Configuracao {
    */
   @Prop({ type: [String], default: [] })
   formasPagamentoNormalizadas!: string[];
+
+  /**
+   * Fase 56.4.2 — remoções de itens de lista ainda não concluídas (ver
+   * `RemocaoPendente`). Documentos legados não têm o campo: ele nunca é
+   * preenchido em massa — surge no primeiro `$push` de uma remoção.
+   */
+  @Prop({ type: [RemocaoPendenteSchema], default: [] })
+  remocoesPendentes!: RemocaoPendente[];
 
   criadoEm!: Date;
   atualizadoEm!: Date;

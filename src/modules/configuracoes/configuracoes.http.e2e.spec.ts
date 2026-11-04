@@ -14,7 +14,7 @@ import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
-import type { Configuracao } from "./schemas/configuracao.schema.js";
+import type { Configuracao, RemocaoPendente } from "./schemas/configuracao.schema.js";
 
 /**
  * Sobe a aplicação HTTP DE VERDADE (mesmos guards, mesmo pipeline de
@@ -143,6 +143,24 @@ describe("HTTP — Configurações (integração — servidor real)", () => {
       expect(Object.keys(loja).sort()).toEqual(["email", "endereco", "logo", "nome", "telefone", "whatsapp"].sort());
       const enderecoResposta = loja["endereco"] as Record<string, unknown>;
       expect(Object.keys(enderecoResposta).sort()).toEqual(["bairro", "cep", "cidade", "complemento", "estado", "logradouro", "numero"].sort());
+    });
+
+    it("Fase 56.4.2 — com uma remoção pendente no documento, a resposta continua sem remocoesPendentes e sem os espelhos normalizados", async () => {
+      await fetch(`${baseUrl}/api/v1/configuracoes`, { headers: jsonHeaders(adminAccessToken) }); // garante o singleton
+      const pendencia: RemocaoPendente = { opId: `http-${Date.now()}`, lista: "cores", valor: "Cor HTTP Pendente", normalizado: "cor http pendente", posicao: 0, em: new Date() };
+      await connection.collection<Configuracao>("configuracoes").updateOne({ _id: "global" }, { $push: { remocoesPendentes: pendencia } });
+      try {
+        const resposta = await fetch(`${baseUrl}/api/v1/configuracoes`, { headers: jsonHeaders(adminAccessToken) });
+        expect(resposta.status).toBe(200);
+        const texto = await resposta.text();
+        const corpo = JSON.parse(texto) as { data: Record<string, unknown> };
+        expect(Object.keys(corpo.data).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "tamanhos"].sort());
+        expect(texto).not.toContain("remocoesPendentes");
+        expect(texto).not.toContain(pendencia.opId);
+        expect(texto).not.toContain("Normalizad");
+      } finally {
+        await connection.collection<Configuracao>("configuracoes").updateOne({ _id: "global" }, { $pull: { remocoesPendentes: { opId: pendencia.opId } } });
+      }
     });
   });
 

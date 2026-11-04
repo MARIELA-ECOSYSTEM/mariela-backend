@@ -8,7 +8,12 @@ import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { normalizarCategoria, normalizarCor, normalizarFormaPagamento, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
 import { VendasRepository } from "../vendas/vendas.repository.js";
 import { CAMPOS_LISTA, type CampoLista } from "./configuracoes.constants.js";
-import { ConfiguracoesRepository, normalizarItemLista } from "./configuracoes.repository.js";
+import {
+  ConfiguracoesRepository,
+  normalizarItemLista,
+  type RemocaoPendenteMalformada,
+  type RemocaoPendenteValida,
+} from "./configuracoes.repository.js";
 import type { DadosLoja } from "./configuracoes.types.js";
 import type { AtualizarLojaDto } from "./dto/atualizar-loja.dto.js";
 import type { ConfiguracaoDocument } from "./schemas/configuracao.schema.js";
@@ -70,7 +75,30 @@ function descreverErro(erro: unknown): string {
 
 type VerificacaoVinculo = { situacao: "com_vinculo" } | { situacao: "sem_vinculo" } | { situacao: "indeterminado"; erro: unknown };
 
-type Restauracao = { ok: true; tentativas: number } | { ok: false; tentativas: number; erro: unknown };
+type Restauracao = { ok: true; tentativas: number; pendenciaEncerradaPorOutraExecucao: boolean } | { ok: false; tentativas: number; erro: unknown };
+
+/** Fase 56.4.2 — remoção gravada junto com a pendência: documento depois do `$pull` e posição registrada. */
+type RemocaoRegistrada = { documento: ConfiguracaoDocument; posicao: number | null };
+
+/**
+ * Fase 56.4.2 — desfecho de cada pendência em `processarRemocoesPendentes`:
+ * - `restaurada`: havia vínculo — item restaurado e pendência encerrada na mesma escrita;
+ * - `finalizada`: sem vínculo — item continua removido, pendência encerrada;
+ * - `ja_concluida`: outra execução concluiu a pendência antes (nada gravado);
+ * - `mantida_falha_consulta` / `mantida_falha_restauracao` / `mantida_falha_finalizacao`: pendência intacta, com log.
+ */
+export type DesfechoRemocaoPendente =
+  | "restaurada"
+  | "finalizada"
+  | "ja_concluida"
+  | "mantida_falha_consulta"
+  | "mantida_falha_restauracao"
+  | "mantida_falha_finalizacao";
+
+export interface ResultadoProcessamentoRemocoes {
+  processadas: { opId: string; lista: CampoLista; valor: string; desfecho: DesfechoRemocaoPendente }[];
+  malformadas: RemocaoPendenteMalformada[];
+}
 
 const NOMES_LISTA: Record<CampoLista, string> = {
   categorias: "categorias",
@@ -185,6 +213,7 @@ export class ConfiguracoesService {
    * negócio — nunca deixa a configuração inconsistente com os produtos reais.
    *
    * Fase 56.4.1 — compensação robusta (ver `removerItemProtegido`).
+   * Fase 56.4.2 — intenção durável (`remocoesPendentes`) gravada junto com o `$pull`.
    */
   async removerItem(lista: string, valorBruto: string, usuarioId: string | null): Promise<ConfiguracaoDocument> {
     const campo = this.validarCampoLista(lista);
@@ -215,29 +244,42 @@ export class ConfiguracoesService {
    *   negócio de sempre (HTTP 400). Se a restauração não puder ser
    *   concluída, registra o contexto em log e responde HTTP 500.
    *
+   * Fase 56.4.2 — o `$pull` grava, na MESMA operação, a pendência `opId`
+   * (`removerComPendencia`). Toda conclusão a encerra atomicamente: a
+   * restauração no mesmo `updateOne` que devolve o item; o caso sem vínculo
+   * com um `$pull` da própria pendência. Se o processo cair, ou a restauração
+   * falhar, a pendência fica no documento para `processarRemocoesPendentes`.
+   *
    * `null` = o item não estava na lista (o chamador traduz em 404).
    */
   private async removerItemProtegido(campo: ListaProtegidaContraExclusao, valor: string): Promise<ConfiguracaoDocument | null> {
     await this.garantirSemVinculo(campo, valor);
     const operacaoId = randomUUID();
-    const posicao = await this.configuracoesRepository.posicaoDoItem(campo, valor);
 
-    const resultado = await this.removerComReconciliacao(campo, valor, operacaoId);
-    if (!resultado) return null;
+    const remocao = await this.removerComPendencia(campo, valor, operacaoId);
+    if (!remocao) return null;
 
     const verificacao = await this.verificarVinculoAposRemocao(campo, valor);
-    if (verificacao.situacao === "sem_vinculo") return resultado;
+    if (verificacao.situacao === "sem_vinculo") {
+      await this.encerrarPendenciaSemVinculo(campo, valor, operacaoId);
+      return remocao.documento;
+    }
 
     const motivo = verificacao.situacao === "com_vinculo" ? "vínculo encontrado na rechecagem" : `rechecagem indeterminada (${descreverErro(verificacao.erro)})`;
-    const restauracao = await this.restaurarComRetentativa(campo, valor, posicao);
-    if (!restauracao.ok) {
+    const restauracao = await this.restaurarComRetentativa(campo, valor, remocao.posicao, operacaoId);
+    // Pendência encerrada por outra execução sem o item de volta (ela concluiu que não havia vínculo): a restauração não aconteceu.
+    const restaurado = restauracao.ok && (!restauracao.pendenciaEncerradaPorOutraExecucao || (await this.itemRepresentadoComSeguranca(campo, valor)));
+    if (!restaurado) {
+      const tentativas = restauracao.tentativas;
+      const erroCompensacao = restauracao.ok ? new Error("A pendência foi encerrada por outra execução sem restaurar o item.") : restauracao.erro;
       this.logger.error(
-        `Compensação da remoção falhou definitivamente — o item pode estar ausente da configuração com vínculo existente. ` +
+        `Compensação da remoção falhou definitivamente — o item pode estar ausente da configuração com vínculo existente; ` +
+          `a pendência fica no documento para processamento posterior. ` +
           `operacao=${operacaoId} lista=${campo} valor=${JSON.stringify(valor)} normalizado=${JSON.stringify(normalizarItemLista(campo, valor))} ` +
-          `tentativas=${restauracao.tentativas} motivo=${motivo} erroCompensacao=${descreverErro(restauracao.erro)}`,
-        restauracao.erro instanceof Error ? restauracao.erro.stack : undefined,
+          `tentativas=${tentativas} motivo=${motivo} erroCompensacao=${descreverErro(erroCompensacao)}`,
+        erroCompensacao instanceof Error ? erroCompensacao.stack : undefined,
       );
-      throw new Error(`Falha ao restaurar "${valor}" na lista de ${NOMES_LISTA[campo]} após a remoção.`, { cause: restauracao.erro });
+      throw new Error(`Falha ao restaurar "${valor}" na lista de ${NOMES_LISTA[campo]} após a remoção.`, { cause: erroCompensacao });
     }
 
     if (verificacao.situacao === "com_vinculo") {
@@ -252,39 +294,145 @@ export class ConfiguracoesService {
   }
 
   /**
-   * Fase 56.4.1 — `$pull` com até 3 tentativas. Um erro transitório numa
-   * escrita NÃO significa que ela não aconteceu (a confirmação pode ter se
-   * perdido depois de o MongoDB aplicar o `$pull`), então, antes de repetir, o
-   * estado persistido é consultado:
-   * - `valor` não está mais na lista → a remoção está feita (por esta ou por
-   *   outra operação concorrente): segue para a rechecagem com o documento atual;
-   * - `valor` continua na lista → nada foi removido: repete (o filtro do
-   *   `$pull` exige o item presente, então repetir é seguro).
-   * Se nem a consulta for possível, o resultado é desconhecido: registra em log e propaga.
+   * Fase 56.4.2 — `$pull` + pendência (uma operação atômica), com até 3
+   * tentativas. Cada tentativa lê a posição atual do item e a exige no filtro
+   * (a pendência registra a posição real); se o item mudou de lugar entre a
+   * leitura e a escrita, relê. Na última tentativa a posição deixa de ser
+   * exigida (continua registrada como lida) para uma lista sob alterações
+   * contínuas não impedir a remoção.
+   *
+   * Erro transitório na escrita = resultado desconhecido (a confirmação pode
+   * ter se perdido depois de o MongoDB aplicar a escrita). Antes de repetir,
+   * a pendência `opId` é procurada: presente → a remoção DESTA operação foi
+   * aplicada, segue para a rechecagem; ausente → nada desta operação foi
+   * gravado, repete. Se nem essa consulta for possível, registra em log e propaga.
    */
-  private async removerComReconciliacao(campo: ListaProtegidaContraExclusao, valor: string, operacaoId: string): Promise<ConfiguracaoDocument | null> {
+  private async removerComPendencia(campo: ListaProtegidaContraExclusao, valor: string, operacaoId: string): Promise<RemocaoRegistrada | null> {
+    const em = new Date();
     let ultimoErro: unknown = null;
     for (let tentativa = 1; tentativa <= MAXIMO_TENTATIVAS; tentativa += 1) {
+      const posicao = await this.comRetentativaTransitoria(() => this.configuracoesRepository.posicaoDoItem(campo, valor));
+      if (posicao === null) return null;
+      const exigirPosicao = tentativa < MAXIMO_TENTATIVAS;
       try {
-        return await this.configuracoesRepository.removerItemLista(campo, valor);
+        const documento = await this.configuracoesRepository.removerItemComPendencia(campo, valor, {
+          opId: operacaoId,
+          posicao: exigirPosicao ? posicao : null,
+          em,
+        });
+        if (documento) return { documento, posicao };
+        if (!exigirPosicao) return null; // sem exigência de posição, `null` só pode significar item fora da lista
+        // O item saiu da posição lida (ou da lista): relê na próxima tentativa.
       } catch (erro) {
         if (!ehErroTransitorioMongo(erro)) throw erro;
         ultimoErro = erro;
-        let aindaPresente: boolean;
+        let aplicada: boolean;
         try {
-          aindaPresente = await this.comRetentativaTransitoria(() => this.configuracoesRepository.contemItemExato(campo, valor));
+          aplicada = await this.comRetentativaTransitoria(() => this.configuracoesRepository.pendenciaExiste(operacaoId));
         } catch (erroConsulta) {
           this.logger.error(
-            `Resultado da remoção desconhecido: falha ao consultar o estado depois de um erro transitório no $pull. ` +
+            `Resultado da remoção desconhecido: falha ao consultar a pendência depois de um erro transitório no $pull. ` +
               `operacao=${operacaoId} lista=${campo} valor=${JSON.stringify(valor)} erroRemocao=${descreverErro(erro)} erroConsulta=${descreverErro(erroConsulta)}`,
           );
           throw erro;
         }
-        if (!aindaPresente) return this.comRetentativaTransitoria(() => this.configuracoesRepository.obter());
+        if (aplicada) {
+          return { documento: await this.comRetentativaTransitoria(() => this.configuracoesRepository.obter()), posicao: exigirPosicao ? posicao : null };
+        }
       }
     }
-    // Item ainda presente depois das tentativas: nada foi removido (estado consistente).
+    // Só se chega aqui com erro transitório na última tentativa e a pendência ausente: nada desta operação foi gravado.
     throw ultimoErro;
+  }
+
+  /**
+   * Fase 56.4.2 — sem vínculo na rechecagem: o item continua removido e a
+   * pendência é encerrada (`$pull` da própria pendência, repetido em erro
+   * transitório — encerrar duas vezes é inofensivo). Se não der para encerrar,
+   * a remoção continua correta (verificada sem vínculo): a pendência fica
+   * para `processarRemocoesPendentes`, com aviso em log.
+   */
+  private async encerrarPendenciaSemVinculo(campo: ListaProtegidaContraExclusao, valor: string, operacaoId: string): Promise<void> {
+    try {
+      await this.comRetentativaTransitoria(() => this.configuracoesRepository.finalizarRemocaoPendente(operacaoId));
+    } catch (erro) {
+      this.logger.warn(
+        `Remoção concluída, mas a pendência não pôde ser encerrada — fica para processamento posterior. ` +
+          `operacao=${operacaoId} lista=${campo} valor=${JSON.stringify(valor)} erro=${descreverErro(erro)}`,
+      );
+    }
+  }
+
+  /** Leitura de confirmação que nunca lança (uma falha conta como "não confirmado"). */
+  private async itemRepresentadoComSeguranca(campo: ListaProtegidaContraExclusao, valor: string): Promise<boolean> {
+    try {
+      return await this.configuracoesRepository.itemRepresentado(campo, valor);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Fase 56.4.2 — processa as remoções que ficaram pendentes (processo
+   * interrompido, restauração que falhou, encerramento que falhou). Uso
+   * INTERNO: não é chamado no bootstrap nem exposto na API nesta fase.
+   *
+   * Para cada pendência válida: rechecagem de vínculos com as regras de
+   * sempre (`existeVinculo`) →
+   * - com vínculo: restaura e encerra a pendência na MESMA escrita atômica;
+   * - sem vínculo: encerra a pendência (o item continua removido);
+   * - consulta falhou: pendência intacta (nunca "sem vínculo"), log de erro;
+   * - restauração/encerramento falhou: pendência intacta, log de erro.
+   * Idempotente: uma pendência já concluída (por outra execução) resulta em
+   * `ja_concluida`, sem nenhuma escrita. Pendências malformadas são
+   * reportadas e registradas em log — nunca apagadas nem ignoradas em silêncio.
+   */
+  async processarRemocoesPendentes(): Promise<ResultadoProcessamentoRemocoes> {
+    const { validas, malformadas } = await this.comRetentativaTransitoria(() => this.configuracoesRepository.lerRemocoesPendentes());
+    for (const malformada of malformadas) {
+      this.logger.error(
+        `Pendência de remoção malformada mantida no documento (não processada). indice=${malformada.indice} ` +
+          `opId=${malformada.opId ?? "(ausente)"} motivo=${malformada.motivo}`,
+      );
+    }
+    const processadas: ResultadoProcessamentoRemocoes["processadas"] = [];
+    for (const pendencia of validas) {
+      processadas.push({ opId: pendencia.opId, lista: pendencia.lista, valor: pendencia.valor, desfecho: await this.processarRemocaoPendente(pendencia) });
+    }
+    return { processadas, malformadas };
+  }
+
+  private async processarRemocaoPendente(pendencia: RemocaoPendenteValida): Promise<DesfechoRemocaoPendente> {
+    const { opId, lista, valor } = pendencia;
+    const contexto = `operacao=${opId} lista=${lista} valor=${JSON.stringify(valor)} normalizado=${JSON.stringify(normalizarItemLista(lista, valor))}`;
+
+    let existe: boolean;
+    try {
+      existe = await this.comRetentativaTransitoria(() => this.existeVinculo(lista, valor));
+    } catch (erro) {
+      this.logger.error(`Pendência de remoção mantida: falha ao verificar vínculos. ${contexto} erro=${descreverErro(erro)}`);
+      return "mantida_falha_consulta";
+    }
+
+    if (!existe) {
+      try {
+        const encerrada = await this.comRetentativaTransitoria(() => this.configuracoesRepository.finalizarRemocaoPendente(opId));
+        return encerrada ? "finalizada" : "ja_concluida";
+      } catch (erro) {
+        this.logger.error(`Pendência de remoção mantida: falha ao encerrar (sem vínculo). ${contexto} erro=${descreverErro(erro)}`);
+        return "mantida_falha_finalizacao";
+      }
+    }
+
+    const restauracao = await this.restaurarComRetentativa(lista, valor, pendencia.posicao, opId);
+    if (!restauracao.ok) {
+      this.logger.error(
+        `Pendência de remoção mantida: falha ao restaurar o item vinculado. ${contexto} tentativas=${restauracao.tentativas} ` +
+          `erro=${descreverErro(restauracao.erro)}`,
+      );
+      return "mantida_falha_restauracao";
+    }
+    return restauracao.pendenciaEncerradaPorOutraExecucao ? "ja_concluida" : "restaurada";
   }
 
   /** Fase 56.4.1 — rechecagem com repetição de erros transitórios; falha não-transitória ou esgotada = indeterminado (nunca "sem vínculo"). */
@@ -304,14 +452,25 @@ export class ConfiguracoesService {
    * Sucesso só depois de CONFIRMAR, numa leitura nova, que o item está na
    * lista (equivalente normalizado) e no espelho. `conflito` (o documento
    * mudou entre leitura e escrita) consome uma tentativa; erro não-transitório encerra na hora.
+   *
+   * Fase 56.4.2 — com `opId`, a restauração encerra a pendência na mesma
+   * escrita, e a confirmação também exige a pendência encerrada.
+   * `pendencia_encerrada` (outra execução concluiu antes) termina sem
+   * escrever nada — quem chama decide o que isso significa.
    */
-  private async restaurarComRetentativa(campo: ListaProtegidaContraExclusao, valor: string, posicao: number | null): Promise<Restauracao> {
+  private async restaurarComRetentativa(
+    campo: ListaProtegidaContraExclusao,
+    valor: string,
+    posicao: number | null,
+    opId: string,
+  ): Promise<Restauracao> {
     let ultimoErro: unknown = null;
     for (let tentativa = 1; tentativa <= MAXIMO_TENTATIVAS; tentativa += 1) {
       try {
-        const resultado = await this.configuracoesRepository.restaurarItemLista(campo, valor, posicao);
-        if (resultado !== "conflito" && (await this.configuracoesRepository.itemRepresentado(campo, valor))) {
-          return { ok: true, tentativas: tentativa };
+        const resultado = await this.configuracoesRepository.restaurarItemLista(campo, valor, posicao, opId);
+        if (resultado === "pendencia_encerrada") return { ok: true, tentativas: tentativa, pendenciaEncerradaPorOutraExecucao: true };
+        if (resultado !== "conflito" && (await this.configuracoesRepository.restauracaoConfirmada(campo, valor, opId))) {
+          return { ok: true, tentativas: tentativa, pendenciaEncerradaPorOutraExecucao: false };
         }
         ultimoErro = new Error(
           resultado === "conflito"
