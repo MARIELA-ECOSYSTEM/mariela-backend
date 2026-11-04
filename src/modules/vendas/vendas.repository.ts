@@ -172,9 +172,10 @@ export class VendasRepository {
       try {
         return await venda.save();
       } catch (erro) {
-        if (!(erro instanceof MongooseErrors.VersionError) || tentativa === tentativas) throw erro;
+        if (!(erro instanceof MongooseErrors.VersionError)) throw erro;
       }
     }
+    // Fase 56.3.2 — todas as tentativas perderam a corrida de versão: nada foi gravado. Conflito (HTTP 409), nunca o `VersionError` cru (HTTP 500).
     throw ApiException.conflict("Não foi possível salvar as alterações: a venda foi modificada por outra operação simultânea. Tente novamente.");
   }
 

@@ -2,8 +2,9 @@ import { afterAll, beforeAll, describe, expect, it, setSystemTime } from "bun:te
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import { Types, type Connection } from "mongoose";
+import { Error as MongooseErrors, Types, type Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
+import { erroDe, executarComConflitosDeVersao } from "../../test-utils/conflito-versao.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { AdquirentesService } from "../adquirentes/adquirentes.service.js";
@@ -6432,6 +6433,149 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.pagamentos[0]!.tarifaAplicada?.percentual).toBe(3);
       // O movimento de caixa sempre usa o valor BRUTO do pagamento (300), nunca o líquido pós-tarifa.
       await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+    });
+  });
+
+  /**
+   * Fase 56.3.2 — esgotamento das tentativas de
+   * `VendasRepository.salvarComRetentativa` (mesmo comportamento da Fase
+   * 56.3.1 em Produtos). A operação sob teste é um `receberPagamento`; durante
+   * cada pausa, um `receberPagamento` concorrente REAL na mesma venda avança o
+   * `__v`. A leitura prévia do service (fora do retry) não conta como tentativa.
+   */
+  describe("conflito de versão no salvarComRetentativa (Fase 56.3.2)", () => {
+    const MENSAGEM_CONFLITO = "Não foi possível salvar as alterações: a venda foi modificada por outra operação simultânea. Tente novamente.";
+    // `VendasRepository` é provido por Vendas, Caixas, Clientes e Vendedores, e no grafo de
+    // módulos com `forwardRef` a instância que o `VendasService` recebe não é a devolvida por
+    // `moduleRef.get`/`select` — por isso os espiões ficam no `prototype` (cobrem qualquer
+    // instância; o original é sempre chamado com o `this` de quem recebeu a chamada).
+    const repositorio = VendasRepository.prototype;
+
+    /** Venda de 1000 com 500 pagos na criação → `valorPendente` 500. */
+    async function vendaComSaldoPendente() {
+      const produto = await criarProdutoComEstoque(1000, 5);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const caixa = await abrirCaixa();
+      try {
+        const venda = await service.criar(
+          {
+            clienteId: cliente.id,
+            vendedorId: vendedor.id,
+            caixaId: caixa.id,
+            itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma: "Dinheiro", valor: 500 }],
+          },
+          null,
+        );
+        return { venda, caixa };
+      } catch (erro) {
+        await fecharCaixaDoTeste(caixa.id);
+        throw erro;
+      }
+    }
+
+    /** Sempre fecha o caixa do teste (com justificativa), para nunca deixar um caixa aberto para os próximos testes. */
+    async function fecharCaixaDoTeste(caixaId: string) {
+      await caixasService.fechar(caixaId, { valorInformado: 0, observacao: "Fechamento do teste de conflito de versão (Fase 56.3.2)" }, null);
+    }
+
+    async function movimentosDaVenda(vendaId: string) {
+      return connection.collection("movimentos_caixa").find({ vendaId }).toArray();
+    }
+
+    it("A. 1 conflito e depois sucesso: exatamente 2 tentativas, recebimento aplicado sobre o saldo já atualizado", async () => {
+      const { venda, caixa } = await vendaComSaldoPendente();
+      try {
+        const { resultado, tentativas } = await executarComConflitosDeVersao(
+          repositorio,
+          1,
+          () => service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 100 }, null),
+          () => service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 50 }, null),
+        );
+        expect(resultado.ok).toBe(true);
+        expect(tentativas).toBe(2);
+        const final = await service.obterPorId(venda.id);
+        expect(final.valorPago).toBe(650); // 500 + 50 (concorrente) + 100 (A)
+        expect(final.valorPendente).toBe(350);
+        expect(final.pagamentos.map((pagamento) => pagamento.valor)).toEqual([500, 50, 100]);
+        expect(await movimentosDaVenda(venda.id)).toHaveLength(3);
+      } finally {
+        await fecharCaixaDoTeste(caixa.id);
+      }
+    });
+
+    it("B. 3 conflitos: 409 CONFLICT com a mensagem do domínio, 3 tentativas, nenhum pagamento nem movimento de A gravado", async () => {
+      const { venda, caixa } = await vendaComSaldoPendente();
+      try {
+        const { resultado, tentativas } = await executarComConflitosDeVersao(
+          repositorio,
+          3,
+          () => service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 100 }, null),
+          () => service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 50 }, null),
+        );
+        expect(resultado.ok).toBe(false);
+        const erro = erroDe(resultado);
+        expect(erro).not.toBeInstanceOf(MongooseErrors.VersionError);
+        expect(erro).toBeInstanceOf(ApiException);
+        expect(erro).toMatchObject({ code: "CONFLICT", message: MENSAGEM_CONFLITO, errors: [] });
+        expect(erro instanceof ApiException ? erro.getStatus() : null).toBe(409);
+        expect(tentativas).toBe(3);
+        const final = await service.obterPorId(venda.id);
+        expect(final.valorPago).toBe(650); // 500 + 3 × 50 — o recebimento de 100 nunca entrou
+        expect(final.valorPendente).toBe(350);
+        expect(final.pagamentos.map((pagamento) => pagamento.valor)).toEqual([500, 50, 50, 50]);
+        expect(await movimentosDaVenda(venda.id)).toHaveLength(4); // criação + 3 concorrentes
+      } finally {
+        await fecharCaixaDoTeste(caixa.id);
+      }
+    });
+
+    it("C. erro de validação do schema no save() não vira 409 nem é retentado", async () => {
+      const { venda, caixa } = await vendaComSaldoPendente();
+      try {
+        const { resultado, tentativas } = await executarComConflitosDeVersao(
+          repositorio,
+          0,
+          // `vendedorNome` é `required` no schema → `ValidationError` no save().
+          () => moduleRef.get(VendasRepository).salvarComRetentativa(venda.id, (documento) => { documento.vendedorNome = ""; }),
+          async () => undefined,
+        );
+        expect(resultado.ok).toBe(false);
+        expect(erroDe(resultado)).toBeInstanceOf(MongooseErrors.ValidationError);
+        expect(erroDe(resultado)).not.toBeInstanceOf(ApiException);
+        expect(tentativas).toBe(1);
+        expect((await service.obterPorId(venda.id)).vendedorNome).toBe(venda.vendedorNome);
+      } finally {
+        await fecharCaixaDoTeste(caixa.id);
+      }
+    });
+
+    it("D. após o conflito a regra de saldo é reavaliada sobre o documento novo: rejeição de negócio (400), não 409", async () => {
+      const { venda, caixa } = await vendaComSaldoPendente(); // pendente 500
+      try {
+        const { resultado, tentativas } = await executarComConflitosDeVersao(
+          repositorio,
+          1,
+          () => service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300 }, null),
+          () => service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300 }, null), // pendente cai para 200
+        );
+        expect(resultado.ok).toBe(false);
+        const erro = erroDe(resultado);
+        expect(erro).toBeInstanceOf(ApiException);
+        expect(erro).toMatchObject({
+          code: "VALIDATION_ERROR",
+          errors: [{ field: "valor", message: "Recebimento maior que o saldo pendente (200.00)." }],
+        });
+        expect(erro instanceof ApiException ? erro.getStatus() : null).toBe(400);
+        expect(tentativas).toBe(2); // a 2ª tentativa releu a venda e parou na regra
+        const final = await service.obterPorId(venda.id);
+        expect(final.valorPago).toBe(800);
+        expect(final.valorPendente).toBe(200);
+        expect(await movimentosDaVenda(venda.id)).toHaveLength(2);
+      } finally {
+        await fecharCaixaDoTeste(caixa.id);
+      }
     });
   });
 });

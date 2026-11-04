@@ -2,8 +2,9 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import type { Connection } from "mongoose";
+import { Error as MongooseErrors, Types, type Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
+import { erroDe, executarComConflitosDeVersao } from "../../test-utils/conflito-versao.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { CaixasService } from "../caixas/caixas.service.js";
@@ -16,6 +17,7 @@ import { VendedoresService } from "../vendedores/vendedores.service.js";
 import type { CriarClienteDto } from "./dto/criar-cliente.dto.js";
 import type { ListarClientesQueryDto } from "./dto/listar-clientes-query.dto.js";
 import { ClientesModule } from "./clientes.module.js";
+import { ClientesRepository } from "./clientes.repository.js";
 import { ClientesService } from "./clientes.service.js";
 import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 
@@ -382,6 +384,89 @@ describe("ClientesService (integração — MongoDB real)", () => {
         excluidoEm: null,
       });
       expect(total).toBe(1); // nunca dois clientes ativos com o mesmo telefone após a corrida
+    });
+  });
+
+  /**
+   * Fase 56.3.2 — esgotamento das tentativas de
+   * `ClientesRepository.salvarComRetentativa` (mesmo comportamento da Fase
+   * 56.3.1 em Produtos). A operação sob teste renomeia o cliente; durante cada
+   * pausa, um `atualizar` concorrente real grava outra observação (mesmo nome
+   * e telefone) e avança o `__v`.
+   */
+  describe("conflito de versão no salvarComRetentativa (Fase 56.3.2)", () => {
+    const MENSAGEM_CONFLITO = "Não foi possível salvar as alterações: o cliente foi modificado por outra operação simultânea. Tente novamente.";
+    let repositorio: ClientesRepository;
+
+    beforeAll(() => {
+      repositorio = moduleRef.get(ClientesRepository);
+    });
+
+    function renomearComConflitos(cliente: { id: string; nome: string; telefone: string }, conflitos: number) {
+      return executarComConflitosDeVersao(
+        repositorio,
+        conflitos,
+        () => service.atualizar(cliente.id, { nome: "Cliente Operação A", telefone: cliente.telefone }, null),
+        (indice) => service.atualizar(cliente.id, { nome: cliente.nome, telefone: cliente.telefone, observacao: `Concorrente ${indice + 1}` }, null),
+      );
+    }
+
+    async function removerFixture(id: string) {
+      await connection.collection("clientes").deleteOne({ _id: new Types.ObjectId(id) });
+      await connection.collection("eventos_cliente").deleteMany({ clienteId: { $in: [id, new Types.ObjectId(id)] } });
+    }
+
+    it("A. 1 conflito e depois sucesso: exatamente 2 tentativas, alteração persistida", async () => {
+      const cliente = await service.criar(payloadCliente("Conflito A"), null);
+      try {
+        const { resultado, tentativas } = await renomearComConflitos(cliente, 1);
+        expect(resultado.ok).toBe(true);
+        expect(tentativas).toBe(2);
+        const final = await service.obterPorId(cliente.id);
+        expect(final.nome).toBe("Cliente Operação A");
+        expect(final.observacao).toBe(""); // PUT completo de A, aplicado sobre o documento relido
+      } finally {
+        await removerFixture(cliente.id);
+      }
+    });
+
+    it("B. 3 conflitos: 409 CONFLICT com a mensagem do domínio, 3 tentativas, nada da operação gravado", async () => {
+      const cliente = await service.criar(payloadCliente("Conflito B"), null);
+      try {
+        const { resultado, tentativas } = await renomearComConflitos(cliente, 3);
+        expect(resultado.ok).toBe(false);
+        const erro = erroDe(resultado);
+        expect(erro).not.toBeInstanceOf(MongooseErrors.VersionError);
+        expect(erro).toBeInstanceOf(ApiException);
+        expect(erro).toMatchObject({ code: "CONFLICT", message: MENSAGEM_CONFLITO, errors: [] });
+        expect(erro instanceof ApiException ? erro.getStatus() : null).toBe(409);
+        expect(tentativas).toBe(3);
+        const final = await service.obterPorId(cliente.id);
+        expect(final.nome).toBe("Cliente Teste Conflito B"); // a renomeação nunca foi gravada
+        expect(final.observacao).toBe("Concorrente 3");
+      } finally {
+        await removerFixture(cliente.id);
+      }
+    });
+
+    it("C. erro de validação do schema no save() não vira 409 nem é retentado", async () => {
+      const cliente = await service.criar(payloadCliente("Conflito C"), null);
+      try {
+        const { resultado, tentativas } = await executarComConflitosDeVersao(
+          repositorio,
+          0,
+          // `nome` acima do `maxlength: 120` do schema → `ValidationError` no save().
+          () => repositorio.salvarComRetentativa(cliente.id, (documento) => { documento.nome = "X".repeat(121); }),
+          async () => undefined,
+        );
+        expect(resultado.ok).toBe(false);
+        expect(erroDe(resultado)).toBeInstanceOf(MongooseErrors.ValidationError);
+        expect(erroDe(resultado)).not.toBeInstanceOf(ApiException);
+        expect(tentativas).toBe(1);
+        expect((await service.obterPorId(cliente.id)).nome).toBe("Cliente Teste Conflito C");
+      } finally {
+        await removerFixture(cliente.id);
+      }
     });
   });
 });
