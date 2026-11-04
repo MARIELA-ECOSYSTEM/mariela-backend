@@ -95,6 +95,18 @@ export type DesfechoRemocaoPendente =
   | "mantida_falha_restauracao"
   | "mantida_falha_finalizacao";
 
+/**
+ * Fase 56.4.3 — previsão, somente leitura, de cada pendência (`avaliarRemocoesPendentes`):
+ * - `restauravel`: há vínculo — a aplicação restauraria o item;
+ * - `finalizavel`: não há vínculo — a aplicação encerraria a pendência mantendo o item removido;
+ * - `indeterminada`: não foi possível consultar os vínculos (nunca tratada como "sem vínculo");
+ * - `malformada`: estrutura inválida — não é processada nem alterada.
+ */
+export type AvaliacaoRemocaoPendente =
+  | { previsao: "restauravel" | "finalizavel"; pendencia: RemocaoPendenteValida }
+  | { previsao: "indeterminada"; pendencia: RemocaoPendenteValida; erro: string }
+  | ({ previsao: "malformada" } & RemocaoPendenteMalformada);
+
 export interface ResultadoProcessamentoRemocoes {
   processadas: { opId: string; lista: CampoLista; valor: string; desfecho: DesfechoRemocaoPendente }[];
   malformadas: RemocaoPendenteMalformada[];
@@ -259,7 +271,7 @@ export class ConfiguracoesService {
     const remocao = await this.removerComPendencia(campo, valor, operacaoId);
     if (!remocao) return null;
 
-    const verificacao = await this.verificarVinculoAposRemocao(campo, valor);
+    const verificacao = await this.verificarVinculoComRetentativa(campo, valor);
     if (verificacao.situacao === "sem_vinculo") {
       await this.encerrarPendenciaSemVinculo(campo, valor, operacaoId);
       return remocao.documento;
@@ -402,19 +414,41 @@ export class ConfiguracoesService {
     return { processadas, malformadas };
   }
 
+  /**
+   * Fase 56.4.3 — PREVISÃO, somente leitura, do que `processarRemocoesPendentes`
+   * faria com cada pendência (usada pelo dry-run do comando operacional).
+   * Lê as pendências e consulta os vínculos com EXATAMENTE a mesma
+   * verificação do processamento real (`verificarVinculoComRetentativa`) —
+   * nenhuma escrita: não restaura, não encerra pendência, não repara espelho,
+   * não toca em pendências malformadas. Falha na consulta = `indeterminada`,
+   * nunca "sem vínculo".
+   */
+  async avaliarRemocoesPendentes(): Promise<AvaliacaoRemocaoPendente[]> {
+    const { validas, malformadas } = await this.comRetentativaTransitoria(() => this.configuracoesRepository.lerRemocoesPendentes());
+    const avaliacoes: AvaliacaoRemocaoPendente[] = [];
+    for (const pendencia of validas) {
+      const verificacao = await this.verificarVinculoComRetentativa(pendencia.lista, pendencia.valor);
+      if (verificacao.situacao === "indeterminado") {
+        avaliacoes.push({ previsao: "indeterminada", pendencia, erro: descreverErro(verificacao.erro) });
+      } else {
+        avaliacoes.push({ previsao: verificacao.situacao === "com_vinculo" ? "restauravel" : "finalizavel", pendencia });
+      }
+    }
+    for (const malformada of malformadas) avaliacoes.push({ previsao: "malformada", ...malformada });
+    return avaliacoes;
+  }
+
   private async processarRemocaoPendente(pendencia: RemocaoPendenteValida): Promise<DesfechoRemocaoPendente> {
     const { opId, lista, valor } = pendencia;
     const contexto = `operacao=${opId} lista=${lista} valor=${JSON.stringify(valor)} normalizado=${JSON.stringify(normalizarItemLista(lista, valor))}`;
 
-    let existe: boolean;
-    try {
-      existe = await this.comRetentativaTransitoria(() => this.existeVinculo(lista, valor));
-    } catch (erro) {
-      this.logger.error(`Pendência de remoção mantida: falha ao verificar vínculos. ${contexto} erro=${descreverErro(erro)}`);
+    const verificacao = await this.verificarVinculoComRetentativa(lista, valor);
+    if (verificacao.situacao === "indeterminado") {
+      this.logger.error(`Pendência de remoção mantida: falha ao verificar vínculos. ${contexto} erro=${descreverErro(verificacao.erro)}`);
       return "mantida_falha_consulta";
     }
 
-    if (!existe) {
+    if (verificacao.situacao === "sem_vinculo") {
       try {
         const encerrada = await this.comRetentativaTransitoria(() => this.configuracoesRepository.finalizarRemocaoPendente(opId));
         return encerrada ? "finalizada" : "ja_concluida";
@@ -435,8 +469,11 @@ export class ConfiguracoesService {
     return restauracao.pendenciaEncerradaPorOutraExecucao ? "ja_concluida" : "restaurada";
   }
 
-  /** Fase 56.4.1 — rechecagem com repetição de erros transitórios; falha não-transitória ou esgotada = indeterminado (nunca "sem vínculo"). */
-  private async verificarVinculoAposRemocao(campo: ListaProtegidaContraExclusao, valor: string): Promise<VerificacaoVinculo> {
+  /**
+   * Fase 56.4.1 — rechecagem com repetição de erros transitórios; falha não-transitória ou esgotada = indeterminado (nunca "sem vínculo").
+   * Fase 56.4.3 — ÚNICA verificação usada pela requisição, pelo processamento das pendências e pela previsão do dry-run.
+   */
+  private async verificarVinculoComRetentativa(campo: ListaProtegidaContraExclusao, valor: string): Promise<VerificacaoVinculo> {
     try {
       const existe = await this.comRetentativaTransitoria(() => this.existeVinculo(campo, valor));
       return existe ? { situacao: "com_vinculo" } : { situacao: "sem_vinculo" };

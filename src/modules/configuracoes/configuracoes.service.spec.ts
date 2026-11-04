@@ -2440,5 +2440,102 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
         await colecaoConfiguracoes().updateOne({ _id: "global" }, { $set: { remocoesPendentes: [] } });
       }
     });
+
+    /**
+     * Fase 56.4.3 — `avaliarRemocoesPendentes`: a previsão do dry-run.
+     * Somente leitura: o documento cru (inclusive `atualizadoEm`, que muda em
+     * QUALQUER escrita via Mongoose) é idêntico antes e depois, e o `debug`
+     * da conexão registra só operações de leitura.
+     */
+    describe("previsão somente leitura — avaliarRemocoesPendentes (Fase 56.4.3)", () => {
+      const METODOS_DE_ESCRITA = [
+        "insertOne",
+        "insertMany",
+        "updateOne",
+        "updateMany",
+        "replaceOne",
+        "findOneAndUpdate",
+        "findOneAndReplace",
+        "findOneAndDelete",
+        "deleteOne",
+        "deleteMany",
+        "bulkWrite",
+      ];
+
+      /** Cenário com as quatro classes: restaurável, finalizável, indeterminada (consulta falha só para ela) e malformada. */
+      async function cenarioComQuatroClasses() {
+        const restauravel = await corComVizinhas("P1");
+        const finalizavel = await corComVizinhas("P2");
+        const indeterminada = await corComVizinhas("P3");
+        const vinculo = await vinculoPendente(restauravel.chave);
+        const pendenciaRestauravel = (await pendenciaInterrompida(restauravel.chave, vinculo.gravar)).pendencia;
+        vinculo.liberar();
+        const pendenciaFinalizavel = (await pendenciaInterrompida(finalizavel.chave)).pendencia;
+        const pendenciaIndeterminada = (await pendenciaInterrompida(indeterminada.chave)).pendencia;
+        const colecaoCrua = connection.collection<{ _id: string; remocoesPendentes?: unknown[] }>("configuracoes");
+        await colecaoCrua.updateOne({ _id: "global" }, { $push: { remocoesPendentes: { opId: `malformada-${Date.now()}`, lista: "cores" } } });
+        return { pendenciaRestauravel, pendenciaFinalizavel, pendenciaIndeterminada, produtoId: vinculo.produtoId, corIndeterminada: indeterminada.chave };
+      }
+
+      /** A consulta de vínculos falha (permanente) só para a cor indicada; as demais usam o método real. */
+      function consultaFalhaPara(cor: string) {
+        const original = produtosRepositorio.listarTodosAtivos.bind(produtosRepositorio);
+        return spyOn(produtosRepositorio, "listarTodosAtivos").mockImplementation(async (filtro) => {
+          if (filtro?.["variantes.corNormalizada"] === normalizarCor(cor)) throw new Error("falha permanente simulada na consulta de vínculos");
+          return original(filtro);
+        });
+      }
+
+      it("classifica restauravel / finalizavel / indeterminada / malformada sem NENHUMA escrita (documento cru idêntico, só leituras)", async () => {
+        const cenario = await cenarioComQuatroClasses();
+        const configuracaoAntes = await documentoCru();
+        const produtoAntes = await connection.collection("produtos").findOne({ _id: new Types.ObjectId(cenario.produtoId) });
+        const operacoes: string[] = [];
+        connection.set("debug", (_colecao: string, metodo: string) => {
+          operacoes.push(metodo);
+        });
+        const espiao = consultaFalhaPara(cenario.corIndeterminada);
+        try {
+          const avaliacoes = await service.avaliarRemocoesPendentes();
+          expect(avaliacoes.map((avaliacao) => avaliacao.previsao)).toEqual(["restauravel", "finalizavel", "indeterminada", "malformada"]);
+          expect(avaliacoes[0]).toMatchObject({ previsao: "restauravel", pendencia: cenario.pendenciaRestauravel });
+          expect(avaliacoes[1]).toMatchObject({ previsao: "finalizavel", pendencia: cenario.pendenciaFinalizavel });
+          expect(avaliacoes[2]).toMatchObject({
+            previsao: "indeterminada",
+            pendencia: cenario.pendenciaIndeterminada,
+            erro: "Error: falha permanente simulada na consulta de vínculos",
+          });
+          expect(avaliacoes[3]).toMatchObject({ previsao: "malformada", indice: 3, motivo: "valor ausente ou inválido" });
+        } finally {
+          connection.set("debug", false);
+          espiao.mockRestore();
+        }
+        expect(await documentoCru()).toEqual(configuracaoAntes); // inclusive atualizadoEm e as 4 pendências
+        expect(await connection.collection("produtos").findOne({ _id: new Types.ObjectId(cenario.produtoId) })).toEqual(produtoAntes);
+        expect(operacoes.length).toBeGreaterThan(0);
+        expect(operacoes.filter((metodo) => METODOS_DE_ESCRITA.includes(metodo))).toEqual([]);
+      });
+
+      it("a previsão usa a MESMA verificação do processamento: restauravel→restaurada, finalizavel→finalizada, indeterminada→mantida_falha_consulta", async () => {
+        const cenario = await cenarioComQuatroClasses();
+        const espiao = consultaFalhaPara(cenario.corIndeterminada);
+        const logs = silenciarLogs();
+        try {
+          const previsoes = new Map<string, string>();
+          for (const avaliacao of await service.avaliarRemocoesPendentes()) {
+            if (avaliacao.previsao !== "malformada") previsoes.set(avaliacao.pendencia.opId, avaliacao.previsao);
+          }
+          const resultado = await service.processarRemocoesPendentes();
+          const correspondencia: Record<string, string> = { restauravel: "restaurada", finalizavel: "finalizada", indeterminada: "mantida_falha_consulta" };
+          expect(resultado.processadas).toHaveLength(3);
+          for (const item of resultado.processadas) expect<string>(item.desfecho).toBe(correspondencia[previsoes.get(item.opId) ?? ""] ?? "sem previsão");
+          expect(resultado.malformadas).toHaveLength(1);
+        } finally {
+          espiao.mockRestore();
+          logs.restaurar();
+          await colecaoConfiguracoes().updateOne({ _id: "global" }, { $set: { remocoesPendentes: [] } });
+        }
+      });
+    });
   });
 });
