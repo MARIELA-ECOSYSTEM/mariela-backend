@@ -86,6 +86,15 @@ export class AdquirentesRepository {
   }
 
   /**
+   * Fase 59 — adquirentes utilizáveis numa venda (consulta do PDV): ativas e
+   * não excluídas — as mesmas que `VendasService.validarPagamentoEstruturado`
+   * aceita. Somente leitura; ordem estável por nome (desempate por `_id`).
+   */
+  async listarAtivasParaVenda(): Promise<AdquirenteDocument[]> {
+    return this.adquirenteModel.find({ excluidoEm: null, ativo: true }).sort({ nome: 1, _id: 1 }).exec();
+  }
+
+  /**
    * Mesmo padrão de concorrência de Produtos/Clientes/Fornecedores/Coleções:
    * aplica `mutar` e salva com o versionamento otimista do Mongoose (`__v`);
    * se outra requisição alterou o documento entre a leitura e a gravação,

@@ -75,6 +75,12 @@ export class AdquirentesService {
     };
   }
 
+  /** Fase 59 — adquirentes ativas e não excluídas, para a consulta do PDV (`PdvPagamentosService`). Somente leitura. */
+  async listarAtivasParaVenda(): Promise<AdquirenteRespostaPublica[]> {
+    const itens = await this.adquirentesRepository.listarAtivasParaVenda();
+    return itens.map((item) => this.paraRespostaPublica(item));
+  }
+
   async obterPorId(id: string): Promise<AdquirenteRespostaPublica> {
     const adquirente = await this.adquirentesRepository.encontrarPorIdOuFalhar(id);
     return this.paraRespostaPublica(adquirente);

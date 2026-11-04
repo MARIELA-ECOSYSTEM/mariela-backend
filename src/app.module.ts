@@ -22,6 +22,7 @@ import { MediaModule } from "./modules/media/media.module.js";
 import { PdvAuthModule } from "./modules/pdv-auth/pdv-auth.module.js";
 import { PdvCaixaModule } from "./modules/pdv-caixa/pdv-caixa.module.js";
 import { PdvClientesModule } from "./modules/pdv-clientes/pdv-clientes.module.js";
+import { PdvPagamentosModule } from "./modules/pdv-pagamentos/pdv-pagamentos.module.js";
 import { PdvProdutosModule } from "./modules/pdv-produtos/pdv-produtos.module.js";
 import { PdvVendasModule } from "./modules/pdv-vendas/pdv-vendas.module.js";
 import { ProdutosModule } from "./modules/produtos/produtos.module.js";
@@ -95,6 +96,7 @@ import { WhatsappModule } from "./modules/whatsapp/whatsapp.module.js";
     PdvAuthModule,
     PdvCaixaModule,
     PdvClientesModule,
+    PdvPagamentosModule,
     PdvProdutosModule,
     PdvVendasModule,
     WhatsappModule,

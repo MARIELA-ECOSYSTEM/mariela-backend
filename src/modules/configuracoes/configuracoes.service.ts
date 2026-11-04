@@ -164,6 +164,17 @@ export class ConfiguracoesService {
     return this.configuracoesRepository.obter();
   }
 
+  /**
+   * Fase 59 — formas de pagamento cadastradas, exatamente como gravadas (as
+   * MESMAS que `VendasService` valida), para a consulta do PDV. Leitura PURA
+   * (`findById`): ao contrário de `obter()` — um `findOneAndUpdate` com
+   * `upsert`, que grava `atualizadoEm` a cada chamada —, nunca escreve no
+   * documento. Sem singleton ainda, a lista é vazia.
+   */
+  async listarFormasPagamento(): Promise<string[]> {
+    return (await this.configuracoesRepository.lerEstadoLista("formasPagamento"))?.lista ?? [];
+  }
+
   async atualizarLoja(dto: AtualizarLojaDto, usuarioId: string | null): Promise<ConfiguracaoDocument> {
     const novaLoja: DadosLoja = {
       nome: dto.nome.trim(),
