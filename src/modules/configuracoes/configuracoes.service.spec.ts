@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken, getModelToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
@@ -6,11 +6,18 @@ import { Types, type Connection, type Model } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
+import { CaixasService } from "../caixas/caixas.service.js";
 import { MovimentoCaixa, type MovimentoCaixaDocument } from "../caixas/schemas/movimento-caixa.schema.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
+import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
+import { normalizarCor } from "../produtos/utils/normalizacao.util.js";
+import { SequenciasService } from "../sequencias/sequencias.service.js";
 import { Venda, type PagamentoVenda, type ParcelaVenda, type VendaDocument } from "../vendas/schemas/venda.schema.js";
+import { VendasService } from "../vendas/vendas.service.js";
+import { VendedoresService } from "../vendedores/vendedores.service.js";
 import { ConfiguracoesModule } from "./configuracoes.module.js";
+import { ConfiguracoesRepository } from "./configuracoes.repository.js";
 import { ConfiguracoesService } from "./configuracoes.service.js";
 import type { AtualizarLojaDto } from "./dto/atualizar-loja.dto.js";
 import type { Configuracao } from "./schemas/configuracao.schema.js";
@@ -57,6 +64,21 @@ function dadosMovimentoMinimo(extra: Partial<MovimentoCaixa> = {}): Partial<Movi
     sentido: "entrada",
     ...extra,
   } as Partial<MovimentoCaixa>;
+}
+
+/**
+ * Fase 56.2 — promise controlada (deferred) para barreiras determinísticas:
+ * `promessa` só resolve quando `liberar()` é chamado (idempotente).
+ */
+class Barreira {
+  private resolver: (() => void) | null = null;
+  readonly promessa = new Promise<void>((resolver) => {
+    this.resolver = resolver;
+  });
+
+  liberar(): void {
+    this.resolver?.();
+  }
 }
 
 function payloadProduto(sufixo: string, extra: Partial<CriarProdutoDto> = {}): CriarProdutoDto {
@@ -369,6 +391,22 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const final = await service.obter();
       expect(final.cores.filter((item) => item === chave)).toHaveLength(1);
     });
+
+    // Fase 56.2 — garantia independente da ordem: o `$push` condicional no
+    // campo-espelho é atômico, então QUALQUER entrelaçamento produz o mesmo
+    // resultado (não precisa de barreira).
+    it("garantia: N adições concorrentes de grafias EQUIVALENTES após normalização — só uma persiste e o espelho tem uma única entrada", async () => {
+      const base = `Grafite${Date.now()}`;
+      const normalizada = base.toLowerCase();
+      const grafias = [base, normalizada, `   ${base.toUpperCase()}   `, base.replace("a", "á"), base.replace("e", "É")];
+      const resultados = await Promise.allSettled(grafias.map((grafia) => service.adicionarItem("cores", grafia, USUARIO_ID)));
+
+      expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      expect(resultados.filter((r) => r.status === "rejected")).toHaveLength(grafias.length - 1);
+      const documento = await connection.collection<Configuracao>("configuracoes").findOne({ _id: "global" });
+      expect((documento?.cores ?? []).filter((item) => normalizarCor(item) === normalizada)).toHaveLength(1);
+      expect((documento?.coresNormalizadas ?? []).filter((item) => item === normalizada)).toHaveLength(1);
+    });
   });
 
   describe("unicidade case-insensitive (Fase 54.0)", () => {
@@ -515,47 +553,10 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       expect(resultado.cores).not.toContain(chave);
     });
 
-    it(
-      "concorrência real: excluir a cor e criar uma variante que a usa ao mesmo tempo nunca deixa a " +
-        "configuração inconsistente com os produtos — ou a cor continua presente E a variante existe, " +
-        "ou a cor foi removida E nenhuma variante a usa",
-      async () => {
-        const chave = `Roxo-${Date.now()}`;
-        await service.adicionarItem("cores", chave, USUARIO_ID);
-        const produto = await produtosService.criar(payloadProduto("P6"), null);
-
-        // Duas operações concorrentes de verdade (mesmo padrão já usado pelos
-        // testes de concorrência acima neste arquivo): o próprio event
-        // loop/I-O real do MongoDB de teste decide o entrelaçamento, não o
-        // teste. Não há transação multi-documento disponível neste projeto
-        // (ver `removerItem`) — por isso a garantia vem de checar→agir→
-        // reconferir→compensar, testado aqui pelo resultado observável, não
-        // por instrumentar o entrelaçamento exato.
-        const [resultadoRemocao] = await Promise.allSettled([
-          service.removerItem("cores", chave, USUARIO_ID),
-          produtosService.adicionarVariante(produto.id, { cor: chave }, null),
-        ]);
-
-        const final = await service.obter();
-        const produtoFinal = await produtosService.obterPorId(produto.id);
-        const varianteExiste = produtoFinal.variantes.some((v) => v.cor === chave);
-        const corPresente = final.cores.includes(chave);
-
-        if (resultadoRemocao.status === "fulfilled") {
-          // Remoção venceu a corrida antes da variante existir: nada ficou vinculado.
-          expect(corPresente).toBe(false);
-          expect(varianteExiste).toBe(false);
-        } else {
-          // A variante existiu a tempo de ser vista (na checagem prévia OU na
-          // reconferência pós-remoção, com compensação): a cor nunca fica
-          // ausente enquanto uma variante a usa.
-          expect(corPresente).toBe(true);
-        }
-        // Invariante final, válido nos dois casos: nunca existe uma variante
-        // usando uma cor que não está mais cadastrada.
-        if (varianteExiste) expect(corPresente).toBe(true);
-      },
-    );
+    // Fase 56.2 — a concorrência exclusão × inclusão de variante (antes um
+    // `Promise.allSettled` probabilístico afirmando uma garantia inexistente)
+    // está no describe "concorrência determinística — exclusão × criação de
+    // vínculo (Fase 56.2)", com os entrelaçamentos controlados por barreiras.
   });
 
   describe("categoria: unicidade, proteção de exclusão e campo-espelho (Fase 55.1)", () => {
@@ -646,33 +647,8 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
         expect(resultado.categorias).not.toContain(chave);
       });
 
-      it(
-        "concorrência real: excluir a categoria e criar um produto que a usa ao mesmo tempo nunca deixa a " +
-          "configuração inconsistente com os produtos — ou a categoria continua presente E o produto existe, " +
-          "ou a categoria foi removida E nenhum produto ativo a usa",
-        async () => {
-          const chave = `Shorts-${Date.now()}`;
-          await service.adicionarItem("categorias", chave, USUARIO_ID);
-
-          const [resultadoRemocao, resultadoCriacao] = await Promise.allSettled([
-            service.removerItem("categorias", chave, USUARIO_ID),
-            produtosService.criar(payloadProduto("CAT4", { categoria: chave }), null),
-          ]);
-
-          const final = await service.obter();
-          const categoriaPresente = final.categorias.includes(chave);
-          const produtoExiste =
-            resultadoCriacao.status === "fulfilled" &&
-            (await produtosService.obterPorId(resultadoCriacao.value.id)).excluidoEm === null;
-
-          if (resultadoRemocao.status === "fulfilled") {
-            expect(categoriaPresente).toBe(false);
-          }
-          // Invariante final, válido em todos os casos: nunca existe um produto
-          // ativo usando uma categoria que não está mais cadastrada.
-          if (produtoExiste) expect(categoriaPresente).toBe(true);
-        },
-      );
+      // Fase 56.2 — concorrência exclusão × criação de produto: ver o describe
+      // "concorrência determinística — exclusão × criação de vínculo (Fase 56.2)".
     });
 
     it("o campo-espelho 'categoriasNormalizadas' nunca é exposto na serialização pública", async () => {
@@ -974,33 +950,340 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
         expect(resultado.formasPagamento).not.toContain(chave);
       });
 
-      it(
-        "concorrência real: excluir a forma e criar uma venda que a usa ao mesmo tempo nunca deixa a " +
-          "configuração inconsistente — ou a forma continua presente E a venda existe, ou a forma foi " +
-          "removida E nenhuma venda a usa",
-        async () => {
-          const chave = `ConcorrenciaForma-${Date.now()}`;
-          await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+      // Fase 56.2 — concorrência exclusão × criação de venda (antes com
+      // `vendaModel.create` cru, sem a validação de `VendasService`): ver o
+      // describe "concorrência determinística — exclusão × criação de vínculo (Fase 56.2)".
+    });
+  });
 
-          const [resultadoRemocao, resultadoCriacao] = await Promise.allSettled([
-            service.removerItem("formasPagamento", chave, USUARIO_ID),
-            vendaModel.create(dadosVendaMinima({ formaPagamento: chave })),
-          ]);
+  /**
+   * Fase 56.2 — concorrência DETERMINÍSTICA entre excluir um item da
+   * configuração e criar um vínculo com ele em outra coleção.
+   *
+   * O que a implementação faz (`ConfiguracoesService.removerItem`): checa
+   * vínculos → `$pull` atômico no documento de configuração → RECHECA →
+   * se achou vínculo, COMPENSA (readiciona) e rejeita. Os consumidores
+   * (`ProdutosService.criar`/`adicionarVariante`, `VendasService.criar`)
+   * validam o item contra a configuração e SÓ DEPOIS gravam em outra
+   * coleção, sem reconferir. Sem transação multi-documento (MongoDB
+   * standalone), isso é MITIGAÇÃO, não garantia:
+   *
+   * - GARANTIA (por compensação): se a gravação do vínculo acontece ANTES da
+   *   rechecagem, a exclusão é desfeita e rejeitada — configuração e vínculo
+   *   ficam consistentes.
+   * - LIMITAÇÃO RESIDUAL (documentada, não corrigida): se a gravação acontece
+   *   DEPOIS da rechecagem, a exclusão vence e o vínculo é gravado com um item
+   *   que não está mais cadastrado.
+   *
+   * Cada teste fixa o entrelaçamento com barreiras em spies sobre métodos
+   * REAIS (que só aguardam e depois chamam o original — nada de banco é
+   * simulado): a criação pausa depois da validação e antes da escrita final;
+   * a exclusão pausa depois do `$pull` e antes da rechecagem. As barreiras são
+   * sempre liberadas e os spies restaurados em `finally`.
+   */
+  describe("concorrência determinística — exclusão × criação de vínculo (Fase 56.2)", () => {
+    type PontoDeParada = { chegou: Barreira; liberacao: Barreira };
 
-          const final = await service.obter();
-          const formaPresente = final.formasPagamento.includes(chave);
+    function novoPonto(): PontoDeParada {
+      return { chegou: new Barreira(), liberacao: new Barreira() };
+    }
 
-          if (resultadoRemocao.status === "fulfilled") {
-            expect(formaPresente).toBe(false);
+    function liberarTudo(...pontos: PontoDeParada[]): void {
+      for (const ponto of pontos) {
+        ponto.chegou.liberar();
+        ponto.liberacao.liberar();
+      }
+    }
+
+    /** Exclusão: pausa DEPOIS do `$pull` (checagem inicial já feita) e ANTES da rechecagem. */
+    function pausarExclusaoAntesDaRechecagem(ponto: PontoDeParada) {
+      const repositorio = moduleRef.get(ConfiguracoesRepository, { strict: false });
+      const original = repositorio.removerItemLista.bind(repositorio);
+      return spyOn(repositorio, "removerItemLista").mockImplementation(async (campo, valor) => {
+        const resultado = await original(campo, valor);
+        ponto.chegou.liberar();
+        await ponto.liberacao.promessa;
+        return resultado;
+      });
+    }
+
+    /** `ProdutosService.criar`: pausa DEPOIS de `validarCategoriaCadastrada` e ANTES do insert. */
+    function pausarInsercaoDeProduto(ponto: PontoDeParada) {
+      const repositorio = moduleRef.get(ProdutosRepository, { strict: false });
+      const original = repositorio.criar.bind(repositorio);
+      return spyOn(repositorio, "criar").mockImplementation(async (dados) => {
+        ponto.chegou.liberar();
+        await ponto.liberacao.promessa;
+        return original(dados);
+      });
+    }
+
+    /** `ProdutosService.adicionarVariante`: pausa DEPOIS de `validarCorCadastrada` e ANTES do `$push` atômico. */
+    function pausarInsercaoDeVariante(ponto: PontoDeParada) {
+      const repositorio = moduleRef.get(ProdutosRepository, { strict: false });
+      const original = repositorio.adicionarVarianteAtomico.bind(repositorio);
+      return spyOn(repositorio, "adicionarVarianteAtomico").mockImplementation(async (produtoId, variante) => {
+        ponto.chegou.liberar();
+        await ponto.liberacao.promessa;
+        return original(produtoId, variante);
+      });
+    }
+
+    /**
+     * `VendasService.criar`: pausa em `proximoValor("venda")` — DEPOIS da
+     * validação da forma e da baixa de estoque, ANTES do insert da venda e do
+     * movimento de caixa. (`SequenciasService` é singleton; `VendasRepository`
+     * é declarado em vários módulos, então um spy nele poderia cair numa
+     * instância diferente da usada por `VendasService`.)
+     */
+    function pausarInsercaoDeVenda(ponto: PontoDeParada) {
+      const sequencias = moduleRef.get(SequenciasService, { strict: false });
+      const original = sequencias.proximoValor.bind(sequencias);
+      return spyOn(sequencias, "proximoValor").mockImplementation(async (chave) => {
+        if (chave === "venda") {
+          ponto.chegou.liberar();
+          await ponto.liberacao.promessa;
+        }
+        return original(chave);
+      });
+    }
+
+    async function produtoAtivo(id: string) {
+      return connection.collection("produtos").findOne({ _id: new Types.ObjectId(id), excluidoEm: null });
+    }
+
+    describe("cor × inclusão de variante", () => {
+      beforeEach(async () => {
+        await garantirItemConfiguracao(service, "categorias", "Vestidos");
+      });
+
+      it("garantia (compensação): variante gravada ENTRE o $pull e a rechecagem → a cor é readicionada e a exclusão é rejeitada", async () => {
+        const chave = `CorComp-${Date.now()}`;
+        await service.adicionarItem("cores", chave, USUARIO_ID);
+        const produto = await produtosService.criar(payloadProduto("DET-COR-1"), null);
+        const pausaVariante = novoPonto();
+        const pausaExclusao = novoPonto();
+        const espiaoVariante = pausarInsercaoDeVariante(pausaVariante);
+        const espiaoExclusao = pausarExclusaoAntesDaRechecagem(pausaExclusao);
+        try {
+          const inclusao = produtosService.adicionarVariante(produto.id, { cor: chave }, null);
+          await pausaVariante.chegou.promessa; // a cor já foi validada como cadastrada
+          const exclusao = service.removerItem("cores", chave, USUARIO_ID);
+          await pausaExclusao.chegou.promessa; // checagem inicial (sem vínculo) + $pull feitos
+          expect((await service.obter()).cores).not.toContain(chave); // janela: removida, ainda sem rechecar
+
+          pausaVariante.liberacao.liberar();
+          await inclusao; // variante gravada ANTES da rechecagem
+          pausaExclusao.liberacao.liberar();
+
+          await expect(exclusao).rejects.toThrow("Não foi possível excluir esta cor porque existem produtos vinculados a ela no sistema.");
+          expect((await service.obter()).cores).toContain(chave); // compensação readicionou
+          expect((await produtosService.obterPorId(produto.id)).variantes.some((variante) => variante.cor === chave)).toBe(true);
+        } finally {
+          liberarTudo(pausaVariante, pausaExclusao);
+          espiaoVariante.mockRestore();
+          espiaoExclusao.mockRestore();
+        }
+      });
+
+      it("limitação residual documentada: variante validada ANTES e gravada DEPOIS da rechecagem fica com uma cor não cadastrada", async () => {
+        const chave = `CorResidual-${Date.now()}`;
+        await service.adicionarItem("cores", chave, USUARIO_ID);
+        const produto = await produtosService.criar(payloadProduto("DET-COR-2"), null);
+        const pausaVariante = novoPonto();
+        const espiaoVariante = pausarInsercaoDeVariante(pausaVariante);
+        try {
+          const inclusao = produtosService.adicionarVariante(produto.id, { cor: chave }, null);
+          await pausaVariante.chegou.promessa; // validada, ainda não gravada
+          // A exclusão inteira (checagem → $pull → rechecagem) não vê vínculo nenhum.
+          expect((await service.removerItem("cores", chave, USUARIO_ID)).cores).not.toContain(chave);
+
+          pausaVariante.liberacao.liberar();
+          await inclusao;
+
+          // Resultado REAL (risco residual aceito, sem transação entre coleções):
+          expect((await service.obter()).cores).not.toContain(chave);
+          expect((await produtosService.obterPorId(produto.id)).variantes.some((variante) => variante.cor === chave)).toBe(true);
+        } finally {
+          liberarTudo(pausaVariante);
+          espiaoVariante.mockRestore();
+        }
+      });
+    });
+
+    describe("categoria × criação de produto", () => {
+      it("garantia (compensação): produto gravado ENTRE o $pull e a rechecagem → a categoria é readicionada e a exclusão é rejeitada", async () => {
+        const chave = `CatComp-${Date.now()}`;
+        await service.adicionarItem("categorias", chave, USUARIO_ID);
+        const pausaProduto = novoPonto();
+        const pausaExclusao = novoPonto();
+        const espiaoProduto = pausarInsercaoDeProduto(pausaProduto);
+        const espiaoExclusao = pausarExclusaoAntesDaRechecagem(pausaExclusao);
+        try {
+          const criacao = produtosService.criar(payloadProduto("DET-CAT-1", { categoria: chave }), null);
+          await pausaProduto.chegou.promessa; // categoria já validada
+          const exclusao = service.removerItem("categorias", chave, USUARIO_ID);
+          await pausaExclusao.chegou.promessa;
+          expect((await service.obter()).categorias).not.toContain(chave);
+
+          pausaProduto.liberacao.liberar();
+          const produto = await criacao; // produto gravado ANTES da rechecagem
+          pausaExclusao.liberacao.liberar();
+
+          await expect(exclusao).rejects.toThrow("Não foi possível excluir esta categoria porque existem produtos vinculados a ela no sistema.");
+          expect((await service.obter()).categorias).toContain(chave);
+          expect((await produtoAtivo(produto.id))?.["categoria"]).toBe(chave);
+        } finally {
+          liberarTudo(pausaProduto, pausaExclusao);
+          espiaoProduto.mockRestore();
+          espiaoExclusao.mockRestore();
+        }
+      });
+
+      it("limitação residual documentada: produto validado ANTES e gravado DEPOIS da rechecagem fica ativo com uma categoria não cadastrada", async () => {
+        const chave = `CatResidual-${Date.now()}`;
+        await service.adicionarItem("categorias", chave, USUARIO_ID);
+        const pausaProduto = novoPonto();
+        const espiaoProduto = pausarInsercaoDeProduto(pausaProduto);
+        try {
+          const criacao = produtosService.criar(payloadProduto("DET-CAT-2", { categoria: chave }), null);
+          await pausaProduto.chegou.promessa;
+          expect((await service.removerItem("categorias", chave, USUARIO_ID)).categorias).not.toContain(chave);
+
+          pausaProduto.liberacao.liberar();
+          const produto = await criacao;
+
+          // Resultado REAL — é exatamente a corrida que o teste probabilístico
+          // anterior acusava de forma intermitente (13–22% das execuções).
+          expect((await service.obter()).categorias).not.toContain(chave);
+          expect((await produtoAtivo(produto.id))?.["categoria"]).toBe(chave);
+        } finally {
+          liberarTudo(pausaProduto);
+          espiaoProduto.mockRestore();
+        }
+      });
+    });
+
+    describe("forma de pagamento × criação de venda (VendasService real)", () => {
+      type CenarioVenda = { produtoId: string; varianteId: string; tamanhoId: string; vendedorId: string; caixaId: string };
+
+      /** Produto com estoque, vendedor e caixa aberto — tudo pelos serviços reais. */
+      async function prepararVenda(sufixo: string): Promise<CenarioVenda> {
+        await garantirItemConfiguracao(service, "categorias", "Vestidos");
+        await garantirItemConfiguracao(service, "cores", "Azul");
+        await garantirItemConfiguracao(service, "tamanhos", "M");
+        const produto = await produtosService.criar(payloadProduto(`DET-VENDA-${sufixo}`), null);
+        const variante = await produtosService.adicionarVariante(produto.id, { cor: "Azul" }, null);
+        const { tamanhoId } = await produtosService.ajustarQuantidadeTamanho(produto.id, String(variante._id), {
+          tamanho: "M",
+          delta: 5,
+          exigirExistente: false,
+        });
+        const vendedor = await moduleRef
+          .get(VendedoresService, { strict: false })
+          .criar({ nome: `Vendedora Config ${sufixo}`, telefone: `1193${String(Date.now()).slice(-6)}`, ativo: true, senha: "senha123" }, null);
+        const caixa = await moduleRef.get(CaixasService, { strict: false }).abrir({ valorInicial: 0 }, null);
+        return { produtoId: produto.id, varianteId: String(variante._id), tamanhoId, vendedorId: vendedor.id, caixaId: caixa.id };
+      }
+
+      function criarVenda(cenario: CenarioVenda, forma: string) {
+        return moduleRef.get(VendasService, { strict: false }).criar(
+          {
+            vendedorId: cenario.vendedorId,
+            caixaId: cenario.caixaId,
+            itens: [{ produtoId: cenario.produtoId, varianteId: cenario.varianteId, tamanhoId: cenario.tamanhoId, quantidade: 1 }],
+            pagamentos: [{ forma, valor: 100 }],
+          },
+          null,
+        );
+      }
+
+      /** Remove só o que este cenário criou (venda, movimentos, caixa, vendedor); o produto sai no afterAll pelo prefixo do nome. */
+      async function limparCenario(cenario: CenarioVenda | null, vendaId: string | null): Promise<void> {
+        if (vendaId) {
+          await connection.collection("vendas").deleteOne({ _id: new Types.ObjectId(vendaId) });
+          await connection.collection("eventos_venda").deleteMany({ vendaId: new Types.ObjectId(vendaId) });
+        }
+        if (!cenario) return;
+        const caixaId = new Types.ObjectId(cenario.caixaId);
+        await connection.collection("movimentos_caixa").deleteMany({ caixaId });
+        await connection.collection("eventos_caixa").deleteMany({ caixaId });
+        await connection.collection("caixas").deleteOne({ _id: caixaId });
+        await connection.collection("vendedores").deleteOne({ _id: new Types.ObjectId(cenario.vendedorId) });
+        await connection.collection("eventos_vendedor").deleteMany({ vendedorId: new Types.ObjectId(cenario.vendedorId) });
+      }
+
+      it("garantia (compensação): venda gravada ENTRE o $pull e a rechecagem → a forma é readicionada e a exclusão é rejeitada", async () => {
+        const chave = `FormaComp-${Date.now()}`;
+        await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+        let cenario: CenarioVenda | null = null;
+        let vendaId: string | null = null;
+        const pausaVenda = novoPonto();
+        const pausaExclusao = novoPonto();
+        try {
+          cenario = await prepararVenda("1");
+          const espiaoVenda = pausarInsercaoDeVenda(pausaVenda);
+          const espiaoExclusao = pausarExclusaoAntesDaRechecagem(pausaExclusao);
+          try {
+            const criacao = criarVenda(cenario, chave);
+            await pausaVenda.chegou.promessa; // forma já validada por VendasService (e estoque baixado)
+            const exclusao = service.removerItem("formasPagamento", chave, USUARIO_ID);
+            await pausaExclusao.chegou.promessa;
+            expect((await service.obter()).formasPagamento).not.toContain(chave);
+
+            pausaVenda.liberacao.liberar();
+            const venda = await criacao; // venda (e movimento de caixa) gravados ANTES da rechecagem
+            vendaId = venda.id;
+            pausaExclusao.liberacao.liberar();
+
+            await expect(exclusao).rejects.toThrow("Não foi possível excluir esta forma de pagamento porque existem vendas ou movimentações financeiras vinculadas a ela.");
+            expect((await service.obter()).formasPagamento).toContain(chave);
+            const vendaNoBanco = await connection.collection("vendas").findOne({ _id: new Types.ObjectId(venda.id) });
+            expect((vendaNoBanco?.["pagamentos"] as { forma: string }[] | undefined)?.[0]?.forma).toBe(chave);
+          } finally {
+            liberarTudo(pausaVenda, pausaExclusao);
+            espiaoVenda.mockRestore();
+            espiaoExclusao.mockRestore();
           }
-          if (resultadoCriacao.status === "fulfilled") {
-            // A venda foi persistida a tempo de ser vista (na checagem prévia
-            // OU na reconferência pós-remoção, com compensação): a forma
-            // nunca fica ausente enquanto uma venda ainda a referencia.
-            expect(formaPresente).toBe(true);
+        } finally {
+          await limparCenario(cenario, vendaId);
+        }
+      });
+
+      it("limitação residual documentada: venda validada ANTES e gravada DEPOIS da rechecagem fica com uma forma não cadastrada", async () => {
+        const chave = `FormaResidual-${Date.now()}`;
+        await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
+        let cenario: CenarioVenda | null = null;
+        let vendaId: string | null = null;
+        const pausaVenda = novoPonto();
+        try {
+          cenario = await prepararVenda("2");
+          const espiaoVenda = pausarInsercaoDeVenda(pausaVenda);
+          try {
+            const criacao = criarVenda(cenario, chave);
+            await pausaVenda.chegou.promessa;
+            // A exclusão inteira não vê venda nem movimento com esta forma.
+            expect((await service.removerItem("formasPagamento", chave, USUARIO_ID)).formasPagamento).not.toContain(chave);
+
+            pausaVenda.liberacao.liberar();
+            const venda = await criacao;
+            vendaId = venda.id;
+
+            // Resultado REAL: venda concluída, com pagamento e movimento de caixa
+            // usando uma forma que já não está cadastrada.
+            expect((await service.obter()).formasPagamento).not.toContain(chave);
+            expect(venda.status).toBe("concluida");
+            expect(venda.pagamentos[0]?.forma).toBe(chave);
+            const movimentos = await connection.collection("movimentos_caixa").countDocuments({ caixaId: new Types.ObjectId(cenario.caixaId), formaPagamento: chave });
+            expect(movimentos).toBe(1);
+          } finally {
+            liberarTudo(pausaVenda);
+            espiaoVenda.mockRestore();
           }
-        },
-      );
+        } finally {
+          await limparCenario(cenario, vendaId);
+        }
+      });
     });
   });
 });
