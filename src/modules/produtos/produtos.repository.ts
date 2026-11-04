@@ -75,6 +75,11 @@ export class ProdutosRepository {
    * `save()` rejeita com `VersionError` e a operação é refeita do zero (nova
    * leitura, nova aplicação de `mutar`) — nunca sobrescreve um estado que não
    * viu. Cobre edição de variante, tamanhos e entrada/saída de estoque.
+   *
+   * Fase 56.3.1 — se TODAS as tentativas terminarem em `VersionError`, a
+   * operação termina com o conflito de negócio abaixo (HTTP 409), nunca com o
+   * `VersionError` cru (que o filtro global transformava em HTTP 500).
+   * Qualquer outro erro continua sendo relançado na hora, sem retentativa.
    */
   async salvarComRetentativa(
     id: string,
@@ -87,10 +92,10 @@ export class ProdutosRepository {
       try {
         return await produto.save();
       } catch (erro) {
-        if (!(erro instanceof MongooseErrors.VersionError) || tentativa === tentativas) throw erro;
+        if (!(erro instanceof MongooseErrors.VersionError)) throw erro;
       }
     }
-    // Inatingível: o loop sempre retorna ou lança na última tentativa.
+    // Todas as tentativas perderam a corrida de versão: nada foi gravado.
     throw ApiException.conflict(
       "Não foi possível salvar as alterações: o produto foi modificado por outra operação simultânea. Tente novamente.",
     );

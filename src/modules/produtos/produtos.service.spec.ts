@@ -1083,32 +1083,137 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       });
     });
 
-    describe("limitação residual documentada (disponibilidade)", () => {
-      it("depois de 3 VersionError seguidos a operação desiste com o VersionError cru (não um erro de negócio) — sem gravar nada parcial", async () => {
-        const { produtoId, varianteId } = await produtoComVariante("CONC-ESGOTA");
-        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 1 }, null);
-        const produtoAntes = await service.obterPorId(produtoId);
-        const tamanhoMId = String(produtoAntes.variantes[0]!.tamanhos[0]!._id);
-        // Leituras de A: 1ª, 3ª e 5ª (pausadas). Entre elas, uma escrita concorrente (2ª, 4ª e 6ª leituras).
-        const pausas = [novoPonto(), novoPonto(), novoPonto()];
-        const { espiao, leituras } = pausarLeiturasDeProduto(new Map([[1, pausas[0]!], [3, pausas[1]!], [5, pausas[2]!]]));
+    /**
+     * Fase 56.3.1 — esgotamento das 3 tentativas de `salvarComRetentativa`.
+     * Antes (Fase 56.3), a 3ª `VersionError` era relançada crua e o filtro
+     * global a devolvia como HTTP 500. Agora termina com
+     * `ApiException.conflict` (HTTP 409, `code: "CONFLICT"`). O limite de 3
+     * tentativas e a reavaliação das regras a cada tentativa não mudaram.
+     *
+     * `forcarConflitos(n)` pausa cada tentativa de A logo depois da leitura e,
+     * nesse intervalo, faz uma escrita concorrente REAL (`ajustarQuantidadeTamanho`
+     * no tamanho M, exatamente 1 leitura) — então as `n` primeiras tentativas
+     * de A perdem a corrida de versão. Tentativas de A = leituras − n.
+     */
+    describe("esgotamento de retentativas (Fase 56.3.1)", () => {
+      const MENSAGEM_CONFLITO = "Não foi possível salvar as alterações: o produto foi modificado por outra operação simultânea. Tente novamente.";
+
+      /** Variante com o tamanho M (quantidade 1), usado pelas escritas concorrentes. */
+      async function varianteComTamanhoM(sufixo: string) {
+        const { produtoId, varianteId } = await produtoComVariante(sufixo);
+        const variante = await service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 1 }, null);
+        return { produtoId, varianteId, tamanhoMId: String(variante.tamanhos[0]!._id) };
+      }
+
+      async function forcarConflitos(
+        conflitos: number,
+        operacaoA: () => Promise<unknown>,
+        escritaConcorrente: (indice: number) => Promise<unknown>,
+      ): Promise<{ a: Resultado; tentativasDeA: number }> {
+        const pausas = Array.from({ length: conflitos }, () => novoPonto());
+        // A tentativa k de A é a leitura 2k−1 (entre duas tentativas de A há exatamente 1 leitura concorrente).
+        const { espiao, leituras } = pausarLeiturasDeProduto(new Map(pausas.map((pausa, indice) => [2 * indice + 1, pausa])));
         try {
-          const resultadoA = capturar(service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 5 }, null));
-          for (const pausa of pausas) {
-            await pausa.chegou.promessa;
-            await service.ajustarQuantidadeTamanho(produtoId, varianteId, { tamanhoId: tamanhoMId, delta: 1, exigirExistente: true });
+          const resultadoA = capturar(operacaoA());
+          for (const [indice, pausa] of pausas.entries()) {
+            await pausa.chegou.promessa; // A leu e está parada antes do save()
+            await escritaConcorrente(indice); // a versão avança: o save() de A vai falhar
             pausa.liberacao.liberar();
           }
           const a = await resultadoA;
-          expect(a.ok).toBe(false);
-          expect(erroDe(a)).toBeInstanceOf(MongooseErrors.VersionError); // não traduzido para ApiException
-          expect(leituras()).toBe(6);
-          const variante = await varianteNoBanco(produtoId, varianteId);
-          expect(variante?.tamanhos.map(({ tamanho, quantidade }) => ({ tamanho, quantidade }))).toEqual([{ tamanho: "M", quantidade: 4 }]); // P nunca entrou
+          return { a, tentativasDeA: leituras() - conflitos };
         } finally {
           liberarTudo(...pausas);
           espiao.mockRestore();
         }
+      }
+
+      async function tamanhosPersistidos(produtoId: string, varianteId: string) {
+        return (await varianteNoBanco(produtoId, varianteId))?.tamanhos.map(({ tamanho, quantidade }) => ({ tamanho, quantidade })).sort((x, y) => x.tamanho.localeCompare(y.tamanho));
+      }
+
+      it("A. 1ª tentativa conflita, 2ª funciona: sucesso em exatamente 2 tentativas, estado correto", async () => {
+        const { produtoId, varianteId, tamanhoMId } = await varianteComTamanhoM("ESG-A");
+        const { a, tentativasDeA } = await forcarConflitos(
+          1,
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 5 }, null),
+          () => service.ajustarQuantidadeTamanho(produtoId, varianteId, { tamanhoId: tamanhoMId, delta: 1, exigirExistente: true }),
+        );
+        expect(a.ok).toBe(true);
+        expect(tentativasDeA).toBe(2);
+        expect(await tamanhosPersistidos(produtoId, varianteId)).toEqual([
+          { tamanho: "M", quantidade: 2 },
+          { tamanho: "P", quantidade: 5 },
+        ]);
+      });
+
+      it("B. 1ª e 2ª tentativas conflitam, 3ª funciona: sucesso em exatamente 3 tentativas, estado correto", async () => {
+        const { produtoId, varianteId, tamanhoMId } = await varianteComTamanhoM("ESG-B");
+        const { a, tentativasDeA } = await forcarConflitos(
+          2,
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 5 }, null),
+          () => service.ajustarQuantidadeTamanho(produtoId, varianteId, { tamanhoId: tamanhoMId, delta: 1, exigirExistente: true }),
+        );
+        expect(a.ok).toBe(true);
+        expect(tentativasDeA).toBe(3);
+        expect(await tamanhosPersistidos(produtoId, varianteId)).toEqual([
+          { tamanho: "M", quantidade: 3 },
+          { tamanho: "P", quantidade: 5 },
+        ]);
+      });
+
+      it("C. as 3 tentativas conflitam: termina com o conflito do contrato (409 CONFLICT), nunca o VersionError cru — sem gravação parcial", async () => {
+        const { produtoId, varianteId, tamanhoMId } = await varianteComTamanhoM("ESG-C");
+        const { a, tentativasDeA } = await forcarConflitos(
+          3,
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 5 }, null),
+          () => service.ajustarQuantidadeTamanho(produtoId, varianteId, { tamanhoId: tamanhoMId, delta: 1, exigirExistente: true }),
+        );
+        expect(a.ok).toBe(false);
+        const erro = erroDe(a);
+        expect(erro).not.toBeInstanceOf(MongooseErrors.VersionError);
+        expect(erro).toBeInstanceOf(ApiException);
+        // Exatamente o que o HttpExceptionFilter serializa para uma ApiException.
+        expect(erro).toMatchObject({ code: "CONFLICT", message: MENSAGEM_CONFLITO, errors: [] });
+        expect(erro instanceof ApiException ? erro.getStatus() : null).toBe(409);
+        expect(tentativasDeA).toBe(3); // limite inalterado
+        // Só as 3 escritas concorrentes entraram; o P de A nunca foi gravado.
+        expect(await tamanhosPersistidos(produtoId, varianteId)).toEqual([{ tamanho: "M", quantidade: 4 }]);
+      });
+
+      it("D. erro que não é VersionError (validação do schema no save) não é convertido em 409 nem retentado", async () => {
+        const { produtoId, varianteId } = await varianteComTamanhoM("ESG-D");
+        const { espiao, leituras } = pausarLeiturasDeProduto(new Map());
+        try {
+          // `quantidade` negativa viola o `min: 0` do schema de tamanho → `ValidationError` no save().
+          const a = await capturar(service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: -1 }, null));
+          expect(a.ok).toBe(false);
+          expect(erroDe(a)).toBeInstanceOf(MongooseErrors.ValidationError); // propagado como antes
+          expect(erroDe(a)).not.toBeInstanceOf(ApiException);
+          expect(leituras()).toBe(1); // sem retentativa
+        } finally {
+          espiao.mockRestore();
+        }
+        expect(await tamanhosPersistidos(produtoId, varianteId)).toEqual([{ tamanho: "M", quantidade: 1 }]);
+      });
+
+      it("E. após o conflito a regra do U é reavaliada sobre o documento novo: rejeição de negócio (400), não 409", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("ESG-E");
+        const { a, tentativasDeA } = await forcarConflitos(
+          1,
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 2 }, null),
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "U", quantidade: 1 }, null),
+        );
+        expect(a.ok).toBe(false);
+        const erro = erroDe(a);
+        expect(erro).toBeInstanceOf(ApiException);
+        expect(erro).toMatchObject({
+          code: "VALIDATION_ERROR",
+          errors: [{ field: "tamanho", message: "Esta variante usa tamanho único (U): não é possível adicionar outros tamanhos." }],
+        });
+        expect(erro instanceof ApiException ? erro.getStatus() : null).toBe(400);
+        expect(tentativasDeA).toBe(2); // a 2ª tentativa releu, viu o U e parou na regra
+        expect(await tamanhosPersistidos(produtoId, varianteId)).toEqual([{ tamanho: "U", quantidade: 1 }]);
       });
     });
   });
