@@ -1,10 +1,11 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import type { Connection } from "mongoose";
+import { Error as MongooseErrors, Types, type Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
+import { liberarTudo, novoPonto, type PontoDeParada } from "../../test-utils/barreira.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { CampanhasService } from "../campanhas/campanhas.service.js";
 import { ColecoesService } from "../colecoes/colecoes.service.js";
@@ -879,6 +880,236 @@ describe("ProdutosService (integração — MongoDB real)", () => {
       );
       expect(typeof atualizado.categoria).toBe("string");
       expect((atualizado as unknown as { categoriaNormalizada?: unknown }).categoriaNormalizada).toBeUndefined();
+    });
+  });
+
+  /**
+   * Fase 56.3 — integridade da variante (mesmo documento de produto).
+   *
+   * `adicionarTamanho`/`atualizarVariante`/`ajustarQuantidadeTamanho` usam
+   * `ProdutosRepository.salvarComRetentativa`: lê o produto → aplica `mutar`
+   * (onde ficam as regras de tamanho duplicado e do tamanho único `U`) → `save()`
+   * com controle otimista (`optimisticConcurrency`, `__v`). Se outra operação
+   * salvou no meio, `save()` rejeita com `VersionError` e tudo é refeito sobre
+   * o documento NOVO — as regras são reavaliadas com o estado real. Até 3
+   * tentativas.
+   *
+   * Barreira determinística: um spy em `encontrarPorIdOuFalhar` (chamado por
+   * `salvarComRetentativa` na mesma instância) pausa a operação A logo DEPOIS
+   * da leitura e ANTES do `save()`; a operação B roda inteira nesse intervalo.
+   * A contagem de leituras prova que A foi refeita (VersionError exercitado).
+   */
+  describe("integridade da variante sob concorrência determinística (Fase 56.3)", () => {
+    type Resultado = { ok: true } | { ok: false; erro: unknown };
+
+    async function produtoComVariante(sufixo: string): Promise<{ produtoId: string; varianteId: string }> {
+      const produto = await service.criar(payloadProduto(`TAM-${sufixo}`), null);
+      const variante = await service.adicionarVariante(produto.id, { cor: "Preto" }, null);
+      return { produtoId: produto.id, varianteId: String(variante._id) };
+    }
+
+    /** Pausa a N-ésima leitura de produto (índices em `pausas`), depois de ler e antes de devolver o documento. */
+    function pausarLeiturasDeProduto(pausas: Map<number, PontoDeParada>) {
+      const original = produtosRepository.encontrarPorIdOuFalhar.bind(produtosRepository);
+      let leituras = 0;
+      const espiao = spyOn(produtosRepository, "encontrarPorIdOuFalhar").mockImplementation(async (id) => {
+        leituras += 1;
+        const produto = await original(id);
+        const ponto = pausas.get(leituras);
+        if (ponto) {
+          ponto.chegou.liberar();
+          await ponto.liberacao.promessa;
+        }
+        return produto;
+      });
+      return { espiao, leituras: () => leituras };
+    }
+
+    function capturar(operacao: Promise<unknown>): Promise<Resultado> {
+      return operacao.then(
+        (): Resultado => ({ ok: true }),
+        (erro: unknown): Resultado => ({ ok: false, erro }),
+      );
+    }
+
+    /** A lê e para antes de salvar; B roda inteira; A é liberada (VersionError → releitura → regras reavaliadas). */
+    async function corrida(operacaoA: () => Promise<unknown>, operacaoB: () => Promise<unknown>) {
+      const pausaA = novoPonto();
+      const { espiao, leituras } = pausarLeiturasDeProduto(new Map([[1, pausaA]]));
+      try {
+        const resultadoA = capturar(operacaoA());
+        await pausaA.chegou.promessa; // A já leu (versão antiga) e está parada antes do save()
+        await operacaoB(); // B lê, aplica e salva: a versão avança
+        pausaA.liberacao.liberar();
+        return { a: await resultadoA, leituras: leituras() };
+      } finally {
+        liberarTudo(pausaA);
+        espiao.mockRestore();
+      }
+    }
+
+    /** Formato persistido (lido direto da coleção, sem hidratar pelo Mongoose). */
+    type ProdutoPersistido = {
+      _id: Types.ObjectId;
+      variantes: { _id: Types.ObjectId; foto: string | null; quantidadeVariante: number; tamanhos: { tamanho: string; quantidade: number }[] }[];
+    };
+
+    async function varianteNoBanco(produtoId: string, varianteId: string) {
+      const produto = await connection.collection<ProdutoPersistido>("produtos").findOne({ _id: new Types.ObjectId(produtoId) });
+      return (produto?.variantes ?? []).find((variante) => String(variante._id) === varianteId);
+    }
+
+    function erroDe(resultado: Resultado): unknown {
+      return resultado.ok ? null : resultado.erro;
+    }
+
+    describe("regra do tamanho único (U) — persistência", () => {
+      it("U em variante vazia é aceito e persistido como 'U' (inclusive a partir de 'u')", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("U-VAZIA");
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "u", quantidade: 2 }, null);
+        expect((await varianteNoBanco(produtoId, varianteId))?.tamanhos.map((item) => item.tamanho)).toEqual(["U"]);
+      });
+
+      it("com U na variante, outro tamanho é rejeitado e a variante continua só com U no banco", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("U-PRIMEIRO");
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "U", quantidade: 2 }, null);
+        await expect(service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 1 }, null)).rejects.toMatchObject({
+          errors: [{ field: "tamanho", message: "Esta variante usa tamanho único (U): não é possível adicionar outros tamanhos." }],
+        });
+        expect((await varianteNoBanco(produtoId, varianteId))?.tamanhos.map((item) => item.tamanho)).toEqual(["U"]);
+      });
+
+      it("com outro tamanho na variante, U é rejeitado e a variante continua só com ele no banco", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("P-PRIMEIRO");
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 2 }, null);
+        await expect(service.adicionarTamanho(produtoId, varianteId, { tamanho: "U", quantidade: 1 }, null)).rejects.toMatchObject({
+          errors: [{ field: "tamanho", message: "Esta variante já possui tamanhos: o tamanho único (U) não pode coexistir com outros." }],
+        });
+        expect((await varianteNoBanco(produtoId, varianteId))?.tamanhos.map((item) => item.tamanho)).toEqual(["P"]);
+      });
+
+      it("entrada de estoque criando um tamanho novo numa variante com U também respeita a regra", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("U-ESTOQUE");
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "U", quantidade: 1 }, null);
+        await expect(
+          service.ajustarQuantidadeTamanho(produtoId, varianteId, { tamanho: "M", delta: 3, exigirExistente: false, exigirTamanhoCadastrado: true }),
+        ).rejects.toMatchObject({ errors: [{ field: "tamanho", message: "Esta variante usa tamanho único (U): não é possível adicionar outros tamanhos." }] });
+        expect((await varianteNoBanco(produtoId, varianteId))?.tamanhos.map((item) => item.tamanho)).toEqual(["U"]);
+      });
+    });
+
+    describe("garantias (controle otimista, entrelaçamento determinístico)", () => {
+      it("tamanhos DISTINTOS na mesma variante: A é refeita após o VersionError e os dois persistem", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("CONC-DIST");
+        const { a, leituras } = await corrida(
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 5 }, null),
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 7 }, null),
+        );
+        expect(a.ok).toBe(true);
+        expect(leituras).toBe(3); // A leu, B leu, A releu após o VersionError
+        const variante = await varianteNoBanco(produtoId, varianteId);
+        expect(variante?.tamanhos.map((item) => item.tamanho).sort()).toEqual(["M", "P"]);
+        expect(variante?.quantidadeVariante).toBe(12);
+      });
+
+      it("MESMO tamanho (grafias equivalentes) na mesma variante: A, refeita sobre o documento novo, é rejeitada — nunca duplica", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("CONC-IGUAL");
+        const { a, leituras } = await corrida(
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 5 }, null),
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: " p ", quantidade: 7 }, null),
+        );
+        expect(a.ok).toBe(false);
+        expect(erroDe(a)).toBeInstanceOf(ApiException);
+        expect(erroDe(a)).toMatchObject({ errors: [{ field: "tamanho", message: "Este tamanho já está cadastrado nesta variante." }] });
+        expect(leituras).toBe(3);
+        const variante = await varianteNoBanco(produtoId, varianteId);
+        expect(variante?.tamanhos.map(({ tamanho, quantidade }) => ({ tamanho, quantidade }))).toEqual([{ tamanho: "P", quantidade: 7 }]);
+      });
+
+      it("U × tamanho convencional: A (U) é refeita, vê o P gravado por B e é rejeitada pela regra do tamanho único", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("CONC-U-P");
+        const { a, leituras } = await corrida(
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "U", quantidade: 1 }, null),
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 2 }, null),
+        );
+        expect(a.ok).toBe(false);
+        expect(erroDe(a)).toBeInstanceOf(ApiException);
+        expect(erroDe(a)).toMatchObject({
+          errors: [{ field: "tamanho", message: "Esta variante já possui tamanhos: o tamanho único (U) não pode coexistir com outros." }],
+        });
+        expect(leituras).toBe(3);
+        expect((await varianteNoBanco(produtoId, varianteId))?.tamanhos.map((item) => item.tamanho)).toEqual(["P"]);
+      });
+
+      it("tamanho convencional × U: A (P) é refeita, vê o U gravado por B e é rejeitada pela regra do tamanho único", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("CONC-P-U");
+        const { a, leituras } = await corrida(
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 2 }, null),
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "U", quantidade: 1 }, null),
+        );
+        expect(a.ok).toBe(false);
+        expect(erroDe(a)).toBeInstanceOf(ApiException);
+        expect(erroDe(a)).toMatchObject({ errors: [{ field: "tamanho", message: "Esta variante usa tamanho único (U): não é possível adicionar outros tamanhos." }] });
+        expect(leituras).toBe(3);
+        expect((await varianteNoBanco(produtoId, varianteId))?.tamanhos.map((item) => item.tamanho)).toEqual(["U"]);
+      });
+
+      it("grafias equivalentes de U ('u' × ' U '): só uma persiste, a outra é rejeitada como duplicada", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("CONC-U-U");
+        const { a, leituras } = await corrida(
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "u", quantidade: 1 }, null),
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: " U ", quantidade: 3 }, null),
+        );
+        expect(a.ok).toBe(false);
+        expect(erroDe(a)).toBeInstanceOf(ApiException);
+        expect(erroDe(a)).toMatchObject({ errors: [{ field: "tamanho", message: "Este tamanho já está cadastrado nesta variante." }] });
+        expect(leituras).toBe(3);
+        expect((await varianteNoBanco(produtoId, varianteId))?.tamanhos.map(({ tamanho, quantidade }) => ({ tamanho, quantidade }))).toEqual([
+          { tamanho: "U", quantidade: 3 },
+        ]);
+      });
+
+      it("atualizar a variante (foto) × adicionar tamanho: nenhuma das duas escritas se perde", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("CONC-FOTO");
+        const { a, leituras } = await corrida(
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 4 }, null),
+          () => service.atualizarVariante(produtoId, varianteId, { cor: "Preto", foto: "https://exemplo.com/foto-concorrente.jpg" }, null),
+        );
+        expect(a.ok).toBe(true);
+        expect(leituras).toBe(4); // A leu; B leu (validação) e leu de novo (salvarComRetentativa); A releu
+        const variante = await varianteNoBanco(produtoId, varianteId);
+        expect(variante?.foto).toBe("https://exemplo.com/foto-concorrente.jpg");
+        expect(variante?.tamanhos.map((item) => item.tamanho)).toEqual(["M"]);
+      });
+    });
+
+    describe("limitação residual documentada (disponibilidade)", () => {
+      it("depois de 3 VersionError seguidos a operação desiste com o VersionError cru (não um erro de negócio) — sem gravar nada parcial", async () => {
+        const { produtoId, varianteId } = await produtoComVariante("CONC-ESGOTA");
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 1 }, null);
+        const produtoAntes = await service.obterPorId(produtoId);
+        const tamanhoMId = String(produtoAntes.variantes[0]!.tamanhos[0]!._id);
+        // Leituras de A: 1ª, 3ª e 5ª (pausadas). Entre elas, uma escrita concorrente (2ª, 4ª e 6ª leituras).
+        const pausas = [novoPonto(), novoPonto(), novoPonto()];
+        const { espiao, leituras } = pausarLeiturasDeProduto(new Map([[1, pausas[0]!], [3, pausas[1]!], [5, pausas[2]!]]));
+        try {
+          const resultadoA = capturar(service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 5 }, null));
+          for (const pausa of pausas) {
+            await pausa.chegou.promessa;
+            await service.ajustarQuantidadeTamanho(produtoId, varianteId, { tamanhoId: tamanhoMId, delta: 1, exigirExistente: true });
+            pausa.liberacao.liberar();
+          }
+          const a = await resultadoA;
+          expect(a.ok).toBe(false);
+          expect(erroDe(a)).toBeInstanceOf(MongooseErrors.VersionError); // não traduzido para ApiException
+          expect(leituras()).toBe(6);
+          const variante = await varianteNoBanco(produtoId, varianteId);
+          expect(variante?.tamanhos.map(({ tamanho, quantidade }) => ({ tamanho, quantidade }))).toEqual([{ tamanho: "M", quantidade: 4 }]); // P nunca entrou
+        } finally {
+          liberarTudo(...pausas);
+          espiao.mockRestore();
+        }
+      });
     });
   });
 });

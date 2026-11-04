@@ -5,13 +5,14 @@ import { Test, type TestingModule } from "@nestjs/testing";
 import { Types, type Connection, type Model } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
+import { liberarTudo, novoPonto, type PontoDeParada } from "../../test-utils/barreira.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { CaixasService } from "../caixas/caixas.service.js";
 import { MovimentoCaixa, type MovimentoCaixaDocument } from "../caixas/schemas/movimento-caixa.schema.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
-import { normalizarCor } from "../produtos/utils/normalizacao.util.js";
+import { normalizarCor, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
 import { Venda, type PagamentoVenda, type ParcelaVenda, type VendaDocument } from "../vendas/schemas/venda.schema.js";
 import { VendasService } from "../vendas/vendas.service.js";
@@ -64,21 +65,6 @@ function dadosMovimentoMinimo(extra: Partial<MovimentoCaixa> = {}): Partial<Movi
     sentido: "entrada",
     ...extra,
   } as Partial<MovimentoCaixa>;
-}
-
-/**
- * Fase 56.2 — promise controlada (deferred) para barreiras determinísticas:
- * `promessa` só resolve quando `liberar()` é chamado (idempotente).
- */
-class Barreira {
-  private resolver: (() => void) | null = null;
-  readonly promessa = new Promise<void>((resolver) => {
-    this.resolver = resolver;
-  });
-
-  liberar(): void {
-    this.resolver?.();
-  }
 }
 
 function payloadProduto(sufixo: string, extra: Partial<CriarProdutoDto> = {}): CriarProdutoDto {
@@ -406,6 +392,80 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const documento = await connection.collection<Configuracao>("configuracoes").findOne({ _id: "global" });
       expect((documento?.cores ?? []).filter((item) => normalizarCor(item) === normalizada)).toHaveLength(1);
       expect((documento?.coresNormalizadas ?? []).filter((item) => item === normalizada)).toHaveLength(1);
+    });
+  });
+
+  /**
+   * Fase 56.3 — tamanhos. `normalizarTamanho` é SÓ `trim()` + `toUpperCase()`
+   * (diferente de cor/categoria/forma): caixa e espaços nas pontas são
+   * equivalentes; acentos e espaços internos NÃO são removidos/colapsados.
+   * A unicidade vem do `$push` condicional no espelho `tamanhosNormalizados`
+   * (atômico), então as asserções concorrentes valem para qualquer ordem.
+   */
+  describe("tamanhos: normalização e inclusão concorrente (Fase 56.3)", () => {
+    async function documentoConfiguracao() {
+      return connection.collection<Configuracao>("configuracoes").findOne({ _id: "global" });
+    }
+
+    /** Toda entrada de `tamanhos` tem o seu normalizado no espelho, e cada normalizado aparece uma única vez nos dois. */
+    function expectEspelhoConsistente(tamanhos: string[], espelho: string[], normalizados: string[]): void {
+      for (const normalizado of normalizados) {
+        expect(tamanhos.filter((tamanho) => normalizarTamanho(tamanho) === normalizado)).toHaveLength(1);
+        expect(espelho.filter((item) => item === normalizado)).toHaveLength(1);
+      }
+      for (const tamanho of tamanhos) expect(espelho).toContain(normalizarTamanho(tamanho));
+    }
+
+    it("normalização real: caixa e espaços nas pontas são equivalentes; acento e espaço interno distinguem tamanhos", async () => {
+      const n = Date.now();
+      await service.adicionarItem("tamanhos", `p${n}`, USUARIO_ID);
+      await expect(service.adicionarItem("tamanhos", `P${n}`, USUARIO_ID)).rejects.toThrow(ApiException);
+      await expect(service.adicionarItem("tamanhos", `   p${n}   `, USUARIO_ID)).rejects.toThrow(ApiException);
+      // NÃO equivalentes para `normalizarTamanho` (sem remoção de acento nem colapso de espaços):
+      await service.adicionarItem("tamanhos", `Ú${n}`, USUARIO_ID);
+      await service.adicionarItem("tamanhos", `U${n}`, USUARIO_ID);
+      await service.adicionarItem("tamanhos", `G ${n}`, USUARIO_ID);
+      await service.adicionarItem("tamanhos", `G  ${n}`, USUARIO_ID);
+
+      const documento = await documentoConfiguracao();
+      expectEspelhoConsistente(documento?.tamanhos ?? [], documento?.tamanhosNormalizados ?? [], [`P${n}`, `Ú${n}`, `U${n}`, `G ${n}`, `G  ${n}`]);
+      expect(documento?.tamanhos).toContain(`p${n}`); // a grafia original cadastrada é preservada
+    });
+
+    it("'u' e ' U ' são a mesma coisa que 'U' (tamanho único) na configuração", async () => {
+      await garantirItemConfiguracao(service, "tamanhos", "U");
+      await expect(service.adicionarItem("tamanhos", "u", USUARIO_ID)).rejects.toThrow(ApiException);
+      await expect(service.adicionarItem("tamanhos", " U ", USUARIO_ID)).rejects.toThrow(ApiException);
+      const documento = await documentoConfiguracao();
+      expect((documento?.tamanhosNormalizados ?? []).filter((item) => item === "U")).toHaveLength(1);
+    });
+
+    it("garantia: N inclusões concorrentes de tamanhos DISTINTOS — todas persistem, sem perda de atualização, espelho consistente", async () => {
+      const n = Date.now();
+      const tamanhos = Array.from({ length: 8 }, (_, indice) => `D${n}-${indice}`);
+      const resultados = await Promise.allSettled(tamanhos.map((tamanho) => service.adicionarItem("tamanhos", tamanho, USUARIO_ID)));
+      expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);
+      const documento = await documentoConfiguracao();
+      expectEspelhoConsistente(documento?.tamanhos ?? [], documento?.tamanhosNormalizados ?? [], tamanhos);
+    });
+
+    it("garantia: N inclusões concorrentes do MESMO tamanho — só uma persiste, as demais rejeitam por duplicidade", async () => {
+      const tamanho = `S${Date.now()}`;
+      const resultados = await Promise.allSettled(Array.from({ length: 5 }, () => service.adicionarItem("tamanhos", tamanho, USUARIO_ID)));
+      expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      expect(resultados.filter((r) => r.status === "rejected")).toHaveLength(4);
+      const documento = await documentoConfiguracao();
+      expectEspelhoConsistente(documento?.tamanhos ?? [], documento?.tamanhosNormalizados ?? [], [tamanho]);
+    });
+
+    it("garantia: N inclusões concorrentes de grafias EQUIVALENTES (caixa/espaços nas pontas) — só uma persiste e o espelho tem uma única entrada", async () => {
+      const n = Date.now();
+      const grafias = [`xl${n}`, `XL${n}`, `  Xl${n}  `, `xL${n}`];
+      const resultados = await Promise.allSettled(grafias.map((grafia) => service.adicionarItem("tamanhos", grafia, USUARIO_ID)));
+      expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      expect(resultados.filter((r) => r.status === "rejected")).toHaveLength(grafias.length - 1);
+      const documento = await documentoConfiguracao();
+      expectEspelhoConsistente(documento?.tamanhos ?? [], documento?.tamanhosNormalizados ?? [], [`XL${n}`]);
     });
   });
 
@@ -982,19 +1042,6 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
    * sempre liberadas e os spies restaurados em `finally`.
    */
   describe("concorrência determinística — exclusão × criação de vínculo (Fase 56.2)", () => {
-    type PontoDeParada = { chegou: Barreira; liberacao: Barreira };
-
-    function novoPonto(): PontoDeParada {
-      return { chegou: new Barreira(), liberacao: new Barreira() };
-    }
-
-    function liberarTudo(...pontos: PontoDeParada[]): void {
-      for (const ponto of pontos) {
-        ponto.chegou.liberar();
-        ponto.liberacao.liberar();
-      }
-    }
-
     /** Exclusão: pausa DEPOIS do `$pull` (checagem inicial já feita) e ANTES da rechecagem. */
     function pausarExclusaoAntesDaRechecagem(ponto: PontoDeParada) {
       const repositorio = moduleRef.get(ConfiguracoesRepository, { strict: false });
@@ -1045,6 +1092,21 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
           await ponto.liberacao.promessa;
         }
         return original(chave);
+      });
+    }
+
+    /**
+     * Fase 56.3 — `ProdutosService.adicionarTamanho`: pausa na entrada de
+     * `salvarComRetentativa` — DEPOIS de `validarTamanhoCadastrado`, ANTES da
+     * leitura/escrita do produto.
+     */
+    function pausarGravacaoDeTamanho(ponto: PontoDeParada) {
+      const repositorio = moduleRef.get(ProdutosRepository, { strict: false });
+      const original = repositorio.salvarComRetentativa.bind(repositorio);
+      return spyOn(repositorio, "salvarComRetentativa").mockImplementation(async (id, mutar, tentativas) => {
+        ponto.chegou.liberar();
+        await ponto.liberacao.promessa;
+        return original(id, mutar, tentativas);
       });
     }
 
@@ -1107,6 +1169,76 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
         } finally {
           liberarTudo(pausaVariante);
           espiaoVariante.mockRestore();
+        }
+      });
+    });
+
+    describe("tamanho × inclusão de tamanho na variante (Fase 56.3)", () => {
+      beforeEach(async () => {
+        await garantirItemConfiguracao(service, "categorias", "Vestidos");
+        await garantirItemConfiguracao(service, "cores", "Azul");
+      });
+
+      async function produtoComVariante(sufixo: string): Promise<{ produtoId: string; varianteId: string }> {
+        const produto = await produtosService.criar(payloadProduto(`DET-TAM-${sufixo}`), null);
+        const variante = await produtosService.adicionarVariante(produto.id, { cor: "Azul" }, null);
+        return { produtoId: produto.id, varianteId: String(variante._id) };
+      }
+
+      async function tamanhosDaVariante(produtoId: string, varianteId: string): Promise<string[]> {
+        const produto = await produtosService.obterPorId(produtoId);
+        return (produto.variantes.find((variante) => String(variante._id) === varianteId)?.tamanhos ?? []).map((item) => item.tamanho);
+      }
+
+      it("garantia (compensação): tamanho gravado na variante ENTRE o $pull e a rechecagem → o tamanho é readicionado e a exclusão é rejeitada", async () => {
+        const chave = `TC${Date.now()}`;
+        await service.adicionarItem("tamanhos", chave, USUARIO_ID);
+        const { produtoId, varianteId } = await produtoComVariante("1");
+        const pausaTamanho = novoPonto();
+        const pausaExclusao = novoPonto();
+        const espiaoTamanho = pausarGravacaoDeTamanho(pausaTamanho);
+        const espiaoExclusao = pausarExclusaoAntesDaRechecagem(pausaExclusao);
+        try {
+          const inclusao = produtosService.adicionarTamanho(produtoId, varianteId, { tamanho: chave, quantidade: 2 }, null);
+          await pausaTamanho.chegou.promessa; // tamanho já validado como cadastrado
+          const exclusao = service.removerItem("tamanhos", chave, USUARIO_ID);
+          await pausaExclusao.chegou.promessa;
+          expect((await service.obter()).tamanhos).not.toContain(chave);
+
+          pausaTamanho.liberacao.liberar();
+          await inclusao; // tamanho gravado na variante ANTES da rechecagem
+          pausaExclusao.liberacao.liberar();
+
+          await expect(exclusao).rejects.toThrow("Não foi possível excluir este tamanho porque existem produtos vinculados a ele no sistema.");
+          expect((await service.obter()).tamanhos).toContain(chave);
+          expect(await tamanhosDaVariante(produtoId, varianteId)).toEqual([chave]);
+        } finally {
+          liberarTudo(pausaTamanho, pausaExclusao);
+          espiaoTamanho.mockRestore();
+          espiaoExclusao.mockRestore();
+        }
+      });
+
+      it("limitação residual documentada: tamanho validado ANTES e gravado na variante DEPOIS da rechecagem fica não cadastrado", async () => {
+        const chave = `TR${Date.now()}`;
+        await service.adicionarItem("tamanhos", chave, USUARIO_ID);
+        const { produtoId, varianteId } = await produtoComVariante("2");
+        const pausaTamanho = novoPonto();
+        const espiaoTamanho = pausarGravacaoDeTamanho(pausaTamanho);
+        try {
+          const inclusao = produtosService.adicionarTamanho(produtoId, varianteId, { tamanho: chave, quantidade: 2 }, null);
+          await pausaTamanho.chegou.promessa;
+          expect((await service.removerItem("tamanhos", chave, USUARIO_ID)).tamanhos).not.toContain(chave);
+
+          pausaTamanho.liberacao.liberar();
+          await inclusao;
+
+          // Resultado REAL (mesma janela de cor/categoria/forma, Fase 56.2):
+          expect((await service.obter()).tamanhos).not.toContain(chave);
+          expect(await tamanhosDaVariante(produtoId, varianteId)).toEqual([chave]);
+        } finally {
+          liberarTudo(pausaTamanho);
+          espiaoTamanho.mockRestore();
         }
       });
     });
