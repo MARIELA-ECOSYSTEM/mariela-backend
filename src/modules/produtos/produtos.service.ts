@@ -88,6 +88,8 @@ export class ProdutosService {
       estoqueZeradoEm: null,
       excluidoEm: null,
       variantes: [],
+      midias: [],
+      midiaPrincipalId: null,
     });
 
     await this.registrarEvento(produto.id, null, "produto.criado", usuarioId, { codProduto });
@@ -198,10 +200,15 @@ export class ProdutosService {
     return produto;
   }
 
+  /**
+   * Fase 60.1 — soft delete pelo mesmo `salvarComRetentativa` das demais mutações: uma escrita concorrente (ex.: na
+   * galeria) não vira mais `VersionError` cru (500); a exclusão é refeita sobre o estado novo e, se esgotar, 409.
+   * Comportamento preservado: só marca `excluidoEm` — galeria, variantes e campos legados ficam intactos.
+   */
   async excluir(id: string, usuarioId: string | null): Promise<void> {
-    const produto = await this.produtosRepository.encontrarPorIdOuFalhar(id);
-    produto.excluidoEm = new Date();
-    await produto.save();
+    const produto = await this.produtosRepository.salvarComRetentativa(id, (documento) => {
+      documento.excluidoEm = new Date();
+    });
     await this.registrarEvento(produto.id, null, "produto.excluido", usuarioId, {});
   }
 
@@ -379,6 +386,11 @@ export class ProdutosService {
       snapshot = { cor: variante.cor, codVariante: variante.codVariante };
       if (String(documento.fotoPrincipalVarianteId) === varianteId) {
         documento.fotoPrincipalVarianteId = null;
+      }
+      // Fase 60.1 — as imagens da galeria associadas à variante são DESASSOCIADAS (nunca removidas), na mesma
+      // escrita que remove a variante: nenhuma mídia fica apontando para uma variante inexistente.
+      for (const midia of documento.midias) {
+        if (midia.varianteId && String(midia.varianteId) === varianteId) midia.varianteId = null;
       }
       documento.variantes.pull({ _id: varianteId });
       this.recalcularDerivados(documento);

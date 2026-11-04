@@ -9,6 +9,7 @@ import { validateEnv } from "../../config/env.validation.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
+import { inserirMidiaDiretamente } from "../../test-utils/media-storage-falso.util.js";
 import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
@@ -254,6 +255,53 @@ describe("PdvProdutosService (integração — MongoDB real)", () => {
 
       const item = await service.obterPorId(produto.id);
       expect(item.imagem).toBe("https://exemplo.com/rosa.jpg");
+    });
+  });
+
+  describe("Fase 60.1 — galeria com compatibilidade legada", () => {
+    it("com imagens na galeria, `imagem` é a principal da galeria (marcada, ou a 1ª pela ordem) — vídeo nunca", async () => {
+      const produto = await criarProduto();
+      const verdeId = await adicionarVarianteComEstoque(produto.id, "Verde", [{ tamanho: "M", quantidade: 1 }], "https://exemplo.com/verde.jpg");
+      await produtosService.definirFotoPrincipal(produto.id, { varianteId: verdeId }, null);
+      await inserirMidiaDiretamente(connection, produto.id, { tipo: "video", ordem: 0, url: "https://midia.exemplo.com/v.mp4" });
+      await inserirMidiaDiretamente(connection, produto.id, { ordem: 2, url: "https://midia.exemplo.com/b.jpg" });
+      const a = await inserirMidiaDiretamente(connection, produto.id, { ordem: 1, url: "https://midia.exemplo.com/a.jpg" });
+
+      expect((await service.obterPorId(produto.id)).imagem).toBe("https://midia.exemplo.com/a.jpg");
+      await connection.collection("produtos").updateOne({ codProduto: produto.codProduto }, { $set: { midiaPrincipalId: "inexistente" } });
+      expect((await service.obterPorId(produto.id)).imagem).toBe("https://midia.exemplo.com/a.jpg");
+      await connection.collection("produtos").updateOne({ codProduto: produto.codProduto }, { $set: { midiaPrincipalId: a } });
+      const lista = await service.listar({ busca: produto.codProduto, ordenarPor: "nome", ordem: "asc", page: 1, limit: 10 });
+      expect(lista.data[0]!.imagem).toBe("https://midia.exemplo.com/a.jpg");
+    });
+
+    it("foto da variante: imagem da galeria associada a ela; sem associação, a `variante.foto` legada", async () => {
+      const produto = await criarProduto();
+      const verdeId = await adicionarVarianteComEstoque(produto.id, "Verde", [{ tamanho: "M", quantidade: 1 }], "https://exemplo.com/verde.jpg");
+      await adicionarVarianteComEstoque(produto.id, "Rosa", [{ tamanho: "M", quantidade: 1 }], "https://exemplo.com/rosa.jpg");
+      await inserirMidiaDiretamente(connection, produto.id, { ordem: 0, url: "https://midia.exemplo.com/verde-galeria.jpg", varianteId: verdeId });
+
+      const item = await service.obterPorId(produto.id);
+      expect(item.variantes.map((variante) => [variante.cor, variante.foto])).toEqual([
+        ["Verde", "https://midia.exemplo.com/verde-galeria.jpg"],
+        ["Rosa", "https://exemplo.com/rosa.jpg"],
+      ]);
+    });
+
+    it("galeria só com vídeo (sem imagens) mantém exatamente a regra legada", async () => {
+      const produto = await criarProduto();
+      await adicionarVarianteComEstoque(produto.id, "Verde", [{ tamanho: "M", quantidade: 1 }], "https://exemplo.com/verde.jpg");
+      await inserirMidiaDiretamente(connection, produto.id, { tipo: "video", ordem: 0 });
+      expect((await service.obterPorId(produto.id)).imagem).toBe("https://exemplo.com/verde.jpg");
+    });
+
+    it("produto antigo sem os campos da galeria no documento continua com a regra legada", async () => {
+      const produto = await criarProduto();
+      await adicionarVarianteComEstoque(produto.id, "Rosa", [{ tamanho: "M", quantidade: 1 }], "https://exemplo.com/rosa.jpg");
+      await connection.collection("produtos").updateOne({ codProduto: produto.codProduto }, { $unset: { midias: "", midiaPrincipalId: "" } });
+      const item = await service.obterPorId(produto.id);
+      expect(item.imagem).toBe("https://exemplo.com/rosa.jpg");
+      expect(item.variantes[0]!.foto).toBe("https://exemplo.com/rosa.jpg");
     });
   });
 });

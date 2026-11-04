@@ -27,6 +27,8 @@ export const ERROR_CODES = {
   WHATSAPP_TIMEOUT: "WHATSAPP_TIMEOUT",
   // Storage de mídia (Fase 40) — R2 não configurado neste ambiente.
   STORAGE_NOT_CONFIGURED: "STORAGE_NOT_CONFIGURED",
+  // Fase 60.1 — R2 configurado, mas a chamada ao provedor falhou (rede, credencial recusada, erro do serviço).
+  STORAGE_UNAVAILABLE: "STORAGE_UNAVAILABLE",
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];

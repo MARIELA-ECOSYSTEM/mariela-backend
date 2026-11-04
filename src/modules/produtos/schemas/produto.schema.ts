@@ -1,6 +1,7 @@
 import { Prop, Schema, SchemaFactory } from "@nestjs/mongoose";
 import { SchemaTypes, type HydratedDocument, type Types } from "mongoose";
 import { aplicarSerializacaoPadrao } from "../../../database/mongoose-json.util.js";
+import { MidiaProduto, MidiaProdutoSchema } from "./midia-produto.schema.js";
 import { Variante, VarianteSchema } from "./variante.schema.js";
 
 /**
@@ -92,6 +93,18 @@ export class Produto {
 
   @Prop({ type: [VarianteSchema], default: [] })
   variantes!: Types.DocumentArray<Variante>;
+
+  /**
+   * Fase 60.1 — galeria de imagens e vídeos (ver `MidiaProduto`). Convive com os campos legados
+   * `variante.foto`/`variante.video`/`fotoPrincipalVarianteId`, que continuam intactos: os consumidores usam a
+   * galeria quando ela tem imagens e, senão, exatamente a regra legada (`utils/midias.util.ts`).
+   */
+  @Prop({ type: [MidiaProdutoSchema], default: [] })
+  midias!: Types.DocumentArray<MidiaProduto>;
+
+  /** `_id` de uma imagem de `midias`, ou `null`. Sem principal válida, a leitura usa a primeira imagem pela ordem. */
+  @Prop({ type: String, default: null })
+  midiaPrincipalId!: string | null;
 
   criadoEm!: Date;
   atualizadoEm!: Date;

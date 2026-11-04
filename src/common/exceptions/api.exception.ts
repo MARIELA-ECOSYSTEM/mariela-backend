@@ -142,6 +142,15 @@ export class ApiException extends HttpException {
     });
   }
 
+  /** Fase 60.1 — o storage de mídia está configurado, mas não respondeu ou recusou a operação (nunca confundido com "não configurado"). */
+  static storageUnavailable(message = "Armazenamento de mídia indisponível no momento. Tente novamente."): ApiException {
+    return new ApiException({
+      statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+      code: ERROR_CODES.STORAGE_UNAVAILABLE,
+      message,
+    });
+  }
+
   static whatsappTimeout(message = "Tempo esgotado ao comunicar com o provedor de WhatsApp."): ApiException {
     return new ApiException({
       statusCode: HttpStatus.GATEWAY_TIMEOUT,

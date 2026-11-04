@@ -6,6 +6,7 @@ import { ProdutosService } from "../produtos/produtos.service.js";
 import type { ProdutoDocument } from "../produtos/schemas/produto.schema.js";
 import type { Tamanho } from "../produtos/schemas/tamanho.schema.js";
 import type { Variante } from "../produtos/schemas/variante.schema.js";
+import { fotoDaVariante, urlImagemPrincipalDaGaleria } from "../produtos/utils/midias.util.js";
 import { precoEfetivo } from "../produtos/utils/precos.util.js";
 import type { ListarProdutosPdvQueryDto } from "./dto/listar-produtos-pdv-query.dto.js";
 import type { ProdutoCatalogoPdv, TamanhoCatalogoPdv, VarianteCatalogoPdv } from "./pdv-produtos.types.js";
@@ -74,15 +75,16 @@ export class PdvProdutosService {
       ehPromocao: produto.ehPromocao,
       quantidadeTotal: produto.quantidadeTotal,
       disponivel: produto.quantidadeTotal > 0,
-      variantes: produto.variantes.map((variante) => this.paraVarianteCatalogo(variante)),
+      variantes: produto.variantes.map((variante) => this.paraVarianteCatalogo(produto, variante)),
     };
   }
 
-  private paraVarianteCatalogo(variante: SubdocumentoComId<Variante>): VarianteCatalogoPdv {
+  private paraVarianteCatalogo(produto: ProdutoDocument, variante: SubdocumentoComId<Variante>): VarianteCatalogoPdv {
     return {
       id: String(variante._id),
       cor: variante.cor,
-      foto: variante.foto,
+      // Fase 60.1 — imagem da galeria associada à variante; sem ela, `variante.foto` (legado, inalterado).
+      foto: fotoDaVariante(produto, variante),
       quantidade: variante.quantidadeVariante,
       disponivel: variante.quantidadeVariante > 0,
       tamanhos: variante.tamanhos.map(
@@ -101,8 +103,13 @@ export class PdvProdutosService {
    * imagem principal é a variante marcada em `fotoPrincipalVarianteId`; sem
    * marcação (ou se a variante marcada não tiver foto), vale a primeira foto
    * cadastrada. Nunca duplicar esta decisão de forma divergente.
+   *
+   * Fase 60.1 — se a galeria tiver imagens, `imagem` passa a ser a principal da galeria (`midiaPrincipalId`, ou a
+   * primeira pela ordem); a regra acima continua valendo, idêntica, para produtos sem galeria.
    */
   private imagemPrincipal(produto: ProdutoDocument): string | null {
+    const daGaleria = urlImagemPrincipalDaGaleria(produto);
+    if (daGaleria) return daGaleria;
     const comFoto = produto.variantes.filter((variante) => Boolean(variante.foto));
     if (comFoto.length === 0) return null;
     const principalId = produto.fotoPrincipalVarianteId ? String(produto.fotoPrincipalVarianteId) : null;

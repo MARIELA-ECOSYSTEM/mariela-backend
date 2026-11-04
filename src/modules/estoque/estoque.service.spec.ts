@@ -5,6 +5,7 @@ import { Test, type TestingModule } from "@nestjs/testing";
 import { Types, type Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
+import { inserirMidiaDiretamente } from "../../test-utils/media-storage-falso.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import type { CriarProdutoDto } from "../produtos/dto/criar-produto.dto.js";
@@ -332,6 +333,29 @@ describe("EstoqueService (integração — MongoDB real)", () => {
       expect(item.cores[0]?.tamanhos[0]?.quantidade).toBe(7);
       expect(item.quantidadeTotal).toBe(7);
       expect(item.totalVariantes).toBe(1);
+    });
+
+    it("Fase 60.1 — sem galeria, foto/fotos seguem exatamente a regra legada (foto da 1ª variante; fotos das variantes com foto)", async () => {
+      const produto = await criarProduto();
+      await produtosService.adicionarVariante(produto.id, { cor: "Azul" }, null);
+      await produtosService.adicionarVariante(produto.id, { cor: "Rosa", foto: "https://exemplo.com/rosa.jpg" }, null);
+      await inserirMidiaDiretamente(connection, produto.id, { tipo: "video", ordem: 0 }); // vídeo não conta como galeria de imagens
+      const item = (await service.listar({ busca: produto.codProduto })).find((registro) => registro.produtoId === produto.id)!;
+      expect(item.foto).toBeNull();
+      expect(item.fotos).toEqual(["https://exemplo.com/rosa.jpg"]);
+    });
+
+    it("Fase 60.1 — com imagens na galeria, foto é a principal e fotos são as imagens pela ordem", async () => {
+      const produto = await criarProduto();
+      await produtosService.adicionarVariante(produto.id, { cor: "Rosa", foto: "https://exemplo.com/rosa.jpg" }, null);
+      await inserirMidiaDiretamente(connection, produto.id, { ordem: 1, url: "https://midia.exemplo.com/b.jpg" });
+      await inserirMidiaDiretamente(connection, produto.id, { ordem: 0, url: "https://midia.exemplo.com/a.jpg" });
+      const principal = await inserirMidiaDiretamente(connection, produto.id, { ordem: 2, url: "https://midia.exemplo.com/c.jpg" });
+      await connection.collection("produtos").updateOne({ _id: new Types.ObjectId(produto.id) }, { $set: { midiaPrincipalId: principal } });
+
+      const item = (await service.listar({ busca: produto.codProduto })).find((registro) => registro.produtoId === produto.id)!;
+      expect(item.foto).toBe("https://midia.exemplo.com/c.jpg");
+      expect(item.fotos).toEqual(["https://midia.exemplo.com/a.jpg", "https://midia.exemplo.com/b.jpg", "https://midia.exemplo.com/c.jpg"]);
     });
   });
 

@@ -10,6 +10,7 @@ import { ClientesRepository } from "../clientes/clientes.repository.js";
 import { ConfiguracoesRepository } from "../configuracoes/configuracoes.repository.js";
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
+import { fotoDaVariante } from "../produtos/utils/midias.util.js";
 import { normalizarFormaPagamento } from "../produtos/utils/normalizacao.util.js";
 import { precoEfetivo } from "../produtos/utils/precos.util.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
@@ -194,7 +195,8 @@ export class VendasService {
         codVariante: variante.codVariante,
         cor: variante.cor,
         tamanho: tamanho.tamanho,
-        foto: variante.foto,
+        // Fase 60.1 — foto histórica copiada no item: imagem da galeria associada à variante, senão `variante.foto`.
+        foto: fotoDaVariante(produto, variante),
         quantidade: solicitado.quantidade,
         precoOriginal,
         precoPraticado,

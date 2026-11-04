@@ -6,6 +6,7 @@ import { Error as MongooseErrors, Types, type Connection } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { erroDe, executarComConflitosDeVersao } from "../../test-utils/conflito-versao.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
+import { inserirMidiaDiretamente } from "../../test-utils/media-storage-falso.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { AdquirentesService } from "../adquirentes/adquirentes.service.js";
 import type { CriarAdquirenteDto } from "../adquirentes/dto/criar-adquirente.dto.js";
@@ -143,6 +144,50 @@ describe("VendasService (integração — MongoDB real)", () => {
       ...extra,
     };
   }
+
+  describe("Fase 60.1 — foto histórica do item com a galeria", () => {
+    it("sem galeria copia a variante.foto; com imagem da galeria associada à variante copia essa imagem; vendas anteriores mantêm a cópia", async () => {
+      const produto = await criarProdutoComEstoque(100, 10);
+      await connection
+        .collection("produtos")
+        .updateOne(
+          { _id: new Types.ObjectId(produto.produtoId), "variantes._id": new Types.ObjectId(produto.varianteId) },
+          { $set: { "variantes.$.foto": "https://legado.exemplo.com/azul.jpg" } },
+        );
+      const vendedor = await criarVendedor();
+      const caixa = await abrirCaixa();
+      const dados = (): DadosCriarVenda => ({
+        vendedorId: vendedor.id,
+        caixaId: caixa.id,
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+      });
+
+      const vendidas: number[] = [];
+      try {
+        const legada = await service.criar(dados(), null);
+        vendidas.push(100);
+        expect(legada.itens[0]!.foto).toBe("https://legado.exemplo.com/azul.jpg");
+
+        // Imagem da galeria NÃO associada à variante: a cópia continua sendo a legada.
+        await inserirMidiaDiretamente(connection, produto.produtoId, { ordem: 0, url: "https://midia.exemplo.com/geral.jpg" });
+        const semAssociacao = await service.criar(dados(), null);
+        vendidas.push(100);
+        expect(semAssociacao.itens[0]!.foto).toBe("https://legado.exemplo.com/azul.jpg");
+
+        await inserirMidiaDiretamente(connection, produto.produtoId, { ordem: 1, url: "https://midia.exemplo.com/azul.jpg", varianteId: produto.varianteId });
+        const associada = await service.criar(dados(), null);
+        vendidas.push(100);
+        expect(associada.itens[0]!.foto).toBe("https://midia.exemplo.com/azul.jpg");
+
+        const relida = await connection.collection<{ _id: Types.ObjectId; itens: { foto: string | null }[] }>("vendas").findOne({ _id: new Types.ObjectId(legada.id) });
+        expect(relida!.itens[0]!.foto).toBe("https://legado.exemplo.com/azul.jpg");
+      } finally {
+        // Fecha o caixa mesmo se uma asserção falhar: um caixa aberto contaminaria os demais testes do arquivo.
+        await caixasService.fechar(caixa.id, { valorInformado: 1000 + vendidas.reduce((total, valor) => total + valor, 0) }, null);
+      }
+    });
+  });
 
   describe("criação (mecanismo interno)", () => {
     it("cria a venda com código/número sequenciais, baixa o estoque e marca CONCLUIDA quando totalmente paga", async () => {

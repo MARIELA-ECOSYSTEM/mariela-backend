@@ -4,6 +4,7 @@ import type { Model } from "mongoose";
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import type { ProdutoDocument } from "../produtos/schemas/produto.schema.js";
+import { urlImagemPrincipalDaGaleria, urlsImagensDaGaleria } from "../produtos/utils/midias.util.js";
 import type { EntradaEstoqueDto } from "./dto/entrada-estoque.dto.js";
 import type { ListarEstoqueQueryDto } from "./dto/listar-estoque-query.dto.js";
 import type { SaidaEstoqueDto } from "./dto/saida-estoque.dto.js";
@@ -105,13 +106,17 @@ export class EstoqueService {
 }
 
 function mapearResumo(produto: ProdutoDocument): ResumoEstoqueProduto {
+  // Fase 60.1 — com imagens na galeria: `foto` é a principal e `fotos` as imagens pela ordem. Sem galeria, a regra
+  // legada exatamente como era (foto da 1ª variante; fotos das variantes que têm foto).
+  const fotosDaGaleria = urlsImagensDaGaleria(produto);
+  const temGaleria = fotosDaGaleria.length > 0;
   return {
     produtoId: produto.id,
     codProduto: produto.codProduto,
     nome: produto.nome,
     categoria: produto.categoria,
-    foto: produto.variantes[0]?.foto ?? null,
-    fotos: produto.variantes.map((variante) => variante.foto).filter((foto): foto is string => Boolean(foto)),
+    foto: temGaleria ? urlImagemPrincipalDaGaleria(produto) : (produto.variantes[0]?.foto ?? null),
+    fotos: temGaleria ? fotosDaGaleria : produto.variantes.map((variante) => variante.foto).filter((foto): foto is string => Boolean(foto)),
     cores: produto.variantes.map((variante) => ({
       varianteId: String(variante._id),
       cor: variante.cor,

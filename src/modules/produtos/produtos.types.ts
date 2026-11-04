@@ -27,6 +27,9 @@ export interface DadosCriarProduto {
   estoqueZeradoEm: null;
   excluidoEm: null;
   variantes: [];
+  /** Fase 60.1 — a galeria sempre nasce vazia: mídia só entra por upload confirmado, depois do produto existir. */
+  midias: [];
+  midiaPrincipalId: null;
 }
 
 export interface DadosNovaVariante {
