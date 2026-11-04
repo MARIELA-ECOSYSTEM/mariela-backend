@@ -8,6 +8,7 @@ import type { Request, Response } from "express";
 import helmet from "helmet";
 import { AppModule } from "./app.module.js";
 import type { Configuration } from "./config/configuration.js";
+import { montarOpcoesCors } from "./config/cors.config.js";
 import { ERROR_CODES } from "./common/constants/error-codes.constant.js";
 import { HttpExceptionFilter } from "./common/filters/http-exception.filter.js";
 import { ResponseInterceptor } from "./common/interceptors/response.interceptor.js";
@@ -52,7 +53,8 @@ async function bootstrap(): Promise<void> {
   const { origins } = configService.get("cors", { infer: true })!;
 
   app.use(helmet());
-  app.enableCors({ origin: origins.length > 0 ? origins : false, credentials: true });
+  // Fase 58 — lista explícita de origens, métodos e cabeçalhos; sem credenciais (ver `cors.config.ts`).
+  app.enableCors(montarOpcoesCors(origins));
 
   // `/health` e `/docs` ficam fora do prefixo versionado: são infraestrutura,
   // não endpoints de negócio.

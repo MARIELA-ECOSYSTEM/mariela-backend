@@ -1,3 +1,5 @@
+import { lerOrigensCors } from "./cors.config.js";
+
 /**
  * Agrupa `process.env` (já validado por `validateEnv`) em namespaces coesos,
  * consumidos via `ConfigService.get('app.port')`, `ConfigService.get('jwt.accessSecret')` etc.
@@ -120,10 +122,7 @@ export default (): Configuration => {
       refreshExpiresIn: process.env["PDV_JWT_REFRESH_EXPIRES_IN"] ?? "12h",
     },
     cors: {
-      origins: (process.env["CORS_ORIGINS"] ?? "")
-        .split(",")
-        .map((origem) => origem.trim())
-        .filter(Boolean),
+      origins: lerOrigensCors(process.env["CORS_ORIGINS"]),
     },
     whatsapp: {
       ownerPhone: process.env["WHATSAPP_OWNER_PHONE"] ?? "",

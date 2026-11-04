@@ -1,5 +1,6 @@
 import { Type, plainToInstance } from "class-transformer";
 import { IsIn, IsInt, IsOptional, IsString, Matches, Max, Min, ValidateIf, validateSync } from "class-validator";
+import { lerOrigensCors, motivoOrigemCorsInvalida } from "./cors.config.js";
 
 enum Ambiente {
   Development = "development",
@@ -209,6 +210,22 @@ function validarSegredosDeProducao(env: EnvironmentVariables): void {
   }
 }
 
+/**
+ * Fase 58 — cada origem de `CORS_ORIGINS` precisa ser exata (ver
+ * `motivoOrigemCorsInvalida`): um curinga, um caminho ou uma barra final nunca
+ * são aceitos em silêncio (o `cors` simplesmente nunca casaria a origem, ou
+ * abriria mais do que o pretendido). Vazio continua válido: CORS desligado.
+ */
+function validarOrigensCors(env: EnvironmentVariables): void {
+  const invalidas = lerOrigensCors(env.CORS_ORIGINS).flatMap((origem) => {
+    const motivo = motivoOrigemCorsInvalida(origem);
+    return motivo ? [`"${origem}" (${motivo})`] : [];
+  });
+  if (invalidas.length > 0) {
+    throw new Error(`Configuração de ambiente inválida: CORS_ORIGINS contém origens inválidas: ${invalidas.join(", ")}.`);
+  }
+}
+
 /** Usado como `validate` do `ConfigModule.forRoot` — recebe `process.env` bruto. */
 export function validateEnv(config: Record<string, unknown>): EnvironmentVariables {
   // Conversão de tipos é sempre explícita (`@Type(() => Number)` em vez de
@@ -225,6 +242,8 @@ export function validateEnv(config: Record<string, unknown>): EnvironmentVariabl
       .join(" | ");
     throw new Error(`Configuração de ambiente inválida: ${detalhes}`);
   }
+
+  validarOrigensCors(validado);
 
   if (validado.NODE_ENV === Ambiente.Production) {
     validarSegredosDeProducao(validado);

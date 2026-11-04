@@ -161,4 +161,37 @@ describe("validateEnv", () => {
       expect(mensagem).not.toContain("JWT_ACCESS_SECRET,");
     });
   });
+
+  describe("Fase 58 — CORS_ORIGINS só aceita origens exatas", () => {
+    const PRODUCAO = {
+      NODE_ENV: "production",
+      JWT_ACCESS_SECRET: SEGREDO_VALIDO_LONGO,
+      JWT_REFRESH_SECRET: SEGREDO_VALIDO_LONGO,
+      PDV_JWT_ACCESS_SECRET: SEGREDO_VALIDO_LONGO,
+      PDV_JWT_REFRESH_SECRET: SEGREDO_VALIDO_LONGO,
+    };
+
+    it("aceita vazio (CORS desligado) e a lista real dos frontends (dev e Tauri empacotado)", () => {
+      expect(() => validateEnv(baseEnv({ CORS_ORIGINS: "" }))).not.toThrow();
+      expect(() =>
+        validateEnv(baseEnv({ CORS_ORIGINS: "http://localhost:8081, http://localhost:8080,http://tauri.localhost,tauri://localhost" })),
+      ).not.toThrow();
+    });
+
+    it("rejeita curinga (*) em qualquer ambiente, inclusive produção — nunca vira 'qualquer origem' por acidente", () => {
+      expect(() => validateEnv(baseEnv({ CORS_ORIGINS: "*" }))).toThrow(/CORS_ORIGINS contém origens inválidas: "\*" \(curinga/);
+      expect(() => validateEnv(baseEnv({ ...PRODUCAO, CORS_ORIGINS: "http://tauri.localhost,*" }))).toThrow(/CORS_ORIGINS/);
+      expect(() => validateEnv(baseEnv({ ...PRODUCAO, CORS_ORIGINS: "https://*.mariela.app" }))).toThrow(/curinga/);
+    });
+
+    it("rejeita origem com caminho, barra final, query ou sem esquema (nunca casaria em silêncio)", () => {
+      for (const invalida of ["http://localhost:8081/", "http://localhost:8081/api", "http://localhost:8081?x=1", "localhost:8081", "ftp://host", "null"]) {
+        expect(() => validateEnv(baseEnv({ CORS_ORIGINS: `http://localhost:8080,${invalida}` }))).toThrow(/CORS_ORIGINS contém origens inválidas/);
+      }
+    });
+
+    it("produção com a lista explícita do Tauri empacotado é aceita", () => {
+      expect(() => validateEnv(baseEnv({ ...PRODUCAO, CORS_ORIGINS: "http://tauri.localhost,tauri://localhost" }))).not.toThrow();
+    });
+  });
 });
