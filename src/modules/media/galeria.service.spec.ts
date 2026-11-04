@@ -39,6 +39,7 @@ interface RegistroUpload {
   produtoId: Types.ObjectId;
   chave: string;
   estado: string;
+  substituiMidiaId?: string | null;
   criadoEm: Date;
   urlExpiraEm: Date;
   limpezaApos: Date;
@@ -116,8 +117,14 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
     return galeria.solicitarUpload(produtoId, { fileName: "foto.jpg", contentType: "image/jpeg", kind: "image", size: 1024, ...extra }, "admin-teste");
   }
   /** Solicita e "envia" (PUT simulado) um arquivo real do formato. */
-  async function enviado(produtoId: string, formato = "image/jpeg", tamanho = 1024): Promise<{ uploadId: string; chave: string }> {
-    const { uploadId } = await solicitar(produtoId, { fileName: NOME_POR_FORMATO[formato]!, contentType: formato, kind: formato.startsWith("video") ? "video" : "image", size: tamanho });
+  async function enviado(produtoId: string, formato = "image/jpeg", tamanho = 1024, substituiMidiaId?: string): Promise<{ uploadId: string; chave: string }> {
+    const { uploadId } = await solicitar(produtoId, {
+      fileName: NOME_POR_FORMATO[formato]!,
+      contentType: formato,
+      kind: formato.startsWith("video") ? "video" : "image",
+      size: tamanho,
+      ...(substituiMidiaId ? { substituiMidiaId } : {}),
+    });
     const chave = storage.ultimaChave();
     storage.enviar(chave, arquivoDoFormato(formato, tamanho), formato);
     return { uploadId, chave };
@@ -139,6 +146,35 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
     const doc = await produtosBrutos().findOne({ _id: new Types.ObjectId(produtoId) });
     if (!doc) throw new Error(`Produto ${produtoId} não existe.`);
     return doc;
+  }
+  /**
+   * Executa confirmações "ao mesmo tempo" de forma determinística: cada uma pausa logo depois de validar o objeto
+   * (antes da escrita no produto) e todas só seguem quando todas chegaram — as escritas disputam o mesmo `__v`.
+   */
+  async function emParalelo<T>(operacoes: (() => Promise<T>)[]): Promise<PromiseSettledResult<T>[]> {
+    const pontos = operacoes.map(() => novoPonto());
+    let chamada = 0;
+    const lerOriginal = storage.lerPrimeirosBytes.bind(storage);
+    const espiao = spyOn(storage, "lerPrimeirosBytes").mockImplementation(async (key: string, quantidade: number) => {
+      const ponto = pontos[chamada];
+      chamada += 1;
+      const bytes = await lerOriginal(key, quantidade);
+      if (ponto) {
+        ponto.chegou.liberar();
+        await ponto.liberacao.promessa;
+      }
+      return bytes;
+    });
+    try {
+      const todas = Promise.allSettled(operacoes.map((operacao) => operacao()));
+      // Se alguma terminar antes de chegar à pausa, não espera para sempre: as asserções mostram o motivo.
+      await Promise.race([Promise.all(pontos.map((ponto) => ponto.chegou.promessa)), todas]);
+      liberarTudo(...pontos);
+      return await todas;
+    } finally {
+      liberarTudo(...pontos);
+      espiao.mockRestore();
+    }
   }
   const idsDaGaleria = async (produtoId: string) => (await galeria.listar(produtoId)).midias.map((midia) => midia._id);
 
@@ -550,7 +586,7 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
       expect(await idsDaGaleria(produtoId)).toEqual([]);
     });
 
-    it("limite conferido também na confirmação (409, registro pendente); a mídia substituída não conta", async () => {
+    it("limite conferido também na confirmação: dois uploads novos autorizados com 19 imagens — só o primeiro entra (409, registro pendente)", async () => {
       const produtoId = await novoProduto();
       for (let i = 0; i < 19; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
       const a = await enviado(produtoId);
@@ -558,14 +594,50 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
       await confirmar(produtoId, a.uploadId); // 20 imagens
       expect((await erroApi(confirmar(produtoId, b.uploadId))).getStatus()).toBe(409);
       expect((await registro(b.uploadId)).estado).toBe("pendente");
-      // Substituindo uma das 20, cabe.
-      const resposta = await confirmar(produtoId, b.uploadId, { substituiMidiaId: a.uploadId });
-      expect(resposta.midias).toHaveLength(20);
+      expect(await idsDaGaleria(produtoId)).toHaveLength(20);
+    });
+
+    it("dois uploads novos CONCORRENTES com 19 imagens: o limite é revalidado na mutação e só um entra", async () => {
+      const produtoId = await novoProduto();
+      for (let i = 0; i < 19; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
+      const a = await enviado(produtoId);
+      const b = await enviado(produtoId);
+      const resultados = await emParalelo([() => confirmar(produtoId, a.uploadId), () => confirmar(produtoId, b.uploadId)]);
+      expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const rejeitado = resultados.find((r) => r.status === "rejected");
+      expect(rejeitado?.status === "rejected" && rejeitado.reason instanceof ApiException && rejeitado.reason.getStatus()).toBe(409);
+      expect(await idsDaGaleria(produtoId)).toHaveLength(20);
     });
   });
 
-  describe("substituição", () => {
-    it("herda ordem, variante e principal na mesma escrita; o registro antigo vira removido e o objeto não é apagado", async () => {
+  describe("substituição (Fase 60.1.1 — intenção registrada na solicitação)", () => {
+    it("galeria cheia: upload novo é 409, substituição do mesmo tipo é autorizada e o registro guarda o alvo", async () => {
+      const produtoId = await novoProduto();
+      const ids: string[] = [];
+      for (let i = 0; i < 20; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+      expect((await erroApi(solicitar(produtoId))).getStatus()).toBe(409);
+
+      const autorizado = await solicitar(produtoId, { substituiMidiaId: ids[3]! });
+      expect(Object.keys(autorizado).sort()).toEqual(["expiresIn", "headers", "method", "uploadId", "uploadUrl"]);
+      expect((await registro(autorizado.uploadId)).substituiMidiaId).toBe(ids[3]!);
+      // Upload novo grava o alvo como null.
+      const outroProduto = await novoProduto();
+      expect((await registro((await solicitar(outroProduto)).uploadId)).substituiMidiaId).toBeNull();
+    });
+
+    it("confirmar substituição com a galeria cheia: herda a ordem e a galeria continua com 20", async () => {
+      const produtoId = await novoProduto();
+      const ids: string[] = [];
+      for (let i = 0; i < 20; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+      const { uploadId } = await enviado(produtoId, "image/jpeg", 1024, ids[7]!);
+      const resposta = await confirmar(produtoId, uploadId); // corpo sem substituiMidiaId: vale o registrado
+      expect(resposta.midias).toHaveLength(20);
+      expect(resposta.midia.ordem).toBe(7);
+      expect(resposta.midias.map((midia) => midia._id)).not.toContain(ids[7]!);
+      expect(resposta.midias[7]!._id).toBe(uploadId);
+    });
+
+    it("abaixo do limite: herda ordem, variante e principal na mesma escrita; registro antigo removido; objeto preservado", async () => {
       const produtoId = await novoProduto();
       const variante = await novaVariante(produtoId);
       const primeira = await confirmada(produtoId);
@@ -573,8 +645,8 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
       const terceira = await confirmada(produtoId);
       const antes = await produtoBruto(produtoId);
 
-      const { uploadId: nova } = await enviado(produtoId, "image/png");
-      const resposta = await confirmar(produtoId, nova, { substituiMidiaId: antiga });
+      const { uploadId: nova } = await enviado(produtoId, "image/png", 1024, antiga);
+      const resposta = await confirmar(produtoId, nova, { substituiMidiaId: antiga }); // repetir o alvo é aceito
 
       expect(resposta.midias.map((midia) => midia._id)).toEqual([primeira, nova, terceira]);
       expect(resposta.midia.ordem).toBe(1);
@@ -589,56 +661,172 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
       expect(storage.exclusoes).toHaveLength(0);
     });
 
-    it("mídia a substituir inexistente: 404, nada gravado, registro pendente", async () => {
+    it("vídeo por vídeo com 3 vídeos: autorizado e confirmado sem passar do limite; vídeo nunca vira principal", async () => {
       const produtoId = await novoProduto();
-      const { uploadId } = await enviado(produtoId);
-      expect((await erroApi(confirmar(produtoId, uploadId, { substituiMidiaId: "nao-existe" }))).getStatus()).toBe(404);
-      expect(await idsDaGaleria(produtoId)).toEqual([]);
+      const imagem = await confirmada(produtoId);
+      const videos: string[] = [];
+      for (let i = 0; i < 3; i += 1) videos.push(await confirmada(produtoId, {}, "video/mp4"));
+      const { uploadId } = await enviado(produtoId, "video/mp4", 1024, videos[1]!);
+      const resposta = await confirmar(produtoId, uploadId);
+      expect(resposta.midias.filter((midia) => midia.tipo === "video").map((midia) => midia._id)).toEqual([videos[0]!, uploadId, videos[2]!]);
+      expect(resposta.midiaPrincipalId).toBe(imagem);
+    });
+
+    it("alvo de outro produto, já removido ou inexistente: 404 na solicitação, sem registro nem assinatura", async () => {
+      const produtoId = await novoProduto();
+      const outro = await novoProduto();
+      const deOutro = await confirmada(outro);
+      const removida = await confirmada(produtoId);
+      await galeria.remover(produtoId, removida);
+      storage.reiniciar();
+      const antes = await uploads().countDocuments({ produtoId: new Types.ObjectId(produtoId) });
+      for (const alvo of [deOutro, removida, "nao-existe"]) {
+        expect((await erroApi(solicitar(produtoId, { substituiMidiaId: alvo }))).getStatus()).toBe(404);
+      }
+      expect(await uploads().countDocuments({ produtoId: new Types.ObjectId(produtoId) })).toBe(antes);
+      expect(storage.assinaturas).toHaveLength(0);
+    });
+
+    it("tipos diferentes são recusados (400): imagem não substitui vídeo para liberar vaga de imagem, nem vídeo substitui imagem", async () => {
+      const produtoId = await novoProduto();
+      const imagens: string[] = [];
+      for (let i = 0; i < 20; i += 1) imagens.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+      const video = await inserirMidiaDiretamente(connection, produtoId, { tipo: "video", ordem: 20 });
+
+      const imagemPorVideo = await erroApi(solicitar(produtoId, { substituiMidiaId: video }));
+      expect(imagemPorVideo.getStatus()).toBe(400);
+      expect(imagemPorVideo.errors[0]!.field).toBe("substituiMidiaId");
+      const videoPorImagem = await erroApi(solicitar(produtoId, { fileName: "v.mp4", contentType: "video/mp4", kind: "video", substituiMidiaId: imagens[0]! }));
+      expect(videoPorImagem.getStatus()).toBe(400);
+      expect(await idsDaGaleria(produtoId)).toHaveLength(21);
+    });
+
+    it("a confirmação não troca o alvo nem introduz substituição (409); repetir o alvo registrado funciona", async () => {
+      const produtoId = await novoProduto();
+      const a = await confirmada(produtoId);
+      const b = await confirmada(produtoId);
+      const comAlvo = await enviado(produtoId, "image/jpeg", 1024, a);
+      const trocado = await erroApi(confirmar(produtoId, comAlvo.uploadId, { substituiMidiaId: b }));
+      expect(trocado.getStatus()).toBe(409);
+      expect(trocado.message).toContain("diferente do registrado");
+
+      const semAlvo = await enviado(produtoId);
+      const introduzido = await erroApi(confirmar(produtoId, semAlvo.uploadId, { substituiMidiaId: a }));
+      expect(introduzido.getStatus()).toBe(409);
+      expect(introduzido.message).toContain("sem substituição");
+
+      expect(await idsDaGaleria(produtoId)).toEqual([a, b]);
+      expect((await registro(comAlvo.uploadId)).estado).toBe("pendente");
+      expect((await registro(semAlvo.uploadId)).estado).toBe("pendente");
+      expect((await confirmar(produtoId, comAlvo.uploadId, { substituiMidiaId: a })).midias.map((midia) => midia._id)).toEqual([comAlvo.uploadId, b]);
+    });
+
+    it("a confirmação revalida o tipo do alvo na mutação (não confia só na solicitação): alvo adulterado para um vídeo → 409, galeria intacta", async () => {
+      const produtoId = await novoProduto();
+      const imagem = await confirmada(produtoId);
+      const video = await confirmada(produtoId, {}, "video/mp4");
+      const { uploadId } = await enviado(produtoId, "image/jpeg", 1024, imagem);
+      await uploads().updateOne({ _id: uploadId }, { $set: { substituiMidiaId: video } });
+      const antes = await produtoBruto(produtoId);
+      const erro = await erroApi(confirmar(produtoId, uploadId));
+      expect(erro.getStatus()).toBe(409);
+      expect(erro.message).toContain("mesmo tipo");
+      expect((await produtoBruto(produtoId)).__v).toBe(antes.__v);
+      expect(await idsDaGaleria(produtoId)).toEqual([imagem, video]);
       expect((await registro(uploadId)).estado).toBe("pendente");
     });
 
-    it("vídeo substituindo imagem associada: herdar a variante viola a regra (400); com varianteId: null substitui e a principal cai no fallback", async () => {
+    it("compatibilidade: registro pendente anterior, sem o campo, confirma como upload novo", async () => {
       const produtoId = await novoProduto();
-      const variante = await novaVariante(produtoId);
-      const imagem = await confirmada(produtoId, { varianteId: variante, principal: true });
-      const outra = await confirmada(produtoId);
-      const { uploadId: video } = await enviado(produtoId, "video/mp4");
-      expect((await erroApi(confirmar(produtoId, video, { substituiMidiaId: imagem }))).getStatus()).toBe(400);
-      expect((await registro(video)).estado).toBe("pendente");
-
-      const final = await confirmar(produtoId, video, { substituiMidiaId: imagem, varianteId: null });
-      expect(final.midia.tipo).toBe("video");
-      expect(final.midia.varianteId).toBeNull();
-      expect(final.midia.ordem).toBe(0);
-      expect((await produtoBruto(produtoId)).midiaPrincipalId).toBeNull();
-      expect(final.midiaPrincipalId).toBe(outra);
+      const a = await confirmada(produtoId);
+      const { uploadId } = await enviado(produtoId);
+      await uploads().updateOne({ _id: uploadId }, { $unset: { substituiMidiaId: "" } });
+      expect((await confirmar(produtoId, uploadId)).midias.map((midia) => midia._id)).toEqual([a, uploadId]);
     });
 
-    it("varianteId explícito na substituição prevalece sobre o herdado", async () => {
+    it("alvo removido entre a solicitação e a confirmação: 409 controlado, galeria intacta, registro pendente", async () => {
+      const produtoId = await novoProduto();
+      const a = await confirmada(produtoId);
+      const b = await confirmada(produtoId);
+      const { uploadId } = await enviado(produtoId, "image/jpeg", 1024, a);
+      await galeria.remover(produtoId, a);
+      const antes = await produtoBruto(produtoId);
+      const erro = await erroApi(confirmar(produtoId, uploadId));
+      expect(erro.getStatus()).toBe(409);
+      expect(erro.message).toContain("não está mais na galeria");
+      const depois = await produtoBruto(produtoId);
+      expect(depois.__v).toBe(antes.__v);
+      expect(await idsDaGaleria(produtoId)).toEqual([b]);
+      expect((await registro(uploadId)).estado).toBe("pendente");
+    });
+
+    it("duas solicitações concorrentes para o mesmo alvo: ambas autorizadas; nas confirmações simultâneas uma vence e a outra recebe 409", async () => {
+      const produtoId = await novoProduto();
+      const alvo = await confirmada(produtoId);
+      const outra = await confirmada(produtoId);
+      const [s1, s2] = await Promise.all([solicitar(produtoId, { substituiMidiaId: alvo }), solicitar(produtoId, { substituiMidiaId: alvo })]);
+      for (const { uploadId } of [s1, s2]) {
+        storage.enviar(`products/${produtoId}/${uploadId}.jpg`, arquivoDoFormato("image/jpeg"), "image/jpeg");
+        expect((await registro(uploadId)).substituiMidiaId).toBe(alvo);
+      }
+      const resultados = await emParalelo([() => confirmar(produtoId, s1.uploadId), () => confirmar(produtoId, s2.uploadId)]);
+      expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const rejeitado = resultados.find((r) => r.status === "rejected");
+      expect(rejeitado?.status === "rejected" && rejeitado.reason instanceof ApiException && rejeitado.reason.getStatus()).toBe(409);
+
+      const ids = await idsDaGaleria(produtoId);
+      expect(ids).toHaveLength(2);
+      expect(ids[1]).toBe(outra);
+      const vencedor = ids[0]!;
+      expect([s1.uploadId, s2.uploadId]).toContain(vencedor);
+      const perdedor = vencedor === s1.uploadId ? s2.uploadId : s1.uploadId;
+      expect((await registro(perdedor)).estado).toBe("pendente");
+      expect((await registro(alvo)).estado).toBe("removido");
+    });
+
+    it("duas substituições diferentes concorrentes com a galeria cheia: ambas concluem e o limite continua em 20", async () => {
+      const produtoId = await novoProduto();
+      const ids: string[] = [];
+      for (let i = 0; i < 20; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+      const x = await enviado(produtoId, "image/jpeg", 1024, ids[2]!);
+      const y = await enviado(produtoId, "image/jpeg", 1024, ids[15]!);
+      const resultados = await emParalelo([() => confirmar(produtoId, x.uploadId), () => confirmar(produtoId, y.uploadId)]);
+      expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);
+      const final = await galeria.listar(produtoId);
+      expect(final.midias).toHaveLength(20);
+      expect(final.midias[2]!._id).toBe(x.uploadId);
+      expect(final.midias[15]!._id).toBe(y.uploadId);
+      expect(final.midias.map((midia) => midia._id)).not.toContain(ids[2]!);
+      expect(final.midias.map((midia) => midia._id)).not.toContain(ids[15]!);
+    });
+
+    it("varianteId explícito na confirmação prevalece sobre a variante herdada", async () => {
       const produtoId = await novoProduto();
       const azul = await novaVariante(produtoId, "Azul");
       const preto = await novaVariante(produtoId, "Preto");
       const antiga = await confirmada(produtoId, { varianteId: azul });
-      const { uploadId: nova } = await enviado(produtoId);
-      expect(String((await confirmar(produtoId, nova, { substituiMidiaId: antiga, varianteId: preto })).midia.varianteId)).toBe(preto);
+      const { uploadId: nova } = await enviado(produtoId, "image/jpeg", 1024, antiga);
+      expect(String((await confirmar(produtoId, nova, { varianteId: preto })).midia.varianteId)).toBe(preto);
     });
 
-    it("retomada após falha ao marcar o registro antigo: a nova confirmação conclui a remoção do substituído", async () => {
+    it("falha parcial (registro antigo não marcado): a repetição conclui a remoção do substituído e é idempotente", async () => {
       const produtoId = await novoProduto();
       const antiga = await confirmada(produtoId);
-      const { uploadId: nova } = await enviado(produtoId);
+      const { uploadId: nova } = await enviado(produtoId, "image/jpeg", 1024, antiga);
       const espiao = spyOn(uploadsRepository, "marcarRemovido").mockImplementationOnce(async () => {
         throw new Error("falha simulada do MongoDB");
       });
       try {
-        await confirmar(produtoId, nova, { substituiMidiaId: antiga });
+        await confirmar(produtoId, nova);
       } finally {
         espiao.mockRestore();
       }
       expect((await registro(antiga)).estado).toBe("confirmado");
-      await confirmar(produtoId, nova, { substituiMidiaId: antiga });
+      await confirmar(produtoId, nova);
       expect((await registro(antiga)).estado).toBe("removido");
+      await confirmar(produtoId, nova);
       expect(await idsDaGaleria(produtoId)).toEqual([nova]);
+      expect((await registro(nova)).estado).toBe("confirmado");
     });
   });
 

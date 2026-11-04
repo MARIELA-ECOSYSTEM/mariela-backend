@@ -23,6 +23,17 @@ export class SolicitarUploadGaleriaDto {
   @IsInt({ message: "Tamanho deve ser um número inteiro de bytes." })
   @Min(1, { message: "Tamanho deve ser maior que zero." })
   size!: number;
+
+  @ApiPropertyOptional({
+    description:
+      "Fase 60.1.1 — id de uma mídia ATIVA deste produto, do MESMO tipo (`kind`), que o novo arquivo vai substituir. " +
+      "Não conta no limite (permite trocar com a galeria cheia) e fica registrado: a confirmação usa este alvo.",
+  })
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty({ message: "Id da mídia a substituir é obrigatório quando informado." })
+  @MaxLength(100)
+  substituiMidiaId?: string;
 }
 
 /** Corpo (opcional) de `POST /produtos/:id/midias/uploads/:uploadId/confirmacao`. */
@@ -41,7 +52,11 @@ export class ConfirmarUploadDto {
   @IsBoolean({ message: "principal deve ser verdadeiro ou falso." })
   principal?: boolean;
 
-  @ApiPropertyOptional({ description: "Id de uma mídia da galeria a ser substituída na mesma escrita (herda ordem, variante e principal)." })
+  @ApiPropertyOptional({
+    description:
+      "Opcional e só confirmatório (Fase 60.1.1): se informado, precisa ser IGUAL ao `substituiMidiaId` da solicitação (senão 409). " +
+      "A substituição em si (herda ordem, variante e principal) vem sempre do que foi registrado na solicitação.",
+  })
   @IsOptional()
   @IsString()
   @IsNotEmpty({ message: "Id da mídia a substituir é obrigatório quando informado." })

@@ -10,7 +10,7 @@ import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
-import { arquivoDoFormato, MediaStorageFalso } from "../../test-utils/media-storage-falso.util.js";
+import { arquivoDoFormato, inserirMidiaDiretamente, MediaStorageFalso } from "../../test-utils/media-storage-falso.util.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
@@ -272,6 +272,64 @@ describe("HTTP — Galeria de mídia do produto (integração — servidor real,
       expect(dados<GaleriaJson>(removida)).toEqual(expect.objectContaining({ midiaPrincipalId: a }));
       expect((await chamar("DELETE", `/produtos/${produtoId}/midias/${b}`, adminToken)).status).toBe(404);
       expect(storage.exclusoes).toHaveLength(0);
+    });
+  });
+
+  describe("substituição com a galeria cheia (Fase 60.1.1)", () => {
+    it("galeria cheia: upload novo 409; com substituiMidiaId do mesmo tipo 200; confirmação sem corpo 201 herdando a ordem, galeria segue com 20", async () => {
+      const produtoId = await novoProduto();
+      const ids: string[] = [];
+      for (let i = 0; i < 20; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+      const caminho = `/produtos/${produtoId}/midias/uploads`;
+      const cheia = await chamar("POST", caminho, adminToken, corpoUpload());
+      expect(cheia.status).toBe(409);
+      expect(cheia.json["code"]).toBe("CONFLICT");
+
+      const autorizado = await chamar("POST", caminho, adminToken, corpoUpload({ substituiMidiaId: ids[4] }));
+      expect(autorizado.status).toBe(200);
+      const { uploadId } = dados<{ uploadId: string }>(autorizado);
+      storage.enviar(storage.ultimaChave(), arquivoDoFormato("image/jpeg"), "image/jpeg");
+
+      const confirmado = await chamar("POST", `${caminho}/${uploadId}/confirmacao`, adminToken, {});
+      expect(confirmado.status).toBe(201);
+      const d = dados<GaleriaJson & { midia: MidiaJson }>(confirmado);
+      expect(d.midias).toHaveLength(20);
+      expect(d.midia.ordem).toBe(4);
+      expect(d.midias.map((midia) => midia.id)).not.toContain(ids[4]);
+    });
+
+    it("solicitação: alvo inexistente/de outro produto 404; tipo diferente 400; substituiMidiaId vazio 400", async () => {
+      const produtoId = await novoProduto();
+      const outro = await novoProduto();
+      const deOutro = await inserirMidiaDiretamente(connection, outro);
+      const video = await inserirMidiaDiretamente(connection, produtoId, { tipo: "video" });
+      const caminho = `/produtos/${produtoId}/midias/uploads`;
+      expect((await chamar("POST", caminho, adminToken, corpoUpload({ substituiMidiaId: "nao-existe" }))).status).toBe(404);
+      expect((await chamar("POST", caminho, adminToken, corpoUpload({ substituiMidiaId: deOutro }))).status).toBe(404);
+      const tipo = await chamar("POST", caminho, adminToken, corpoUpload({ substituiMidiaId: video }));
+      expect(tipo.status).toBe(400);
+      expect(tipo.json["code"]).toBe("VALIDATION_ERROR");
+      expect((await chamar("POST", caminho, adminToken, corpoUpload({ substituiMidiaId: "" }))).status).toBe(400);
+      expect(storage.assinaturas).toHaveLength(0);
+    });
+
+    it("confirmação com substituiMidiaId diferente do registrado (ou introduzido) responde 409 e não altera a galeria", async () => {
+      const produtoId = await novoProduto();
+      const a = await midiaConfirmada(produtoId);
+      const b = await midiaConfirmada(produtoId);
+      const caminho = `/produtos/${produtoId}/midias/uploads`;
+      const { uploadId: comAlvo } = dados<{ uploadId: string }>(await chamar("POST", caminho, adminToken, corpoUpload({ substituiMidiaId: a })));
+      storage.enviar(storage.ultimaChave(), arquivoDoFormato("image/jpeg"), "image/jpeg");
+      const { uploadId: semAlvo } = dados<{ uploadId: string }>(await chamar("POST", caminho, adminToken, corpoUpload()));
+      storage.enviar(storage.ultimaChave(), arquivoDoFormato("image/jpeg"), "image/jpeg");
+
+      const trocado = await chamar("POST", `${caminho}/${comAlvo}/confirmacao`, adminToken, { substituiMidiaId: b });
+      expect(trocado.status).toBe(409);
+      expect(trocado.json["code"]).toBe("CONFLICT");
+      expect((await chamar("POST", `${caminho}/${semAlvo}/confirmacao`, adminToken, { substituiMidiaId: a })).status).toBe(409);
+      expect(dados<GaleriaJson>(await chamar("GET", `/produtos/${produtoId}/midias`, adminToken)).midias.map((midia) => midia.id)).toEqual([a, b]);
+
+      expect((await chamar("POST", `${caminho}/${comAlvo}/confirmacao`, adminToken, { substituiMidiaId: a })).status).toBe(201);
     });
   });
 

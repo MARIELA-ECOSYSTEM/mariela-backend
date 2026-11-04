@@ -47,6 +47,7 @@ const ROTULO_ESTADO: Record<EstadoUploadMidia, string> = {
 };
 
 const MENSAGEM_MIDIA_NAO_ENCONTRADA = "Mídia não encontrada neste produto.";
+const MENSAGEM_TIPO_SUBSTITUICAO = "A substituição precisa ser do mesmo tipo: imagem por imagem, vídeo por vídeo.";
 
 function contemMidia(produto: ProdutoDocument, midiaId: string): boolean {
   return produto.midias.some((midia) => midia._id === midiaId);
@@ -96,7 +97,15 @@ export class GaleriaService {
     exigirBaseUrlPublica(this.configService);
     const produto = await this.produtosRepository.encontrarPorIdOuFalhar(produtoId);
     const { extensao } = validarArquivoDeclarado(dto);
-    this.garantirLimite(produto, dto.kind, null);
+    // Fase 60.1.1 — substituição: o alvo precisa ser uma mídia ATIVA deste produto e do MESMO tipo; ela não conta no
+    // limite (sai na mesma escrita que a nova entra). Upload novo continua contando uma mídia a mais.
+    const substituiMidiaId = dto.substituiMidiaId ?? null;
+    if (substituiMidiaId) {
+      const antiga = produto.midias.find((midia) => midia._id === substituiMidiaId);
+      if (!antiga) throw ApiException.notFound("Mídia a substituir não encontrada neste produto.");
+      if (antiga.tipo !== dto.kind) throw erroDeValidacao("substituiMidiaId", MENSAGEM_TIPO_SUBSTITUICAO);
+    }
+    this.garantirLimite(produto, dto.kind, substituiMidiaId);
 
     const uploadId = randomUUID();
     const chave = `${PREFIXO_CHAVE_PRODUTOS}/${produto.id}/${uploadId}.${extensao}`;
@@ -109,6 +118,7 @@ export class GaleriaService {
       contentType: dto.contentType,
       tamanho: dto.size,
       nomeOriginal: dto.fileName.trim(),
+      substituiMidiaId,
       criadoPor: usuarioId,
       criadoEm: new Date(agora),
       urlExpiraEm: new Date(agora + EXPIRACAO_UPLOAD_SEGUNDOS * 1000),
@@ -152,10 +162,21 @@ export class GaleriaService {
     const registro = await this.uploadsRepository.encontrarPorId(uploadId);
     if (!registro || String(registro.produtoId) !== produtoId) throw ApiException.notFound("Upload não encontrado para este produto.");
 
+    // Fase 60.1.1 — a intenção registrada na SOLICITAÇÃO é a fonte de verdade da substituição. O corpo pode repeti-la,
+    // nunca trocá-la nem introduzi-la (registros anteriores, sem o campo, valem como "sem substituição").
+    const alvo = registro.substituiMidiaId ?? null;
+    if (dto.substituiMidiaId !== undefined && dto.substituiMidiaId !== alvo) {
+      throw ApiException.conflict(
+        alvo
+          ? "O substituiMidiaId informado é diferente do registrado na solicitação deste upload."
+          : "Este upload foi solicitado sem substituição; a confirmação não pode introduzir uma.",
+      );
+    }
+
     const produto = await this.produtosRepository.encontrarPorIdOuFalhar(produtoId);
     if (contemMidia(produto, uploadId)) {
       // Repetição (ou retomada depois de falha parcial): a mídia já está na galeria — só conclui os registros.
-      await this.concluirRegistros(produtoId, uploadId, dto.substituiMidiaId && !contemMidia(produto, dto.substituiMidiaId) ? dto.substituiMidiaId : null, true);
+      await this.concluirRegistros(produtoId, uploadId, alvo && !contemMidia(produto, alvo) ? alvo : null, true);
       return this.respostaConfirmacao(produto, uploadId);
     }
 
@@ -183,17 +204,18 @@ export class GaleriaService {
       let principal = dto.principal === true;
       let antiga: MidiaSubdocumento | null = null;
 
-      if (dto.substituiMidiaId) {
-        antiga = documento.midias.find((midia) => midia._id === dto.substituiMidiaId) ?? null;
-        if (!antiga) throw ApiException.notFound("Mídia a substituir não encontrada neste produto.");
+      if (alvo) {
+        // Revalidado DENTRO da mutação: o alvo pode ter sido removido (ou já substituído por outro upload) depois da
+        // solicitação. Erro controlado, galeria intacta, registro pendente.
+        antiga = documento.midias.find((midia) => midia._id === alvo) ?? null;
+        if (!antiga) throw ApiException.conflict("A mídia a ser substituída não está mais na galeria. Solicite um novo upload.");
+        if (antiga.tipo !== registro.tipo) throw ApiException.conflict(MENSAGEM_TIPO_SUBSTITUICAO);
         ordem = antiga.ordem;
         if (dto.varianteId === undefined) varianteId = antiga.varianteId ? String(antiga.varianteId) : null;
         if (documento.midiaPrincipalId === antiga._id && registro.tipo === "image") principal = true;
       }
 
-      if (registro.tipo === "video" && varianteId) {
-        throw erroDeValidacao("varianteId", "Vídeos não podem ser associados a uma variante. Informe varianteId: null para substituir uma imagem associada.");
-      }
+      if (registro.tipo === "video" && varianteId) throw erroDeValidacao("varianteId", "Vídeos não podem ser associados a uma variante.");
       if (varianteId) garantirVarianteDoProduto(documento, varianteId);
       this.garantirLimite(documento, registro.tipo, antiga?._id ?? null);
 

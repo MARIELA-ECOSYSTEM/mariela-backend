@@ -38,6 +38,14 @@ export class UploadMidia {
   @Prop({ type: String, required: true })
   nomeOriginal!: string;
 
+  /**
+   * Fase 60.1.1 — mídia da galeria que este upload vai substituir, fixada na SOLICITAÇÃO (fonte de verdade: a
+   * confirmação nunca troca nem introduz o alvo). `null` = upload novo. Registros anteriores não têm o campo e
+   * valem como `null` (default aplicado na leitura).
+   */
+  @Prop({ type: String, default: null })
+  substituiMidiaId!: string | null;
+
   @Prop({ type: String, required: true, enum: ESTADOS_UPLOAD_MIDIA, default: "pendente" })
   estado!: EstadoUploadMidia;
 
