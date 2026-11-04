@@ -117,7 +117,7 @@ Se o MongoDB de produção migrar para auto-hospedado (ex.: dentro do próprio `
 
 ## CI/CD
 
-`.github/workflows/ci.yml` roda em todo Pull Request e todo push em `main`: instalação determinística (`bun install --frozen-lockfile`), typecheck, suíte completa (contra um MongoDB de serviço do próprio runner) e build de produção. Não há deploy automático — esse é um passo manual/operacional separado (ver seção "Deploy com Docker" acima).
+`.github/workflows/ci.yml` roda em todo Pull Request e todo push em `main`: instalação determinística (`bun install --frozen-lockfile`), typecheck, suíte completa (contra um MongoDB de serviço do próprio runner), build de produção e audit de dependências (`bun audit`). O audit tem uma única exceção explícita, `GHSA-g3hv-75wg-m249` (dependência de desenvolvimento do `@nestjs/cli`, sem correção compatível), com a justificativa e a política de revisão no comentário do próprio passo no workflow. Não há deploy automático — esse é um passo manual/operacional separado (ver seção "Deploy com Docker" acima).
 
 ## Arquitetura
 

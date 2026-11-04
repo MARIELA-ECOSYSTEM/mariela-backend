@@ -72,5 +72,22 @@ jobs:
       - name: Build de produção
         run: bun run build
 
+      # Fase 58.1 — exceção controlada e RESTRITA a um único advisory, via a opção
+      # nativa `--ignore` do `bun audit` (Bun 1.4.2). Qualquer outro advisory,
+      # de qualquer gravidade, continua reprovando este passo.
+      #   - GHSA-g3hv-75wg-m249 (moderada): DoS por amplificação de "globparts" no
+      #     `minimatch` < 11.0.1.
+      #   - Dependência TRANSITIVA DE DESENVOLVIMENTO: `@nestjs/cli` > `minimatch`.
+      #     Todas as versões 12.x do `@nestjs/cli` fixam exatamente
+      #     `minimatch@10.2.6`; a correção só existe no 11.x (versão major), fora
+      #     da faixa fixada pelo NestJS CLI — `bun audit fix` reporta "blocked by a
+      #     dependent's range". Não há override nem upgrade forçado.
+      #   - A imagem de produção NÃO contém o `@nestjs/cli` (Dockerfile: o estágio
+      #     final instala com `--production`, sem devDependencies); o CLI só roda
+      #     no build, com padrões de glob do próprio projeto (o ataque exige
+      #     padrões controlados por terceiros).
+      #   - REVISAR esta exceção a cada atualização do `@nestjs/cli` (ou quando
+      #     houver correção compatível com a faixa dele): se o `bun audit` sem
+      #     `--ignore` deixar de acusar este advisory, remova o `--ignore`.
       - name: Audit de dependências
-        run: bun audit
+        run: bun audit --ignore=GHSA-g3hv-75wg-m249
