@@ -16,15 +16,19 @@ import { ProdutosRepository } from "../modules/produtos/produtos.repository.js";
 import { ProdutosService } from "../modules/produtos/produtos.service.js";
 import { normalizarCor, normalizarFormaPagamento } from "../modules/produtos/utils/normalizacao.util.js";
 import { Venda, type VendaDocument } from "../modules/vendas/schemas/venda.schema.js";
+import { fileURLToPath } from "node:url";
 import {
-  abrirContextoDaAplicacao,
+  abrirContextoDoComando,
   analisarUri,
   CODIGOS_DE_SAIDA,
+  criarAbridorDeContexto,
   executarComando,
   interpretarArgumentos,
   ocultarSegredos,
   validarAmbiente,
+  verificarExecucaoLocal,
   type AbrirContexto,
+  type AmbienteDeExecucao,
   type ContextoRecuperacao,
 } from "./processar-remocoes-pendentes.comando.js";
 
@@ -71,10 +75,17 @@ function abrirContextoDeTeste(aoAbrir?: (moduloDoComando: TestingModule) => void
   };
 }
 
+/** Fase 56.4.3.1 — execução LOCAL autorizada: o ponto de entrada real em `src/scripts`, sem sinais de ambiente implantado. */
+const EXECUCAO_LOCAL: AmbienteDeExecucao = {
+  arquivoDeEntrada: fileURLToPath(new URL("./processar-remocoes-pendentes.ts", import.meta.url)),
+  variaveis: {},
+  existeArquivo: () => false,
+};
+
 /** `uri: null` = MONGODB_URI ausente (um `undefined` explícito cairia no valor padrão do parâmetro). */
-async function executar(argv: string[], abrir: AbrirContexto, uri: string | null = MONGODB_URI_TESTE) {
+async function executar(argv: string[], abrir: AbrirContexto, uri: string | null = MONGODB_URI_TESTE, execucao: AmbienteDeExecucao = EXECUCAO_LOCAL) {
   const saida: string[] = [];
-  const codigo = await executarComando({ argv, uri: uri ?? undefined, escrever: (linha) => saida.push(linha), abrirContexto: abrir });
+  const codigo = await executarComando({ argv, uri: uri ?? undefined, escrever: (linha) => saida.push(linha), abrirContexto: abrir, execucao });
   return { codigo, texto: saida.join("\n") };
 }
 
@@ -230,6 +241,77 @@ describe("comando processar-remocoes-pendentes (Fase 56.4.3)", () => {
       expect(divergente.codigo).toBe(CODIGOS_DE_SAIDA.falha);
       expect(divergente.texto).toContain('ERRO: a conexão aberta não aponta para "mariela_test" — operação abortada antes de qualquer consulta.');
       expect(consultou).toBe(false);
+    });
+  });
+
+  /**
+   * Fase 56.4.3.1 — execução exclusivamente local. A verificação é a
+   * PRIMEIRA coisa do comando: antes dos argumentos, da URI e da conexão.
+   */
+  describe("execução exclusivamente local (Fase 56.4.3.1)", () => {
+    const ENTRADA_COMPILADA = "/app/dist/scripts/processar-remocoes-pendentes.js";
+    const cenariosImplantados: { nome: string; execucao: AmbienteDeExecucao; mensagem: string }[] = [
+      {
+        nome: "artefato compilado (dist/), como na imagem de produção",
+        execucao: { ...EXECUCAO_LOCAL, arquivoDeEntrada: ENTRADA_COMPILADA },
+        mensagem: "a execução do artefato compilado (dist/) é recusada",
+      },
+      {
+        nome: "artefato compilado em Windows",
+        execucao: { ...EXECUCAO_LOCAL, arquivoDeEntrada: "C:\\deploy\\dist\\scripts\\processar-remocoes-pendentes.js" },
+        mensagem: "a execução do artefato compilado (dist/) é recusada",
+      },
+      {
+        nome: "NODE_ENV=production (definido pelo Dockerfile)",
+        execucao: { ...EXECUCAO_LOCAL, variaveis: { NODE_ENV: "production" } },
+        mensagem: "sinais detectados: NODE_ENV=production",
+      },
+      {
+        nome: "variáveis da plataforma Render",
+        execucao: { ...EXECUCAO_LOCAL, variaveis: { RENDER: "true", RENDER_SERVICE_ID: "srv-x" } },
+        mensagem: "variáveis da plataforma Render (RENDER, RENDER_SERVICE_ID)",
+      },
+      {
+        nome: "container Docker (/.dockerenv)",
+        execucao: { ...EXECUCAO_LOCAL, existeArquivo: (caminho) => caminho === "/.dockerenv" },
+        mensagem: "/.dockerenv (container Docker)",
+      },
+    ];
+
+    it("7. execução local autorizada (código-fonte, sem sinais de implantação) é aceita", () => {
+      expect(verificarExecucaoLocal(EXECUCAO_LOCAL)).toEqual({ ok: true, valor: null });
+      expect(EXECUCAO_LOCAL.arquivoDeEntrada.replaceAll("\\", "/")).toEndWith("/src/scripts/processar-remocoes-pendentes.ts");
+    });
+
+    for (const cenario of cenariosImplantados) {
+      it(`8. ambiente implantado é recusado ANTES da conexão — ${cenario.nome}`, async () => {
+        const abridor = abridorQueNaoConecta();
+        const { codigo, texto } = await executar(ARGS_DRY_RUN, abridor.abrir, MONGODB_URI_TESTE, cenario.execucao);
+        expect(codigo).toBe(CODIGOS_DE_SAIDA.recusado);
+        expect(texto).toContain(cenario.mensagem);
+        expect(texto).toContain("Nenhuma conexão foi aberta");
+        expect(texto).not.toContain("Banco selecionado");
+        expect(abridor.chamadas).toEqual([]);
+      });
+    }
+
+    it("9. o bloqueio não é contornado com --apply (nem em banco de teste)", async () => {
+      const abridor = abridorQueNaoConecta();
+      for (const cenario of cenariosImplantados) {
+        const { codigo } = await executar(ARGS_APPLY, abridor.abrir, MONGODB_URI_TESTE, cenario.execucao);
+        expect(codigo).toBe(CODIGOS_DE_SAIDA.recusado);
+      }
+      expect(abridor.chamadas).toEqual([]);
+    });
+
+    it("10. o bloqueio não é contornado com --confirmar-producao exato (produção, dentro do servidor)", async () => {
+      const abridor = abridorQueNaoConecta();
+      for (const cenario of cenariosImplantados) {
+        const { codigo, texto } = await executar(["--banco", "marielaDB", "--apply", "--confirmar-producao", "marielaDB"], abridor.abrir, URI_PRODUCAO, cenario.execucao);
+        expect(codigo).toBe(CODIGOS_DE_SAIDA.recusado);
+        expect(texto).not.toContain("SenhaSecretaDoAtlas123");
+      }
+      expect(abridor.chamadas).toEqual([]);
     });
   });
 
@@ -649,24 +731,155 @@ describe("comando processar-remocoes-pendentes (Fase 56.4.3)", () => {
       });
     });
 
-    it("contexto REAL do comando (AppModule) em mariela_test: dry-run e depois --apply, conexão conferida antes de operar", async () => {
-      const alvo = await pendenciaFinalizavel("Real");
-      const uriAnterior = process.env["MONGODB_URI"];
-      try {
-        const previsao = await executar(ARGS_DRY_RUN, abrirContextoDaAplicacao);
-        expect(previsao.codigo).toBe(CODIGOS_DE_SAIDA.sucesso);
-        expect(previsao.texto).toContain(`[PREVISÃO] finalizavel opId=${alvo.pendencia.opId}`);
-        expect((await documentoCru())?.remocoesPendentes).toEqual([alvo.pendencia]);
+    /**
+     * Fase 56.4.3.1 — contexto REAL do comando (`ComandoRemocoesPendentesModule`).
+     * Instrumentação real, instalada ANTES de qualquer model ser compilado:
+     * o monitoramento de comandos do DRIVER (tudo o que é enviado ao servidor,
+     * inclusive `createIndexes`/`dropIndexes`/`create`) e o `debug` do Mongoose
+     * (inclusive `createIndex`/`syncIndexes`).
+     */
+    describe("contexto real do comando — sem escritas na inicialização (Fase 56.4.3.1)", () => {
+      /** Comandos do protocolo que alteram dados, índices ou coleções. */
+      const COMANDOS_DE_ESCRITA = [
+        "insert",
+        "update",
+        "delete",
+        "findAndModify",
+        "createIndexes",
+        "dropIndexes",
+        "create",
+        "drop",
+        "dropDatabase",
+        "renameCollection",
+        "collMod",
+        "bulkWrite",
+      ];
+      /** Os ÚNICOS comandos que uma execução somente leitura pode enviar. */
+      const COMANDOS_DE_LEITURA_ACEITOS = new Set(["find", "getMore", "killCursors", "aggregate", "count", "distinct", "endSessions"]);
+      const METODOS_MONGOOSE_DE_INDICE_OU_ESCRITA = [
+        "createIndex",
+        "createIndexes",
+        "ensureIndexes",
+        "syncIndexes",
+        "dropIndex",
+        "dropIndexes",
+        "createCollection",
+        "insertOne",
+        "insertMany",
+        "updateOne",
+        "updateMany",
+        "replaceOne",
+        "findOneAndUpdate",
+        "findOneAndReplace",
+        "findOneAndDelete",
+        "deleteOne",
+        "deleteMany",
+        "bulkWrite",
+      ];
 
-        const aplicacao = await executar(ARGS_APPLY, abrirContextoDaAplicacao);
-        expect(aplicacao.codigo).toBe(CODIGOS_DE_SAIDA.sucesso);
-        expect(aplicacao.texto).toContain(`opId=${alvo.pendencia.opId} lista=cores valor=${JSON.stringify(alvo.cor)} → finalizada`);
-        expect((await documentoCru())?.remocoesPendentes).toEqual([]);
-        for (const { texto } of [previsao, aplicacao]) expect(texto).not.toContain("mongodb://");
-      } finally {
-        if (uriAnterior === undefined) delete process.env["MONGODB_URI"];
-        else process.env["MONGODB_URI"] = uriAnterior;
+      type EventoDeComando = { commandName: string; command: Record<string, unknown> };
+
+      function instrumentar(destino: { comandos: EventoDeComando[]; metodos: string[]; conexoes: Connection[] }) {
+        return (conexao: Connection) => {
+          destino.conexoes.push(conexao);
+          conexao.set("debug", (_colecao: string, metodo: string) => {
+            destino.metodos.push(metodo);
+          });
+          conexao.getClient().on("commandStarted", (evento: EventoDeComando) => {
+            destino.comandos.push({ commandName: evento.commandName, command: evento.command });
+          });
+        };
       }
+
+      it("controle positivo: o grafo normal da aplicação (ConfiguracoesModule) EMITE comandos de índice na inicialização — a instrumentação os enxerga", async () => {
+        const comandos: string[] = [];
+        const moduloNormal = await Test.createTestingModule({
+          imports: [
+            MongooseModule.forRoot(MONGODB_URI_TESTE, {
+              monitorCommands: true,
+              connectionFactory: (conexao: Connection) => {
+                conexao.getClient().on("commandStarted", (evento: EventoDeComando) => comandos.push(evento.commandName));
+                return conexao;
+              },
+            }),
+            JWT_MODULO_DE_TESTE,
+            ConfiguracoesModule,
+          ],
+        }).compile();
+        await moduloNormal.init(); // dispara os onModuleInit (syncIndexes de caixas/movimentos)
+        await moduloNormal.close();
+        expect(comandos).toContain("createIndexes");
+      });
+
+      it("1-5. dry-run pelo contexto real: nenhum comando de índice ou de escrita (driver e Mongoose), documento cru e pendências intactos, conexão encerrada", async () => {
+        const restauravel = await pendenciaRestauravel("R1");
+        const finalizavel = await pendenciaFinalizavel("R2");
+        const opIdMalformada = await pendenciaMalformada();
+        const configuracaoAntes = await documentoCru();
+        const instrumentacao = { comandos: [] as EventoDeComando[], metodos: [] as string[], conexoes: [] as Connection[] };
+
+        const { codigo, texto } = await executar(ARGS_DRY_RUN, criarAbridorDeContexto({ aoConectar: instrumentar(instrumentacao) }));
+
+        expect(codigo).toBe(CODIGOS_DE_SAIDA.intervencaoNecessaria); // a malformada
+        expect(texto).toContain(`[PREVISÃO] restauravel opId=${restauravel.pendencia.opId}`);
+        expect(texto).toContain(`[PREVISÃO] finalizavel opId=${finalizavel.pendencia.opId}`);
+        expect(texto).toContain(`[PREVISÃO] malformada opId=${opIdMalformada}`);
+
+        const nomes = instrumentacao.comandos.map((evento) => evento.commandName);
+        expect(nomes).toContain("find");
+        expect(nomes.filter((nome) => COMANDOS_DE_ESCRITA.includes(nome))).toEqual([]);
+        expect(nomes.filter((nome) => !COMANDOS_DE_LEITURA_ACEITOS.has(nome))).toEqual([]);
+        const agregacoesQueGravam = instrumentacao.comandos.filter(
+          (evento) => evento.commandName === "aggregate" && JSON.stringify(evento.command["pipeline"] ?? []).match(/"\$(out|merge)"/),
+        );
+        expect(agregacoesQueGravam).toEqual([]);
+        expect(instrumentacao.metodos.filter((metodo) => METODOS_MONGOOSE_DE_INDICE_OU_ESCRITA.includes(metodo))).toEqual([]);
+
+        expect(await documentoCru()).toEqual(configuracaoAntes); // inclusive atualizadoEm e as pendências
+        expect(instrumentacao.conexoes).toHaveLength(1);
+        expect(instrumentacao.conexoes[0]?.readyState).toBe(0); // 13. desconectada ao final
+      });
+
+      it("6, 7, 12, 13. dry-run e --apply pelo contexto real: as previsões correspondem aos desfechos; reaplicar não muda nada; conexões encerradas", async () => {
+        const restauravel = await pendenciaRestauravel("R3");
+        const finalizavel = await pendenciaFinalizavel("R4");
+        const instrumentacao = { comandos: [] as EventoDeComando[], metodos: [] as string[], conexoes: [] as Connection[] };
+        const abrir = criarAbridorDeContexto({ aoConectar: instrumentar(instrumentacao) });
+
+        const previsao = await executar(ARGS_DRY_RUN, abrir);
+        expect(previsao.codigo).toBe(CODIGOS_DE_SAIDA.sucesso);
+        const aplicacao = await executar(ARGS_APPLY, abrir);
+        expect(aplicacao.codigo).toBe(CODIGOS_DE_SAIDA.sucesso);
+
+        for (const [alvo, prevista, efetiva] of [
+          [restauravel, "restauravel", "restaurada"],
+          [finalizavel, "finalizavel", "finalizada"],
+        ] as const) {
+          expect(previsao.texto).toContain(`[PREVISÃO] ${prevista} opId=${alvo.pendencia.opId}`);
+          expect(aplicacao.texto).toContain(`[RESULTADO] opId=${alvo.pendencia.opId} lista=cores valor=${JSON.stringify(alvo.cor)} → ${efetiva}`);
+        }
+        expect(await representacao(restauravel.cor)).toEqual({ naLista: 1, noEspelho: 1 });
+        expect((await documentoCru())?.remocoesPendentes).toEqual([]);
+
+        // O --apply escreve só documentos — nunca índices nem coleções.
+        const nomes = instrumentacao.comandos.map((evento) => evento.commandName);
+        expect(nomes).toContain("update");
+        expect(nomes.filter((nome) => ["createIndexes", "dropIndexes", "create", "drop", "collMod"].includes(nome))).toEqual([]);
+
+        const depois = await documentoCru();
+        const reaplicacao = await executar(ARGS_APPLY, abrir);
+        expect(reaplicacao.texto).toContain("Total de pendências encontradas: 0");
+        expect(await documentoCru()).toEqual(depois);
+        expect(instrumentacao.conexoes.map((conexao) => conexao.readyState)).toEqual([0, 0, 0]);
+        for (const { texto } of [previsao, aplicacao, reaplicacao]) expect(texto).not.toContain("mongodb://");
+      });
+
+      it("o abridor padrão do comando (o usado pelo ponto de entrada) funciona em mariela_test", async () => {
+        const alvo = await pendenciaFinalizavel("R5");
+        const { codigo, texto } = await executar(ARGS_DRY_RUN, abrirContextoDoComando);
+        expect(codigo).toBe(CODIGOS_DE_SAIDA.sucesso);
+        expect(texto).toContain(`[PREVISÃO] finalizavel opId=${alvo.pendencia.opId}`);
+      });
     });
   });
 });

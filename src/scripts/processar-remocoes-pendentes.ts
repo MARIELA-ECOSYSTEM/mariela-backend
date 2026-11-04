@@ -1,5 +1,7 @@
 import "reflect-metadata";
-import { abrirContextoDaAplicacao, executarComando } from "./processar-remocoes-pendentes.comando.js";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { abrirContextoDoComando, executarComando } from "./processar-remocoes-pendentes.comando.js";
 
 /**
  * Fase 56.4.3 — consulta (padrão, somente leitura) ou processa (`--apply`)
@@ -16,6 +18,9 @@ import { abrirContextoDaAplicacao, executarComando } from "./processar-remocoes-
  * ambiente; `mariela_dev_local` é recusado. Em banco protegido (produção ou
  * não reconhecido como teste local), `--apply` só vale junto com
  * `--confirmar-producao <nome-exato>`. Nunca imprime a URI nem credenciais.
+ * Fase 56.4.3.1 — recusa rodar fora da máquina do operador (artefato
+ * compilado em `dist/`, `NODE_ENV=production`, variáveis do Render,
+ * container Docker) e conecta sem criar/sincronizar índices.
  * Ver `processar-remocoes-pendentes.comando.ts`.
  */
 async function bootstrap(): Promise<void> {
@@ -23,7 +28,8 @@ async function bootstrap(): Promise<void> {
     argv: process.argv.slice(2),
     uri: process.env["MONGODB_URI"],
     escrever: (linha) => console.log(linha),
-    abrirContexto: abrirContextoDaAplicacao,
+    abrirContexto: abrirContextoDoComando,
+    execucao: { arquivoDeEntrada: fileURLToPath(import.meta.url), variaveis: process.env, existeArquivo: existsSync },
   });
 }
 

@@ -1,7 +1,7 @@
 import { NestFactory } from "@nestjs/core";
 import { getConnectionToken } from "@nestjs/mongoose";
 import type { Connection } from "mongoose";
-import { AppModule } from "../app.module.js";
+import { ComandoRemocoesPendentesModule } from "./processar-remocoes-pendentes.modulo.js";
 import {
   ConfiguracoesService,
   type AvaliacaoRemocaoPendente,
@@ -63,6 +63,52 @@ export interface OpcoesComando {
 }
 
 type Resultado<T> = { ok: true; valor: T } | { ok: false; erro: string };
+
+/**
+ * Fase 56.4.3.1 — onde e como o comando está sendo executado (o ponto de
+ * entrada informa os valores reais; os testes informam cenários).
+ */
+export interface AmbienteDeExecucao {
+  /** Caminho absoluto do arquivo de entrada efetivamente executado. */
+  arquivoDeEntrada: string;
+  variaveis: Readonly<Record<string, string | undefined>>;
+  existeArquivo: (caminho: string) => boolean;
+}
+
+/** Sufixo do ÚNICO ponto de entrada aceito: o código-fonte TypeScript, nunca o artefato compilado. */
+const ENTRADA_LOCAL_ESPERADA = "/src/scripts/processar-remocoes-pendentes.ts";
+
+/**
+ * Fase 56.4.3.1 — recusa execução fora da máquina do operador, ANTES de
+ * qualquer conexão. Garantia principal (estrutural): o comando só roda a
+ * partir do código-fonte (`src/scripts/*.ts`); a imagem de produção contém
+ * apenas `dist/` (Dockerfile: `COPY --from=build /app/dist ./dist`), então
+ * dentro dela só existe o `.js` compilado — recusado. Sinais adicionais de
+ * ambiente implantado, cada um suficiente para recusar (nenhum deles
+ * AUTORIZA nada): `NODE_ENV=production` (definido pelo próprio Dockerfile),
+ * variáveis da plataforma Render (`RENDER`, `RENDER_*`) e `/.dockerenv`.
+ * `--apply`/`--confirmar-producao` nunca contornam esta verificação.
+ */
+export function verificarExecucaoLocal(ambiente: AmbienteDeExecucao): Resultado<null> {
+  const caminho = ambiente.arquivoDeEntrada.replaceAll("\\", "/");
+  if (!caminho.endsWith(ENTRADA_LOCAL_ESPERADA)) {
+    return {
+      ok: false,
+      erro:
+        "Este comando só pode ser executado a partir do código-fonte (src/scripts/processar-remocoes-pendentes.ts) na máquina do operador; " +
+        "a execução do artefato compilado (dist/) é recusada.",
+    };
+  }
+  const sinais: string[] = [];
+  if (ambiente.variaveis["NODE_ENV"] === "production") sinais.push("NODE_ENV=production");
+  const variaveisRender = Object.keys(ambiente.variaveis).filter((nome) => nome === "RENDER" || nome.startsWith("RENDER_"));
+  if (variaveisRender.length > 0) sinais.push(`variáveis da plataforma Render (${variaveisRender.sort().join(", ")})`);
+  if (ambiente.existeArquivo("/.dockerenv")) sinais.push("/.dockerenv (container Docker)");
+  if (sinais.length > 0) {
+    return { ok: false, erro: `Execução em ambiente implantado recusada — sinais detectados: ${sinais.join("; ")}. Execute na máquina do operador.` };
+  }
+  return { ok: true, valor: null };
+}
 
 const PARAMETROS_CONHECIDOS = new Set(["--banco", "--apply", "--confirmar-producao"]);
 
@@ -186,20 +232,26 @@ export interface ContextoRecuperacao {
 export type AbrirContexto = (uri: string) => Promise<ContextoRecuperacao>;
 
 /**
- * Contexto real do comando: o mesmo `AppModule` dos scripts operacionais
- * existentes (`seed-admin`), com `MONGODB_URI` fixada na URI JÁ validada.
+ * Contexto real do comando (Fase 56.4.3.1): `ComandoRemocoesPendentesModule`,
+ * conectado EXATAMENTE à URI já validada (sem passar pelo ambiente), sem
+ * criação/sincronização automática de índices. `aoConectar` é o ponto de
+ * instrumentação, chamado antes de qualquer model ser compilado.
  */
-export const abrirContextoDaAplicacao: AbrirContexto = async (uri) => {
-  process.env["MONGODB_URI"] = uri;
-  const app = await NestFactory.createApplicationContext(AppModule, { logger: false });
-  return { service: app.get(ConfiguracoesService), conexao: app.get<Connection>(getConnectionToken()), fechar: () => app.close() };
-};
+export function criarAbridorDeContexto(opcoes: { aoConectar?: (conexao: Connection) => void } = {}): AbrirContexto {
+  return async (uri) => {
+    const app = await NestFactory.createApplicationContext(ComandoRemocoesPendentesModule.paraUri(uri, opcoes.aoConectar), { logger: false });
+    return { service: app.get(ConfiguracoesService), conexao: app.get<Connection>(getConnectionToken()), fechar: () => app.close() };
+  };
+}
+
+export const abrirContextoDoComando: AbrirContexto = criarAbridorDeContexto();
 
 export interface DependenciasComando {
   argv: readonly string[];
   uri: string | undefined;
   escrever: (linha: string) => void;
   abrirContexto: AbrirContexto;
+  execucao: AmbienteDeExecucao;
 }
 
 const EXPLICACAO_PREVISAO: Record<"restauravel" | "finalizavel" | "indeterminada", string> = {
@@ -290,6 +342,12 @@ function relatarAplicacao(escrever: (linha: string) => void, execucao: ExecucaoA
 /** Executa o comando e devolve o código de saída. Nunca escreve a URI nem credenciais. */
 export async function executarComando(dependencias: DependenciasComando): Promise<number> {
   const { escrever } = dependencias;
+  const local = verificarExecucaoLocal(dependencias.execucao);
+  if (!local.ok) {
+    escrever(`ERRO: ${local.erro}`);
+    escrever("Nenhuma conexão foi aberta: nada foi lido nem alterado.");
+    return CODIGOS_DE_SAIDA.recusado;
+  }
   const argumentos = interpretarArgumentos(dependencias.argv);
   if (!argumentos.ok) {
     escrever(`ERRO: ${argumentos.erro}`);
