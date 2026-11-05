@@ -3,11 +3,27 @@ import { getConnectionToken } from "@nestjs/mongoose";
 import type { Connection } from "mongoose";
 import { ComandoRemocoesPendentesModule } from "./processar-remocoes-pendentes.modulo.js";
 import {
+  analisarUri,
+  BANCO_RECUSADO,
+  classificarAmbiente,
+  descreverArgumento,
+  NOME_DE_BANCO_VALIDO,
+  ocultarSegredos,
+  verificarExecucaoLocal as verificarExecucaoLocalDoComando,
+  type Ambiente,
+  type AmbienteDeExecucao,
+  type Resultado,
+} from "./comando-local.util.js";
+import {
   ConfiguracoesService,
   type AvaliacaoRemocaoPendente,
   type DesfechoRemocaoPendente,
   type ResultadoProcessamentoRemocoes,
 } from "../modules/configuracoes/configuracoes.service.js";
+
+// Reexportados para manter a API pública deste módulo inalterada (consumida pelo ponto de entrada e pelos testes).
+export { analisarUri, BANCO_RECUSADO, classificarAmbiente, ocultarSegredos };
+export type { Ambiente, AmbienteDeExecucao, AnaliseUri } from "./comando-local.util.js";
 
 /**
  * Fase 56.4.3 — lógica do comando operacional `processar-remocoes-pendentes`
@@ -21,20 +37,6 @@ import {
  * usa `ConfiguracoesService.avaliarRemocoesPendentes` (somente leitura) e o
  * `--apply` usa `ConfiguracoesService.processarRemocoesPendentes`.
  */
-
-/** Banco de desenvolvimento local do operador — sempre recusado por este comando. */
-export const BANCO_RECUSADO = "mariela_dev_local";
-
-/**
- * Únicos bancos tratados como TESTE (escrita sem confirmação extra), e só
- * quando a URI aponta para um host local. Qualquer outro banco — produção
- * (`marielaDB`) ou desconhecido — é tratado como PROTEGIDO: falha segura.
- */
-const BANCOS_DE_TESTE = new Set(["mariela_test"]);
-const HOSTS_LOCAIS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
-
-/** Caracteres aceitos pelo MongoDB num nome de banco, sem `/\. "$*<>:|?` (limite de 63 para caber nos 64 bytes). */
-const NOME_DE_BANCO_VALIDO = /^[A-Za-z0-9_-]{1,63}$/;
 
 export const CODIGOS_DE_SAIDA = {
   /** Execução concluída; nenhuma pendência exige intervenção. */
@@ -62,60 +64,18 @@ export interface OpcoesComando {
   confirmacaoProducao: string | null;
 }
 
-type Resultado<T> = { ok: true; valor: T } | { ok: false; erro: string };
-
-/**
- * Fase 56.4.3.1 — onde e como o comando está sendo executado (o ponto de
- * entrada informa os valores reais; os testes informam cenários).
- */
-export interface AmbienteDeExecucao {
-  /** Caminho absoluto do arquivo de entrada efetivamente executado. */
-  arquivoDeEntrada: string;
-  variaveis: Readonly<Record<string, string | undefined>>;
-  existeArquivo: (caminho: string) => boolean;
-}
-
 /** Sufixo do ÚNICO ponto de entrada aceito: o código-fonte TypeScript, nunca o artefato compilado. */
-const ENTRADA_LOCAL_ESPERADA = "/src/scripts/processar-remocoes-pendentes.ts";
+const ENTRADA_LOCAL_ESPERADA = "src/scripts/processar-remocoes-pendentes.ts";
 
 /**
- * Fase 56.4.3.1 — recusa execução fora da máquina do operador, ANTES de
- * qualquer conexão. Garantia principal (estrutural): o comando só roda a
- * partir do código-fonte (`src/scripts/*.ts`); a imagem de produção contém
- * apenas `dist/` (Dockerfile: `COPY --from=build /app/dist ./dist`), então
- * dentro dela só existe o `.js` compilado — recusado. Sinais adicionais de
- * ambiente implantado, cada um suficiente para recusar (nenhum deles
- * AUTORIZA nada): `NODE_ENV=production` (definido pelo próprio Dockerfile),
- * variáveis da plataforma Render (`RENDER`, `RENDER_*`) e `/.dockerenv`.
- * `--apply`/`--confirmar-producao` nunca contornam esta verificação.
+ * Fase 56.4.3.1 — recusa execução fora da máquina do operador, ANTES de qualquer conexão (regra completa em
+ * `comando-local.util.ts`, compartilhada desde a Fase 60.2). `--apply`/`--confirmar-producao` nunca contornam esta verificação.
  */
 export function verificarExecucaoLocal(ambiente: AmbienteDeExecucao): Resultado<null> {
-  const caminho = ambiente.arquivoDeEntrada.replaceAll("\\", "/");
-  if (!caminho.endsWith(ENTRADA_LOCAL_ESPERADA)) {
-    return {
-      ok: false,
-      erro:
-        "Este comando só pode ser executado a partir do código-fonte (src/scripts/processar-remocoes-pendentes.ts) na máquina do operador; " +
-        "a execução do artefato compilado (dist/) é recusada.",
-    };
-  }
-  const sinais: string[] = [];
-  if (ambiente.variaveis["NODE_ENV"] === "production") sinais.push("NODE_ENV=production");
-  const variaveisRender = Object.keys(ambiente.variaveis).filter((nome) => nome === "RENDER" || nome.startsWith("RENDER_"));
-  if (variaveisRender.length > 0) sinais.push(`variáveis da plataforma Render (${variaveisRender.sort().join(", ")})`);
-  if (ambiente.existeArquivo("/.dockerenv")) sinais.push("/.dockerenv (container Docker)");
-  if (sinais.length > 0) {
-    return { ok: false, erro: `Execução em ambiente implantado recusada — sinais detectados: ${sinais.join("; ")}. Execute na máquina do operador.` };
-  }
-  return { ok: true, valor: null };
+  return verificarExecucaoLocalDoComando(ambiente, ENTRADA_LOCAL_ESPERADA);
 }
 
 const PARAMETROS_CONHECIDOS = new Set(["--banco", "--apply", "--confirmar-producao"]);
-
-/** Nunca ecoa valores livres (um operador pode colar a URI por engano): só nomes de parâmetro com formato de parâmetro. */
-function descreverArgumento(argumento: string): string {
-  return /^--[a-z][a-z-]*$/.test(argumento) ? `"${argumento}"` : "(valor não exibido)";
-}
 
 export function interpretarArgumentos(argv: readonly string[]): Resultado<OpcoesComando> {
   let banco: string | null = null;
@@ -143,37 +103,6 @@ export function interpretarArgumentos(argv: readonly string[]): Resultado<Opcoes
   if (!NOME_DE_BANCO_VALIDO.test(banco)) return { ok: false, erro: "Nome de banco inválido em --banco (use só letras, números, _ ou -)." };
   if (confirmacaoProducao !== null && !aplicar) return { ok: false, erro: '"--confirmar-producao" só pode ser usado junto com "--apply".' };
   return { ok: true, valor: { banco, aplicar, confirmacaoProducao } };
-}
-
-export interface AnaliseUri {
-  banco: string;
-  /** Todos os hosts são locais e o esquema é `mongodb://` (nunca `+srv`, que é sempre remoto). */
-  local: boolean;
-}
-
-/** Extrai o banco do path da URI e se ela é local — sem nunca devolver host, usuário ou senha. */
-export function analisarUri(uri: string): AnaliseUri | null {
-  const correspondencia = /^(mongodb(?:\+srv)?):\/\/([^/]+)\/([^/?]+)/.exec(uri.trim());
-  const [, esquema, autoridade, bancoCodificado] = correspondencia ?? [];
-  if (!esquema || !autoridade || !bancoCodificado) return null;
-  let banco: string;
-  try {
-    banco = decodeURIComponent(bancoCodificado);
-  } catch {
-    return null;
-  }
-  const hosts = autoridade
-    .slice(autoridade.lastIndexOf("@") + 1)
-    .split(",")
-    .map((host) => (host.startsWith("[") ? host.slice(0, host.indexOf("]") + 1) : (host.split(":")[0] ?? "")).toLowerCase());
-  const local = esquema === "mongodb" && hosts.length > 0 && hosts.every((host) => HOSTS_LOCAIS.has(host));
-  return { banco, local };
-}
-
-export type Ambiente = "teste" | "protegido";
-
-export function classificarAmbiente(analise: AnaliseUri): Ambiente {
-  return BANCOS_DE_TESTE.has(analise.banco) && analise.local ? "teste" : "protegido";
 }
 
 export interface ExecucaoAutorizada {
@@ -209,18 +138,6 @@ export function validarAmbiente(opcoes: OpcoesComando, uri: string | undefined):
     };
   }
   return { ok: true, valor: { banco: opcoes.banco, uri, ambiente, modo: opcoes.aplicar ? "apply" : "dry-run" } };
-}
-
-/** Remove a URI (e usuário/senha embutidos) de qualquer texto antes de exibi-lo. */
-export function ocultarSegredos(texto: string, uri: string): string {
-  let resultado = texto;
-  const credenciais = /^mongodb(?:\+srv)?:\/\/([^@/]+)@/.exec(uri.trim())?.[1];
-  if (uri.trim()) resultado = resultado.split(uri.trim()).join("<uri oculta>");
-  if (credenciais) {
-    resultado = resultado.split(credenciais).join("<credenciais ocultas>");
-    for (const parte of credenciais.split(":")) if (parte.length >= 3) resultado = resultado.split(parte).join("<oculto>");
-  }
-  return resultado.replace(/mongodb(?:\+srv)?:\/\/\S+/g, "<uri oculta>");
 }
 
 export interface ContextoRecuperacao {
