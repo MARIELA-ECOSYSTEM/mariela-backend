@@ -41,8 +41,10 @@ export interface ConfirmacaoResposta extends GaleriaResposta {
 
 const ROTULO_ESTADO: Record<EstadoUploadMidia, string> = {
   pendente: "pendente",
+  confirmando: "em confirmação",
   confirmado: "confirmado",
   removido: "removido",
+  limpando: "em limpeza (expirado)",
   descartado: "descartado",
 };
 
@@ -157,6 +159,9 @@ export class GaleriaService {
    * Falhas parciais: qualquer erro antes da escrita do produto deixa o registro `pendente` (nova tentativa
    * possível); se o produto foi gravado mas o registro não, a resposta é sucesso e a próxima confirmação reconcilia.
    * O registro só vira `confirmado` depois de o produto comprovadamente referenciar a mídia.
+   *
+   * Fase 60.3.1 — a escrita do produto só acontece segurando a reserva `confirmando` (ver `gravarComReserva`),
+   * excludente com a reserva `limpando` da limpeza de uploads abandonados.
    */
   async confirmarUpload(produtoId: string, uploadId: string, dto: ConfirmarUploadDto, usuarioId: string | null): Promise<ConfirmacaoResposta> {
     const registro = await this.uploadsRepository.encontrarPorId(uploadId);
@@ -180,10 +185,11 @@ export class GaleriaService {
       return this.respostaConfirmacao(produto, uploadId);
     }
 
-    if (registro.estado !== "pendente") {
+    // `confirmando` = retomada/repetição de uma confirmação (a limpeza nunca toca esse estado).
+    if (registro.estado !== "pendente" && registro.estado !== "confirmando") {
       throw ApiException.conflict(`Este upload não pode ser confirmado: ele está ${ROTULO_ESTADO[registro.estado]}.`);
     }
-    if (Date.now() > registro.limpezaApos.getTime()) {
+    if (registro.estado === "pendente" && Date.now() > registro.limpezaApos.getTime()) {
       throw ApiException.conflict("Upload expirado. Solicite um novo upload.");
     }
     if (registro.tipo === "video" && dto.varianteId) throw erroDeValidacao("varianteId", "Vídeos não podem ser associados a uma variante.");
@@ -192,9 +198,23 @@ export class GaleriaService {
     const baseUrl = exigirBaseUrlPublica(this.configService);
     await this.verificarObjeto(registro);
 
+    // Fase 60.3.1 — RESERVA atômica antes de gravar o produto. As verificações acima são assíncronas (storage) e o
+    // estado lido no início pode estar velho: só a reserva (escrita condicional, mesmo documento que a limpeza
+    // reserva) decide. Se a limpeza assumiu o registro (`limpando`) ou ele venceu, nenhuma escrita no produto acontece.
+    const tokenReserva = randomUUID();
+    if (!(await this.uploadsRepository.reservarParaConfirmacao(uploadId, tokenReserva, new Date()))) {
+      const atual = await this.produtosRepository.encontrarPorIdOuFalhar(produtoId);
+      if (contemMidia(atual, uploadId)) {
+        // Uma confirmação concorrente do mesmo upload concluiu primeiro: resultado idempotente.
+        await this.concluirRegistros(produtoId, uploadId, null, true);
+        return this.respostaConfirmacao(atual, uploadId);
+      }
+      throw ApiException.conflict("Este upload não pode mais ser confirmado (expirado, em limpeza ou encerrado). Solicite um novo upload.");
+    }
+
     const agora = new Date();
     const desfecho: { substituida: string | null } = { substituida: null };
-    const salvo = await this.produtosRepository.salvarComRetentativa(produtoId, (documento) => {
+    const salvo = await this.gravarComReserva(uploadId, tokenReserva, () => this.produtosRepository.salvarComRetentativa(produtoId, (documento) => {
       desfecho.substituida = null;
       // Uma confirmação concorrente do mesmo upload já gravou: nada a fazer (nunca duplica).
       if (contemMidia(documento, uploadId)) return;
@@ -239,7 +259,7 @@ export class GaleriaService {
         criadoPor: usuarioId,
       });
       if (principal) documento.midiaPrincipalId = uploadId;
-    });
+    }));
 
     await this.concluirRegistros(produtoId, uploadId, desfecho.substituida, false);
     return this.respostaConfirmacao(salvo, uploadId);
@@ -304,6 +324,24 @@ export class GaleriaService {
     });
     await this.tolerarFalha("marcar upload como removido", midiaId, () => this.uploadsRepository.marcarRemovido(midiaId, new Date()));
     return this.galeria(salvo);
+  }
+
+  /**
+   * Fase 60.3.1 — executa a escrita do produto segurando a reserva de confirmação. Se a escrita for RECUSADA com
+   * certeza (erro de domínio: validação, limite, mídia substituída sumiu, produto inexistente, concorrência
+   * esgotada — todos antes de qualquer gravação), a reserva volta a `pendente` (só pelo dono, via token). Qualquer
+   * outro erro (ex.: rede, sem saber se a gravação aconteceu) mantém `confirmando`: a limpeza nunca o toca, e a
+   * próxima confirmação reentra e reconcilia — preferimos um registro preso a arriscar excluir uma mídia gravada.
+   */
+  private async gravarComReserva<T>(uploadId: string, token: string, gravar: () => Promise<T>): Promise<T> {
+    try {
+      return await gravar();
+    } catch (erro) {
+      if (erro instanceof ApiException) {
+        await this.tolerarFalha("liberar a reserva de confirmação", uploadId, () => this.uploadsRepository.liberarReservaDeConfirmacao(uploadId, token));
+      }
+      throw erro;
+    }
   }
 
   /** Conta só as mídias ATIVAS do tipo (a substituída, se houver, não conta: ela sai na mesma escrita). */

@@ -64,5 +64,10 @@ export const PRAZO_LIMPEZA_UPLOAD_MS = 24 * 60 * 60 * 1000;
 /** Bytes lidos do início do objeto para conferir a assinatura real do formato (WebP precisa de 12; MP4 de 8). */
 export const BYTES_ASSINATURA_FORMATO = 16;
 
-export const ESTADOS_UPLOAD_MIDIA = ["pendente", "confirmado", "removido", "descartado"] as const;
+/**
+ * Fase 60.3.1 — `confirmando` e `limpando` são RESERVAS transitórias, mutuamente exclusivas, adquiridas por
+ * escrita condicional a partir de `pendente`: a confirmação só grava o produto segurando `confirmando`, e a limpeza
+ * só exclui o objeto segurando `limpando`. Ver `UploadsMidiaRepository` e `limpar-uploads-abandonados.comando.ts`.
+ */
+export const ESTADOS_UPLOAD_MIDIA = ["pendente", "confirmando", "confirmado", "removido", "limpando", "descartado"] as const;
 export type EstadoUploadMidia = (typeof ESTADOS_UPLOAD_MIDIA)[number];

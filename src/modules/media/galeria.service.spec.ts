@@ -482,7 +482,8 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
         espiao.mockRestore();
       }
       expect(await idsDaGaleria(produtoId)).toEqual([uploadId]);
-      expect((await registro(uploadId)).estado).toBe("pendente");
+      // Fase 60.3.1 — fica com a reserva da confirmação (`confirmando`), que a limpeza nunca toca.
+      expect((await registro(uploadId)).estado).toBe("confirmando");
 
       // Recuperação idempotente: reconhece que o produto já referencia a mídia e só conclui o registro.
       storage.falhas.inspecionar = true; // nem precisa do storage para reconciliar

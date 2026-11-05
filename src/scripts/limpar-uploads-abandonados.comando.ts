@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { ConfigService } from "@nestjs/config";
 import { NestFactory } from "@nestjs/core";
 import { getConnectionToken } from "@nestjs/mongoose";
@@ -23,26 +24,42 @@ import { ComandoLimpezaUploadsModule, LeitorLimpezaUploads, type RegistroUpload 
  * Fase 60.3 — lógica do comando `limpar-uploads-abandonados` (ponto de entrada: `limpar-uploads-abandonados.ts`).
  * Mesma estrutura dos comandos 56.4.3/60.2: execução local → argumentos → banco da URI → autorização → conexão.
  *
- * Seleção: registros de `uploads_midia` em `pendente` cujo `limpezaApos` venceu há pelo menos
- * `MARGEM_DE_SEGURANCA_MS`. Para cada um: revalida o registro → confirma a existência do produto → procura
- * referências (produtos e vendas) → `HeadObject` → [apply] revalida registro e referências de novo → exclui o
- * objeto (se existir) → `pendente` → `descartado` condicional. Qualquer dúvida (falha de leitura, referência,
- * estado mudado) = nada é excluído e o registro fica como está.
+ * Seleção: registros `pendente` cujo `limpezaApos` venceu há pelo menos `MARGEM_DE_SEGURANCA_MS`, e reservas de
+ * limpeza (`limpando`) interrompidas há pelo menos `PRAZO_RECUPERACAO_LIMPEZA_MS`.
  *
- * Limites honestos de coordenação MongoDB × R2 (sem transação entre os dois): entre a última revalidação e a
- * exclusão existe uma janela mínima. Ela é fechada na prática por duas regras já existentes — a confirmação
- * recusa upload com `limpezaApos` vencido, e a margem de segurança deixa de fora confirmações que começaram antes
- * do vencimento e ainda estejam em andamento. Se o objeto for excluído e a marcação falhar, o registro continua
- * `pendente` e a próxima execução o conclui (objeto já ausente → `descartado`).
+ * Fase 60.3.1 — coordenação com a confirmação por RESERVA atômica no próprio registro (MongoDB standalone, sem
+ * transação multi-documento). [apply] `pendente` → `limpando` + token (condicional) → produto e referências →
+ * `HeadObject` → posse da reserva e referências de novo → `DeleteObject` (se existir) → `limpando` → `descartado`
+ * (condicional ao token). Sem a reserva, nada é excluído; qualquer dúvida devolve o registro a `pendente`.
+ *
+ * Por que é seguro: a confirmação só grava o produto depois de reservar o registro (`pendente` no prazo →
+ * `confirmando`, escrita condicional no mesmo documento). As duas reservas se excluem; e um registro que a limpeza
+ * já assumiu nunca mais volta a ser reservável pela confirmação — a reserva da limpeza grava a marca permanente
+ * `limpezaIniciadaEm`, e a da confirmação exige que ela esteja ausente (independe de relógio). Logo, depois da
+ * reserva da limpeza nenhuma confirmação grava referência nova; as gravadas antes estão visíveis na consulta feita
+ * depois da reserva. A margem de 15 minutos continua como proteção complementar, não como garantia.
+ *
+ * Recuperação: uma reserva `limpando` interrompida (processo caiu) é retomada por outra execução depois do prazo,
+ * trocando o token por escrita condicional. A execução antiga, se ainda estiver viva, perde a posse: suas
+ * transições exigem o token antigo e ela confere a posse imediatamente antes de excluir. No pior caso ela ainda
+ * exclui um objeto que, pelo argumento acima, nenhuma confirmação pode ter referenciado desde a primeira reserva.
+ * Limite (fora do protocolo): uma URL colada à mão em `variante.foto`/`video` não passa pela reserva; a limpeza a
+ * procura antes de excluir, mas não há como bloqueá-la atomicamente.
  */
 
 const ENTRADA_LOCAL_ESPERADA = "src/scripts/limpar-uploads-abandonados.ts";
 
 /**
- * Tempo extra, depois de `limpezaApos`, antes de um registro ser elegível. Cobre uma confirmação que passou pela
- * checagem de prazo pouco antes do vencimento e ainda está gravando o produto (decisão desta fase, a revisar).
+ * Tempo extra, depois de `limpezaApos`, antes de um registro ser elegível — proteção operacional complementar à
+ * reserva atômica (Fase 60.3.1), que é a garantia.
  */
 export const MARGEM_DE_SEGURANCA_MS = 15 * 60 * 1000;
+
+/**
+ * Fase 60.3.1 — idade mínima de uma reserva `limpando` para outra execução retomá-la (processo interrompido).
+ * Bem maior que o tempo de processar um registro; retomar uma reserva ainda viva é seguro (ver o cabeçalho).
+ */
+export const PRAZO_RECUPERACAO_LIMPEZA_MS = 30 * 60 * 1000;
 
 export const CODIGOS_DE_SAIDA = {
   /** Concluído sem falhas, conflitos nem registros preservados por referência. */
@@ -143,7 +160,10 @@ export function validarAmbiente(opcoes: OpcoesComando, uri: string | undefined, 
 }
 
 export interface ContextoLimpeza {
-  leitor: Pick<LeitorLimpezaUploads, "listarRegistros" | "lerRegistro" | "produtoExiste" | "buscarReferencia" | "marcarDescartado">;
+  leitor: Pick<
+    LeitorLimpezaUploads,
+    "listarRegistros" | "lerRegistro" | "produtoExiste" | "buscarReferencia" | "assumirLimpeza" | "recuperarLimpeza" | "possuiReserva" | "liberarLimpeza" | "marcarDescartado"
+  >;
   /** `null` = storage não configurado (só possível no dry-run): objetos ficam "não verificados". */
   storage: Pick<MediaStorage, "inspecionarObjeto" | "excluirObjeto"> | null;
   conexao: Connection;
@@ -186,6 +206,9 @@ export type Desfecho =
   | "fora_de_escopo"
   | "nao_expirado"
   | "dentro_da_margem"
+  | "em_confirmacao"
+  | "confirmacao_interrompida"
+  | "limpeza_em_andamento"
   | "preservado_referencia"
   | "falha_consulta"
   | "falha_leitura_storage"
@@ -205,128 +228,173 @@ interface ResultadoRegistro {
   objetoExistia: boolean | null;
   /** O objeto foi efetivamente excluído nesta execução. */
   excluido: boolean;
+  /** Registro era uma reserva `limpando` interrompida, retomada (ou que seria retomada) por esta execução. */
+  recuperado: boolean;
   detalhe: string;
 }
 
+/** Desfechos de registros que esta execução não processa (só contados). */
+const NAO_PROCESSADOS = new Set<Desfecho>(["fora_de_escopo", "nao_expirado", "dentro_da_margem", "em_confirmacao", "confirmacao_interrompida", "limpeza_em_andamento"]);
+
 function elegivel(registro: RegistroUpload, agora: Date): boolean {
   return registro.estado === "pendente" && registro.limpezaApos instanceof Date && registro.limpezaApos.getTime() + MARGEM_DE_SEGURANCA_MS <= agora.getTime();
+}
+
+/** Reserva de limpeza interrompida: `limpando` reservada há pelo menos o prazo de recuperação. */
+function recuperavel(registro: RegistroUpload, agora: Date): boolean {
+  return registro.estado === "limpando" && registro.reservadoEm instanceof Date && registro.reservadoEm.getTime() + PRAZO_RECUPERACAO_LIMPEZA_MS <= agora.getTime();
 }
 
 function descreverErro(erro: unknown, uri: string): string {
   return ocultarSegredos(erro instanceof Error ? `${erro.name}: ${erro.message}` : String(erro), uri);
 }
 
-/** Processa UM registro elegível. Nunca exclui diante de dúvida; nunca lança (todo erro vira desfecho). */
+/** Processa UM registro elegível ou recuperável. Nunca exclui diante de dúvida; nunca lança (todo erro vira desfecho). */
 async function processarRegistro(contexto: ContextoLimpeza, registro: RegistroUpload, execucao: ExecucaoAutorizada, agora: Date): Promise<ResultadoRegistro> {
+  const recuperacao = registro.estado === "limpando";
   const resultado = (desfecho: Desfecho, detalhe: string, objetoExistia: boolean | null = null, excluido = false): ResultadoRegistro => ({
     registro,
     desfecho,
     objetoExistia,
     excluido,
-    detalhe,
+    recuperado: recuperacao,
+    detalhe: recuperacao ? `[reserva interrompida ${execucao.modo === "apply" ? "retomada" : "— seria retomada"}] ${detalhe}` : detalhe,
   });
   const { leitor } = contexto;
   const uploadId = registro._id;
 
-  /** Estado e referências — usado antes da verificação do objeto e de novo imediatamente antes da exclusão. */
-  async function revalidar(): Promise<ResultadoRegistro | null> {
-    let atual: RegistroUpload | null;
+  /** Produto e referências (lidos depois da reserva no apply, e de novo imediatamente antes da exclusão). */
+  async function verificarReferencias(): Promise<{ impedimento: ResultadoRegistro | null; nota: string }> {
+    let produtoExiste: boolean;
     try {
-      atual = await leitor.lerRegistro(uploadId);
+      produtoExiste = await leitor.produtoExiste(registro.produtoId);
     } catch (erro) {
-      return resultado("falha_consulta", `falha ao reler o registro (${descreverErro(erro, execucao.uri)})`);
-    }
-    if (!atual || !elegivel(atual, agora) || atual.chave !== registro.chave) {
-      return resultado("conflito", `o registro mudou durante a limpeza (estado atual: ${atual?.estado ?? "inexistente"})`);
+      return { impedimento: resultado("falha_consulta", `falha ao ler o produto ${String(registro.produtoId)} (${descreverErro(erro, execucao.uri)})`), nota: "" };
     }
     try {
       const referencia = await leitor.buscarReferencia(uploadId, registro.chave);
-      if (referencia) return resultado("preservado_referencia", `arquivo referenciado por ${referencia}: objeto preservado (inconsistência a analisar)`);
+      if (referencia) return { impedimento: resultado("preservado_referencia", `arquivo referenciado por ${referencia}: objeto preservado (inconsistência a analisar)`), nota: "" };
     } catch (erro) {
-      return resultado("falha_consulta", `falha ao procurar referências (${descreverErro(erro, execucao.uri)})`);
+      return { impedimento: resultado("falha_consulta", `falha ao procurar referências (${descreverErro(erro, execucao.uri)})`), nota: "" };
     }
-    return null;
+    return { impedimento: null, nota: produtoExiste ? "" : " (produto inexistente — consulta bem-sucedida sem documento)" };
   }
 
-  let produtoExiste: boolean;
+  if (execucao.modo === "dry-run") {
+    // Somente leitura: nenhuma reserva é adquirida.
+    const { impedimento, nota } = await verificarReferencias();
+    if (impedimento) return impedimento;
+    if (!contexto.storage) return resultado("nao_verificado", `storage não configurado: objeto não verificado${nota}`);
+    try {
+      return (await contexto.storage.inspecionarObjeto(registro.chave)).existe
+        ? resultado("seria_excluido", `objeto existe e não é referenciado: seria excluído e o registro descartado${nota}`, true)
+        : resultado("seria_descartado_ausente", `objeto já ausente: o registro seria marcado como descartado${nota}`, false);
+    } catch (erro) {
+      return resultado("falha_leitura_storage", `falha ao consultar o objeto no storage (${descreverErro(erro, execucao.uri)})`);
+    }
+  }
+
+  // 1. Reserva atômica (ou retomada de uma reserva interrompida, trocando o token).
+  const token = randomUUID();
   try {
-    produtoExiste = await leitor.produtoExiste(registro.produtoId);
+    const assumiu = recuperacao
+      ? await leitor.recuperarLimpeza(uploadId, registro.tokenReserva ?? null, new Date(agora.getTime() - PRAZO_RECUPERACAO_LIMPEZA_MS), token, agora)
+      : await leitor.assumirLimpeza(uploadId, new Date(agora.getTime() - MARGEM_DE_SEGURANCA_MS), token, agora);
+    if (!assumiu) return resultado("conflito", "outra execução ou operação assumiu ou alterou o registro antes da reserva: nada foi feito");
   } catch (erro) {
-    return resultado("falha_consulta", `falha ao ler o produto ${String(registro.produtoId)} (${descreverErro(erro, execucao.uri)})`);
+    return resultado("falha_consulta", `falha ao reservar o registro (${descreverErro(erro, execucao.uri)})`);
   }
-  const notaProduto = produtoExiste ? "" : " (produto inexistente — consulta bem-sucedida sem documento)";
 
-  const impedimento = await revalidar();
-  if (impedimento) return impedimento;
-  if (!contexto.storage) return resultado("nao_verificado", `storage não configurado: objeto não verificado${notaProduto}`);
+  /** Devolve a reserva (`limpando` → `pendente`) quando nada foi excluído. Se a devolução falhar, ela fica recuperável após o prazo. */
+  async function liberar(item: ResultadoRegistro): Promise<ResultadoRegistro> {
+    try {
+      await leitor.liberarLimpeza(uploadId, token);
+      return item;
+    } catch (erro) {
+      return { ...item, detalhe: `${item.detalhe} (falha ao liberar a reserva — o registro fica em limpeza e será recuperável após o prazo: ${descreverErro(erro, execucao.uri)})` };
+    }
+  }
 
+  if (!contexto.storage) return liberar(resultado("nao_verificado", "storage não configurado: objeto não verificado"));
+
+  // 2. Objeto.
   let existe: boolean;
   try {
     existe = (await contexto.storage.inspecionarObjeto(registro.chave)).existe;
   } catch (erro) {
-    return resultado("falha_leitura_storage", `falha ao consultar o objeto no storage (${descreverErro(erro, execucao.uri)})`);
+    return liberar(resultado("falha_leitura_storage", `falha ao consultar o objeto no storage (${descreverErro(erro, execucao.uri)})`));
   }
 
-  if (execucao.modo === "dry-run") {
-    return existe
-      ? resultado("seria_excluido", `objeto existe e não é referenciado: seria excluído e o registro descartado${notaProduto}`, true)
-      : resultado("seria_descartado_ausente", `objeto já ausente: o registro seria marcado como descartado${notaProduto}`, false);
+  // 3. Imediatamente antes de excluir (e DEPOIS da reserva): a reserva continua desta execução e nada referencia o
+  // arquivo — qualquer confirmação concluída antes da reserva já está visível aqui.
+  try {
+    if (!(await leitor.possuiReserva(uploadId, token))) {
+      return resultado("conflito", "a reserva foi retomada por outra execução antes da exclusão: nada foi excluído por esta execução", existe);
+    }
+  } catch (erro) {
+    return liberar(resultado("falha_consulta", `falha ao conferir a posse da reserva (${descreverErro(erro, execucao.uri)})`, existe));
   }
+  const final = await verificarReferencias();
+  if (final.impedimento) return liberar({ ...final.impedimento, objetoExistia: existe });
 
-  // Última revalidação, imediatamente antes de qualquer exclusão.
-  const impedimentoFinal = await revalidar();
-  if (impedimentoFinal) return { ...impedimentoFinal, objetoExistia: existe };
-
+  // 4. Exclusão física (só se existir) e 5. marcação condicional ao token.
   if (existe) {
     try {
       await contexto.storage.excluirObjeto(registro.chave);
     } catch (erro) {
-      return resultado("falha_exclusao", `falha ao excluir o objeto — registro mantido pendente (${descreverErro(erro, execucao.uri)})`, true);
+      return liberar(resultado("falha_exclusao", `falha ao excluir o objeto — registro devolvido a pendente (${descreverErro(erro, execucao.uri)})`, true));
     }
   }
   try {
-    if (!(await leitor.marcarDescartado(uploadId))) {
-      return resultado(
-        "conflito",
-        existe ? "o objeto foi excluído, mas o registro deixou de estar pendente antes da marcação (outra execução ou operação)" : "o registro deixou de estar pendente antes da marcação",
-        existe,
-        existe,
-      );
+    if (!(await leitor.marcarDescartado(uploadId, token))) {
+      return resultado("conflito", `${existe ? "objeto excluído, mas " : ""}a reserva foi retomada por outra execução antes da marcação (ela conclui o registro)`, existe, existe);
     }
   } catch (erro) {
     return resultado(
       "falha_atualizacao",
-      `${existe ? "objeto excluído, mas " : ""}falha ao marcar como descartado — a próxima execução conclui (${descreverErro(erro, execucao.uri)})`,
+      `${existe ? "objeto excluído, mas " : ""}falha ao marcar como descartado — o registro fica em limpeza e será concluído após o prazo de recuperação (${descreverErro(erro, execucao.uri)})`,
       existe,
       existe,
     );
   }
   return existe
-    ? resultado("excluido_e_descartado", `objeto excluído e registro descartado${notaProduto}`, true, true)
-    : resultado("descartado_ausente", `objeto já ausente; registro descartado${notaProduto}`, false);
+    ? resultado("excluido_e_descartado", `objeto excluído e registro descartado${final.nota}`, true, true)
+    : resultado("descartado_ausente", `objeto já ausente; registro descartado${final.nota}`, false);
 }
 
-const DESFECHOS_PARA_ANALISE = new Set<Desfecho>(["preservado_referencia", "falha_consulta", "falha_leitura_storage", "falha_exclusao", "falha_atualizacao", "conflito"]);
+const DESFECHOS_PARA_ANALISE = new Set<Desfecho>([
+  "preservado_referencia",
+  "falha_consulta",
+  "falha_leitura_storage",
+  "falha_exclusao",
+  "falha_atualizacao",
+  "conflito",
+  "confirmacao_interrompida",
+]);
 
 function relatar(escrever: (linha: string) => void, execucao: ExecucaoAutorizada, resultados: ResultadoRegistro[], analisados: number): number {
   const aplicar = execucao.modo === "apply";
   for (const item of resultados) {
-    if (item.desfecho === "fora_de_escopo" || item.desfecho === "nao_expirado" || item.desfecho === "dentro_da_margem") continue;
+    if (NAO_PROCESSADOS.has(item.desfecho) && item.desfecho !== "confirmacao_interrompida") continue;
     escrever(`[${item.desfecho.toUpperCase()}] upload ${item.registro._id} chave=${item.registro.chave}: ${item.detalhe}`);
   }
   const contar = (...desfechos: Desfecho[]) => resultados.filter((item) => desfechos.includes(item.desfecho)).length;
-  const elegiveis = resultados.filter((item) => !["fora_de_escopo", "nao_expirado", "dentro_da_margem"].includes(item.desfecho));
+  const processados = resultados.filter((item) => !NAO_PROCESSADOS.has(item.desfecho));
 
   escrever(aplicar ? "Resumo — resultados EFETIVOS da limpeza:" : "Resumo — PREVISÃO do dry-run (NENHUMA escrita no MongoDB nem no storage):");
   escrever(`  Banco selecionado: ${execucao.banco}`);
   escrever(`  Modo: ${execucao.modo}`);
   escrever(`  Registros analisados: ${analisados}`);
   escrever(`  Fora do escopo (confirmado, removido ou descartado — nunca tocados): ${contar("fora_de_escopo")}`);
+  escrever(`  Em confirmação (reserva da confirmação — nunca tocados): ${contar("em_confirmacao")}`);
+  escrever(`  Confirmações interrompidas (em confirmação após o prazo — análise manual, nunca excluídas): ${contar("confirmacao_interrompida")}`);
+  escrever(`  Limpezas em andamento em outra execução (reserva com menos de ${PRAZO_RECUPERACAO_LIMPEZA_MS / 60_000} min — não tocadas): ${contar("limpeza_em_andamento")}`);
   escrever(`  Pendentes não expirados: ${contar("nao_expirado")}`);
   escrever(`  Pendentes vencidos ainda dentro da margem de segurança (${MARGEM_DE_SEGURANCA_MS / 60_000} min): ${contar("dentro_da_margem")}`);
-  escrever(`  Registros elegíveis: ${elegiveis.length}`);
-  escrever(`  Objetos existentes: ${elegiveis.filter((item) => item.objetoExistia === true).length}`);
-  escrever(`  Objetos já ausentes: ${elegiveis.filter((item) => item.objetoExistia === false).length}`);
+  escrever(`  Registros elegíveis: ${processados.length}`);
+  escrever(`  Reservas de limpeza interrompidas ${aplicar ? "retomadas" : "que seriam retomadas"}: ${processados.filter((item) => item.recuperado).length}`);
+  escrever(`  Objetos existentes: ${processados.filter((item) => item.objetoExistia === true).length}`);
+  escrever(`  Objetos já ausentes: ${processados.filter((item) => item.objetoExistia === false).length}`);
   escrever(`  Objetos não verificados (storage não configurado): ${contar("nao_verificado")}`);
   escrever(`  Objetos que seriam excluídos: ${aplicar ? "não se aplica ao apply" : contar("seria_excluido")}`);
   escrever(`  Objetos efetivamente excluídos: ${resultados.filter((item) => item.excluido).length}`);
@@ -379,11 +447,23 @@ export async function executarComando(dependencias: DependenciasComando): Promis
     const registros = await contexto.leitor.listarRegistros();
     const resultados: ResultadoRegistro[] = [];
     for (const registro of registros) {
-      const base = { registro, objetoExistia: null, excluido: false, detalhe: "" };
-      if (registro.estado !== "pendente") resultados.push({ ...base, desfecho: "fora_de_escopo" });
-      else if (!(registro.limpezaApos instanceof Date) || registro.limpezaApos.getTime() > agora.getTime()) resultados.push({ ...base, desfecho: "nao_expirado" });
-      else if (!elegivel(registro, agora)) resultados.push({ ...base, desfecho: "dentro_da_margem" });
-      else resultados.push(await processarRegistro(contexto, registro, execucao, agora));
+      const base = { registro, objetoExistia: null, excluido: false, recuperado: false, detalhe: "" };
+      const vencido = registro.limpezaApos instanceof Date && registro.limpezaApos.getTime() + MARGEM_DE_SEGURANCA_MS <= agora.getTime();
+      if (registro.estado === "pendente") {
+        if (!(registro.limpezaApos instanceof Date) || registro.limpezaApos.getTime() > agora.getTime()) resultados.push({ ...base, desfecho: "nao_expirado" });
+        else if (!elegivel(registro, agora)) resultados.push({ ...base, desfecho: "dentro_da_margem" });
+        else resultados.push(await processarRegistro(contexto, registro, execucao, agora));
+      } else if (registro.estado === "limpando") {
+        if (recuperavel(registro, agora)) resultados.push(await processarRegistro(contexto, registro, execucao, agora));
+        else resultados.push({ ...base, desfecho: "limpeza_em_andamento" });
+      } else if (registro.estado === "confirmando") {
+        // Nunca tocado: a confirmação pode ter gravado o produto sem concluir o registro. Vencido = análise manual.
+        resultados.push(
+          vencido
+            ? { ...base, desfecho: "confirmacao_interrompida", detalhe: "em confirmação após o prazo: objeto nunca excluído; reconciliar com uma nova confirmação ou analisar" }
+            : { ...base, desfecho: "em_confirmacao" },
+        );
+      } else resultados.push({ ...base, desfecho: "fora_de_escopo" });
     }
     return relatar(escrever, execucao, resultados, registros.length);
   } catch (erro) {

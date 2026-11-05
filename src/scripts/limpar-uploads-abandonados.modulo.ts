@@ -17,9 +17,12 @@ export interface RegistroUpload {
   chave: string;
   estado: EstadoUploadMidia;
   limpezaApos: Date;
+  /** Fase 60.3.1 — dono e instante da reserva atual (`limpando`/`confirmando`); ausentes em registros antigos. */
+  tokenReserva?: string | null;
+  reservadoEm?: Date | null;
 }
 
-const PROJECAO_REGISTRO = { _id: 1, produtoId: 1, chave: 1, estado: 1, limpezaApos: 1 } as const;
+const PROJECAO_REGISTRO = { _id: 1, produtoId: 1, chave: 1, estado: 1, limpezaApos: 1, tokenReserva: 1, reservadoEm: 1 } as const;
 
 function escaparRegex(texto: string): string {
   return texto.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -66,9 +69,49 @@ export class LeitorLimpezaUploads {
     return venda ? `venda ${String(venda._id)}` : null;
   }
 
-  /** `pendente` → `descartado`, condicional ao estado: `false` se outra operação mudou o registro antes. */
-  async marcarDescartado(uploadId: string): Promise<boolean> {
-    const resultado = await this.uploads().updateOne({ _id: uploadId, estado: "pendente" }, { $set: { estado: "descartado" } });
+  /**
+   * Fase 60.3.1 — RESERVA da limpeza: `pendente` vencido (até `limiteVencimento`) → `limpando` com o token desta
+   * execução. Escrita condicional no MESMO documento que a confirmação reserva (`confirmando`, só a partir de
+   * `pendente` no prazo): no máximo uma das duas vence. `false` = outra execução/operação chegou antes.
+   */
+  async assumirLimpeza(uploadId: string, limiteVencimento: Date, token: string, agora: Date): Promise<boolean> {
+    const resultado = await this.uploads().updateOne(
+      { _id: uploadId, estado: "pendente", limpezaApos: { $lte: limiteVencimento } },
+      // `limpezaIniciadaEm` é permanente: a partir daqui o registro nunca mais é reservável pela confirmação.
+      { $set: { estado: "limpando", tokenReserva: token, reservadoEm: agora, limpezaIniciadaEm: agora } },
+    );
+    return resultado.modifiedCount === 1;
+  }
+
+  /**
+   * Recupera uma reserva de limpeza INTERROMPIDA: `limpando` com o token antigo e reservada antes de
+   * `limiteReserva` → novo token. A execução antiga perde a posse: todas as suas transições exigem o token antigo.
+   */
+  async recuperarLimpeza(uploadId: string, tokenAntigo: string | null, limiteReserva: Date, token: string, agora: Date): Promise<boolean> {
+    const resultado = await this.uploads().updateOne(
+      { _id: uploadId, estado: "limpando", tokenReserva: tokenAntigo, reservadoEm: { $lte: limiteReserva } },
+      { $set: { tokenReserva: token, reservadoEm: agora } },
+    );
+    return resultado.modifiedCount === 1;
+  }
+
+  /** A reserva de limpeza ainda é desta execução (lida imediatamente antes da exclusão). */
+  async possuiReserva(uploadId: string, token: string): Promise<boolean> {
+    return (await this.uploads().findOne({ _id: uploadId, estado: "limpando", tokenReserva: token }, { projection: { _id: 1 } })) !== null;
+  }
+
+  /** `limpando` → `pendente` pelo dono da reserva (nada foi excluído: referência, falha de leitura ou de exclusão). */
+  async liberarLimpeza(uploadId: string, token: string): Promise<boolean> {
+    const resultado = await this.uploads().updateOne(
+      { _id: uploadId, estado: "limpando", tokenReserva: token },
+      { $set: { estado: "pendente", tokenReserva: null, reservadoEm: null } },
+    );
+    return resultado.modifiedCount === 1;
+  }
+
+  /** `limpando` → `descartado`, só pelo dono da reserva: `false` se a reserva foi recuperada por outra execução. */
+  async marcarDescartado(uploadId: string, token: string): Promise<boolean> {
+    const resultado = await this.uploads().updateOne({ _id: uploadId, estado: "limpando", tokenReserva: token }, { $set: { estado: "descartado", tokenReserva: null } });
     return resultado.modifiedCount === 1;
   }
 }

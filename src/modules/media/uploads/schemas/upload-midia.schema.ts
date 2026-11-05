@@ -66,6 +66,27 @@ export class UploadMidia {
 
   @Prop({ type: Date, default: null })
   removidoEm!: Date | null;
+
+  /**
+   * Fase 60.3.1 — dono da reserva atual (`confirmando` ou `limpando`): token aleatório gerado por quem a adquiriu.
+   * Toda transição de saída da reserva é condicionada a este token, então uma execução antiga (cuja reserva foi
+   * recuperada por outra) nunca altera o estado de uma execução mais recente. `null` fora de reserva.
+   */
+  @Prop({ type: String, default: null })
+  tokenReserva!: string | null;
+
+  /** Quando a reserva atual foi adquirida — base do prazo de recuperação de uma limpeza interrompida. */
+  @Prop({ type: Date, default: null })
+  reservadoEm!: Date | null;
+
+  /**
+   * Fase 60.3.1 — marca PERMANENTE (nunca apagada) de que alguma execução da limpeza já reservou este registro.
+   * A reserva da confirmação exige que ela esteja ausente: um registro tocado pela limpeza nunca mais pode ser
+   * confirmado, independentemente de relógio (a reconciliação de um produto que já referencia a mídia não depende
+   * da reserva e continua funcionando).
+   */
+  @Prop({ type: Date, default: null })
+  limpezaIniciadaEm!: Date | null;
 }
 
 export type UploadMidiaDocument = HydratedDocument<UploadMidia>;
