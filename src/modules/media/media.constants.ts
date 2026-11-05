@@ -36,6 +36,37 @@ export const ROTULO_TAMANHO_MAXIMO: Record<TipoMidia, string> = {
 /** Validade da URL de upload — curta de propósito (10 minutos). */
 export const EXPIRACAO_UPLOAD_SEGUNDOS = 600;
 
+/**
+ * Fase 60.4.1 — transporte das chamadas de rede ao R2 (`HeadObject`, `GetObject` com Range, `DeleteObject`; a
+ * assinatura de URL é cálculo local e não usa nada disto). Valores PADRÃO, sobrescrevíveis por
+ * `R2_CONNECTION_TIMEOUT_MS`, `R2_REQUEST_TIMEOUT_MS` e `R2_MAX_ATTEMPTS`. São decisões operacionais deste
+ * projeto (não recomendações da Cloudflare): as respostas são minúsculas (cabeçalhos, 16 bytes, exclusão), então
+ * 3 s para conectar + 10 s para responder (13 s por tentativa) já são folgados; 2 tentativas = uma única nova
+ * tentativa para falha transitória, sem multiplicar a espera de quem está numa requisição HTTP.
+ *
+ * O prazo de cada tentativa (conexão + resposta) é aplicado pelo PRÓPRIO projeto, com `AbortSignal`: medido nesta
+ * fase, no runtime Bun (o de produção) os timeouts do handler HTTP do SDK não interrompem uma requisição sem
+ * resposta. Ver `R2PresignerProvider.enviar`.
+ */
+export const TRANSPORTE_R2_PADRAO = {
+  timeoutConexaoMs: 3_000,
+  timeoutRequisicaoMs: 10_000,
+  maxTentativas: 2,
+} as const;
+
+/** Espera antes da N-ésima nova tentativa: N × este valor (250 ms, 500 ms, ...) — entra no prazo total da operação. */
+export const ESPERA_ENTRE_TENTATIVAS_R2_MS = 250;
+
+/**
+ * Faixas aceitas para as variáveis de transporte (validadas no boot e pelo comando `midias:verificar-r2`): evitam
+ * um prazo tão curto que corta toda chamada e uma espera que prenda a requisição HTTP por minutos.
+ */
+export const LIMITES_TRANSPORTE_R2 = {
+  R2_CONNECTION_TIMEOUT_MS: { minimo: 100, maximo: 60_000 },
+  R2_REQUEST_TIMEOUT_MS: { minimo: 100, maximo: 120_000 },
+  R2_MAX_ATTEMPTS: { minimo: 1, maximo: 5 },
+} as const;
+
 /** Prefixo controlado pelo backend: o cliente nunca informa bucket nem chave. */
 export const PREFIXO_CHAVE_PRODUTOS = "products";
 

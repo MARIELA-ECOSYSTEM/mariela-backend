@@ -1,7 +1,16 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import configuration from "./configuration.js";
 
-const VARIAVEIS_R2 = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME", "R2_PUBLIC_BASE_URL"] as const;
+const VARIAVEIS_R2 = [
+  "R2_ACCOUNT_ID",
+  "R2_ACCESS_KEY_ID",
+  "R2_SECRET_ACCESS_KEY",
+  "R2_BUCKET_NAME",
+  "R2_PUBLIC_BASE_URL",
+  "R2_CONNECTION_TIMEOUT_MS",
+  "R2_REQUEST_TIMEOUT_MS",
+  "R2_MAX_ATTEMPTS",
+] as const;
 const originais = Object.fromEntries(VARIAVEIS_R2.map((nome) => [nome, process.env[nome]]));
 
 afterEach(() => {
@@ -30,5 +39,26 @@ describe("configuration — storage.r2 (Fase 40)", () => {
       bucketName: "bucket",
       publicBaseUrl: "https://midia.exemplo.com",
     });
+  });
+});
+
+describe("configuration — storage.transporte (Fase 60.4.1)", () => {
+  it("sem as variáveis de transporte: padrões do projeto (3 s, 10 s, 2 tentativas)", () => {
+    for (const nome of VARIAVEIS_R2) delete process.env[nome];
+    expect(configuration().storage.transporte).toEqual({ timeoutConexaoMs: 3_000, timeoutRequisicaoMs: 10_000, maxTentativas: 2 });
+  });
+
+  it("variáveis vazias também caem nos padrões", () => {
+    process.env["R2_CONNECTION_TIMEOUT_MS"] = "";
+    process.env["R2_REQUEST_TIMEOUT_MS"] = "";
+    process.env["R2_MAX_ATTEMPTS"] = "";
+    expect(configuration().storage.transporte).toEqual({ timeoutConexaoMs: 3_000, timeoutRequisicaoMs: 10_000, maxTentativas: 2 });
+  });
+
+  it("sobrescrita por ambiente", () => {
+    process.env["R2_CONNECTION_TIMEOUT_MS"] = "1500";
+    process.env["R2_REQUEST_TIMEOUT_MS"] = "4000";
+    process.env["R2_MAX_ATTEMPTS"] = "3";
+    expect(configuration().storage.transporte).toEqual({ timeoutConexaoMs: 1_500, timeoutRequisicaoMs: 4_000, maxTentativas: 3 });
   });
 });

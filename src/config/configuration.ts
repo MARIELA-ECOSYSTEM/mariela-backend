@@ -1,3 +1,4 @@
+import { TRANSPORTE_R2_PADRAO } from "../modules/media/media.constants.js";
 import { lerOrigensCors } from "./cors.config.js";
 
 /**
@@ -70,6 +71,18 @@ export interface StorageConfig {
     /** Base pública do bucket (domínio próprio ou `pub-….r2.dev`), sem barra final. */
     publicBaseUrl: string;
   };
+  /**
+   * Fase 60.4.1 — timeouts e tentativas das chamadas de rede ao R2. Opcional de propósito: contextos que montam
+   * só `r2` (ex.: o comando local de limpeza) usam os padrões de `TRANSPORTE_R2_PADRAO`.
+   */
+  transporte?: {
+    /** Tempo máximo para estabelecer a conexão (ms). */
+    timeoutConexaoMs: number;
+    /** Inatividade máxima do socket por tentativa (ms). */
+    timeoutRequisicaoMs: number;
+    /** Tentativas por operação, incluindo a primeira (só falhas transitórias são repetidas). */
+    maxTentativas: number;
+  };
 }
 
 /**
@@ -140,6 +153,11 @@ export default (): Configuration => {
         secretAccessKey: (process.env["R2_SECRET_ACCESS_KEY"] ?? "").trim(),
         bucketName: (process.env["R2_BUCKET_NAME"] ?? "").trim(),
         publicBaseUrl: (process.env["R2_PUBLIC_BASE_URL"] ?? "").trim().replace(/\/+$/, ""),
+      },
+      transporte: {
+        timeoutConexaoMs: Number(process.env["R2_CONNECTION_TIMEOUT_MS"] || TRANSPORTE_R2_PADRAO.timeoutConexaoMs),
+        timeoutRequisicaoMs: Number(process.env["R2_REQUEST_TIMEOUT_MS"] || TRANSPORTE_R2_PADRAO.timeoutRequisicaoMs),
+        maxTentativas: Number(process.env["R2_MAX_ATTEMPTS"] || TRANSPORTE_R2_PADRAO.maxTentativas),
       },
     },
     rateLimit: {

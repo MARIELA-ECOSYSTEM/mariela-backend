@@ -85,14 +85,23 @@ bun run start:prod
 
 ## Mídia (imagens e vídeos) — Cloudflare R2
 
-O backend **não recebe arquivos**: ele só autoriza o envio. A mídia vai direto do Backoffice para um bucket do Cloudflare R2 (API S3) por uma URL pré-assinada, e o banco guarda apenas a URL pública nos campos que já existem (`foto` e `video` da variante — contrato de Produto/Variante inalterado). Nada de mídia fica no MongoDB nem no disco do servidor.
+O backend **não recebe arquivos**: ele só autoriza o envio e confere o resultado. O arquivo vai direto do Backoffice para um bucket do Cloudflare R2 (API compatível com S3) por uma URL pré-assinada; o MongoDB guarda só metadados e URLs públicas. Nada de mídia fica no disco do servidor.
 
-**Fluxo**
+**Arquitetura**
 
-1. `POST /api/v1/media/presigned-upload` (só Backoffice, `ADMIN`; o token do PDV é rejeitado) com `{ fileName, contentType, kind, size, produtoId }`.
-2. O backend valida e responde `{ data: { uploadUrl, method: "PUT", headers, publicUrl, key, expiresIn } }`.
-3. O cliente faz `PUT uploadUrl` com o arquivo, enviando exatamente os `headers` devolvidos (o `Content-Length` é o `size` declarado; um tipo ou tamanho diferente invalida a assinatura).
-4. O cliente salva `publicUrl` em `foto`/`video` pelos endpoints de variante já existentes (`POST`/`PUT /produtos/:id/variantes`).
+- Abstração `MediaStorage` (token `MEDIA_STORAGE`; `MEDIA_PRESIGNER` aponta para a mesma instância), implementada por `R2PresignerProvider`: assina uploads (cálculo local, sem rede) e faz `HeadObject`, `GetObject` com Range e `DeleteObject`.
+- Endpoint S3: `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`, região `auto`.
+- Leitura **pública** pelo domínio de `R2_PUBLIC_BASE_URL`: a URL de cada objeto é `R2_PUBLIC_BASE_URL + "/" + chave` (a base precisa apontar para a raiz do bucket). Só a escrita é assinada.
+- Chaves geradas pelo backend: `products/{produtoId}/{uuid}.{ext}`. O cliente nunca informa bucket, chave nem URL.
+
+**Galeria do produto (fluxo atual)** — `Produto.midias[]`, `Produto.midiaPrincipalId`, ciclo de vida em `uploads_midia`. Todos os endpoints exigem `ADMIN` (o token do PDV é rejeitado).
+
+1. `POST /api/v1/produtos/:id/midias/uploads` com `{ fileName, contentType, kind, size, substituiMidiaId? }` → `{ uploadId, uploadUrl, method: "PUT", headers, expiresIn: 600 }`. Cria o registro `pendente`; a galeria não muda.
+2. O cliente faz `PUT uploadUrl` com o arquivo e **exatamente** os `headers` devolvidos: `Content-Type` e `Cache-Control: public, max-age=31536000, immutable`. O `Content-Length` (definido pelo navegador a partir do arquivo) precisa ser igual ao `size` declarado. Os três estão na assinatura: qualquer diferença faz o R2 recusar. A URL vale **10 minutos**.
+3. `POST /api/v1/produtos/:id/midias/uploads/:uploadId/confirmacao` com `{ varianteId?, principal?, substituiMidiaId? }` → `201 { midia, midias, midiaPrincipalId }`. O backend confere no R2 a existência, o tamanho, o `Content-Type` e a assinatura real do formato (primeiros bytes); só então grava a mídia no produto, segurando a reserva atômica do registro (`pendente → confirmando`). Repetir a confirmação é idempotente.
+4. Gestão: `GET /produtos/:id/midias`, `PATCH /produtos/:id/midias/:midiaId` (variante, só imagem), `PUT /produtos/:id/midias/principal`, `PUT /produtos/:id/midias/ordem`, `DELETE /produtos/:id/midias/:midiaId` (tira da galeria; **o objeto no R2 não é apagado**).
+
+**Endpoint antigo (Fase 40) — legado, a ser descontinuado** — `POST /api/v1/media/presigned-upload` com `{ fileName, contentType, kind, size, produtoId }` → `{ uploadUrl, method, headers: { Content-Type }, publicUrl, key, expiresIn }`; o cliente gravava `publicUrl` em `variante.foto`/`video`. Continua ativo e com o contrato inalterado, mas **não cria registro em `uploads_midia`**: um objeto enviado por ele e nunca salvo fica órfão, invisível à limpeza. Novos usos devem ir para a galeria.
 
 **Regras (validadas no backend)**
 
@@ -100,14 +109,33 @@ O backend **não recebe arquivos**: ele só autoriza o envio. A mídia vai diret
 |---|---|---|
 | Tipos | `image/jpeg`, `image/png`, `image/webp`, `image/gif` | `video/mp4` |
 | Tamanho máximo | 5 MB | 15 MB |
+| Por produto (galeria) | 20 | 3 |
 
-A extensão de `fileName` precisa corresponder ao tipo (`.jpg`/`.jpeg`, `.png`, `.webp`, `.gif`, `.mp4`). O produto precisa existir. A chave é sempre `products/{produtoId}/{uuid}.{ext}` — o nome original nunca é usado e o cliente não informa bucket nem chave (campos extras são rejeitados com 400). A URL expira em 10 minutos.
+A extensão de `fileName` precisa corresponder ao tipo. A substituição (`substituiMidiaId`) precisa ser do mesmo tipo e não conta no limite.
 
-**Erros:** `400 VALIDATION_ERROR` (tipo, extensão, tamanho, corpo), `401` (sem token, token inválido ou do PDV), `404` (produto), `503 STORAGE_NOT_CONFIGURED` (variáveis R2 ausentes; a resposta cita só os nomes).
+**Erros:** `400 VALIDATION_ERROR`, `401`, `404`, `409 CONFLICT` (limite, upload expirado/em limpeza, alvo de substituição divergente, concorrência), `503 STORAGE_NOT_CONFIGURED` (alguma variável `R2_*` ausente; cita só os nomes), `503 STORAGE_UNAVAILABLE` (o R2 falhou ou não respondeu dentro do prazo).
 
-**Variáveis** (todas opcionais para o boot; ver `.env.example`): `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_BASE_URL`.
+**Variáveis** (opcionais para o boot; ver `.env.example`):
 
-**Configuração necessária no bucket (feita no Cloudflare, fora do código):** leitura pública (domínio próprio ou endereço público do R2) e CORS permitindo `PUT` a partir das origens do Backoffice, com o cabeçalho `Content-Type`. Ainda não implementado (fora do escopo): remoção de arquivos órfãos, redimensionamento/thumbnails, várias mídias por variante.
+- `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_BASE_URL` — as cinco são necessárias para a mídia funcionar.
+- `R2_CONNECTION_TIMEOUT_MS` (padrão 3000), `R2_REQUEST_TIMEOUT_MS` (padrão 10000), `R2_MAX_ATTEMPTS` (padrão 2) — transporte das chamadas ao R2. O prazo de cada tentativa (conexão + resposta) é aplicado pelo próprio backend; só falhas transitórias (5xx, 429, rede, prazo esgotado) são repetidas; erros permanentes (403, 404, 400...) falham na hora. Os padrões são decisões deste projeto, não recomendações da Cloudflare. Os comandos locais usam os padrões.
+
+`bun run midias:verificar-r2` confere, **sem rede**, se as variáveis do processo estão presentes e com formato válido (nunca imprime os valores). Não testa credenciais, bucket, domínio nem CORS.
+
+**Configuração externa necessária (Cloudflare — fora do código; não verificada por este repositório):**
+
+- Token R2 com permissão de leitura e escrita de objetos, restrito ao bucket (o backend assina `PutObject` e executa `HeadObject`, `GetObject` e `DeleteObject`).
+- Leitura pública do bucket pelo domínio de `R2_PUBLIC_BASE_URL`.
+- **CORS do bucket** (o `PUT` vai direto ao R2, não passa pelo CORS do backend): origens iguais às de `CORS_ORIGINS` — inclusive `http://tauri.localhost` (Backoffice empacotado no Windows) e, se houver macOS/Linux, `tauri://localhost`; em desenvolvimento, `http://localhost:8081` (Backoffice) e `http://localhost:8080` (PDV) —, método `PUT` e cabeçalhos permitidos **`content-type` e `cache-control`**. Sem `cache-control`, o upload da galeria falha no preflight.
+- Recomendado: um bucket separado para testes, nunca o de produção.
+
+**Limpeza e histórico**
+
+- `bun run midias:limpar-abandonadas --banco <banco>` (dry-run por padrão) exclui só objetos de uploads `pendente` vencidos (`limpezaApos` + 15 min) que nenhum produto nem venda referencia, e marca o registro `descartado` (registros nunca são apagados). Reserva atômica (`limpando`) excludente com a confirmação. Nesta etapa, `--apply` só no banco de teste local.
+- Mídias removidas da galeria e fotos copiadas nas vendas são **preservadas**: nenhum fluxo apaga um objeto que já esteve na galeria.
+- `bun run midias:migrar-legado --banco <banco>` (dry-run por padrão) copia `variante.foto`/`video` para a galeria sem alterar os campos legados.
+
+Ainda não implementado: miniaturas/redimensionamento, pôster de vídeo.
 
 ## Backup e recuperação do MongoDB
 

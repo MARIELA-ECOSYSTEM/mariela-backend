@@ -1,5 +1,6 @@
-import { Type, plainToInstance } from "class-transformer";
+import { Transform, Type, plainToInstance, type TransformFnParams } from "class-transformer";
 import { IsIn, IsInt, IsOptional, IsString, Matches, Max, Min, ValidateIf, validateSync } from "class-validator";
+import { LIMITES_TRANSPORTE_R2 } from "../modules/media/media.constants.js";
 import { lerOrigensCors, motivoOrigemCorsInvalida } from "./cors.config.js";
 
 enum Ambiente {
@@ -10,6 +11,16 @@ enum Ambiente {
 
 /** Piso comum recomendado (OWASP) para uma chave de assinatura/HMAC — 32 caracteres ≈ 256 bits em um charset típico. Só é exigido em produção (ver `validarSegredosDeProducao`) para não quebrar segredos de desenvolvimento/teste mais curtos já em uso. */
 const TAMANHO_MINIMO_SEGREDO_PRODUCAO = 32;
+
+/**
+ * Fase 60.4.1 — variável numérica OPCIONAL: vazia (como em `.env.example`, `R2_MAX_ATTEMPTS=`) conta como
+ * ausente (vale o padrão do projeto); qualquer outro texto vira número e passa pelas validações (texto inválido
+ * vira `NaN` e é recusado).
+ */
+function vazioComoAusente({ value }: TransformFnParams): number | undefined {
+  if (value === undefined || value === null || (typeof value === "string" && value.trim() === "")) return undefined;
+  return Number(value);
+}
 
 /**
  * Contrato das variáveis de ambiente aceitas pela API.
@@ -163,6 +174,32 @@ class EnvironmentVariables {
     message: "R2_PUBLIC_BASE_URL deve ser uma URL http(s) sem query string (ex.: https://midia.exemplo.com).",
   })
   R2_PUBLIC_BASE_URL = "";
+
+  /**
+   * Fase 60.4.1 — transporte das chamadas de rede ao R2 (padrões em `TRANSPORTE_R2_PADRAO`). Opcionais; quando
+   * informadas precisam ser inteiras e dentro de faixas que evitam tanto um timeout que corta toda chamada quanto
+   * uma espera que prende a requisição HTTP por minutos.
+   */
+  @IsOptional()
+  @Transform(vazioComoAusente)
+  @IsInt({ message: "R2_CONNECTION_TIMEOUT_MS deve ser um número inteiro de milissegundos." })
+  @Min(LIMITES_TRANSPORTE_R2.R2_CONNECTION_TIMEOUT_MS.minimo)
+  @Max(LIMITES_TRANSPORTE_R2.R2_CONNECTION_TIMEOUT_MS.maximo)
+  R2_CONNECTION_TIMEOUT_MS?: number;
+
+  @IsOptional()
+  @Transform(vazioComoAusente)
+  @IsInt({ message: "R2_REQUEST_TIMEOUT_MS deve ser um número inteiro de milissegundos." })
+  @Min(LIMITES_TRANSPORTE_R2.R2_REQUEST_TIMEOUT_MS.minimo)
+  @Max(LIMITES_TRANSPORTE_R2.R2_REQUEST_TIMEOUT_MS.maximo)
+  R2_REQUEST_TIMEOUT_MS?: number;
+
+  @IsOptional()
+  @Transform(vazioComoAusente)
+  @IsInt({ message: "R2_MAX_ATTEMPTS deve ser um número inteiro." })
+  @Min(LIMITES_TRANSPORTE_R2.R2_MAX_ATTEMPTS.minimo)
+  @Max(LIMITES_TRANSPORTE_R2.R2_MAX_ATTEMPTS.maximo)
+  R2_MAX_ATTEMPTS?: number;
 
   /**
    * Etapa 24 — rate limiting GLOBAL/moderado (`@nestjs/throttler`, aplicado a

@@ -194,4 +194,40 @@ describe("validateEnv", () => {
       expect(() => validateEnv(baseEnv({ ...PRODUCAO, CORS_ORIGINS: "http://tauri.localhost,tauri://localhost" }))).not.toThrow();
     });
   });
+  describe("transporte do R2 (Fase 60.4.1)", () => {
+    it("ausentes são aceitas (os padrões do projeto valem)", () => {
+      const validado = validateEnv(baseEnv());
+      expect(validado.R2_CONNECTION_TIMEOUT_MS).toBeUndefined();
+      expect(validado.R2_MAX_ATTEMPTS).toBeUndefined();
+    });
+
+    it("vazias (como no .env.example) contam como ausentes: a API sobe com os padrões", () => {
+      const validado = validateEnv(baseEnv({ R2_CONNECTION_TIMEOUT_MS: "", R2_REQUEST_TIMEOUT_MS: "  ", R2_MAX_ATTEMPTS: "" }));
+      expect(validado.R2_CONNECTION_TIMEOUT_MS).toBeUndefined();
+      expect(validado.R2_REQUEST_TIMEOUT_MS).toBeUndefined();
+      expect(validado.R2_MAX_ATTEMPTS).toBeUndefined();
+    });
+
+    it("valores válidos são aceitos e convertidos para número", () => {
+      const validado = validateEnv(baseEnv({ R2_CONNECTION_TIMEOUT_MS: "1500", R2_REQUEST_TIMEOUT_MS: "4000", R2_MAX_ATTEMPTS: "3" }));
+      expect(validado.R2_CONNECTION_TIMEOUT_MS).toBe(1500);
+      expect(validado.R2_REQUEST_TIMEOUT_MS).toBe(4000);
+      expect(validado.R2_MAX_ATTEMPTS).toBe(3);
+    });
+
+    it("rejeita fora da faixa ou não inteiro (a API não sobe)", () => {
+      for (const [nome, valor] of [
+        ["R2_CONNECTION_TIMEOUT_MS", "50"],
+        ["R2_CONNECTION_TIMEOUT_MS", "60001"],
+        ["R2_REQUEST_TIMEOUT_MS", "99"],
+        ["R2_REQUEST_TIMEOUT_MS", "120001"],
+        ["R2_REQUEST_TIMEOUT_MS", "dez"],
+        ["R2_MAX_ATTEMPTS", "0"],
+        ["R2_MAX_ATTEMPTS", "6"],
+        ["R2_MAX_ATTEMPTS", "2.5"],
+      ] as const) {
+        expect(() => validateEnv(baseEnv({ [nome]: valor }))).toThrow(new RegExp(nome));
+      }
+    });
+  });
 });
