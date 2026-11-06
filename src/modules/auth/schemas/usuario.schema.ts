@@ -33,6 +33,17 @@ export class Usuario {
   @Prop({ type: Date, default: null })
   ultimoLoginEm!: Date | null;
 
+  /** Fase 60.4.3.1.5 — quando `ativo` passou a `false` pelo comando `admin:desativar`; `null` enquanto ativo. */
+  @Prop({ type: Date, default: null })
+  desativadoEm!: Date | null;
+
+  /**
+   * Fase 60.4.3.1.5 — marca de que o evento `ADMIN_DEACTIVATED` deste usuário já foi (ou está sendo) gravado.
+   * Reivindicada por escrita condicional ANTES de gravar o evento: duas execuções nunca gravam dois eventos.
+   */
+  @Prop({ type: Date, default: null })
+  desativacaoAuditadaEm!: Date | null;
+
   criadoEm!: Date;
   atualizadoEm!: Date;
 }

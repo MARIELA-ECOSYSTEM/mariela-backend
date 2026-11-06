@@ -126,11 +126,23 @@ export class AuthService {
       throw ApiException.invalidCredentials();
     }
 
+    const tokens = await this.emitirTokens(usuario, contexto);
+
+    // Fase 60.4.3.1.5 — releitura DEPOIS de gravar a sessão. A desativação (`admin:desativar`) grava `ativo: false`
+    // ANTES de revogar todas as sessões; então uma sessão gravada aqui ou é alcançada por aquela revogação, ou foi
+    // gravada depois de `ativo: false` — e esta releitura a enxerga e a revoga. Sem isto, um login que leu o usuário
+    // ainda ativo (antes do argon2id, que é lento) podia deixar uma sessão não revogada depois da desativação.
+    const atual = await this.usuariosRepository.encontrarPorId(usuario.id);
+    if (!atual?.ativo) {
+      await this.refreshTokensRepository.revogarSeValido(this.hashRefreshToken(tokens.refreshToken), new Date());
+      this.loginThrottleService.registrarFalha(chaveThrottle);
+      await this.registrarEvento(usuario.id, "LOGIN_FAILED", contexto);
+      throw ApiException.invalidCredentials();
+    }
+
     this.loginThrottleService.registrarSucesso(chaveThrottle);
     await this.usuariosRepository.registrarLogin(usuario.id);
     await this.registrarEvento(usuario.id, "LOGIN_SUCCESS", contexto);
-
-    const tokens = await this.emitirTokens(usuario, contexto);
     return { ...tokens, usuario: this.paraUsuarioPublico(usuario) };
   }
 

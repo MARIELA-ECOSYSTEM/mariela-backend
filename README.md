@@ -55,6 +55,25 @@ ADMIN_EMAIL=admin@mariela.com ADMIN_NAME="Administradora" ADMIN_PASSWORD="uma-se
 
 Idempotente — rodar de novo com o mesmo e-mail não duplica nem falha, só avisa que o usuário já existe. Nunca imprime a senha em nenhuma saída.
 
+## Desativar um administrador
+
+Também sem rota HTTP. `bun run admin:desativar` grava `ativo: false`, revoga **todas** as sessões (refresh tokens) do usuário e registra o evento `ADMIN_DEACTIVATED` em `eventos_auth` (motivo, executor, sessões revogadas). O documento, a senha, o perfil e todo o histórico são preservados. Só desativa ADMIN.
+
+```bash
+# dry-run (padrão, somente leitura): mostra o estado e o que seria feito
+ADMIN_EMAIL=alvo@exemplo.com bun run admin:desativar --banco <banco-da-MONGODB_URI>
+
+# aplica — a confirmação repete o MESMO e-mail; o motivo é obrigatório
+ADMIN_EMAIL=alvo@exemplo.com ADMIN_DEACTIVATE_CONFIRM=alvo@exemplo.com \
+ADMIN_DEACTIVATE_REASON="motivo" [ADMIN_DEACTIVATE_EXECUTOR="quem executa"] \
+  bun run admin:desativar --banco <banco> --apply [--confirmar-producao <banco>]
+```
+
+- `--banco` precisa ser exatamente o banco da `MONGODB_URI`; `mariela_dev_local` é recusado; em banco protegido (produção ou não reconhecido como teste local) o `--apply` exige também `--confirmar-producao <nome-exato>`. Recusa rodar a partir de `dist/`, com `NODE_ENV=production`, no Render ou em container.
+- Idempotente: reexecutar não duplica o evento; se o usuário já estava inativo, só revoga sessões remanescentes (evento `ADMIN_SESSIONS_REVOKED` quando houver alguma). Uma falha no meio é relatada com a etapa; reexecutar conclui.
+- Login e renovação de sessão passam a ser recusados na hora. **Limitação:** um access token JWT já emitido continua válido até expirar (`JWT_ACCESS_EXPIRES_IN`, padrão 15 min) — o guard é stateless.
+- Não há comando de reativação.
+
 ## Health check
 
 `GET /health` (fora do prefixo `/api/v1`) — responde:

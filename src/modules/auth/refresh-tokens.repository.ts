@@ -38,9 +38,18 @@ export class RefreshTokensRepository {
       .exec();
   }
 
-  /** Resposta a uma reutilização detectada: mata toda a família de sessões daquele usuário. */
-  async revogarTodosDoUsuario(usuarioId: Types.ObjectId, agora: Date): Promise<void> {
-    await this.refreshTokenModel.updateMany({ usuarioId, revogadoEm: null }, { $set: { revogadoEm: agora } }).exec();
+  /**
+   * Resposta a uma reutilização detectada: mata toda a família de sessões daquele usuário. Fase 60.4.3.1.5 — também
+   * usado pela desativação administrativa; devolve quantas sessões foram revogadas por esta chamada.
+   */
+  async revogarTodosDoUsuario(usuarioId: Types.ObjectId, agora: Date): Promise<number> {
+    const resultado = await this.refreshTokenModel.updateMany({ usuarioId, revogadoEm: null }, { $set: { revogadoEm: agora } }).exec();
+    return resultado.modifiedCount;
+  }
+
+  /** Fase 60.4.3.1.5 — sessões ainda utilizáveis do usuário (não revogadas e não expiradas). Somente leitura. */
+  async contarValidosDoUsuario(usuarioId: Types.ObjectId, agora: Date): Promise<number> {
+    return this.refreshTokenModel.countDocuments({ usuarioId, revogadoEm: null, expiresAt: { $gt: agora } }).exec();
   }
 
   /** Só para rastreabilidade da cadeia de rotação — nunca usado em validação. */

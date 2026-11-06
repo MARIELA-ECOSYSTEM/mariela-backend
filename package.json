@@ -18,6 +18,7 @@
     "test:watch": "bun test --watch",
     "seed:admin": "bun src/scripts/seed-admin.ts",
     "admin:reset-password": "bun src/scripts/reset-admin-password.ts",
+    "admin:desativar": "bun src/scripts/desativar-admin.ts",
     "midias:migrar-legado": "bun src/scripts/migrar-midias-legadas.ts",
     "midias:limpar-abandonadas": "bun src/scripts/limpar-uploads-abandonados.ts",
     "midias:verificar-r2": "bun src/scripts/verificar-config-r2.ts"
