@@ -1,47 +1,29 @@
 import "reflect-metadata";
-import { NestFactory } from "@nestjs/core";
-import { AppModule } from "../app.module.js";
-import { AuthService } from "../modules/auth/auth.service.js";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { abrirContextoDoComando, executarComando } from "./seed-admin.comando.js";
 
 /**
- * Cria o primeiro administrador do Backoffice. NÃO existe rota HTTP pública
- * para isto de propósito (§19) — só este script, executado localmente por
- * quem já tem acesso ao servidor/ambiente.
+ * Cria um administrador do Backoffice. NÃO existe rota HTTP pública para isto de propósito (§19) — só este script,
+ * executado localmente pelo operador (a imagem de produção não contém `src/`).
  *
- *   ADMIN_EMAIL=admin@mariela.com ADMIN_NAME="Administradora" ADMIN_PASSWORD="..." bun run seed:admin
+ *   ADMIN_EMAIL=admin@mariela.com ADMIN_NAME="Administradora" bun run seed:admin --banco mariela_test          (dry-run)
+ *   ADMIN_EMAIL=admin@mariela.com ADMIN_NAME="Administradora" ADMIN_PASSWORD="..." ADMIN_SEED_CONFIRM=admin@mariela.com \
+ *     bun run seed:admin --banco mariela_test --apply                                                          (cria)
  *
- * Idempotente: rodar de novo com o mesmo e-mail não duplica nem falha, só
- * avisa que o usuário já existe. Nunca imprime a senha.
+ * Idempotente: com o e-mail já existente não altera nada (código de saída 1). Fase 60.4.3.2.1 — roda num contexto
+ * mínimo (`seed-admin.modulo.ts`, sem `AppModule`, sem criar coleções nem índices) e com as guardas dos comandos
+ * administrativos (`--banco`, dry-run por padrão, `--confirmar-producao` em banco protegido). Nunca imprime a senha.
+ * Ver `seed-admin.comando.ts`.
  */
 async function bootstrap(): Promise<void> {
-  const email = process.env["ADMIN_EMAIL"]?.trim();
-  const nome = process.env["ADMIN_NAME"]?.trim();
-  const senha = process.env["ADMIN_PASSWORD"];
-
-  if (!email || !nome || !senha) {
-    console.error("Defina ADMIN_EMAIL, ADMIN_NAME e ADMIN_PASSWORD antes de rodar este script.");
-    process.exitCode = 1;
-    return;
-  }
-  if (senha.length < 8) {
-    console.error("ADMIN_PASSWORD deve ter pelo menos 8 caracteres.");
-    process.exitCode = 1;
-    return;
-  }
-
-  const app = await NestFactory.createApplicationContext(AppModule, { logger: false });
-  try {
-    const authService = app.get(AuthService);
-    const resultado = await authService.criarAdminSeed({ nome, email, senha });
-
-    if (resultado.criado) {
-      console.log(`Administrador criado: ${resultado.usuario.codigo} <${resultado.usuario.email}>`);
-    } else {
-      console.log(`Já existe um usuário com este e-mail (${resultado.usuario.codigo}) — nada foi feito.`);
-    }
-  } finally {
-    await app.close();
-  }
+  process.exitCode = await executarComando({
+    argv: process.argv.slice(2),
+    variaveis: process.env,
+    escrever: (linha) => console.log(linha),
+    abrirContexto: abrirContextoDoComando,
+    execucao: { arquivoDeEntrada: fileURLToPath(import.meta.url), variaveis: process.env, existeArquivo: existsSync },
+  });
 }
 
 void bootstrap();

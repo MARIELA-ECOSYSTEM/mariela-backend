@@ -8,14 +8,7 @@ import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { Configuration } from "../../config/configuration.js";
 import type { JwtPayload } from "../../common/types/jwt-payload.interface.js";
 import type { Role } from "../../common/types/role.type.js";
-import {
-  ARGON2_MEMORY_COST,
-  ARGON2_TIME_COST,
-  CHAVE_SEQUENCIA_USUARIO,
-  DIGITOS_CODIGO_USUARIO,
-  PREFIXO_CODIGO_USUARIO,
-  REFRESH_TOKEN_BYTES,
-} from "./auth.constants.js";
+import { ARGON2_MEMORY_COST, ARGON2_TIME_COST, REFRESH_TOKEN_BYTES } from "./auth.constants.js";
 import { paraMilissegundos } from "./duracao.util.js";
 import type { LoginDto } from "./dto/login.dto.js";
 import type { RefreshTokenDto } from "./dto/refresh-token.dto.js";
@@ -25,7 +18,8 @@ import type { UsuarioDocument } from "./schemas/usuario.schema.js";
 import type { ResultadoAutenticacao, UsuarioPublico } from "./types/usuario-publico.interface.js";
 import { UsuariosRepository } from "./usuarios.repository.js";
 import { LoginThrottleService } from "./login-throttle.service.js";
-import { SequenciasService } from "../sequencias/sequencias.service.js";
+import { ProvisionamentoAdminService } from "./provisionamento-admin.service.js";
+import { gerarHashDeSenha, normalizarEmailAdmin, paraUsuarioPublico } from "./usuario-admin.util.js";
 
 export interface ContextoRequisicao {
   ip: string | null;
@@ -44,7 +38,7 @@ export class AuthService {
   constructor(
     private readonly usuariosRepository: UsuariosRepository,
     private readonly refreshTokensRepository: RefreshTokensRepository,
-    private readonly sequenciasService: SequenciasService,
+    private readonly provisionamentoAdminService: ProvisionamentoAdminService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService<Configuration>,
     private readonly loginThrottleService: LoginThrottleService,
@@ -56,31 +50,15 @@ export class AuthService {
    * pública para criar usuários nesta etapa. Idempotente: se o e-mail já
    * existir, devolve `criado: false` em vez de lançar erro (o seed pode ser
    * executado de novo com segurança).
+   *
+   * Fase 60.4.3.2.1 — a regra mora em `ProvisionamentoAdminService` (o comando `seed:admin` a usa num contexto
+   * mínimo, sem o `AuthService`); este método só delega, com o mesmo contrato.
    */
   async criarAdminSeed(dados: { nome: string; email: string; senha: string }): Promise<{
     criado: boolean;
     usuario: UsuarioPublico;
   }> {
-    const emailNormalizado = this.normalizarEmail(dados.email);
-    const existente = await this.usuariosRepository.encontrarPorEmail(emailNormalizado);
-    if (existente) return { criado: false, usuario: this.paraUsuarioPublico(existente) };
-
-    const codigo = await this.sequenciasService.proximoCodigo(
-      CHAVE_SEQUENCIA_USUARIO,
-      PREFIXO_CODIGO_USUARIO,
-      DIGITOS_CODIGO_USUARIO,
-    );
-    const senhaHash = await this.hashSenha(dados.senha);
-    const usuario = await this.usuariosRepository.criar({
-      codigo,
-      nome: dados.nome.trim(),
-      email: emailNormalizado,
-      senhaHash,
-      role: "ADMIN",
-      ativo: true,
-      ultimoLoginEm: null,
-    });
-    return { criado: true, usuario: this.paraUsuarioPublico(usuario) };
+    return this.provisionamentoAdminService.criar(dados);
   }
 
   /**
@@ -263,23 +241,17 @@ export class AuthService {
     return createHmac("sha256", segredo).update(tokenBruto).digest("hex");
   }
 
+  /** Fase 60.4.3.2.1 — as três regras abaixo vivem em `usuario-admin.util.ts`, compartilhadas com os comandos locais. */
   private async hashSenha(senha: string): Promise<string> {
-    return Bun.password.hash(senha, { algorithm: "argon2id", memoryCost: ARGON2_MEMORY_COST, timeCost: ARGON2_TIME_COST });
+    return gerarHashDeSenha(senha);
   }
 
   private normalizarEmail(valor: string): string {
-    return valor.trim().toLowerCase();
+    return normalizarEmailAdmin(valor);
   }
 
   private paraUsuarioPublico(usuario: UsuarioDocument): UsuarioPublico {
-    return {
-      id: usuario.id,
-      codigo: usuario.codigo,
-      nome: usuario.nome,
-      email: usuario.email,
-      tipo: usuario.role as Role,
-      ativo: usuario.ativo,
-    };
+    return paraUsuarioPublico(usuario);
   }
 
   private async registrarEvento(

@@ -91,6 +91,77 @@ export function classificarAmbiente(analise: AnaliseUri): Ambiente {
   return BANCOS_DE_TESTE.has(analise.banco) && analise.local ? "teste" : "protegido";
 }
 
+/**
+ * Fase 60.4.3.2.1 — argumentos e autorização dos comandos administrativos de ESCRITA (`admin:desativar`,
+ * `seed:admin`), extraídos sem mudança de `desativar-admin.comando.ts` (mesma regra de
+ * `processar-remocoes-pendentes`): `--banco <nome>` obrigatório e igual ao banco da URI; sem `--apply`, dry-run;
+ * em banco protegido, `--apply` só com `--confirmar-producao <nome-exato>`.
+ */
+export interface OpcoesDeEscrita {
+  banco: string;
+  aplicar: boolean;
+  confirmacaoProducao: string | null;
+}
+
+const PARAMETROS_DE_ESCRITA = new Set(["--banco", "--apply", "--confirmar-producao"]);
+
+export function interpretarArgumentosDeEscrita(argv: readonly string[]): Resultado<OpcoesDeEscrita> {
+  let banco: string | null = null;
+  let aplicar = false;
+  let confirmacaoProducao: string | null = null;
+  const vistos = new Set<string>();
+  for (let indice = 0; indice < argv.length; indice += 1) {
+    const argumento = argv[indice] ?? "";
+    if (!PARAMETROS_DE_ESCRITA.has(argumento)) return { ok: false, erro: `Parâmetro desconhecido ${descreverArgumento(argumento)}.` };
+    if (vistos.has(argumento)) return { ok: false, erro: `Parâmetro repetido "${argumento}".` };
+    vistos.add(argumento);
+    if (argumento === "--apply") {
+      aplicar = true;
+      continue;
+    }
+    const valor = argv[indice + 1];
+    if (valor === undefined || valor.startsWith("--") || valor.trim() === "") return { ok: false, erro: `O parâmetro "${argumento}" exige um valor.` };
+    indice += 1;
+    if (argumento === "--banco") banco = valor;
+    else confirmacaoProducao = valor;
+  }
+  if (banco === null) return { ok: false, erro: 'O parâmetro "--banco <nome-do-banco>" é obrigatório.' };
+  if (!NOME_DE_BANCO_VALIDO.test(banco)) return { ok: false, erro: "Nome de banco inválido em --banco (use só letras, números, _ ou -)." };
+  if (confirmacaoProducao !== null && !aplicar) return { ok: false, erro: '"--confirmar-producao" só pode ser usado junto com "--apply".' };
+  return { ok: true, valor: { banco, aplicar, confirmacaoProducao } };
+}
+
+export interface ExecucaoAutorizada {
+  banco: string;
+  uri: string;
+  ambiente: Ambiente;
+  modo: "dry-run" | "apply";
+}
+
+/** Valida banco e autorização ANTES de qualquer conexão. Nunca devolve nem ecoa a URI. */
+export function validarAmbienteDeEscrita(opcoes: OpcoesDeEscrita, uri: string | undefined): Resultado<ExecucaoAutorizada> {
+  if (opcoes.banco === BANCO_RECUSADO) return { ok: false, erro: `O banco "${BANCO_RECUSADO}" é recusado por este comando.` };
+  if (!uri || uri.trim() === "") return { ok: false, erro: "MONGODB_URI não está definida no ambiente." };
+  const analise = analisarUri(uri);
+  if (!analise) return { ok: false, erro: "MONGODB_URI não tem um nome de banco reconhecível no path (a URI não é exibida)." };
+  if (analise.banco === BANCO_RECUSADO) return { ok: false, erro: `A MONGODB_URI configurada aponta para "${BANCO_RECUSADO}", recusado por este comando.` };
+  if (analise.banco !== opcoes.banco) {
+    return { ok: false, erro: `O banco informado em --banco ("${opcoes.banco}") é diferente do banco da MONGODB_URI configurada ("${analise.banco}").` };
+  }
+  const ambiente = classificarAmbiente(analise);
+  if (opcoes.confirmacaoProducao !== null) {
+    if (ambiente === "teste") return { ok: false, erro: '"--confirmar-producao" não se aplica a um banco de teste local.' };
+    if (opcoes.confirmacaoProducao !== opcoes.banco) return { ok: false, erro: '"--confirmar-producao" não corresponde EXATAMENTE ao banco selecionado.' };
+  }
+  if (opcoes.aplicar && ambiente === "protegido" && opcoes.confirmacaoProducao !== opcoes.banco) {
+    return {
+      ok: false,
+      erro: `Escrita em banco protegido ("${opcoes.banco}") exige "--apply" E "--confirmar-producao ${opcoes.banco}". "--apply" sozinho não autoriza.`,
+    };
+  }
+  return { ok: true, valor: { banco: opcoes.banco, uri, ambiente, modo: opcoes.aplicar ? "apply" : "dry-run" } };
+}
+
 /** Remove a URI (e usuário/senha embutidos) de qualquer texto antes de exibi-lo. */
 export function ocultarSegredos(texto: string, uri: string): string {
   let resultado = texto;

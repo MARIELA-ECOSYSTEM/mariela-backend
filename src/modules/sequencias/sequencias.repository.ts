@@ -24,4 +24,10 @@ export class SequenciasRepository {
       .exec();
     return documento!.valor;
   }
+
+  /** Fase 60.4.3.2.1 — valor atual da sequência, SEM incrementar (0 se ela ainda não existe). Somente leitura. */
+  async valorAtual(chave: string): Promise<number> {
+    const documento = await this.sequenciaModel.findById(chave).lean().exec();
+    return documento?.valor ?? 0;
+  }
 }

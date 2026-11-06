@@ -26,4 +26,13 @@ export class SequenciasService {
   async proximoValor(chave: string): Promise<number> {
     return this.sequenciasRepository.proximoValor(chave);
   }
+
+  /**
+   * Fase 60.4.3.2.1 — PREVISÃO do próximo código, sem reservá-lo (somente leitura; usada por dry-runs). Outra
+   * operação pode consumir o número antes; o código real só é definido por `proximoCodigo`.
+   */
+  async previsaoDoProximoCodigo(chave: string, prefixo: string, digitos = 4): Promise<string> {
+    const atual = await this.sequenciasRepository.valorAtual(chave);
+    return `${prefixo}-${String(atual + 1).padStart(digitos, "0")}`;
+  }
 }

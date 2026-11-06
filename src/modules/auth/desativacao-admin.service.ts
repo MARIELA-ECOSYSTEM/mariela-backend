@@ -4,15 +4,14 @@ import type { Model } from "mongoose";
 import { RefreshTokensRepository } from "./refresh-tokens.repository.js";
 import { EventoAuth, type EventoAuthDocument } from "./schemas/evento-auth.schema.js";
 import type { UsuarioDocument } from "./schemas/usuario.schema.js";
+import { normalizarEmailAdmin } from "./usuario-admin.util.js";
 import { UsuariosRepository } from "./usuarios.repository.js";
 
 /** Valor de `EventoAuth.origem` dos eventos gravados por este serviço. */
 export const ORIGEM_DESATIVACAO_ADMIN = "comando:admin:desativar";
 
-/** Mesma regra de `AuthService.normalizarEmail` (trim + minúsculas): o e-mail gravado já está normalizado. */
-export function normalizarEmailAdmin(email: string): string {
-  return email.trim().toLowerCase();
-}
+/** Mesma regra do login (trim + minúsculas), compartilhada em `usuario-admin.util.ts`. */
+export { normalizarEmailAdmin };
 
 /** Identificação NÃO sensível do usuário alvo (nunca senha, hash ou token). */
 export interface AlvoDesativacao {

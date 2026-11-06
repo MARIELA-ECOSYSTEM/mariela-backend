@@ -47,13 +47,21 @@ A suíte é majoritariamente de integração (MongoDB real via `mongodb://127.0.
 
 ## Primeiro administrador (seed)
 
-Não existe rota HTTP para criar o primeiro usuário ADMIN, de propósito. Use o script local:
+Não existe rota HTTP para criar usuário ADMIN, de propósito. Use o script local:
 
 ```bash
-ADMIN_EMAIL=admin@mariela.com ADMIN_NAME="Administradora" ADMIN_PASSWORD="uma-senha-forte" bun run seed:admin
+# dry-run (padrão, somente leitura): diz se o e-mail já existe e qual seria o código USR-####
+MONGODB_URI=... ADMIN_EMAIL=admin@mariela.com ADMIN_NAME="Administradora" bun run seed:admin --banco <banco-da-MONGODB_URI>
+
+# cria — a confirmação repete o MESMO e-mail
+MONGODB_URI=... ADMIN_EMAIL=admin@mariela.com ADMIN_NAME="Administradora" ADMIN_PASSWORD="uma-senha-forte" \
+ADMIN_SEED_CONFIRM=admin@mariela.com bun run seed:admin --banco <banco> --apply [--confirmar-producao <banco>]
 ```
 
-Idempotente — rodar de novo com o mesmo e-mail não duplica nem falha, só avisa que o usuário já existe. Nunca imprime a senha em nenhuma saída.
+- **Não lê o `.env`** (`bun --no-env-file`): `MONGODB_URI` e as `ADMIN_*` vêm só do processo — uma senha esquecida num `.env` nunca é usada sem querer.
+- Mesmas guardas de `admin:desativar`: `--banco` igual ao banco da URI, `mariela_dev_local` recusado, dry-run por padrão, `--confirmar-producao <nome-exato>` para escrever em banco protegido, recusa em `dist/`/`NODE_ENV=production`/Render/container.
+- Contexto mínimo (Fase 60.4.3.2.1): só os models `usuarios` e `sequencias`, sem `AppModule`, sem criar coleções nem índices (`autoIndex`/`autoCreate` desligados, nenhum `syncIndexes`). O `--apply` escreve só o incremento da sequência `usuario` e o documento do usuário.
+- Idempotente — com o e-mail já existente não altera nada (nem consome a sequência) e sai com **código 1**. Senha de 8 a 200 caracteres; nunca impressa. Códigos de saída: `0` criado (ou seria), `1` já existe, `2` recusado antes de conectar, `3` falha.
 
 ## Desativar um administrador
 
@@ -69,6 +77,7 @@ ADMIN_DEACTIVATE_REASON="motivo" [ADMIN_DEACTIVATE_EXECUTOR="quem executa"] \
   bun run admin:desativar --banco <banco> --apply [--confirmar-producao <banco>]
 ```
 
+- Também não lê o `.env` (`bun --no-env-file`): `MONGODB_URI` e as `ADMIN_*` vêm só do processo.
 - `--banco` precisa ser exatamente o banco da `MONGODB_URI`; `mariela_dev_local` é recusado; em banco protegido (produção ou não reconhecido como teste local) o `--apply` exige também `--confirmar-producao <nome-exato>`. Recusa rodar a partir de `dist/`, com `NODE_ENV=production`, no Render ou em container.
 - Idempotente: reexecutar não duplica o evento; se o usuário já estava inativo, só revoga sessões remanescentes (evento `ADMIN_SESSIONS_REVOKED` quando houver alguma). Uma falha no meio é relatada com a etapa; reexecutar conclui.
 - Login e renovação de sessão passam a ser recusados na hora. **Limitação:** um access token JWT já emitido continua válido até expirar (`JWT_ACCESS_EXPIRES_IN`, padrão 15 min) — o guard é stateless.

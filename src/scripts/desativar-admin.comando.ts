@@ -5,21 +5,19 @@ import type { Connection } from "mongoose";
 import {
   DesativacaoAdminService,
   FalhaDesativacaoAdmin,
-  normalizarEmailAdmin,
   type AvaliacaoDesativacao,
   type EtapaDesativacao,
   type ResultadoDesativacao,
 } from "../modules/auth/desativacao-admin.service.js";
+import { FORMATO_EMAIL_ADMIN, normalizarEmailAdmin, TAMANHO_MAXIMO_EMAIL } from "../modules/auth/usuario-admin.util.js";
 import {
-  analisarUri,
-  BANCO_RECUSADO,
-  classificarAmbiente,
-  descreverArgumento,
-  NOME_DE_BANCO_VALIDO,
+  interpretarArgumentosDeEscrita,
   ocultarSegredos,
+  validarAmbienteDeEscrita,
   verificarExecucaoLocal,
-  type Ambiente,
   type AmbienteDeExecucao,
+  type ExecucaoAutorizada,
+  type OpcoesDeEscrita,
   type Resultado,
 } from "./comando-local.util.js";
 import { ComandoDesativarAdminModule } from "./desativar-admin.modulo.js";
@@ -60,41 +58,12 @@ export const USO = [
 ].join("\n");
 
 const ENTRADA_LOCAL_ESPERADA = "src/scripts/desativar-admin.ts";
-const PARAMETROS_CONHECIDOS = new Set(["--banco", "--apply", "--confirmar-producao"]);
 
-export const LIMITES = { emailMaximo: 254, motivoMinimo: 5, motivoMaximo: 500, executorMaximo: 120 } as const;
+export const LIMITES = { emailMaximo: TAMANHO_MAXIMO_EMAIL, motivoMinimo: 5, motivoMaximo: 500, executorMaximo: 120 } as const;
 
-export interface OpcoesComando {
-  banco: string;
-  aplicar: boolean;
-  confirmacaoProducao: string | null;
-}
-
-export function interpretarArgumentos(argv: readonly string[]): Resultado<OpcoesComando> {
-  let banco: string | null = null;
-  let aplicar = false;
-  let confirmacaoProducao: string | null = null;
-  const vistos = new Set<string>();
-  for (let indice = 0; indice < argv.length; indice += 1) {
-    const argumento = argv[indice] ?? "";
-    if (!PARAMETROS_CONHECIDOS.has(argumento)) return { ok: false, erro: `Parâmetro desconhecido ${descreverArgumento(argumento)}.` };
-    if (vistos.has(argumento)) return { ok: false, erro: `Parâmetro repetido "${argumento}".` };
-    vistos.add(argumento);
-    if (argumento === "--apply") {
-      aplicar = true;
-      continue;
-    }
-    const valor = argv[indice + 1];
-    if (valor === undefined || valor.startsWith("--") || valor.trim() === "") return { ok: false, erro: `O parâmetro "${argumento}" exige um valor.` };
-    indice += 1;
-    if (argumento === "--banco") banco = valor;
-    else confirmacaoProducao = valor;
-  }
-  if (banco === null) return { ok: false, erro: 'O parâmetro "--banco <nome-do-banco>" é obrigatório.' };
-  if (!NOME_DE_BANCO_VALIDO.test(banco)) return { ok: false, erro: "Nome de banco inválido em --banco (use só letras, números, _ ou -)." };
-  if (confirmacaoProducao !== null && !aplicar) return { ok: false, erro: '"--confirmar-producao" só pode ser usado junto com "--apply".' };
-  return { ok: true, valor: { banco, aplicar, confirmacaoProducao } };
-}
+/** Fase 60.4.3.2.1 — argumentos e autorização compartilhados com `seed:admin` (`comando-local.util.ts`), sem mudança de regra. */
+export { interpretarArgumentosDeEscrita as interpretarArgumentos, validarAmbienteDeEscrita as validarAmbiente };
+export type { ExecucaoAutorizada, OpcoesDeEscrita as OpcoesComando };
 
 export interface PedidoDesativacao {
   email: string;
@@ -102,14 +71,11 @@ export interface PedidoDesativacao {
   executor: string | null;
 }
 
-/** Formato mínimo de e-mail: um único `@`, partes não vazias, sem espaços. */
-const FORMATO_EMAIL = /^[^\s@]+@[^\s@]+$/;
-
 /** Valida as variáveis `ADMIN_*`. O e-mail do alvo pode aparecer na saída (não é segredo); motivo e executor não são ecoados em erros. */
 export function interpretarVariaveis(variaveis: Readonly<Record<string, string | undefined>>, aplicar: boolean): Resultado<PedidoDesativacao> {
   const email = normalizarEmailAdmin(variaveis["ADMIN_EMAIL"] ?? "");
   if (!email) return { ok: false, erro: "Defina ADMIN_EMAIL com o e-mail do ADMIN a desativar." };
-  if (email.length > LIMITES.emailMaximo || !FORMATO_EMAIL.test(email)) return { ok: false, erro: "ADMIN_EMAIL não tem formato de e-mail válido." };
+  if (email.length > LIMITES.emailMaximo || !FORMATO_EMAIL_ADMIN.test(email)) return { ok: false, erro: "ADMIN_EMAIL não tem formato de e-mail válido." };
 
   const executorBruto = (variaveis["ADMIN_DEACTIVATE_EXECUTOR"] ?? "").trim();
   if (executorBruto.length > LIMITES.executorMaximo) return { ok: false, erro: `ADMIN_DEACTIVATE_EXECUTOR excede ${LIMITES.executorMaximo} caracteres.` };
@@ -128,37 +94,6 @@ export function interpretarVariaveis(variaveis: Readonly<Record<string, string |
     return { ok: false, erro: `--apply exige ADMIN_DEACTIVATE_REASON com ${LIMITES.motivoMinimo} a ${LIMITES.motivoMaximo} caracteres (motivo da desativação).` };
   }
   return { ok: true, valor: { email, motivo, executor } };
-}
-
-export interface ExecucaoAutorizada {
-  banco: string;
-  uri: string;
-  ambiente: Ambiente;
-  modo: "dry-run" | "apply";
-}
-
-/** Mesma regra de `processar-remocoes-pendentes`: em banco protegido, `--apply` só com `--confirmar-producao <nome-exato>`. */
-export function validarAmbiente(opcoes: OpcoesComando, uri: string | undefined): Resultado<ExecucaoAutorizada> {
-  if (opcoes.banco === BANCO_RECUSADO) return { ok: false, erro: `O banco "${BANCO_RECUSADO}" é recusado por este comando.` };
-  if (!uri || uri.trim() === "") return { ok: false, erro: "MONGODB_URI não está definida no ambiente." };
-  const analise = analisarUri(uri);
-  if (!analise) return { ok: false, erro: "MONGODB_URI não tem um nome de banco reconhecível no path (a URI não é exibida)." };
-  if (analise.banco === BANCO_RECUSADO) return { ok: false, erro: `A MONGODB_URI configurada aponta para "${BANCO_RECUSADO}", recusado por este comando.` };
-  if (analise.banco !== opcoes.banco) {
-    return { ok: false, erro: `O banco informado em --banco ("${opcoes.banco}") é diferente do banco da MONGODB_URI configurada ("${analise.banco}").` };
-  }
-  const ambiente = classificarAmbiente(analise);
-  if (opcoes.confirmacaoProducao !== null) {
-    if (ambiente === "teste") return { ok: false, erro: '"--confirmar-producao" não se aplica a um banco de teste local.' };
-    if (opcoes.confirmacaoProducao !== opcoes.banco) return { ok: false, erro: '"--confirmar-producao" não corresponde EXATAMENTE ao banco selecionado.' };
-  }
-  if (opcoes.aplicar && ambiente === "protegido" && opcoes.confirmacaoProducao !== opcoes.banco) {
-    return {
-      ok: false,
-      erro: `Escrita em banco protegido ("${opcoes.banco}") exige "--apply" E "--confirmar-producao ${opcoes.banco}". "--apply" sozinho não autoriza.`,
-    };
-  }
-  return { ok: true, valor: { banco: opcoes.banco, uri, ambiente, modo: opcoes.aplicar ? "apply" : "dry-run" } };
 }
 
 export interface ContextoDesativacao {
@@ -264,7 +199,7 @@ export async function executarComando(dependencias: DependenciasComando): Promis
     escrever("Nenhuma conexão foi aberta: nada foi lido nem alterado.");
     return CODIGOS_DE_SAIDA.recusado;
   }
-  const argumentos = interpretarArgumentos(dependencias.argv);
+  const argumentos = interpretarArgumentosDeEscrita(dependencias.argv);
   if (!argumentos.ok) {
     escrever(`ERRO: ${argumentos.erro}`);
     escrever(USO);
@@ -277,7 +212,7 @@ export async function executarComando(dependencias: DependenciasComando): Promis
     return CODIGOS_DE_SAIDA.recusado;
   }
   const uri = variaveis["MONGODB_URI"];
-  const autorizacao = validarAmbiente(argumentos.valor, uri);
+  const autorizacao = validarAmbienteDeEscrita(argumentos.valor, uri);
   if (!autorizacao.ok) {
     escrever(`ERRO: ${autorizacao.erro}`);
     escrever("Nenhuma conexão foi aberta: nada foi lido nem alterado.");

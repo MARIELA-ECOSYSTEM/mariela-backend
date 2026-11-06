@@ -4,6 +4,7 @@ import { SequenciasModule } from "../sequencias/sequencias.module.js";
 import { AuthController } from "./auth.controller.js";
 import { AuthService } from "./auth.service.js";
 import { LoginThrottleService } from "./login-throttle.service.js";
+import { ProvisionamentoAdminService } from "./provisionamento-admin.service.js";
 import { RefreshTokensRepository } from "./refresh-tokens.repository.js";
 import { EventoAuth, EventoAuthSchema } from "./schemas/evento-auth.schema.js";
 import { RefreshToken, RefreshTokenSchema } from "./schemas/refresh-token.schema.js";
@@ -20,7 +21,7 @@ import { UsuariosRepository } from "./usuarios.repository.js";
     SequenciasModule,
   ],
   controllers: [AuthController],
-  providers: [AuthService, UsuariosRepository, RefreshTokensRepository, LoginThrottleService],
+  providers: [AuthService, ProvisionamentoAdminService, UsuariosRepository, RefreshTokensRepository, LoginThrottleService],
   // O script de seed (`bun run seed:admin`) usa `AuthService` fora de um controller.
   exports: [AuthService],
 })
