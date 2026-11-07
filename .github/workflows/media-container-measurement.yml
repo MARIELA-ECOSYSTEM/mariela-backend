@@ -145,10 +145,10 @@ jobs:
             if estado=$(docker inspect -f '{{.State.Running}}|{{json .State.Health}}' "$1" 2>/dev/null); then
               rodando=${estado%%|*}
               health=${estado#*|}
-              printf '{"t":%s,"health":%s}\\n' "$t" "$health" >> "$2"
+              printf '{"t":%s,"health":%s}\n' "$t" "$health" >> "$2"
               printf '%s' "$rodando"
             else
-              printf '{"t":%s,"health":null,"erro":"docker inspect falhou"}\\n' "$t" >> "$2"
+              printf '{"t":%s,"health":null,"erro":"docker inspect falhou"}\n' "$t" >> "$2"
               return 1
             fi
           }
@@ -229,7 +229,7 @@ jobs:
             docker logs "$api1" > "$dir/cenario1-api.log" 2>&1 || true
             # Ordem garantida: para o coletor (espera a iteração em curso) → amostra FINAL (contêiner ainda existe) → remove → consolida.
             parar_coletor "$coletor" "$RUNNER_TEMP/parar-coletor1-$modo"
-            amostrar_saude "$api1" "$dir/cenario1-health.ndjson"
+            amostrar_saude "$api1" "$dir/cenario1-health.ndjson" >/dev/null
             docker rm -f "$api1"
             consolidar_saude "$dir" cenario1-health.ndjson cenario1-healthcheck-consolidado.json "$esperado"; rc=$?
             if [ "$rc" -ne 0 ]; then
@@ -257,7 +257,7 @@ jobs:
             docker inspect "$api2" --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} RestartCount={{.RestartCount}} Health={{if .State.Health}}{{.State.Health.Status}}/falhas={{.State.Health.FailingStreak}}/execucoes_no_log={{len .State.Health.Log}}{{else}}desabilitado{{end}}' | tee -a "$dir/cenarios-2-6.txt"
             docker logs "$api2" > "$dir/api-medicao.log" 2>&1 || true
             parar_coletor "$coletor" "$RUNNER_TEMP/parar-coletor2-$modo"
-            amostrar_saude "$api2" "$dir/api-medicao-health.ndjson"
+            amostrar_saude "$api2" "$dir/api-medicao-health.ndjson" >/dev/null
             docker rm -f "$sonda" "$api2" "$mongo" || true
             consolidar_saude "$dir" api-medicao-health.ndjson api-medicao-healthcheck-consolidado.json "$esperado" resultado.json; rc=$?
             if [ "$rc" -ne 0 ]; then
