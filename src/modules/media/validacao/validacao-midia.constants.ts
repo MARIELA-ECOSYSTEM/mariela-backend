@@ -26,8 +26,12 @@ export const LIMITES_VALIDACAO_MIDIA = {
 /** Prazo TOTAL de uma validação (espera na fila + subprocesso). Esgotado: o subprocesso é encerrado e a resposta é 503. */
 export const PRAZO_VALIDACAO_MIDIA_MS = 10_000;
 
-/** Validações simultâneas por instância da API (as demais esperam na fila, dentro do prazo total). */
-export const CONCORRENCIA_VALIDACAO_MIDIA = 2;
+/**
+ * Validações simultâneas por instância da API (as demais esperam na fila, dentro do prazo total).
+ * Fase 60.4.3.4.3 — reduzido de 2 para 1: a instância do Render tem 512 MiB e duas validações pesadas (25 MP)
+ * mediram ~490–510 MiB no total (Windows, Fase 60.4.3.4.2). Com 1, o pior caso medido fica em ~380 MiB.
+ */
+export const CONCORRENCIA_VALIDACAO_MIDIA = 1;
 
 /** Teto de bytes aceitos pelo subprocesso na entrada (o maior limite de tamanho, 15 MiB). */
 export const BYTES_MAXIMOS_VALIDACAO = 15 * 1024 * 1024;

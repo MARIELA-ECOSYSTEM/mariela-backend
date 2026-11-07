@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { fileURLToPath } from "node:url";
 import { ApiException } from "../../../common/exceptions/api.exception.js";
 import { arquivoDoFormato, fixtureDeMidia, FIXTURES_MIDIA } from "../../../test-utils/media-storage-falso.util.js";
@@ -30,9 +30,9 @@ describe("ValidadorMidiaService — subprocesso isolado (Fase 60.4.3.4.1)", () =
     delete process.env[SEGREDO];
   });
 
-  it("padrões aprovados: prazo total de 10 s e 2 validações simultâneas", () => {
+  it("padrões aprovados: prazo total de 10 s e 1 validação simultânea (Fase 60.4.3.4.3; era 2)", () => {
     expect(PRAZO_VALIDACAO_MIDIA_MS).toBe(10_000);
-    expect(CONCORRENCIA_VALIDACAO_MIDIA).toBe(2);
+    expect(CONCORRENCIA_VALIDACAO_MIDIA).toBe(1);
   });
 
   it("script real: aceita os 5 formatos e o MP4 fragmentado; recusa o N8 (sem lançar exceção)", async () => {
@@ -80,8 +80,10 @@ describe("ValidadorMidiaService — subprocesso isolado (Fase 60.4.3.4.1)", () =
     expect(erro.code).toBe("MEDIA_VALIDATION_UNAVAILABLE");
   });
 
-  it("concorrência: com 6 validações simultâneas, nunca mais de 2 subprocessos ao mesmo tempo; todas concluem", async () => {
-    const validador = new ValidadorMidiaService({ script: falso("processo-lento") });
+  // Fase 60.4.3.4.3 — o padrão passou a 1; este teste fixa `concorrencia: 2` explicitamente para continuar provando que o
+  // semáforo respeita um limite N > 1 (a asserção original, "nunca mais de 2", é mantida). O padrão 1 é coberto abaixo.
+  it("concorrência (semáforo com limite explícito 2): com 6 validações simultâneas, nunca mais de 2 subprocessos ao mesmo tempo; todas concluem", async () => {
+    const validador = new ValidadorMidiaService({ script: falso("processo-lento"), concorrencia: 2 });
     let maximo = 0;
     const monitor = setInterval(() => {
       maximo = Math.max(maximo, validador.emExecucao);
@@ -117,5 +119,112 @@ describe("ValidadorMidiaService — subprocesso isolado (Fase 60.4.3.4.1)", () =
     const nomes = resultado.valido ? [] : resultado.detalhe.split(",");
     expect(nomes).not.toContain(SEGREDO);
     for (const proibida of ["MONGODB_URI", "JWT_SECRET", "JWT_ACCESS_SECRET", "R2_SECRET_ACCESS_KEY", "R2_ACCESS_KEY_ID"]) expect(nomes).not.toContain(proibida);
+  });
+
+  /**
+   * Fase 60.4.3.4.3 — UMA validação por vez (o padrão, sem a opção `concorrencia`). O script `processo-roteiro` muda de
+   * comportamento pelo MIME, então a MESMA instância (a mesma fila) alterna sucesso, recusa, erro e travamento.
+   * `teste/carimbo` devolve o início e o fim medidos DENTRO do subprocesso: a prova de que os subprocessos não se sobrepõem.
+   */
+  describe("limite padrão de uma validação simultânea (Fase 60.4.3.4.3)", () => {
+    const BYTES = arquivoDoFormato("image/jpeg", 1024);
+    const intervalo = (resultado: Awaited<ReturnType<ValidadorMidiaService["validar"]>>): [number, number] => {
+      if (resultado.valido) throw new Error("esperava o carimbo do subprocesso");
+      const [inicio, fim] = resultado.detalhe.split("-").map(Number);
+      return [inicio!, fim!];
+    };
+
+    it("uma validação executa normalmente e devolve a vaga", async () => {
+      const validador = new ValidadorMidiaService({ script: falso("processo-roteiro") });
+      expect(await validador.validar("image/jpeg", BYTES)).toMatchObject({ valido: true });
+      expect(validador.emExecucao).toBe(0);
+    });
+
+    it("3 solicitações simultâneas: a 2ª só começa depois que a 1ª termina, a 3ª depois da 2ª; nunca mais de 1 ativa", async () => {
+      const validador = new ValidadorMidiaService({ script: falso("processo-roteiro") });
+      let maximo = 0;
+      const monitor = setInterval(() => {
+        maximo = Math.max(maximo, validador.emExecucao);
+      }, 2);
+      let resultados: Awaited<ReturnType<ValidadorMidiaService["validar"]>>[];
+      try {
+        resultados = await Promise.all([1, 2, 3].map(() => validador.validar("teste/carimbo", BYTES)));
+      } finally {
+        clearInterval(monitor);
+      }
+      const intervalos = resultados.map(intervalo).sort((a, b) => a[0] - b[0]);
+      expect(intervalos[1]![0]).toBeGreaterThanOrEqual(intervalos[0]![1]);
+      expect(intervalos[2]![0]).toBeGreaterThanOrEqual(intervalos[1]![1]);
+      expect(maximo).toBe(1);
+      expect(validador.emExecucao).toBe(0);
+    });
+
+    it("a fila libera após sucesso, arquivo inválido e erro do subprocesso: as solicitações seguintes executam", async () => {
+      const validador = new ValidadorMidiaService({ script: falso("processo-roteiro") });
+      const [sucesso, invalido, erro, depois] = await Promise.allSettled([
+        validador.validar("image/jpeg", BYTES),
+        validador.validar("teste/carimbo", BYTES),
+        validador.validar("teste/quebrar", BYTES),
+        validador.validar("image/jpeg", BYTES),
+      ]);
+      expect(sucesso).toMatchObject({ status: "fulfilled", value: { valido: true } });
+      expect(invalido).toMatchObject({ status: "fulfilled", value: { valido: false, motivo: "estrutura" } });
+      expect(erro).toMatchObject({ status: "rejected", reason: { code: "MEDIA_VALIDATION_UNAVAILABLE" } });
+      expect(depois).toMatchObject({ status: "fulfilled", value: { valido: true } });
+      expect(validador.emExecucao).toBe(0);
+    });
+
+    it("a fila libera após o arquivo inválido REAL (N8, script de produção)", async () => {
+      const validador = new ValidadorMidiaService();
+      const [n8, valido] = await Promise.all([validador.validar("image/jpeg", fixtureDeMidia(FIXTURES_MIDIA.n8)), validador.validar("image/jpeg", BYTES)]);
+      expect(n8).toMatchObject({ valido: false, motivo: "estrutura" });
+      expect(valido.valido).toBe(true);
+      expect(validador.emExecucao).toBe(0);
+    });
+
+    it("a fila libera após timeout: o subprocesso travado é encerrado no prazo e a próxima validação executa", async () => {
+      const validador = new ValidadorMidiaService({ script: falso("processo-roteiro"), prazoMs: 600 });
+      const inicio = performance.now();
+      const erro = await erroApi(validador.validar("teste/travar", BYTES));
+      expect(erro.code).toBe("MEDIA_VALIDATION_UNAVAILABLE");
+      expect(performance.now() - inicio).toBeGreaterThanOrEqual(550);
+      expect(validador.emExecucao).toBe(0);
+      expect(await validador.validar("image/jpeg", BYTES)).toMatchObject({ valido: true });
+      expect(validador.emExecucao).toBe(0);
+    });
+
+    it("a fila libera após falha de inicialização do subprocesso (Bun.spawn lança): a próxima validação executa", async () => {
+      const validador = new ValidadorMidiaService({ script: falso("processo-roteiro") });
+      const espiao = spyOn(Bun, "spawn").mockImplementationOnce(() => {
+        throw new Error("spawn ENOENT (simulado)");
+      });
+      try {
+        const [falha, depois] = await Promise.allSettled([validador.validar("image/jpeg", BYTES), validador.validar("image/jpeg", BYTES)]);
+        expect(falha).toMatchObject({ status: "rejected", reason: { code: "MEDIA_VALIDATION_UNAVAILABLE" } });
+        expect(depois).toMatchObject({ status: "fulfilled", value: { valido: true } });
+      } finally {
+        espiao.mockRestore();
+      }
+      expect(validador.emExecucao).toBe(0);
+    });
+
+    it("solicitações excedentes não provocam deadlock: 6 mistas (sucesso, recusa, erro, timeout) se resolvem e a fila esvazia", async () => {
+      const validador = new ValidadorMidiaService({ script: falso("processo-roteiro"), prazoMs: 4_000 });
+      const inicio = performance.now();
+      const tipos = ["image/jpeg", "teste/quebrar", "teste/carimbo", "image/jpeg", "teste/quebrar", "image/jpeg"];
+      const resultados = await Promise.allSettled(tipos.map((tipo) => validador.validar(tipo, BYTES)));
+      expect(resultados.map((resultado) => resultado.status)).toEqual(["fulfilled", "rejected", "fulfilled", "fulfilled", "rejected", "fulfilled"]);
+      expect(performance.now() - inicio).toBeLessThan(4_000);
+      expect(validador.emExecucao).toBe(0);
+    });
+
+    it("prazo vencido NA FILA (vaga ocupada por um subprocesso travado) é 503 sem iniciar subprocesso; depois a fila volta a andar", async () => {
+      const validador = new ValidadorMidiaService({ script: falso("processo-roteiro"), prazoMs: 500 });
+      const [travado, naFila] = await Promise.allSettled([validador.validar("teste/travar", BYTES), validador.validar("image/jpeg", BYTES)]);
+      expect(travado).toMatchObject({ status: "rejected", reason: { code: "MEDIA_VALIDATION_UNAVAILABLE" } });
+      expect(naFila).toMatchObject({ status: "rejected", reason: { code: "MEDIA_VALIDATION_UNAVAILABLE" } });
+      expect(validador.emExecucao).toBe(0);
+      expect(await validador.validar("image/jpeg", BYTES)).toMatchObject({ valido: true });
+    });
   });
 });
