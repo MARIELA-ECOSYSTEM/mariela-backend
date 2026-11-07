@@ -7,7 +7,8 @@
 // (RSS da API e de cada subprocesso validador). Sem segredos: o ambiente é fictício (definido no workflow).
 //
 // Variáveis: MEDICAO_DIST (/app/dist), MEDICAO_ARQUIVOS (/saida/arquivos), MEDICAO_SAIDA (/saida),
-// MEDICAO_SONDA (/saida/sonda.ndjson), PORT (3000).
+// MEDICAO_SONDA (/saida/sonda.ndjson), PORT (3000), MEDICAO_REPOUSO_MS (10000), MEDICAO_MODO (rótulo do cenário de
+// HEALTHCHECK, Fase 60.4.3.4.5). O harness NÃO liga nem desliga o HEALTHCHECK: isso é do `docker run` do workflow.
 import "reflect-metadata";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -22,6 +23,8 @@ const ARQUIVOS = process.env["MEDICAO_ARQUIVOS"] ?? "/saida/arquivos";
 const SAIDA = process.env["MEDICAO_SAIDA"] ?? "/saida";
 const SONDA = process.env["MEDICAO_SONDA"] ?? join(SAIDA, "sonda.ndjson");
 const PORTA = Number(process.env["PORT"] ?? 3000);
+const REPOUSO_MS = Number(process.env["MEDICAO_REPOUSO_MS"] ?? 10_000);
+const MODO = process.env["MEDICAO_MODO"] ?? "nao-informado";
 const FALSOS = fileURLToPath(new URL("./falsos/", import.meta.url));
 const log = (objeto: unknown) => console.log(`[medicao] ${JSON.stringify(objeto)}`);
 
@@ -63,17 +66,27 @@ function statusKb(pid: number | "self"): { rssKb: number; hwmKb: number } | null
   return { rssKb: campo("VmRSS"), hwmKb: campo("VmHWM") };
 }
 const temProc = existsSync("/proc/self/status");
-function subprocessosValidador(): { pid: number; rssKb: number; hwmKb: number; cmd: string }[] {
-  if (!temProc) return [];
-  const lista = [];
+type Processo = { pid: number; rssKb: number; hwmKb: number; cmd: string };
+/**
+ * Uma varredura do /proc por amostra: subprocessos do VALIDADOR e processos do Docker HEALTHCHECK da imagem
+ * (Fase 60.4.3.4.5 — `bun -e "fetch('http://127.0.0.1:'+…/health')…"`, executado pelo daemon dentro do contêiner).
+ */
+function varrerProcessos(): { validadores: Processo[]; healthchecks: Processo[] } {
+  const validadores: Processo[] = [], healthchecks: Processo[] = [];
+  if (!temProc) return { validadores, healthchecks };
   for (const nome of readdirSync("/proc")) {
     if (!/^\d+$/.test(nome) || Number(nome) === process.pid) continue;
     const cmd = (ler(`/proc/${nome}/cmdline`) ?? "").replaceAll("\0", " ");
-    if (!/validador-midia\.processo|\/falsos\//.test(cmd)) continue;
+    const ehValidador = /validador-midia\.processo|\/falsos\//.test(cmd);
+    // O HEALTHCHECK do Dockerfile é forma shell: `/bin/sh -c 'bun -e …'`. Conta só o processo do `bun` (argv[0]),
+    // não o `sh` que o envolve (que também traz o texto do fetch na linha de comando).
+    const ehHealthcheck = !ehValidador && cmd.includes("fetch('http://127.0.0.1:'") && /(^|\/)bun$/.test(cmd.split(" ")[0] ?? "");
+    if (!ehValidador && !ehHealthcheck) continue;
     const st = statusKb(Number(nome));
-    if (st) lista.push({ pid: Number(nome), ...st, cmd: cmd.trim().split(" ").slice(-2).join(" ") });
+    if (!st) continue;
+    (ehValidador ? validadores : healthchecks).push({ pid: Number(nome), ...st, cmd: cmd.trim().split(" ").slice(-2).join(" ") });
   }
-  return lista;
+  return { validadores, healthchecks };
 }
 
 // ---------------- API (igual ao main.ts) ----------------
@@ -159,19 +172,24 @@ async function janela(rotulo: string, acao: () => Promise<unknown>): Promise<Jan
   const ev0 = eventosMemoria(), cpu0 = cpuUsec(), memAntes = memoriaContainer(), apiAntes = statusKb("self");
   let memMax = memAntes, apiRssMaxKb = apiAntes?.rssKb ?? NaN, ativosMax = 0, emExecucaoMax = 0;
   const filhos = new Map<number, Filho>();
+  const healthchecks = new Map<number, Filho>();
+  let healthchecksAtivosMax = 0;
+  const registrar = (mapa: Map<number, Filho>, f: Processo, agora: number) => {
+    const atual = mapa.get(f.pid) ?? { pid: f.pid, primeiroVisto: agora, ultimoVisto: agora, hwmMaxKb: 0, rssMaxKb: 0, cmd: f.cmd };
+    atual.ultimoVisto = agora; atual.hwmMaxKb = Math.max(atual.hwmMaxKb, f.hwmKb); atual.rssMaxKb = Math.max(atual.rssMaxKb, f.rssKb);
+    mapa.set(f.pid, atual);
+  };
   const amostrar = () => {
     const agora = Date.now();
     memMax = Math.max(memMax, memoriaContainer());
     const api = statusKb("self");
     if (api) apiRssMaxKb = Math.max(apiRssMaxKb, api.rssKb);
-    const ativos = subprocessosValidador();
-    ativosMax = Math.max(ativosMax, ativos.length);
+    const { validadores, healthchecks: hcs } = varrerProcessos();
+    ativosMax = Math.max(ativosMax, validadores.length);
+    healthchecksAtivosMax = Math.max(healthchecksAtivosMax, hcs.length);
     emExecucaoMax = Math.max(emExecucaoMax, validador.emExecucao);
-    for (const f of ativos) {
-      const atual = filhos.get(f.pid) ?? { pid: f.pid, primeiroVisto: agora, ultimoVisto: agora, hwmMaxKb: 0, rssMaxKb: 0, cmd: f.cmd };
-      atual.ultimoVisto = agora; atual.hwmMaxKb = Math.max(atual.hwmMaxKb, f.hwmKb); atual.rssMaxKb = Math.max(atual.rssMaxKb, f.rssKb);
-      filhos.set(f.pid, atual);
-    }
+    for (const f of validadores) registrar(filhos, f, agora);
+    for (const f of hcs) registrar(healthchecks, f, agora);
   };
   const inicio = Date.now();
   const temporizador = setInterval(amostrar, 10);
@@ -189,6 +207,12 @@ async function janela(rotulo: string, acao: () => Promise<unknown>): Promise<Jan
     apiRssAntesMiB: apiAntes ? MiB(apiAntes.rssKb * 1024) : null, apiRssMaxMiB: MiB(apiRssMaxKb * 1024), apiHwmMiB: MiB((statusKb("self")?.hwmKb ?? NaN) * 1024),
     subprocessosAtivosMax: ativosMax, emExecucaoMax,
     subprocessos: [...filhos.values()].sort((a, b) => a.primeiroVisto - b.primeiroVisto).map((f) => ({ pid: f.pid, iniciouMsAposJanela: f.primeiroVisto - inicio, vivoMs: f.ultimoVisto - f.primeiroVisto, picoRssMiB: MiB(f.hwmMaxKb * 1024), cmd: f.cmd })),
+    healthcheckDocker: {
+      execucoesVistas: healthchecks.size,
+      ativosSimultaneosMax: healthchecksAtivosMax,
+      picoRssMiB: healthchecks.size ? MiB(Math.max(...[...healthchecks.values()].map((f) => f.hwmMaxKb)) * 1024) : null,
+      execucoes: [...healthchecks.values()].sort((a, b) => a.primeiroVisto - b.primeiroVisto).map((f) => ({ iniciouMsAposJanela: f.primeiroVisto - inicio, vivoMs: f.ultimoVisto - f.primeiroVisto, picoRssMiB: MiB(f.hwmMaxKb * 1024) })),
+    },
     eventosMemoriaDelta: Object.fromEntries(Object.keys(ev1).map((k) => [k, (ev1[k] ?? 0) - (ev0[k] ?? 0)])),
     cpuMs: +(((cpuUsec() - cpu0) / 1000)).toFixed(0),
     memoriaStat: statMemoria(),
@@ -202,7 +226,8 @@ async function janela(rotulo: string, acao: () => Promise<unknown>): Promise<Jan
 
 // ---------------- cenários ----------------
 await Bun.sleep(10_000); // estabilização após o boot
-await janela("C1b API (harness) em repouso, 10 s", () => Bun.sleep(10_000));
+// Fase 60.4.3.4.5 — repouso configurável (o workflow usa 75 s: ≥ 60 s e ao menos 2 execuções do HEALTHCHECK de 30 s).
+await janela(`C1b API (harness) em repouso, ${REPOUSO_MS / 1000} s`, () => Bun.sleep(REPOUSO_MS));
 
 for (const nome of ["webp-5000x5000.webp", "png-5000x5000.png"]) {
   const confirmar = await preparar(nome);
@@ -258,6 +283,8 @@ const latencias = janelas.map((j) => {
   return { rotulo: j.rotulo, n: dentro.length, erros: dentro.length - ok.length, p50: percentil(ok, 0.5), p95: percentil(ok, 0.95), max: ok.length ? ok[ok.length - 1] : null };
 });
 const resumo = {
+  modo: MODO,
+  repousoMs: REPOUSO_MS,
   ambiente: { bun: Bun.version, plataforma: process.platform, arch: process.arch, cgroupV2: temCgroup, memoryMax: ler(`${CG}/memory.max`)?.trim() ?? null, swapMax: ler(`${CG}/memory.swap.max`)?.trim() ?? null, cpuMax: ler(`${CG}/cpu.max`)?.trim() ?? null },
   validador: { concorrenciaConstante: CONCORRENCIA_VALIDACAO_MIDIA, prazoConstanteMs: PRAZO_VALIDACAO_MIDIA_MS },
   memoriaPicoAcumuladoMiB: MiB(picoContainer()),

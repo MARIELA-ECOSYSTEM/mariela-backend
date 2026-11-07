@@ -1,25 +1,38 @@
 name: Medição de mídia na imagem de produção
 
 # Fase 60.4.3.4.4 — medição operacional da validação estrutural de mídias DENTRO da imagem Docker de produção, com
-# limite de 512 MiB. Workflow MANUAL e ISOLADO:
+# limite de memória. Fase 60.4.3.4.5 — comparação COM e SEM o Docker HEALTHCHECK da imagem.
+# Workflow MANUAL e ISOLADO:
 #   - só `workflow_dispatch` (nunca roda em push/PR);
 #   - constrói a imagem com o `Dockerfile` do repositório SEM alterações e NÃO publica em registry;
+#   - cada cenário de HEALTHCHECK roda em SEQUÊNCIA, com rede, MongoDB e contêineres NOVOS (nada é reaproveitado);
 #   - rede Docker `--internal` (sem saída para a internet): só a API, um MongoDB descartável e a sonda;
 #   - nenhum secret do GitHub; ambiente 100% fictício; nenhum acesso a banco, R2, Redis ou APIs de produção; sem deploy;
 #   - o R2 é substituído por um storage em memória pelo harness (`.github/media-measurement/harness.ts`), sem alterar
 #     o código da aplicação.
-# Resultados: artifact `medicao-docker-<run_id>` (resultado.json, sonda.ndjson, logs, ambiente, docker stats).
+# Cenário `sem_healthcheck`: API com `--no-healthcheck`. Cenário `com_healthcheck`: API SEM essa flag — o Docker executa
+# o HEALTHCHECK definido no Dockerfile (não é sobrescrito). A sonda externa de `/health` roda nos DOIS cenários.
+# Resultados: artifact `medicao-docker-<run_id>` (uma pasta por cenário + ambiente).
 on:
   workflow_dispatch:
     inputs:
       cpus:
-        description: "Limite de CPU do contêiner (docker --cpus). Padrão 0.5 = premissa a confirmar para a instância de 512 MiB do Render."
+        description: "Limite de CPU do contêiner (docker --cpus). Informe o valor REAL da instância (Render Free = 0.1). O padrão 0.5 é só visual."
         required: true
         default: "0.5"
       memoria:
-        description: "Limite de memória do contêiner (docker --memory e --memory-swap; sem swap)."
+        description: "Limite de memória do contêiner (docker --memory e --memory-swap; sem swap). Instância atual: 512m."
         required: true
         default: "512m"
+      healthcheck_mode:
+        description: "Cenário do Docker HEALTHCHECK da imagem: sem_healthcheck, com_healthcheck ou ambos (em sequência)."
+        required: true
+        type: choice
+        default: ambos
+        options:
+          - ambos
+          - sem_healthcheck
+          - com_healthcheck
 
 permissions:
   contents: read
@@ -30,27 +43,29 @@ concurrency:
 
 jobs:
   medir:
-    name: Medir validação de mídia (imagem de produção, ${{ inputs.memoria }}, ${{ inputs.cpus }} CPU)
+    name: Medir mídia (${{ inputs.memoria }}, ${{ inputs.cpus }} CPU, ${{ inputs.healthcheck_mode }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 150
     env:
       IMAGEM: mariela-backend:medicao-${{ github.sha }}
-      REDE: medicao-midia
       SAIDA: ${{ github.workspace }}/saida
       MEDICAO: ${{ github.workspace }}/.github/media-measurement
       LIMITE_MEMORIA: ${{ inputs.memoria }}
       LIMITE_CPU: ${{ inputs.cpus }}
+      MODO_HEALTHCHECK: ${{ inputs.healthcheck_mode }}
+      ROTULO: medicao-midia=1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Ambiente do runner
+      - name: Ambiente do runner e parâmetros
         run: |
           mkdir -p "$SAIDA/arquivos" && chmod -R 777 "$SAIDA"
           {
             echo "commit=${GITHUB_SHA}"
+            echo "parametros: memoria=${LIMITE_MEMORIA} cpus=${LIMITE_CPU} healthcheck_mode=${MODO_HEALTHCHECK}"
             echo "--- uname"; uname -a
             echo "--- os-release"; cat /etc/os-release
             echo "--- nproc"; nproc
@@ -64,17 +79,17 @@ jobs:
           docker build --pull -t "$IMAGEM" . 2>&1 | tee "$SAIDA/docker-build.log"
           {
             echo "--- imagem"; docker image inspect "$IMAGEM" --format 'Id={{.Id}} Size={{.Size}} User={{.Config.User}} Cmd={{json .Config.Cmd}}'
+            echo "--- HEALTHCHECK da imagem (durações em ns)"; docker image inspect "$IMAGEM" --format '{{json .Config.Healthcheck}}'
             echo "--- base oven/bun:1.4.2-slim"; docker image inspect oven/bun:1.4.2-slim --format 'RepoDigests={{json .RepoDigests}}'
-            echo "--- bun na imagem"; docker run --rm --network none "$IMAGEM" bun --version
-            echo "--- os da imagem"; docker run --rm --network none "$IMAGEM" cat /etc/os-release
-            echo "--- concorrência e prazo compilados"; docker run --rm --network none "$IMAGEM" grep -E "CONCORRENCIA_VALIDACAO_MIDIA =|PRAZO_VALIDACAO_MIDIA_MS =" /app/dist/modules/media/validacao/validacao-midia.constants.js
+            echo "--- bun na imagem"; docker run --rm --no-healthcheck --network none "$IMAGEM" bun --version
+            echo "--- os da imagem"; docker run --rm --no-healthcheck --network none "$IMAGEM" cat /etc/os-release
+            echo "--- concorrência e prazo compilados"; docker run --rm --no-healthcheck --network none "$IMAGEM" grep -E "CONCORRENCIA_VALIDACAO_MIDIA =|PRAZO_VALIDACAO_MIDIA_MS =" /app/dist/modules/media/validacao/validacao-midia.constants.js
           } | tee -a "$SAIDA/ambiente.txt"
+          docker image inspect "$IMAGEM" --format '{{json .Config.Healthcheck}}' > "$SAIDA/healthcheck-imagem.json"
 
-      - name: Rede isolada, MongoDB descartável e ambiente fictício
+      - name: Ambiente fictício e imagem do MongoDB descartável
         run: |
           docker pull mongo:7
-          docker network create --internal "$REDE"
-          docker run -d --name mongo-medicao --network "$REDE" mongo:7
           # Valores FICTÍCIOS (nenhum secret). Segredos JWT com >= 32 caracteres porque NODE_ENV=production os exige.
           cat > "$RUNNER_TEMP/medicao.env" <<'EOF'
           NODE_ENV=production
@@ -97,78 +112,115 @@ jobs:
 
       - name: Gerar arquivos representativos (dentro da imagem, sem rede)
         run: |
-          docker run --rm --network none \
+          docker run --rm --no-healthcheck --network none --label "$ROTULO" \
             -v "$MEDICAO:/app/medicao:ro" -v "$GITHUB_WORKSPACE/src/test-utils/fixtures/midia:/fixtures:ro" -v "$SAIDA:/saida" \
             -e BUN_RUNTIME_TRANSPILER_CACHE_PATH=0 \
             "$IMAGEM" bun --no-env-file /app/medicao/gerar-arquivos.ts /fixtures /saida/arquivos
           cp "$SAIDA/arquivos/manifesto.json" "$SAIDA/manifesto-arquivos.json"
 
-      - name: Cenário 1 — API em repouso com o CMD ORIGINAL da imagem (bun dist/main.js)
+      - name: Cenários por modo de HEALTHCHECK (em sequência, infraestrutura nova a cada modo)
         run: |
-          docker run -d --name api-repouso --network "$REDE" --no-healthcheck \
-            --memory="$LIMITE_MEMORIA" --memory-swap="$LIMITE_MEMORIA" --cpus="$LIMITE_CPU" \
-            --env-file "$RUNNER_TEMP/medicao.env" "$IMAGEM"
-          pronta=0
-          for i in $(seq 1 60); do
-            if docker run --rm --network "$REDE" "$IMAGEM" bun -e "fetch('http://api-repouso:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then pronta=1; break; fi
-            sleep 2
-          done
-          echo "pronta=$pronta" | tee "$SAIDA/cenario1.txt"
-          sleep 30
-          for i in $(seq 1 6); do
-            {
-              echo "--- amostra $i $(date -u +%FT%T.%3NZ)"
-              docker exec api-repouso sh -c 'echo memory.current=$(cat /sys/fs/cgroup/memory.current); echo memory.peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null); grep -E "^(anon|file|shmem) " /sys/fs/cgroup/memory.stat; cat /sys/fs/cgroup/memory.events; grep -E "^(VmRSS|VmHWM)" /proc/1/status'
-              docker stats --no-stream --format 'docker-stats {{.MemUsage}} {{.CPUPerc}}' api-repouso
-            } | tee -a "$SAIDA/cenario1.txt"
-            sleep 5
-          done
-          docker inspect api-repouso --format '{{json .State}}' > "$SAIDA/cenario1-estado.json"
-          docker logs api-repouso > "$SAIDA/cenario1-api.log" 2>&1 || true
-          docker rm -f api-repouso
+          case "$MODO_HEALTHCHECK" in
+            ambos) MODOS="sem_healthcheck com_healthcheck" ;;
+            sem_healthcheck|com_healthcheck) MODOS="$MODO_HEALTHCHECK" ;;
+            *) echo "healthcheck_mode inválido: $MODO_HEALTHCHECK"; exit 1 ;;
+          esac
+          falhas=0
 
-      - name: Cenários 2 a 6 — harness na imagem (API do dist + validações + falhas + sonda de saúde)
-        run: |
-          docker run -d --name sonda --network "$REDE" \
-            -v "$MEDICAO:/app/medicao:ro" -v "$SAIDA:/saida" -e BUN_RUNTIME_TRANSPILER_CACHE_PATH=0 \
-            "$IMAGEM" bun --no-env-file /app/medicao/sonda-health.ts http://api-medicao:3000/health /saida/sonda.ndjson
-          docker run -d --name api-medicao --network "$REDE" --no-healthcheck \
-            --memory="$LIMITE_MEMORIA" --memory-swap="$LIMITE_MEMORIA" --cpus="$LIMITE_CPU" \
-            --env-file "$RUNNER_TEMP/medicao.env" \
-            -e MEDICAO_DIST=/app/dist -e MEDICAO_ARQUIVOS=/saida/arquivos -e MEDICAO_SAIDA=/saida -e MEDICAO_SONDA=/saida/sonda.ndjson \
-            -v "$MEDICAO:/app/medicao:ro" -v "$SAIDA:/saida" \
-            "$IMAGEM" bun --no-env-file /app/medicao/harness.ts
-          ( while [ "$(docker inspect -f '{{.State.Running}}' api-medicao 2>/dev/null)" = "true" ]; do
-              docker stats --no-stream --format "$(date -u +%T) {{.MemUsage}} {{.CPUPerc}}" api-medicao >> "$SAIDA/docker-stats-api-medicao.txt" 2>/dev/null || true
+          executar_modo() {
+            local modo="$1" dir="$SAIDA/$1" rede="medicao-$1" api1="api-repouso-$1" api2="api-medicao-$1" sonda="sonda-$1" mongo="mongo-$1"
+            local flags_hc=()
+            if [ "$modo" = "sem_healthcheck" ]; then flags_hc=(--no-healthcheck); fi
+            mkdir -p "$dir" && chmod 777 "$dir"
+            echo "=== modo=$modo | flags de HEALTHCHECK na API: ${flags_hc[*]:-<nenhuma: HEALTHCHECK da imagem ativo>} | inicio=$(date -u +%FT%TZ)" | tee "$dir/modo.txt"
+
+            docker network create --internal --label "$ROTULO" "$rede"
+            docker run -d --name "$mongo" --label "$ROTULO" --network "$rede" --network-alias mongo-medicao mongo:7
+
+            # ---- Cenário 1: API em repouso com o CMD ORIGINAL da imagem (bun dist/main.js) ----
+            docker run -d --name "$api1" --label "$ROTULO" --network "$rede" "${flags_hc[@]}" \
+              --memory="$LIMITE_MEMORIA" --memory-swap="$LIMITE_MEMORIA" --cpus="$LIMITE_CPU" \
+              --env-file "$RUNNER_TEMP/medicao.env" "$IMAGEM"
+            docker inspect "$api1" --format '{{json .Config.Healthcheck}}' > "$dir/cenario1-healthcheck-config.json"
+            local pronta=0 inicio_boot
+            inicio_boot=$(date +%s)
+            for i in $(seq 1 120); do
+              if docker run --rm --no-healthcheck --label "$ROTULO" --network "$rede" "$IMAGEM" bun -e "fetch('http://$api1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then pronta=1; break; fi
               sleep 2
-            done ) &
-          codigo=$(timeout 1500 docker wait api-medicao || echo "timeout")
-          echo "codigo_saida_harness=$codigo" | tee "$SAIDA/cenarios-2-6.txt"
-          docker inspect api-medicao --format '{{json .State}}' > "$SAIDA/api-medicao-estado.json"
-          docker inspect api-medicao --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} RestartCount={{.RestartCount}}' | tee -a "$SAIDA/cenarios-2-6.txt"
-          docker logs api-medicao > "$SAIDA/api-medicao.log" 2>&1 || true
-          docker rm -f sonda api-medicao || true
-          test "$codigo" = "0"
+            done
+            echo "pronta=$pronta segundos_ate_pronta=$(( $(date +%s) - inicio_boot ))" | tee "$dir/cenario1.txt"
+            sleep 30
+            # 13 amostras × 5 s ≈ 65 s de repouso medido (≥ 60 s; ≥ 2 execuções do HEALTHCHECK de 30 s no modo com_healthcheck).
+            for i in $(seq 1 13); do
+              {
+                echo "--- amostra $i $(date -u +%FT%T.%3NZ)"
+                docker exec "$api1" sh -c 'echo memory.current=$(cat /sys/fs/cgroup/memory.current); echo memory.peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null); grep -E "^(anon|file|shmem) " /sys/fs/cgroup/memory.stat; cat /sys/fs/cgroup/memory.events; grep -E "^usage_usec" /sys/fs/cgroup/cpu.stat; grep -E "^(VmRSS|VmHWM)" /proc/1/status'
+                docker stats --no-stream --format 'docker-stats {{.MemUsage}} {{.CPUPerc}}' "$api1"
+              } >> "$dir/cenario1.txt"
+              sleep 5
+            done
+            docker inspect "$api1" --format '{{json .State}}' > "$dir/cenario1-estado.json"
+            docker inspect "$api1" --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} RestartCount={{.RestartCount}} Health={{if .State.Health}}{{.State.Health.Status}}/falhas={{.State.Health.FailingStreak}}/execucoes_no_log={{len .State.Health.Log}}{{else}}desabilitado{{end}}' | tee -a "$dir/cenario1.txt"
+            docker logs "$api1" > "$dir/cenario1-api.log" 2>&1 || true
+            docker rm -f "$api1"
+
+            # ---- Cenários 2 a 6: harness (API do dist + validações + falhas) e sonda externa de /health ----
+            docker run -d --name "$sonda" --label "$ROTULO" --no-healthcheck --network "$rede" \
+              -v "$MEDICAO:/app/medicao:ro" -v "$dir:/saida" -e BUN_RUNTIME_TRANSPILER_CACHE_PATH=0 \
+              "$IMAGEM" bun --no-env-file /app/medicao/sonda-health.ts "http://$api2:3000/health" /saida/sonda.ndjson
+            docker run -d --name "$api2" --label "$ROTULO" --network "$rede" "${flags_hc[@]}" \
+              --memory="$LIMITE_MEMORIA" --memory-swap="$LIMITE_MEMORIA" --cpus="$LIMITE_CPU" \
+              --env-file "$RUNNER_TEMP/medicao.env" \
+              -e MEDICAO_DIST=/app/dist -e MEDICAO_ARQUIVOS=/arquivos -e MEDICAO_SAIDA=/saida -e MEDICAO_SONDA=/saida/sonda.ndjson \
+              -e MEDICAO_REPOUSO_MS=75000 -e MEDICAO_MODO="$modo" \
+              -v "$MEDICAO:/app/medicao:ro" -v "$SAIDA/arquivos:/arquivos:ro" -v "$dir:/saida" \
+              "$IMAGEM" bun --no-env-file /app/medicao/harness.ts
+            docker inspect "$api2" --format '{{json .Config.Healthcheck}}' > "$dir/api-medicao-healthcheck-config.json"
+            ( while [ "$(docker inspect -f '{{.State.Running}}' "$api2" 2>/dev/null)" = "true" ]; do
+                docker stats --no-stream --format "$(date -u +%T) {{.MemUsage}} {{.CPUPerc}}" "$api2" >> "$dir/docker-stats-api-medicao.txt" 2>/dev/null || true
+                sleep 2
+              done ) &
+            local codigo
+            codigo=$(timeout 3000 docker wait "$api2" || echo "timeout")
+            echo "codigo_saida_harness=$codigo" | tee "$dir/cenarios-2-6.txt"
+            docker inspect "$api2" --format '{{json .State}}' > "$dir/api-medicao-estado.json"
+            docker inspect "$api2" --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} RestartCount={{.RestartCount}} Health={{if .State.Health}}{{.State.Health.Status}}/falhas={{.State.Health.FailingStreak}}/execucoes_no_log={{len .State.Health.Log}}{{else}}desabilitado{{end}}' | tee -a "$dir/cenarios-2-6.txt"
+            docker logs "$api2" > "$dir/api-medicao.log" 2>&1 || true
+            docker rm -f "$sonda" "$api2" "$mongo" || true
+            docker network rm "$rede" || true
+            echo "fim=$(date -u +%FT%TZ)" >> "$dir/modo.txt"
+            [ "$codigo" = "0" ]
+          }
+
+          for modo in $MODOS; do
+            if ! executar_modo "$modo"; then falhas=$((falhas + 1)); echo "::warning::modo $modo terminou com falha (ver $modo/cenarios-2-6.txt)"; fi
+          done
+          test "$falhas" -eq 0
 
       - name: Resumo
         if: always()
         run: |
           {
-            echo "## Medição de mídia — imagem de produção (${LIMITE_MEMORIA}, ${LIMITE_CPU} CPU)"
-            cat "$SAIDA/cenarios-2-6.txt" 2>/dev/null || true
-            if [ -f "$SAIDA/resultado.json" ]; then
+            echo "## Medição de mídia — imagem de produção (${LIMITE_MEMORIA}, ${LIMITE_CPU} CPU, ${MODO_HEALTHCHECK})"
+            for dir in "$SAIDA"/sem_healthcheck "$SAIDA"/com_healthcheck; do
+              [ -d "$dir" ] || continue
+              echo "### $(basename "$dir")"
               echo '```'
-              jq -r '"pico acumulado do contêiner: \(.memoriaPicoAcumuladoMiB) MiB | memory.events: \(.eventosMemoriaFinais|tojson)"' "$SAIDA/resultado.json"
-              jq -r '.janelas[] | "\(.rotulo) | contêiner máx \(.containerMaxAmostradoMiB) MiB | API RSS máx \(.apiRssMaxMiB) MiB | subprocessos ativos máx \(.subprocessosAtivosMax) | \(.duracaoMs) ms | oom Δ \(.eventosMemoriaDelta.oom // 0) oom_kill Δ \(.eventosMemoriaDelta.oom_kill // 0)"' "$SAIDA/resultado.json"
+              cat "$dir/cenario1.txt" 2>/dev/null | grep -E "^(pronta|OOMKilled)" || true
+              cat "$dir/cenarios-2-6.txt" 2>/dev/null || true
+              if [ -f "$dir/resultado.json" ]; then
+                jq -r '"pico acumulado do contêiner: \(.memoriaPicoAcumuladoMiB) MiB | memory.events: \(.eventosMemoriaFinais|tojson)"' "$dir/resultado.json"
+                jq -r '.janelas[] | "\(.rotulo) | contêiner máx \(.containerMaxAmostradoMiB) MiB | API RSS máx \(.apiRssMaxMiB) MiB | validadores máx \(.subprocessosAtivosMax) | HEALTHCHECK vistos \(.healthcheckDocker.execucoesVistas) (pico \(.healthcheckDocker.picoRssMiB) MiB) | \(.duracaoMs) ms | oom Δ \(.eventosMemoriaDelta.oom // 0) oom_kill Δ \(.eventosMemoriaDelta.oom_kill // 0)"' "$dir/resultado.json"
+              fi
               echo '```'
-            fi
+            done
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Limpeza
         if: always()
         run: |
-          docker rm -f sonda api-medicao api-repouso mongo-medicao 2>/dev/null || true
-          docker network rm "$REDE" 2>/dev/null || true
+          docker ps -aq --filter "label=$ROTULO" | xargs -r docker rm -f || true
+          docker network ls -q --filter "label=$ROTULO" | xargs -r docker network rm || true
           rm -f "$SAIDA"/arquivos/*.jpg "$SAIDA"/arquivos/*.png "$SAIDA"/arquivos/*.webp "$SAIDA"/arquivos/*.gif "$SAIDA"/arquivos/*.mp4 || true
 
       - name: Publicar resultados como artifact
