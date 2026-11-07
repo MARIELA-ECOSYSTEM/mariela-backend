@@ -8,7 +8,10 @@ import { ApiException } from "../../common/exceptions/api.exception.js";
 import { liberarTudo, novoPonto } from "../../test-utils/barreira.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { erroDe, executarComConflitosDeVersao } from "../../test-utils/conflito-versao.util.js";
-import { arquivoDoFormato, inserirMidiaDiretamente, MediaStorageFalso } from "../../test-utils/media-storage-falso.util.js";
+import { fileURLToPath } from "node:url";
+import { arquivoDoFormato, chunkPng, fixtureDeMidia, FIXTURES_MIDIA, inserirMidiaDiretamente, MediaStorageFalso } from "../../test-utils/media-storage-falso.util.js";
+import { mp4Sintetico } from "../../test-utils/mp4-sintetico.util.js";
+import { ValidadorMidiaService } from "./validacao/validador-midia.service.js";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
@@ -1058,6 +1061,103 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
       );
       expect((erroDe(resultado) as ApiException).getStatus()).toBe(409);
       expect((await produtoBruto(produtoId)).excluidoEm).toBeNull();
+    });
+  });
+
+  describe("validação estrutural na confirmação (Fase 60.4.3.4.1)", () => {
+    /** Solicita com o tamanho exato do conteúdo e simula o PUT. */
+    async function enviadoComConteudo(produtoId: string, formato: string, conteudo: Uint8Array): Promise<string> {
+      const { uploadId } = await solicitar(produtoId, {
+        fileName: NOME_POR_FORMATO[formato]!,
+        contentType: formato,
+        kind: formato.startsWith("video") ? "video" : "image",
+        size: conteudo.length,
+      });
+      storage.enviar(storage.ultimaChave(), conteudo, formato);
+      return uploadId;
+    }
+    async function semEfeito(produtoId: string, uploadId: string): Promise<void> {
+      expect((await produtoBruto(produtoId)).midias ?? []).toHaveLength(0);
+      expect((await registro(uploadId)).estado).toBe("pendente");
+      expect(storage.exclusoes).toHaveLength(0);
+    }
+
+    it("N8: JPEG com assinatura válida e conteúdo corrompido é recusado com 400 VALIDATION_ERROR (campo arquivo) e nada entra na galeria", async () => {
+      const produtoId = await novoProduto();
+      const uploadId = await enviadoComConteudo(produtoId, "image/jpeg", fixtureDeMidia(FIXTURES_MIDIA.n8));
+      const erro = await erroApi(confirmar(produtoId, uploadId));
+      expect(erro.getStatus()).toBe(400);
+      expect(erro.code).toBe("VALIDATION_ERROR");
+      expect(erro.errors).toEqual([{ field: "arquivo", message: "O arquivo está corrompido ou incompleto." }]);
+      // Nenhum detalhe interno (offset, nome de marcador) chega ao cliente.
+      expect(JSON.stringify(erro.getResponse())).not.toContain("offset");
+      await semEfeito(produtoId, uploadId);
+    });
+
+    it("animação, quadros, dados extras e codec recusados com a mensagem pública do motivo", async () => {
+      const produtoId = await novoProduto();
+      const png = fixtureDeMidia(FIXTURES_MIDIA.png);
+      const apng = new Uint8Array(Buffer.concat([png.subarray(0, 33), chunkPng("acTL", new Uint8Array(8)), png.subarray(33)]));
+      const casos: [string, Uint8Array, string][] = [
+        ["image/png", apng, "APNG"],
+        ["image/png", new Uint8Array(Buffer.concat([png, Buffer.from("lixo-anexado")])), "dados adicionais"],
+        ["video/mp4", mp4Sintetico({ codecVideo: "hvc1" }), "H.264"],
+        ["video/mp4", mp4Sintetico({ duracaoVideoSegundos: 31 }), "30 segundos"],
+      ];
+      for (const [formato, conteudo, trecho] of casos) {
+        const uploadId = await enviadoComConteudo(produtoId, formato, conteudo);
+        const erro = await erroApi(confirmar(produtoId, uploadId));
+        expect(erro.getStatus()).toBe(400);
+        expect(erro.errors[0]!.field).toBe("arquivo");
+        expect(erro.errors[0]!.message).toContain(trecho);
+        await semEfeito(produtoId, uploadId);
+      }
+    });
+
+    it("MP4 fragmentado (bateria) e MP4 com áudio AAC são confirmados", async () => {
+      const produtoId = await novoProduto();
+      const fragmentado = await enviadoComConteudo(produtoId, "video/mp4", fixtureDeMidia(FIXTURES_MIDIA.mp4Fragmentado));
+      expect((await confirmar(produtoId, fragmentado)).midia._id).toBe(fragmentado);
+      const comAudio = await enviadoComConteudo(produtoId, "video/mp4", mp4Sintetico({ trilhaExtra: { manipulador: "soun", codec: "mp4a", oti: 0x40 } }));
+      expect((await confirmar(produtoId, comAudio)).midia._id).toBe(comAudio);
+      expect(await idsDaGaleria(produtoId)).toEqual([fragmentado, comAudio]);
+    });
+
+    it("falha operacional do validador é 503 MEDIA_VALIDATION_UNAVAILABLE, sem efeito; a nova tentativa confirma", async () => {
+      const produtoId = await novoProduto();
+      const { uploadId } = await enviado(produtoId);
+      const validador = moduleRef.get(ValidadorMidiaService);
+      const quebrado = new ValidadorMidiaService({ script: fileURLToPath(new URL("../../test-utils/validador-midia-falso/processo-quebrado.ts", import.meta.url)) });
+      const espiao = spyOn(validador, "validar").mockImplementation((contentType: string, bytes: Uint8Array) => quebrado.validar(contentType, bytes));
+      try {
+        const erro = await erroApi(confirmar(produtoId, uploadId));
+        expect(erro.getStatus()).toBe(503);
+        expect(erro.code).toBe("MEDIA_VALIDATION_UNAVAILABLE");
+        await semEfeito(produtoId, uploadId);
+      } finally {
+        espiao.mockRestore();
+      }
+      expect((await confirmar(produtoId, uploadId)).midia._id).toBe(uploadId);
+    });
+
+    it("objeto substituído entre a inspeção (HEAD) e a leitura completa: 409 pelo ETag, sem efeito; nova confirmação valida a versão nova", async () => {
+      const produtoId = await novoProduto();
+      const { uploadId, chave } = await enviado(produtoId);
+      const inspecionarOriginal = storage.inspecionarObjeto.bind(storage);
+      const espiao = spyOn(storage, "inspecionarObjeto").mockImplementationOnce(async (key: string) => {
+        const inspecao = await inspecionarOriginal(key);
+        // Um novo PUT na mesma chave (mesmo tamanho e tipo) logo depois do HEAD.
+        storage.enviar(chave, arquivoDoFormato("image/jpeg", 1024), "image/jpeg");
+        return inspecao;
+      });
+      try {
+        const erro = await erroApi(confirmar(produtoId, uploadId));
+        expect(erro.getStatus()).toBe(409);
+        await semEfeito(produtoId, uploadId);
+      } finally {
+        espiao.mockRestore();
+      }
+      expect((await confirmar(produtoId, uploadId)).midia._id).toBe(uploadId);
     });
   });
 });

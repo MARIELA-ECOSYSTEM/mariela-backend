@@ -29,6 +29,9 @@ export const ERROR_CODES = {
   STORAGE_NOT_CONFIGURED: "STORAGE_NOT_CONFIGURED",
   // Fase 60.1 — R2 configurado, mas a chamada ao provedor falhou (rede, credencial recusada, erro do serviço).
   STORAGE_UNAVAILABLE: "STORAGE_UNAVAILABLE",
+  // Fase 60.4.3.4.1 — o validador de conteúdo de mídia não concluiu (prazo, fila cheia, falha do subprocesso).
+  // Nunca significa "arquivo inválido" (esse é 400 VALIDATION_ERROR).
+  MEDIA_VALIDATION_UNAVAILABLE: "MEDIA_VALIDATION_UNAVAILABLE",
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];

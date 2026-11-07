@@ -14,7 +14,20 @@ export interface MediaPresigner {
 }
 
 /** Resultado do `HeadObject`: ausência é um resultado normal (o cliente pode não ter enviado), não uma falha do storage. */
-export type InspecaoObjeto = { existe: false } | { existe: true; tamanho: number | null; contentType: string | null };
+export type InspecaoObjeto = { existe: false } | { existe: true; tamanho: number | null; contentType: string | null; etag?: string };
+
+/**
+ * Fase 60.4.3.4.1 — leitura COMPLETA do objeto para a validação de conteúdo. `alterado` = o objeto não é mais a
+ * versão inspecionada (ETag diferente, `If-Match` → 412) ou passou do tamanho esperado.
+ */
+export type LeituraObjeto = { estado: "ausente" } | { estado: "alterado" } | { estado: "lido"; bytes: Uint8Array };
+
+export interface LerObjetoOpcoes {
+  /** Bytes máximos aceitos (o tamanho registrado na solicitação); acima disso a leitura é `alterado`. */
+  tamanhoMaximo: number;
+  /** ETag do `HeadObject`: garante que o conteúdo validado é exatamente a versão inspecionada. */
+  ifMatch?: string;
+}
 
 /**
  * Fase 60.1 — abstração completa do storage de mídia. Toda falha do provedor (rede, credencial, erro do serviço)
@@ -24,6 +37,8 @@ export interface MediaStorage extends MediaPresigner {
   inspecionarObjeto(key: string): Promise<InspecaoObjeto>;
   /** Primeiros `quantidade` bytes do objeto (Range); `null` se o objeto não existe. */
   lerPrimeirosBytes(key: string, quantidade: number): Promise<Uint8Array | null>;
+  /** Fase 60.4.3.4.1 — objeto inteiro (limitado a `tamanhoMaximo`), condicionado ao ETag quando informado. */
+  lerObjeto(key: string, opcoes: LerObjetoOpcoes): Promise<LeituraObjeto>;
   /** Capacidade reservada para a limpeza futura (Fase 60.3) — nenhum fluxo desta fase a executa. */
   excluirObjeto(key: string): Promise<void>;
 }

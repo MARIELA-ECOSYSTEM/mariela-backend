@@ -151,6 +151,15 @@ export class ApiException extends HttpException {
     });
   }
 
+  /** Fase 60.4.3.4.1 — a validação de conteúdo da mídia não pôde ser concluída agora (não é "arquivo inválido"). */
+  static mediaValidationUnavailable(message = "Não foi possível validar o arquivo no momento. Tente novamente."): ApiException {
+    return new ApiException({
+      statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+      code: ERROR_CODES.MEDIA_VALIDATION_UNAVAILABLE,
+      message,
+    });
+  }
+
   static whatsappTimeout(message = "Tempo esgotado ao comunicar com o provedor de WhatsApp."): ApiException {
     return new ApiException({
       statusCode: HttpStatus.GATEWAY_TIMEOUT,

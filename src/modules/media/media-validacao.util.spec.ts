@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { ApiException } from "../../common/exceptions/api.exception.js";
-import { arquivoDoFormato } from "../../test-utils/media-storage-falso.util.js";
+import { prefixoDoFormato } from "../../test-utils/media-storage-falso.util.js";
 import { assinaturaDoFormatoConfere, validarArquivoDeclarado } from "./media-validacao.util.js";
 
 const bytes = (...valores: number[]) => new Uint8Array(valores);
@@ -9,16 +9,16 @@ const ascii = (texto: string) => [...texto].map((caractere) => caractere.charCod
 describe("assinaturaDoFormatoConfere (Fase 60.1)", () => {
   it("aceita o cabeçalho real de cada formato permitido", () => {
     for (const formato of ["image/jpeg", "image/png", "image/gif", "image/webp", "video/mp4"]) {
-      expect(assinaturaDoFormatoConfere(formato, arquivoDoFormato(formato, 16))).toBe(true);
+      expect(assinaturaDoFormatoConfere(formato, prefixoDoFormato(formato, 16))).toBe(true);
     }
   });
 
   it("recusa conteúdo de outro formato declarado como imagem/vídeo (ex.: HTML como PNG)", () => {
-    const html = arquivoDoFormato("text/html", 16);
+    const html = prefixoDoFormato("text/html", 16);
     for (const formato of ["image/jpeg", "image/png", "image/gif", "image/webp", "video/mp4"]) {
       expect(assinaturaDoFormatoConfere(formato, html)).toBe(false);
     }
-    expect(assinaturaDoFormatoConfere("image/png", arquivoDoFormato("image/jpeg", 16))).toBe(false);
+    expect(assinaturaDoFormatoConfere("image/png", prefixoDoFormato("image/jpeg", 16))).toBe(false);
   });
 
   it("WebP exige RIFF no início E WEBP no deslocamento 8 (RIFF de WAV não passa)", () => {

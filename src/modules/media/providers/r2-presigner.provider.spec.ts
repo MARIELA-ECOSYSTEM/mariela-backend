@@ -120,6 +120,41 @@ describe("R2PresignerProvider — inspeção, leitura por Range e exclusão (sen
     expect(await provider().lerPrimeirosBytes(KEY, 16)).toEqual(new Uint8Array(0));
   });
 
+  it("Fase 60.4.3.4.1 — HeadObject devolve o ETag quando o R2 informa", async () => {
+    resposta = async () => ({ ContentLength: 10, ContentType: "image/png", ETag: '"abc"' });
+    expect(await provider().inspecionarObjeto(KEY)).toEqual({ existe: true, tamanho: 10, contentType: "image/png", etag: '"abc"' });
+  });
+
+  it("Fase 60.4.3.4.1 — lerObjeto: GetObject SEM Range e com IfMatch; 404 → ausente; 412 → alterado; acima do máximo → alterado", async () => {
+    resposta = async () => ({ ContentLength: 3, Body: { transformToByteArray: async () => new Uint8Array([1, 2, 3]) } });
+    expect(await provider().lerObjeto(KEY, { tamanhoMaximo: 3, ifMatch: '"abc"' })).toEqual({ estado: "lido", bytes: new Uint8Array([1, 2, 3]) });
+    expect((recebidos[0] as GetObjectCommand).input).toEqual({ Bucket: "mariela-midia", Key: KEY, IfMatch: '"abc"' });
+
+    resposta = async () => ({ ContentLength: 3, Body: { transformToByteArray: async () => new Uint8Array([1, 2, 3]) } });
+    expect(await provider().lerObjeto(KEY, { tamanhoMaximo: 2 })).toEqual({ estado: "alterado" });
+    expect((recebidos[1] as GetObjectCommand).input).toEqual({ Bucket: "mariela-midia", Key: KEY });
+
+    resposta = async () => {
+      throw erroSdk("NoSuchKey", 404);
+    };
+    expect(await provider().lerObjeto(KEY, { tamanhoMaximo: 3 })).toEqual({ estado: "ausente" });
+    resposta = async () => {
+      throw erroSdk("PreconditionFailed", 412);
+    };
+    expect(await provider().lerObjeto(KEY, { tamanhoMaximo: 3, ifMatch: '"velho"' })).toEqual({ estado: "alterado" });
+    resposta = async () => {
+      throw erroSdk("AccessDenied", 403);
+    };
+    let falha: unknown = null;
+    try {
+      await provider().lerObjeto(KEY, { tamanhoMaximo: 3 });
+    } catch (erro) {
+      falha = erro;
+    }
+    expect(falha).toBeInstanceOf(ApiException);
+    expect(falha).toMatchObject({ code: "STORAGE_UNAVAILABLE" });
+  });
+
   it("DeleteObject existe como capacidade (para a limpeza futura) e monta o comando certo", async () => {
     await provider().excluirObjeto(KEY);
     expect((recebidos[0] as DeleteObjectCommand).input).toEqual({ Bucket: "mariela-midia", Key: KEY });

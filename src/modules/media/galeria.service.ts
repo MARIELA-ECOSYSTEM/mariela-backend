@@ -24,6 +24,8 @@ import {
 import type { MediaStorage, UploadGaleriaAutorizado } from "./media.types.js";
 import type { UploadMidiaDocument } from "./uploads/schemas/upload-midia.schema.js";
 import { UploadsMidiaRepository } from "./uploads/uploads-midia.repository.js";
+import { MENSAGEM_DE_RECUSA } from "./validacao/validacao-midia.types.js";
+import { ValidadorMidiaService } from "./validacao/validador-midia.service.js";
 
 /** Elemento de `Produto.midias` (subdocumento serializado com `id` no lugar de `_id`). */
 export type MidiaSubdocumento = ProdutoDocument["midias"][number];
@@ -89,6 +91,7 @@ export class GaleriaService {
     private readonly produtosRepository: ProdutosRepository,
     private readonly uploadsRepository: UploadsMidiaRepository,
     @Inject(MEDIA_STORAGE) private readonly storage: MediaStorage,
+    private readonly validador: ValidadorMidiaService,
   ) {}
 
   /**
@@ -153,8 +156,10 @@ export class GaleriaService {
   /**
    * Confirma um upload e inclui a mídia na galeria. Ordem: registro do produto → produto ativo → reconciliação
    * (o produto já referencia o `uploadId`) → estado `pendente` → prazo → objeto no storage (existência, tamanho,
-   * `Content-Type`) → assinatura real do formato → escrita atômica do produto (variante, limite, substituição e
-   * principal validados DENTRO da mutação) → registro `confirmado`.
+   * `Content-Type`) → assinatura real do formato → conteúdo completo (ETag) → validação estrutural e decodificação
+   * (Fase 60.4.3.4.1, subprocesso isolado) → escrita atômica do produto (variante, limite, substituição e principal
+   * validados DENTRO da mutação) → registro `confirmado`. Qualquer recusa ou falha antes da escrita deixa o registro
+   * `pendente` e a galeria intacta.
    *
    * Falhas parciais: qualquer erro antes da escrita do produto deixa o registro `pendente` (nova tentativa
    * possível); se o produto foi gravado mas o registro não, a resposta é sucesso e a próxima confirmação reconcilia.
@@ -364,10 +369,27 @@ export class GaleriaService {
     if (tipoRecebido !== registro.contentType) {
       throw erroDeValidacao("contentType", "O tipo do arquivo enviado é diferente do declarado na solicitação.");
     }
+    // Rejeição barata antes de baixar o arquivo inteiro: os primeiros bytes já precisam ser do formato declarado.
     const bytes = await this.chamarStorage(() => this.storage.lerPrimeirosBytes(registro.chave, BYTES_ASSINATURA_FORMATO));
     if (bytes === null) throw ausente();
     if (!assinaturaDoFormatoConfere(registro.contentType, bytes)) {
       throw erroDeValidacao("contentType", "O conteúdo do arquivo não corresponde ao formato declarado.");
+    }
+
+    // Fase 60.4.3.4.1 — conteúdo COMPLETO (≤ tamanho registrado), condicionado ao ETag inspecionado, e validação
+    // estrutural + decodificação real num subprocesso isolado. Só depois disso a reserva e a escrita da galeria acontecem.
+    const leitura = await this.chamarStorage(() =>
+      this.storage.lerObjeto(registro.chave, { tamanhoMaximo: registro.tamanho, ...(inspecao.etag ? { ifMatch: inspecao.etag } : {}) }),
+    );
+    if (leitura.estado === "ausente") throw ausente();
+    if (leitura.estado === "alterado" || leitura.bytes.length !== registro.tamanho) {
+      throw ApiException.conflict("O arquivo foi alterado durante a confirmação. Confirme novamente.");
+    }
+    const resultado = await this.validador.validar(registro.contentType, leitura.bytes);
+    if (!resultado.valido) {
+      // O detalhe técnico fica só no log; o cliente recebe a mensagem pública do motivo.
+      this.logger.warn(`Upload ${registro._id} recusado na validação de conteúdo (${resultado.motivo}: ${resultado.detalhe}).`);
+      throw erroDeValidacao("arquivo", MENSAGEM_DE_RECUSA[resultado.motivo]);
     }
   }
 

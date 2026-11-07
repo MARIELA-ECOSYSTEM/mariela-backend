@@ -13,6 +13,7 @@ import { MONGODB_URI_TESTE, mongooseModuloDeTeste } from "../test-utils/mongo-te
 import { ConfiguracoesService } from "../modules/configuracoes/configuracoes.service.js";
 import { GaleriaService } from "../modules/media/galeria.service.js";
 import { MEDIA_STORAGE } from "../modules/media/media.constants.js";
+import type { LerObjetoOpcoes } from "../modules/media/media.types.js";
 import { MediaModule } from "../modules/media/media.module.js";
 import { UploadsMidiaRepository } from "../modules/media/uploads/uploads-midia.repository.js";
 import { ProdutosRepository } from "../modules/produtos/produtos.repository.js";
@@ -155,12 +156,14 @@ describe("concorrência confirmação × limpeza de uploads (Fase 60.3.1)", () =
     const produtoId = await novoProduto();
     const { uploadId, chave } = await enviado(produtoId);
     const ponto = novoPonto();
-    const lerOriginal = storage.lerPrimeirosBytes.bind(storage);
-    const espiao = spyOn(storage, "lerPrimeirosBytes").mockImplementationOnce(async (key: string, quantidade: number) => {
-      const bytes = await lerOriginal(key, quantidade);
-      ponto.chegou.liberar(); // a confirmação já leu o registro (pendente, no prazo) e validou o objeto
+    // Fase 60.4.3.4.1 — a pausa fica na ÚLTIMA leitura do storage (o conteúdo completo, `lerObjeto`): a partir daí a
+    // confirmação não consulta mais o objeto, só o valida e tenta reservar/gravar.
+    const lerOriginal = storage.lerObjeto.bind(storage);
+    const espiao = spyOn(storage, "lerObjeto").mockImplementationOnce(async (key: string, opcoes: LerObjetoOpcoes) => {
+      const leitura = await lerOriginal(key, opcoes);
+      ponto.chegou.liberar(); // a confirmação já leu o registro (pendente, no prazo) e o objeto inteiro
       await ponto.liberacao.promessa;
-      return bytes;
+      return leitura;
     });
     try {
       const confirmacao = erroApi(galeria.confirmarUpload(produtoId, uploadId, {}, null));

@@ -5,7 +5,7 @@ import { ConfigService } from "@nestjs/config";
 import { ApiException } from "../../../common/exceptions/api.exception.js";
 import type { Configuration } from "../../../config/configuration.js";
 import { ESPERA_ENTRE_TENTATIVAS_R2_MS, TRANSPORTE_R2_PADRAO } from "../media.constants.js";
-import type { AssinarUploadParams, InspecaoObjeto, MediaStorage } from "../media.types.js";
+import type { AssinarUploadParams, InspecaoObjeto, LeituraObjeto, LerObjetoOpcoes, MediaStorage } from "../media.types.js";
 
 /**
  * Storage do Cloudflare R2 (API S3). A assinatura é calculada localmente; `HeadObject`, `GetObject` (Range) e
@@ -47,7 +47,7 @@ export class R2PresignerProvider implements MediaStorage {
   async inspecionarObjeto(key: string): Promise<InspecaoObjeto> {
     try {
       const resposta = await this.enviar((abortSignal) => this.obterCliente().send(new HeadObjectCommand({ Bucket: this.bucket(), Key: key }), { abortSignal }));
-      return { existe: true, tamanho: resposta.ContentLength ?? null, contentType: resposta.ContentType ?? null };
+      return { existe: true, tamanho: resposta.ContentLength ?? null, contentType: resposta.ContentType ?? null, ...(resposta.ETag ? { etag: resposta.ETag } : {}) };
     } catch (erro) {
       if (statusHttp(erro) === 404) return { existe: false };
       throw this.indisponivel("inspecionar objeto", erro);
@@ -67,6 +67,35 @@ export class R2PresignerProvider implements MediaStorage {
       // 416: objeto vazio (nenhum byte no intervalo pedido) — a conferência de assinatura recusa.
       if (status === 416) return new Uint8Array(0);
       throw this.indisponivel("ler bytes do objeto", erro);
+    }
+  }
+
+  /**
+   * Fase 60.4.3.4.1 — `GetObject` COMPLETO (sem Range) para a validação de conteúdo, com `If-Match` no ETag do
+   * `HeadObject` (412 → `alterado`: o conteúdo mudou entre a inspeção e a leitura). Um `Content-Length` acima de
+   * `tamanhoMaximo` é recusado ANTES de ler o corpo; o corpo é lido dentro da tentativa (mesmo prazo).
+   */
+  async lerObjeto(key: string, { tamanhoMaximo, ifMatch }: LerObjetoOpcoes): Promise<LeituraObjeto> {
+    try {
+      return await this.enviar(async (abortSignal): Promise<LeituraObjeto> => {
+        const resposta = await this.obterCliente().send(new GetObjectCommand({ Bucket: this.bucket(), Key: key, ...(ifMatch ? { IfMatch: ifMatch } : {}) }), { abortSignal });
+        if (resposta.ContentLength !== undefined && resposta.ContentLength > tamanhoMaximo) {
+          // Não lê o corpo: descarta a conexão do corpo (melhor esforço) e informa a divergência.
+          try {
+            await resposta.Body?.transformToWebStream().cancel();
+          } catch {
+            // corpo já consumido/fechado — nada a liberar
+          }
+          return { estado: "alterado" };
+        }
+        const bytes = resposta.Body ? await resposta.Body.transformToByteArray() : new Uint8Array(0);
+        return bytes.length > tamanhoMaximo ? { estado: "alterado" } : { estado: "lido", bytes };
+      });
+    } catch (erro) {
+      const status = statusHttp(erro);
+      if (status === 404) return { estado: "ausente" };
+      if (status === 412) return { estado: "alterado" };
+      throw this.indisponivel("ler objeto", erro);
     }
   }
 

@@ -97,6 +97,38 @@ describe("R2PresignerProvider — timeouts e novas tentativas (Fase 60.4.1, serv
     expect(configurado.prazoTotalMs()).toBe(3 * 3_000 + 250 + 500);
   });
 
+  it("Fase 60.4.3.4.1 — lerObjeto com o SDK real: envia If-Match, lê o corpo inteiro; 412 → alterado (sem repetir)", async () => {
+    const cabecalhosRecebidos: (string | null)[] = [];
+    const corpo = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]);
+    const servidorIfMatch = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: (requisicao) => {
+        const ifMatch = requisicao.headers.get("if-match");
+        cabecalhosRecebidos.push(ifMatch);
+        if (ifMatch === '"velho"') return new Response(erroXml("PreconditionFailed"), { status: 412, headers: { "content-type": "application/xml" } });
+        return new Response(corpo, { status: 200, headers: { "content-type": "image/jpeg", "content-length": String(corpo.length), etag: '"novo"' } });
+      },
+    });
+    class R2IfMatch extends R2PresignerProvider {
+      protected override endpoint(): string {
+        return `http://127.0.0.1:${servidorIfMatch.port}`;
+      }
+      protected override enderecamentoPorCaminho(): boolean {
+        return true;
+      }
+    }
+    try {
+      const p = new R2IfMatch(new ConfigService<Configuration>({ storage: { r2: R2, transporte: TRANSPORTE_RAPIDO } }));
+      expect(await p.lerObjeto("products/p/a.jpg", { tamanhoMaximo: 8, ifMatch: '"novo"' })).toEqual({ estado: "lido", bytes: corpo });
+      expect(await p.lerObjeto("products/p/a.jpg", { tamanhoMaximo: 8, ifMatch: '"velho"' })).toEqual({ estado: "alterado" });
+      expect(await p.lerObjeto("products/p/a.jpg", { tamanhoMaximo: 4 })).toEqual({ estado: "alterado" });
+      expect(cabecalhosRecebidos).toEqual(['"novo"', '"velho"', null]);
+    } finally {
+      servidorIfMatch.stop(true);
+    }
+  });
+
   it("falha transitória (503) seguida de sucesso: repete UMA vez e conclui", async () => {
     roteiro = (indice) => (indice === 0 ? { status: 503 } : { status: 200, cabecalhos: { "content-type": "image/jpeg" } });
     const resultado = await provider(TRANSPORTE_RAPIDO).inspecionarObjeto("products/p/a.jpg");

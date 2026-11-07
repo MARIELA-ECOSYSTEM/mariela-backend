@@ -1,4 +1,5 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { ValidationPipe } from "@nestjs/common";
 import { getConnectionToken } from "@nestjs/mongoose";
 import type { NestExpressApplication } from "@nestjs/platform-express";
@@ -10,7 +11,7 @@ import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
 import { validationExceptionFactory } from "../../common/pipes/validation-exception-factory.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
-import { arquivoDoFormato, inserirMidiaDiretamente, MediaStorageFalso } from "../../test-utils/media-storage-falso.util.js";
+import { arquivoDoFormato, fixtureDeMidia, FIXTURES_MIDIA, inserirMidiaDiretamente, MediaStorageFalso } from "../../test-utils/media-storage-falso.util.js";
 import { MONGODB_URI_TESTE } from "../../test-utils/mongo-teste.util.js";
 import { AuthService } from "../auth/auth.service.js";
 import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
@@ -18,6 +19,7 @@ import { ProdutosService } from "../produtos/produtos.service.js";
 import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 import { MEDIA_STORAGE } from "./media.constants.js";
+import { ValidadorMidiaService } from "./validacao/validador-midia.service.js";
 
 const BASE_PUBLICA = "https://midia.exemplo.com";
 const SECRET_FICTICIO = "segredo-ficticio-que-nunca-pode-aparecer-em-resposta";
@@ -363,6 +365,44 @@ describe("HTTP — Galeria de mídia do produto (integração — servidor real,
       const resposta = await fetch(`${baseUrl}/api/v1/produtos/${produtoId}`, { method: "DELETE", headers: { authorization: `Bearer ${adminToken}` } });
       expect(resposta.status).toBeLessThan(300);
       expect((await chamar("GET", `/produtos/${produtoId}/midias`, adminToken)).status).toBe(404);
+    });
+  });
+
+  describe("validação estrutural na confirmação (Fase 60.4.3.4.1) — contrato HTTP", () => {
+    async function solicitarEEnviar(produtoId: string, conteudo: Uint8Array): Promise<string> {
+      const solicitado = await chamar("POST", `/produtos/${produtoId}/midias/uploads`, adminToken, corpoUpload({ size: conteudo.length }));
+      expect(solicitado.status).toBe(200);
+      storage.enviar(storage.ultimaChave(), conteudo, "image/jpeg");
+      return dados<{ uploadId: string }>(solicitado).uploadId;
+    }
+
+    it("N8 pelo HTTP: 400 VALIDATION_ERROR com a mensagem pública (sem detalhe interno nem stack) e a galeria continua vazia", async () => {
+      const produtoId = await novoProduto();
+      const uploadId = await solicitarEEnviar(produtoId, fixtureDeMidia(FIXTURES_MIDIA.n8));
+      const resposta = await chamar("POST", `/produtos/${produtoId}/midias/uploads/${uploadId}/confirmacao`, adminToken, {});
+      expect(resposta.status).toBe(400);
+      expect(resposta.json["code"]).toBe("VALIDATION_ERROR");
+      expect(resposta.json["errors"]).toEqual([{ field: "arquivo", message: "O arquivo está corrompido ou incompleto." }]);
+      const corpo = JSON.stringify(resposta.json);
+      for (const proibido of ["offset", "stack", "JPEG:", "Bun.Image"]) expect(corpo).not.toContain(proibido);
+      expect(dados<GaleriaJson>(await chamar("GET", `/produtos/${produtoId}/midias`, adminToken)).midias).toHaveLength(0);
+    });
+
+    it("validador indisponível pelo HTTP: 503 MEDIA_VALIDATION_UNAVAILABLE, sem stack; depois confirma normalmente", async () => {
+      const produtoId = await novoProduto();
+      const uploadId = await solicitarEEnviar(produtoId, arquivoDoFormato("image/jpeg", 1024));
+      const quebrado = new ValidadorMidiaService({ script: fileURLToPath(new URL("../../test-utils/validador-midia-falso/processo-quebrado.ts", import.meta.url)) });
+      const espiao = spyOn(app.get(ValidadorMidiaService), "validar").mockImplementation((contentType: string, bytes: Uint8Array) => quebrado.validar(contentType, bytes));
+      try {
+        const resposta = await chamar("POST", `/produtos/${produtoId}/midias/uploads/${uploadId}/confirmacao`, adminToken, {});
+        expect(resposta.status).toBe(503);
+        expect(resposta.json["code"]).toBe("MEDIA_VALIDATION_UNAVAILABLE");
+        expect(JSON.stringify(resposta.json)).not.toContain("stack");
+        expect(JSON.stringify(resposta.json)).not.toContain("decodificador");
+      } finally {
+        espiao.mockRestore();
+      }
+      expect((await chamar("POST", `/produtos/${produtoId}/midias/uploads/${uploadId}/confirmacao`, adminToken, {})).status).toBe(201);
     });
   });
 });
