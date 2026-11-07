@@ -207,7 +207,10 @@ async function janela(rotulo: string, acao: () => Promise<unknown>): Promise<Jan
     apiRssAntesMiB: apiAntes ? MiB(apiAntes.rssKb * 1024) : null, apiRssMaxMiB: MiB(apiRssMaxKb * 1024), apiHwmMiB: MiB((statusKb("self")?.hwmKb ?? NaN) * 1024),
     subprocessosAtivosMax: ativosMax, emExecucaoMax,
     subprocessos: [...filhos.values()].sort((a, b) => a.primeiroVisto - b.primeiroVisto).map((f) => ({ pid: f.pid, iniciouMsAposJanela: f.primeiroVisto - inicio, vivoMs: f.ultimoVisto - f.primeiroVisto, picoRssMiB: MiB(f.hwmMaxKb * 1024), cmd: f.cmd })),
+    // Fase 60.4.3.4.7 — observação AUXILIAR pelo /proc (amostragem de 10 ms pode não ver execuções curtas). A contagem
+    // DEFINITIVA vem do histórico do Docker (`*-healthcheck-consolidado.json`, gerado por healthcheck-log.ts).
     healthcheckDocker: {
+      fonte: "proc-auxiliar",
       execucoesVistas: healthchecks.size,
       ativosSimultaneosMax: healthchecksAtivosMax,
       picoRssMiB: healthchecks.size ? MiB(Math.max(...[...healthchecks.values()].map((f) => f.hwmMaxKb)) * 1024) : null,

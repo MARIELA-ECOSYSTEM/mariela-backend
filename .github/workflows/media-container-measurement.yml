@@ -110,6 +110,12 @@ jobs:
           EOF
           sed -i 's/^ *//' "$RUNNER_TEMP/medicao.env"
 
+      - name: Verificar a contabilização do HEALTHCHECK (casos fixos, dentro da imagem, sem rede)
+        run: |
+          docker run --rm --no-healthcheck --network none --label "$ROTULO" \
+            -v "$MEDICAO:/app/medicao:ro" -e BUN_RUNTIME_TRANSPILER_CACHE_PATH=0 \
+            "$IMAGEM" bun --no-env-file /app/medicao/verificar-healthcheck-log.ts | tee "$SAIDA/verificacao-healthcheck-log.txt"
+
       - name: Gerar arquivos representativos (dentro da imagem, sem rede)
         run: |
           docker run --rm --no-healthcheck --network none --label "$ROTULO" \
@@ -127,6 +133,16 @@ jobs:
           esac
           falhas=0
 
+          # Fase 60.4.3.4.7 — histórico do Docker HEALTHCHECK: `.State.Health.Log` guarda só as 5 últimas execuções, então
+          # ele é consultado periodicamente (NDJSON { t, health }) e consolidado depois (healthcheck-log.ts). Com o
+          # HEALTHCHECK desabilitado, `.State.Health` é null.
+          amostrar_saude() { printf '{"t":%s,"health":%s}\n' "$(date +%s%3N)" "$(docker inspect -f '{{json .State.Health}}' "$1" 2>/dev/null || echo null)" >> "$2"; }
+          consolidar_saude() {
+            docker run --rm --no-healthcheck --network none --label "$ROTULO" \
+              -v "$MEDICAO:/app/medicao:ro" -v "$1:/saida" -e BUN_RUNTIME_TRANSPILER_CACHE_PATH=0 \
+              "$IMAGEM" bun --no-env-file /app/medicao/healthcheck-log.ts "/saida/$2" "/saida/$3" ${4:+"/saida/$4"} || true
+          }
+
           executar_modo() {
             local modo="$1" dir="$SAIDA/$1" rede="medicao-$1" api1="api-repouso-$1" api2="api-medicao-$1" sonda="sonda-$1" mongo="mongo-$1"
             local flags_hc=()
@@ -142,6 +158,9 @@ jobs:
               --memory="$LIMITE_MEMORIA" --memory-swap="$LIMITE_MEMORIA" --cpus="$LIMITE_CPU" \
               --env-file "$RUNNER_TEMP/medicao.env" "$IMAGEM"
             docker inspect "$api1" --format '{{json .Config.Healthcheck}}' > "$dir/cenario1-healthcheck-config.json"
+            ( while [ "$(docker inspect -f '{{.State.Running}}' "$api1" 2>/dev/null)" = "true" ]; do
+                amostrar_saude "$api1" "$dir/cenario1-health.ndjson"; sleep 10
+              done ) &
             local pronta=0 inicio_boot
             inicio_boot=$(date +%s)
             for i in $(seq 1 120); do
@@ -162,7 +181,9 @@ jobs:
             docker inspect "$api1" --format '{{json .State}}' > "$dir/cenario1-estado.json"
             docker inspect "$api1" --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} RestartCount={{.RestartCount}} Health={{if .State.Health}}{{.State.Health.Status}}/falhas={{.State.Health.FailingStreak}}/execucoes_no_log={{len .State.Health.Log}}{{else}}desabilitado{{end}}' | tee -a "$dir/cenario1.txt"
             docker logs "$api1" > "$dir/cenario1-api.log" 2>&1 || true
+            amostrar_saude "$api1" "$dir/cenario1-health.ndjson"
             docker rm -f "$api1"
+            consolidar_saude "$dir" cenario1-health.ndjson cenario1-healthcheck-consolidado.json
 
             # ---- Cenários 2 a 6: harness (API do dist + validações + falhas) e sonda externa de /health ----
             docker run -d --name "$sonda" --label "$ROTULO" --no-healthcheck --network "$rede" \
@@ -178,6 +199,7 @@ jobs:
             docker inspect "$api2" --format '{{json .Config.Healthcheck}}' > "$dir/api-medicao-healthcheck-config.json"
             ( while [ "$(docker inspect -f '{{.State.Running}}' "$api2" 2>/dev/null)" = "true" ]; do
                 docker stats --no-stream --format "$(date -u +%T) {{.MemUsage}} {{.CPUPerc}}" "$api2" >> "$dir/docker-stats-api-medicao.txt" 2>/dev/null || true
+                amostrar_saude "$api2" "$dir/api-medicao-health.ndjson"
                 sleep 2
               done ) &
             local codigo
@@ -186,7 +208,9 @@ jobs:
             docker inspect "$api2" --format '{{json .State}}' > "$dir/api-medicao-estado.json"
             docker inspect "$api2" --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} RestartCount={{.RestartCount}} Health={{if .State.Health}}{{.State.Health.Status}}/falhas={{.State.Health.FailingStreak}}/execucoes_no_log={{len .State.Health.Log}}{{else}}desabilitado{{end}}' | tee -a "$dir/cenarios-2-6.txt"
             docker logs "$api2" > "$dir/api-medicao.log" 2>&1 || true
+            amostrar_saude "$api2" "$dir/api-medicao-health.ndjson"
             docker rm -f "$sonda" "$api2" "$mongo" || true
+            consolidar_saude "$dir" api-medicao-health.ndjson api-medicao-healthcheck-consolidado.json resultado.json
             docker network rm "$rede" || true
             echo "fim=$(date -u +%FT%TZ)" >> "$dir/modo.txt"
             [ "$codigo" = "0" ]
@@ -208,6 +232,10 @@ jobs:
               echo '```'
               cat "$dir/cenario1.txt" 2>/dev/null | grep -E "^(pronta|OOMKilled)" || true
               cat "$dir/cenarios-2-6.txt" 2>/dev/null || true
+              for c in cenario1 api-medicao; do
+                f="$dir/$c-healthcheck-consolidado.json"
+                if [ -f "$f" ]; then jq -r --arg c "$c" 'if .habilitado then "HEALTHCHECK (\($c), histórico do Docker): execuções \(.execucoes) | sucessos \(.sucessos) | falhas \(.falhas) | prazo excedido \(.prazoExcedido) | duração ms \(.duracaoMs|tojson) | status final \(.statusFinal) | failing streak máx \(.failingStreakMax) | /proc: observadas \(.correlacaoProc.observadas), não observadas \(.correlacaoProc.naoObservadas), fora de janela \(.correlacaoProc.foraDeJanela) | histórico possivelmente incompleto: \(.historicoPodeEstarIncompleto)" else "HEALTHCHECK (\($c)): desabilitado" end' "$f" || true; fi
+              done
               if [ -f "$dir/resultado.json" ]; then
                 jq -r '"pico acumulado do contêiner: \(.memoriaPicoAcumuladoMiB) MiB | memory.events: \(.eventosMemoriaFinais|tojson)"' "$dir/resultado.json"
                 jq -r '.janelas[] | "\(.rotulo) | contêiner máx \(.containerMaxAmostradoMiB) MiB | API RSS máx \(.apiRssMaxMiB) MiB | validadores máx \(.subprocessosAtivosMax) | HEALTHCHECK vistos \(.healthcheckDocker.execucoesVistas) (pico \(.healthcheckDocker.picoRssMiB) MiB) | \(.duracaoMs) ms | oom Δ \(.eventosMemoriaDelta.oom // 0) oom_kill Δ \(.eventosMemoriaDelta.oom_kill // 0)"' "$dir/resultado.json"
