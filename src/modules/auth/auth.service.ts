@@ -83,6 +83,13 @@ export class AuthService {
 
     const senhaHash = await this.hashSenha(dados.senha);
     await this.usuariosRepository.atualizarSenhaHash(usuario.id, senhaHash);
+    // Fase 60.4.3.4.12 (F08) — redefinir a senha (tipicamente por suspeita de comprometimento) encerra TODAS as sessões
+    // do administrador: sem isto, um refresh token emitido antes continuaria renovando a sessão por até
+    // `JWT_REFRESH_EXPIRES_IN`. Mesma regra já aplicada ao vendedor (`VendedoresService.redefinirSenha`). A revogação vem
+    // DEPOIS de gravar a senha nova: um login concorrente com a senha antiga que tenha passado antes disso tem a sessão
+    // alcançada por esta revogação; um login posterior já exige a senha nova. Resta só o access token stateless (até
+    // `JWT_ACCESS_EXPIRES_IN`), mesma janela já aceita na desativação.
+    await this.refreshTokensRepository.revogarTodosDoUsuario(usuario._id, new Date());
     return { status: "atualizado", usuario: this.paraUsuarioPublico(usuario) };
   }
 

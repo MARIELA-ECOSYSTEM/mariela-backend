@@ -311,6 +311,19 @@ describe("AuthService (integração — MongoDB real)", () => {
       );
     });
 
+    it("Fase 60.4.3.4.12 (F08) — revoga todas as sessões existentes: o refresh token emitido antes da redefinição deixa de renovar", async () => {
+      const email = emailUnico("RESET-REVOGA");
+      await service.criarAdminSeed({ nome: "Reset Revoga", email, senha: "senha-antiga-123" });
+      const sessao = await service.login({ usuario: email, senha: "senha-antiga-123" }, contextoTeste);
+
+      const resultado = await service.redefinirSenhaAdmin({ email, senha: "senha-nova-456" });
+
+      expect(resultado.status).toBe("atualizado");
+      const usuario = await connection.collection("usuarios").findOne({ email });
+      expect(await connection.collection("refresh_tokens").countDocuments({ usuarioId: usuario!["_id"], revogadoEm: null })).toBe(0);
+      await expect(service.refresh({ refreshToken: sessao.refreshToken }, contextoTeste)).rejects.toThrow(ApiException);
+    });
+
     it("preserva integralmente codigo, nome, email, role, ativo, ultimoLoginEm e criadoEm — só senhaHash muda", async () => {
       const email = emailUnico("RESET-PRESERVA");
       await service.criarAdminSeed({ nome: "Reset Preserva", email, senha: "senha-antiga-123" });

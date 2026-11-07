@@ -6,7 +6,7 @@ import {
   HttpStatus,
   Logger,
 } from "@nestjs/common";
-import type { Response } from "express";
+import type { Request, Response } from "express";
 import { ApiException } from "../exceptions/api.exception.js";
 import { ERROR_CODES } from "../constants/error-codes.constant.js";
 import type { ApiErrorResponse, ApiFieldError } from "../types/api-response.interface.js";
@@ -28,11 +28,25 @@ export class HttpExceptionFilter implements ExceptionFilter {
 
     const payload = this.paraEnvelope(exception, producao);
 
+    // Fase 60.4.3.4.12 (F07) — UMA linha por erro 5xx, com método e caminho da requisição (sem a query string, que pode
+    // conter termos de busca com dados pessoais) e a mensagem REAL da exceção (a resposta ao cliente continua genérica
+    // em produção). Antes, erros não mapeados eram logados duas vezes e nenhuma linha dizia qual rota falhou.
     if (payload.statusCode >= HttpStatus.INTERNAL_SERVER_ERROR) {
-      this.logger.error(payload.message, exception instanceof Error ? exception.stack : undefined);
+      const mensagemInterna = exception instanceof Error ? exception.message : payload.message;
+      this.logger.error(
+        `${this.descreverRequisicao(ctx.getRequest<Request | undefined>())} → ${payload.statusCode} ${payload.code}: ${mensagemInterna}`,
+        exception instanceof Error ? exception.stack : undefined,
+      );
     }
 
     response.status(payload.statusCode).json(payload);
+  }
+
+  /** `MÉTODO /caminho` sem query string; tolera contextos sem requisição HTTP. */
+  private descreverRequisicao(request: Request | undefined): string {
+    if (!request?.method) return "(sem requisição HTTP)";
+    const caminho = (request.originalUrl ?? request.url ?? "").split("?")[0] || "/";
+    return `${request.method} ${caminho}`;
   }
 
   private paraEnvelope(exception: unknown, producao: boolean): ApiErrorResponse {
@@ -55,10 +69,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
       };
     }
 
-    this.logger.error(
-      exception instanceof Error ? exception.message : "Erro desconhecido.",
-      exception instanceof Error ? exception.stack : undefined,
-    );
+    // O log deste erro não mapeado é feito em `catch` (uma única linha, com a rota) — nunca aqui também.
     return {
       statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
       code: ERROR_CODES.INTERNAL_ERROR,

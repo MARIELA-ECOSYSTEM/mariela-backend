@@ -222,7 +222,19 @@ function unico(): string {
   return `${Date.now()}-${contador}`;
 }
 
-describe(`${PREFIXO} integridade entre venda e estoque (Fase 60.4.3.4.11.1)`, () => {
+/**
+ * Fase 60.4.3.4.12 — suíte E2E OPT-IN. Sem `MONGODB_URI_E2E_F04` no processo (caso do CI e de qualquer `bun test`
+ * comum), a suíte inteira fica marcada como "skip" — explicitamente, nunca como aprovada — em vez de falhar no
+ * `beforeAll` por `[SETUP]` (o que deixava o passo de testes do CI vermelho, sem relação com o código). Com a variável
+ * definida, nada muda: a validação completa da URI e do banco continua acontecendo em `lerUriE2E()`, antes de qualquer
+ * conexão, e os cenários rodam normalmente. Só a PRESENÇA da variável é consultada aqui; o valor nunca é exibido.
+ */
+const SUITE_E2E_HABILITADA = (process.env[VARIAVEL_URI_E2E] ?? "").trim() !== "";
+if (!SUITE_E2E_HABILITADA) {
+  console.warn(`[E2E F04] suíte de caracterização IGNORADA: ${VARIAVEL_URI_E2E} não definida neste processo (execução opt-in).`);
+}
+
+describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e estoque (Fase 60.4.3.4.11.1)`, () => {
   let moduleRef: TestingModule | undefined;
   let service: VendasService;
   let repositorio: VendasRepository;
