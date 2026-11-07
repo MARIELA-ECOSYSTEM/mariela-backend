@@ -4,6 +4,8 @@
 // na primeira divergência. O workflow executa esta verificação antes das medições.
 // Fase 60.4.3.4.9.15 (R06) — as leituras trazem `running` (e, parado, `exitCode`/`finishedAt`); os casos T01–T10
 // verificam a separação entre estado operacional, estado após a parada e estado do contêiner.
+// Fase 60.4.3.4.9.16 — C01–C19 verificam a coerência running × exitCode × finishedAt × erro; R01–R02 verificam que
+// `container.runningNaUltimaAmostraValida` só descreve a última leitura válida.
 import { consolidar, lerAmostras, paraEpochMs, transicoesDeStatus, unirExecucoes, type Amostra, type EntradaDocker, type Esperado, type SaudeDocker } from "./healthcheck-log.ts";
 
 let falhas = 0;
@@ -117,7 +119,7 @@ const deNdjson = (linhas: string[], esperado: Esperado = "habilitado") => {
 const blocos = (r: ReturnType<typeof consolidar>) => ({
   operacional: [r.estadoOperacional.status, r.estadoOperacional.failingStreak],
   aposParada: [r.estadoAposParada.status, r.estadoAposParada.amostras],
-  container: [r.container.runningFinal, r.container.exitCode, r.container.encerramento],
+  container: [r.container.runningNaUltimaAmostraValida, r.container.exitCode, r.container.encerramento],
 });
 const ok5 = execucao(5, 400, 0), ok35 = execucao(35, 400, 0), falha5 = execucao(5, 700, 1);
 
@@ -202,6 +204,63 @@ const p = lerAmostras([
 ].join("\n"));
 confere("P tipos errados (running texto, health texto, exitCode texto, finishedAt número, FailingStreak texto, sem health) → 6 linhas inválidas", [p.amostras.length, p.linhasInvalidas], [3, 6]);
 confere("P linhas válidas preservam running/exitCode/finishedAt; erro de leitura sem running", p.amostras.map((a) => [a.t, a.running ?? null, a.exitCode ?? null, a.finishedAt ?? null, a.erro ?? null]), [[7, true, null, null, null], [8, false, 137, "2026-11-07T16:00:09.123456789Z", null], [9, null, null, null, "docker inspect falhou"]]);
+
+// ---------------------------------------------------------------------------------------------------------------
+// 12. Fase 60.4.3.4.9.16 — coerência do contrato NDJSON (combinações de running, exitCode, finishedAt e erro).
+// ---------------------------------------------------------------------------------------------------------------
+const linhaC = (campos: Record<string, unknown>) => JSON.stringify({ t: base + 20_000, ...campos });
+const resumoLido = (linha: string) => {
+  const r = lerAmostras(`${linha}\n`);
+  return [r.amostras.length, r.linhasInvalidas, r.amostras.map((a) => [a.running ?? null, a.exitCode ?? null, a.finishedAt ?? null, a.erro ?? null])];
+};
+const operacionalOk = emExecucao(10, saude("healthy", 0, [ok5]));
+const fimC = finishedAt(20);
+
+// Casos válidos.
+confere("C01 running=true, exitCode=null, finishedAt=null → válida", resumoLido(linhaC({ running: true, exitCode: null, finishedAt: null, health: null })), [1, 0, [[true, null, null, null]]]);
+confere("C02 running=false, exitCode=0, finishedAt não vazio → válida", resumoLido(linhaC({ running: false, exitCode: 0, finishedAt: fimC, health: null })), [1, 0, [[false, 0, fimC, null]]]);
+confere("C03 running=false, exitCode=137, finishedAt não vazio → válida", resumoLido(linhaC({ running: false, exitCode: 137, finishedAt: fimC, health: null })), [1, 0, [[false, 137, fimC, null]]]);
+confere("C04 falha de inspect sem running, health=null, erro não vazio → válida como erro de leitura", resumoLido(linhaC({ health: null, erro: "docker inspect falhou" })), [1, 0, [[null, null, null, "docker inspect falhou"]]]);
+const c04 = deNdjson([operacionalOk, linhaC({ health: null, erro: "docker inspect falhou" })]);
+confere("C04 falha de inspect não vira parado nem desabilitado; reprova a integridade como erro de leitura", [c04.habilitado, c04.estadoAposParada.amostras, c04.container.runningNaUltimaAmostraValida, c04.container.encerramento, c04.integridade.ok, c04.integridade.problemas], [true, 0, true, "nao_observado", false, ["1 leitura(s) do docker inspect falharam"]]);
+const c05Linha = linhaC({ health: saude("healthy", 0, [ok5]) });
+confere("C05 NDJSON antigo sem running → lido para diagnóstico", resumoLido(c05Linha), [1, 0, [[null, null, null, null]]]);
+const c05 = deNdjson([c05Linha]);
+confere("C05 NDJSON antigo mantém a reprovação por estado operacional indeterminável", [c05.integridade.ok, c05.integridade.problemas], [false, ["1 leitura(s) válida(s) sem o campo running: estado operacional indeterminável", "nenhuma amostra operacional (running=true) válida"]]);
+
+// Casos inválidos: a linha isolada é rejeitada (0 válidas, 1 inválida) e, junto de uma leitura operacional válida,
+// é contada em linhasInvalidas e reprova a integridade.
+const invalidos: [string, Record<string, unknown>][] = [
+  ["C06 running=true com exitCode=137", { running: true, exitCode: 137, finishedAt: null, health: null }],
+  ["C07 running=true com finishedAt preenchido", { running: true, exitCode: null, finishedAt: fimC, health: null }],
+  ["C08 running=true sem exitCode", { running: true, finishedAt: null, health: null }],
+  ["C09 running=true sem finishedAt", { running: true, exitCode: null, health: null }],
+  ["C10 running=false sem exitCode", { running: false, finishedAt: fimC, health: null }],
+  ["C11 running=false com exitCode=null", { running: false, exitCode: null, finishedAt: fimC, health: null }],
+  ["C12 running=false com exitCode fracionário", { running: false, exitCode: 0.5, finishedAt: fimC, health: null }],
+  ["C13 running=false sem finishedAt", { running: false, exitCode: 0, health: null }],
+  ["C14 running=false com finishedAt vazio", { running: false, exitCode: 0, finishedAt: "", health: null }],
+  ["C15 falha de inspect com erro vazio", { health: null, erro: "" }],
+  ["C16 falha de inspect com health diferente de null", { health: saude("healthy", 0, [ok5]), erro: "docker inspect falhou" }],
+  // Complementares (combinações que o produtor nunca grava): `erro` junto de running; exitCode/finishedAt sem running.
+  ["C17 running=true com erro", { running: true, exitCode: null, finishedAt: null, health: null, erro: "docker inspect falhou" }],
+  ["C18 falha de inspect com exitCode/finishedAt", { health: null, erro: "docker inspect falhou", exitCode: 0, finishedAt: fimC }],
+  ["C19 formato antigo (sem running) com exitCode", { health: saude("healthy", 0, [ok5]), exitCode: 0 }],
+];
+for (const [descricao, campos] of invalidos) {
+  const linha = linhaC(campos);
+  const consolidado = deNdjson([operacionalOk, linha]);
+  confere(`${descricao} → linha inválida; consolidada reprova a integridade`, [resumoLido(linha), consolidado.integridade.linhasInvalidas, consolidado.integridade.ok, consolidado.integridade.problemas], [[0, 1, []], 1, false, ["1 linha(s) ilegível(is) no NDJSON"]]);
+}
+
+// R01 — última leitura válida com running=true seguida de falha de inspect: o campo descreve SÓ aquela leitura; nada
+// afirma que o contêiner continuou ativo até o fim (encerramento não observado, sem exitCode/finishedAt).
+const r01 = deNdjson([operacionalOk, erroLeitura(30)]);
+confere("R01 runningNaUltimaAmostraValida reflete a última leitura válida (t=10 s), não o fim da coleta", r01.container, { runningNaUltimaAmostraValida: true, exitCode: null, finishedAt: null, encerramento: "nao_observado", ultimaAmostraObservada: { t: base + 10_000, running: true, status: "healthy", failingStreak: 0 } });
+const camposContainer = ["runningNaUltimaAmostraValida", "exitCode", "finishedAt", "encerramento", "ultimaAmostraObservada"];
+confere("R01 bloco container com exatamente os 5 campos do contrato (sem alias do nome antigo)", Object.keys(r01.container), camposContainer);
+// R02 — última leitura válida com running=false (T01): o campo e a leitura que o fundamenta.
+confere("R02 runningNaUltimaAmostraValida=false fundamentado pela leitura pós-parada; mesmos 5 campos", [t01.container.runningNaUltimaAmostraValida, t01.container.ultimaAmostraObservada?.t, Object.keys(t01.container)], [false, base + 42_000, camposContainer]);
 
 console.log(falhas ? `\n${falhas} verificação(ões) FALHARAM` : "\nTodas as verificações passaram.");
 process.exit(falhas ? 1 : 0);

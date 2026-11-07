@@ -63,6 +63,12 @@ function ehSaudeDocker(v: unknown): v is SaudeDocker {
 /**
  * Converte uma linha do NDJSON em amostra; `null` = linha inválida. Tipos errados NÃO são "consertados": um `health`
  * que não é objeto do Docker nem null invalidaria a distinção habilitado × desabilitado, então a linha é rejeitada.
+ * Fase 60.4.3.4.9.16 — além dos tipos, valida as COMBINAÇÕES permitidas (nada é inventado nem convertido em null):
+ *   - running=true:  `exitCode` e `finishedAt` presentes e null; sem `erro`;
+ *   - running=false: `exitCode` presente e inteiro; `finishedAt` presente e texto não vazio; sem `erro`;
+ *   - sem running, com `erro`: falha de leitura — `erro` texto não vazio, `health` null, sem `exitCode`/`finishedAt`;
+ *   - sem running e sem `erro`: formato antigo — lido para diagnóstico (a integridade reprova em `consolidar`), sem
+ *     `exitCode`/`finishedAt` (que só existem no formato novo, junto com `running`).
  */
 function paraAmostra(obj: unknown): Amostra | null {
   if (!ehObjeto(obj) || !("health" in obj)) return null;
@@ -72,21 +78,18 @@ function paraAmostra(obj: unknown): Amostra | null {
   if (health === null) saude = null;
   else if (ehSaudeDocker(health)) saude = health;
   else return null;
-  if (erro !== undefined && typeof erro !== "string") return null;
-  if (running !== undefined && typeof running !== "boolean") return null;
-  let codigo: number | null | undefined;
-  if (exitCode === undefined || exitCode === null || typeof exitCode === "number") codigo = exitCode;
-  else return null;
-  let fim: string | null | undefined;
-  if (finishedAt === undefined || finishedAt === null || typeof finishedAt === "string") fim = finishedAt;
-  else return null;
-  return {
-    t, health: saude,
-    ...(typeof erro === "string" ? { erro } : {}),
-    ...(typeof running === "boolean" ? { running } : {}),
-    ...(codigo === undefined ? {} : { exitCode: codigo }),
-    ...(fim === undefined ? {} : { finishedAt: fim }),
-  };
+  if (running === true) {
+    if (!("exitCode" in obj) || exitCode !== null || !("finishedAt" in obj) || finishedAt !== null || erro !== undefined) return null;
+    return { t, health: saude, running, exitCode: null, finishedAt: null };
+  }
+  if (running === false) {
+    if (typeof exitCode !== "number" || !Number.isInteger(exitCode) || typeof finishedAt !== "string" || finishedAt === "" || erro !== undefined) return null;
+    return { t, health: saude, running, exitCode, finishedAt };
+  }
+  if (running !== undefined || "exitCode" in obj || "finishedAt" in obj) return null;
+  if (erro === undefined) return { t, health: saude };
+  if (typeof erro !== "string" || erro === "" || saude !== null) return null;
+  return { t, health: null, erro };
 }
 
 /** Lê o NDJSON de amostras; linhas inválidas (JSON ilegível ou campos com tipo errado) são ignoradas e contadas. */
@@ -194,7 +197,9 @@ export function separarEstados(validas: Amostra[]) {
       ultimaAmostraObservada: ultimaAposParada ? resumir(ultimaAposParada) : null,
     },
     container: {
-      runningFinal: ultimaObservada?.running ?? null,
+      // Estado registrado na ÚLTIMA LEITURA VÁLIDA (`ultimaAmostraObservada`) — não prova o estado efetivo do contêiner
+      // no fim da coleta (pode ter parado depois dela, ou a leitura seguinte pode ter falhado).
+      runningNaUltimaAmostraValida: ultimaObservada?.running ?? null,
       exitCode,
       finishedAt: parado ? ultimaObservada?.finishedAt ?? null : null,
       encerramento,
