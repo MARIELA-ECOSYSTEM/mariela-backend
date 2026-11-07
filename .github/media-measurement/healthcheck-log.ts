@@ -10,12 +10,22 @@
 // Fase 60.4.3.4.8 — o JSON SEMPRE é gravado (inclusive com problemas, para diagnóstico), mas a CLI sai com código 2
 // quando a integridade falha: amostra ilegível, falha de `docker inspect`, nenhuma leitura válida, estado diferente do
 // esperado para o modo, histórico possivelmente incompleto ou `resultado.json` do harness exigido e não lido.
+// Fase 60.4.3.4.9.15 (R06) — o Docker marca o HEALTHCHECK como `unhealthy` quando o contêiner PARA, mesmo com todas as
+// execuções bem-sucedidas. Por isso cada leitura traz `running`, e o consolidado separa três conceitos:
+//   - estadoOperacional: só leituras com running=true (o que o HEALTHCHECK dizia enquanto o contêiner rodava);
+//   - estadoAposParada:  leituras com running=false (preservadas, mas NUNCA sobrescrevem o estado operacional);
+//   - container:         se o contêiner foi visto parado, com que código de saída e quando.
 import { readFileSync, writeFileSync } from "node:fs";
 
 export interface EntradaDocker { Start: string; End: string; ExitCode: number; Output?: string }
 export interface SaudeDocker { Status: string; FailingStreak: number; Log?: EntradaDocker[] | null }
-/** `erro` presente = a LEITURA falhou (ex.: `docker inspect` com erro) — nunca confundir com HEALTHCHECK desabilitado. */
-export interface Amostra { t: number; health: SaudeDocker | null; erro?: string }
+/**
+ * `erro` presente = a LEITURA falhou (ex.: `docker inspect` com erro) — nunca confundir com HEALTHCHECK desabilitado
+ * nem com contêiner parado (leituras com erro não têm `running`).
+ * `running` ausente numa leitura válida = formato antigo: o estado operacional fica indeterminável (integridade falha).
+ * `exitCode`/`finishedAt` só têm valor com running=false (em execução o workflow grava null).
+ */
+export interface Amostra { t: number; health: SaudeDocker | null; erro?: string; running?: boolean; exitCode?: number | null; finishedAt?: string | null }
 export type Esperado = "habilitado" | "desabilitado";
 
 export interface Execucao {
@@ -39,19 +49,55 @@ export function paraEpochMs(iso: string): number {
   return ms;
 }
 
-/** Lê o NDJSON de amostras; linhas inválidas são ignoradas e contadas. */
+const ehObjeto = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+function ehEntradaDocker(v: unknown): v is EntradaDocker {
+  return ehObjeto(v) && typeof v["Start"] === "string" && typeof v["End"] === "string" && typeof v["ExitCode"] === "number" && (v["Output"] === undefined || typeof v["Output"] === "string");
+}
+/** `.State.Health` no formato do Docker: Status, FailingStreak e Log (lista de execuções, ou ausente/null). */
+function ehSaudeDocker(v: unknown): v is SaudeDocker {
+  if (!ehObjeto(v) || typeof v["Status"] !== "string" || typeof v["FailingStreak"] !== "number") return false;
+  const log = v["Log"];
+  return log === undefined || log === null || (Array.isArray(log) && log.every(ehEntradaDocker));
+}
+
+/**
+ * Converte uma linha do NDJSON em amostra; `null` = linha inválida. Tipos errados NÃO são "consertados": um `health`
+ * que não é objeto do Docker nem null invalidaria a distinção habilitado × desabilitado, então a linha é rejeitada.
+ */
+function paraAmostra(obj: unknown): Amostra | null {
+  if (!ehObjeto(obj) || !("health" in obj)) return null;
+  const { t, health, erro, running, exitCode, finishedAt } = obj;
+  if (typeof t !== "number") return null;
+  let saude: SaudeDocker | null;
+  if (health === null) saude = null;
+  else if (ehSaudeDocker(health)) saude = health;
+  else return null;
+  if (erro !== undefined && typeof erro !== "string") return null;
+  if (running !== undefined && typeof running !== "boolean") return null;
+  let codigo: number | null | undefined;
+  if (exitCode === undefined || exitCode === null || typeof exitCode === "number") codigo = exitCode;
+  else return null;
+  let fim: string | null | undefined;
+  if (finishedAt === undefined || finishedAt === null || typeof finishedAt === "string") fim = finishedAt;
+  else return null;
+  return {
+    t, health: saude,
+    ...(typeof erro === "string" ? { erro } : {}),
+    ...(typeof running === "boolean" ? { running } : {}),
+    ...(codigo === undefined ? {} : { exitCode: codigo }),
+    ...(fim === undefined ? {} : { finishedAt: fim }),
+  };
+}
+
+/** Lê o NDJSON de amostras; linhas inválidas (JSON ilegível ou campos com tipo errado) são ignoradas e contadas. */
 export function lerAmostras(texto: string): { amostras: Amostra[]; linhasInvalidas: number } {
   const amostras: Amostra[] = [];
   let linhasInvalidas = 0;
   for (const linha of texto.split(/\r?\n/)) {
     if (!linha.trim()) continue;
-    try {
-      const obj = JSON.parse(linha) as { t?: unknown; health?: unknown; erro?: unknown };
-      if (typeof obj.t !== "number") throw new Error("sem t");
-      amostras.push({ t: obj.t, health: obj.health && typeof obj.health === "object" ? (obj.health as SaudeDocker) : null, ...(typeof obj.erro === "string" ? { erro: obj.erro } : {}) });
-    } catch {
-      linhasInvalidas += 1;
-    }
+    let amostra: Amostra | null = null;
+    try { amostra = paraAmostra(JSON.parse(linha)); } catch { amostra = null; }
+    if (amostra) amostras.push(amostra); else linhasInvalidas += 1;
   }
   return { amostras, linhasInvalidas };
 }
@@ -107,22 +153,79 @@ export interface OpcoesConsolidacao {
   resultadoHarnessLido?: boolean;
 }
 
+/** Resumo de uma leitura para o consolidado (auditoria): instante, se o contêiner rodava e o que o HEALTHCHECK dizia. */
+export interface ResumoAmostra { t: number; running: boolean | null; status: string | null; failingStreak: number | null }
+const resumir = (a: Amostra): ResumoAmostra => ({ t: a.t, running: a.running ?? null, status: a.health?.Status ?? null, failingStreak: a.health?.FailingStreak ?? null });
+const ultimaPorT = (lista: Amostra[]): Amostra | null => lista.reduce<Amostra | null>((maior, a) => (!maior || a.t > maior.t ? a : maior), null);
+const primeiraPorT = (lista: Amostra[]): Amostra | null => lista.reduce<Amostra | null>((menor, a) => (!menor || a.t < menor.t ? a : menor), null);
+
+/** Encerramento do contêiner: só é conhecido se a última leitura válida o viu parado (running=false). */
+export type Encerramento = "nao_observado" | "normal" | "com_erro" | "indeterminado";
+
+/**
+ * Fase 60.4.3.4.9.15 (R06) — separa os três conceitos a partir das leituras VÁLIDAS (leituras com `erro` não entram:
+ * não são "parado" nem "desabilitado").
+ */
+export function separarEstados(validas: Amostra[]) {
+  const operacionais = validas.filter((a) => a.running === true);
+  const aposParada = validas.filter((a) => a.running === false);
+  const ultimaOperacional = ultimaPorT(operacionais);
+  const ultimaAposParada = ultimaPorT(aposParada);
+  const ultimaObservada = ultimaPorT(validas);
+  const parado = ultimaObservada?.running === false;
+  const exitCode = parado ? ultimaObservada?.exitCode ?? null : null;
+  const encerramento: Encerramento = !parado ? "nao_observado" : exitCode === null ? "indeterminado" : exitCode === 0 ? "normal" : "com_erro";
+  return {
+    operacionais,
+    estadoOperacional: {
+      status: ultimaOperacional?.health?.Status ?? null,
+      failingStreak: ultimaOperacional?.health?.FailingStreak ?? null,
+      // Só leituras em execução: o estado observado depois da parada nunca entra no contador nem nas transições.
+      failingStreakMax: operacionais.some((a) => a.health) ? Math.max(0, ...operacionais.map((a) => a.health?.FailingStreak ?? 0)) : null,
+      transicoesDeStatus: transicoesDeStatus(operacionais),
+      amostras: operacionais.length,
+      ultimaAmostraOperacional: ultimaOperacional ? resumir(ultimaOperacional) : null,
+    },
+    estadoAposParada: {
+      status: ultimaAposParada?.health?.Status ?? null,
+      failingStreak: ultimaAposParada?.health?.FailingStreak ?? null,
+      amostras: aposParada.length,
+      primeiraAmostraT: primeiraPorT(aposParada)?.t ?? null,
+      ultimaAmostraObservada: ultimaAposParada ? resumir(ultimaAposParada) : null,
+    },
+    container: {
+      runningFinal: ultimaObservada?.running ?? null,
+      exitCode,
+      finishedAt: parado ? ultimaObservada?.finishedAt ?? null : null,
+      encerramento,
+      ultimaAmostraObservada: ultimaObservada ? resumir(ultimaObservada) : null,
+    },
+  };
+}
+
 export function consolidar(amostras: Amostra[], janelas: JanelaHarness[] = [], opcoes: OpcoesConsolidacao = {}) {
   const linhasInvalidas = opcoes.linhasInvalidas ?? 0;
   // Só leituras VÁLIDAS (sem `erro`) contam para estado e lacuna: uma falha de leitura não é "desabilitado".
   const validas = amostras.filter((a) => a.erro === undefined);
   const errosDeLeitura = amostras.length - validas.length;
+  const { operacionais, estadoOperacional, estadoAposParada, container } = separarEstados(validas);
+  const semRunning = validas.filter((a) => a.running === undefined).length;
   const habilitado = validas.some((a) => a.health !== null);
   const lacuna = maiorLacunaMs(validas);
   const problemas: string[] = [];
   if (linhasInvalidas > 0) problemas.push(`${linhasInvalidas} linha(s) ilegível(is) no NDJSON`);
   if (errosDeLeitura > 0) problemas.push(`${errosDeLeitura} leitura(s) do docker inspect falharam`);
   if (validas.length === 0) problemas.push("nenhuma leitura válida do estado de saúde");
+  if (semRunning > 0) problemas.push(`${semRunning} leitura(s) válida(s) sem o campo running: estado operacional indeterminável`);
+  // Sem nenhuma leitura com o contêiner em execução não há estado operacional — nem "desabilitado" comprovado.
+  if (validas.length > 0 && operacionais.length === 0) problemas.push("nenhuma amostra operacional (running=true) válida");
   if (opcoes.esperado && validas.length > 0 && (opcoes.esperado === "habilitado") !== habilitado) problemas.push(`estado ${habilitado ? "habilitado" : "desabilitado"} diferente do esperado (${opcoes.esperado})`);
+  if (opcoes.esperado === "habilitado" && habilitado && estadoOperacional.ultimaAmostraOperacional && estadoOperacional.status === null) problemas.push("última amostra operacional sem estado de HEALTHCHECK");
   if (habilitado && lacuna >= 5 * 30_000) problemas.push(`lacuna de ${lacuna} ms entre leituras válidas: o histórico pode ter perdido execuções`);
   if (opcoes.resultadoHarnessLido === false) problemas.push("resultado.json do harness exigido e não lido: correlação com o /proc indisponível");
   const integridade = { ok: problemas.length === 0, problemas, amostras: amostras.length, leiturasValidas: validas.length, errosDeLeitura, linhasInvalidas, esperado: opcoes.esperado ?? null };
-  if (!habilitado) return { habilitado: false, integridade, amostras: amostras.length, linhasInvalidas, observacao: "sem .State.Health nas leituras válidas: HEALTHCHECK desabilitado neste contêiner (esperado no modo sem_healthcheck)" };
+  if (!habilitado) return { habilitado: false, integridade, amostras: amostras.length, linhasInvalidas, estadoOperacional, estadoAposParada, container, observacao: "sem .State.Health nas leituras válidas: HEALTHCHECK desabilitado neste contêiner (esperado no modo sem_healthcheck)" };
+  // O Log das leituras após a parada contém execuções REAIS (feitas enquanto o contêiner rodava): entra no histórico.
   const execucoes = unirExecucoes(validas);
   // Fase 60.4.3.4.9 — habilitado mas SEM nenhuma execução registrada não prova que o HEALTHCHECK rodou: reprova.
   if (opcoes.esperado === "habilitado" && execucoes.length === 0) {
@@ -131,7 +234,6 @@ export function consolidar(amostras: Amostra[], janelas: JanelaHarness[] = [], o
   }
   const correlacionadas = correlacionarComProc(execucoes, janelas);
   const duracoes = execucoes.map((e) => e.duracaoMs).sort((a, b) => a - b);
-  const ultima = [...validas].sort((a, b) => b.t - a.t).find((a) => a.health)?.health ?? null;
   const conta = (c: string) => correlacionadas.filter((e) => e.classificacao === c).length;
   return {
     habilitado: true,
@@ -145,10 +247,9 @@ export function consolidar(amostras: Amostra[], janelas: JanelaHarness[] = [], o
     falhas: execucoes.filter((e) => !e.sucesso).length,
     prazoExcedido: execucoes.filter((e) => e.prazoExcedido).length,
     duracaoMs: duracoes.length ? { min: duracoes[0], mediana: duracoes[Math.floor(duracoes.length / 2)], max: duracoes[duracoes.length - 1] } : null,
-    statusFinal: ultima?.Status ?? null,
-    failingStreakFinal: ultima?.FailingStreak ?? null,
-    failingStreakMax: Math.max(0, ...validas.map((a) => a.health?.FailingStreak ?? 0)),
-    transicoesDeStatus: transicoesDeStatus(validas),
+    estadoOperacional,
+    estadoAposParada,
+    container,
     correlacaoProc: { observadas: conta("observada_no_proc"), naoObservadas: conta("nao_observada_no_proc"), foraDeJanela: conta("fora_de_janela_de_medicao") },
     detalhes: correlacionadas,
   };

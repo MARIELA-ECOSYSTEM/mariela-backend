@@ -138,14 +138,28 @@ jobs:
           # HEALTHCHECK desabilitado, `.State.Health` é null.
           # Fase 60.4.3.4.8 — falha de `docker inspect` é registrada como ERRO de leitura (campo `erro`), nunca como
           # `health: null` (que significa HEALTHCHECK desabilitado).
+          # Fase 60.4.3.4.9.15 (R06) — cada leitura válida grava também `running`, `exitCode` e `finishedAt` (os dois
+          # últimos só com o contêiner parado; em execução são null). A consolidação separa o estado OPERACIONAL
+          # (running=true) do estado observado DEPOIS DA PARADA (running=false) e do estado do contêiner.
           amostrar_saude() {
-            local t estado rodando health
+            local t estado rodando codigo fim health
             t=$(date +%s%3N)
-            # Uma única chamada obtém Running e Health: evita uma segunda leitura que poderia falhar sem registro.
-            if estado=$(docker inspect -f '{{.State.Running}}|{{json .State.Health}}' "$1" 2>/dev/null); then
-              rodando=${estado%%|*}
-              health=${estado#*|}
-              printf '{"t":%s,"health":%s}\n' "$t" "$health" >> "$2"
+            # Uma única chamada obtém Running, ExitCode, FinishedAt e Health: evita uma segunda leitura que poderia falhar
+            # sem registro. Health é o ÚLTIMO campo: um `|` dentro do JSON (ex.: no Output) não afeta a separação.
+            if estado=$(docker inspect -f '{{.State.Running}}|{{.State.ExitCode}}|{{.State.FinishedAt}}|{{json .State.Health}}' "$1" 2>/dev/null); then
+              rodando=${estado%%|*}; estado=${estado#*|}
+              codigo=${estado%%|*}; estado=${estado#*|}
+              fim=${estado%%|*}; health=${estado#*|}
+              # Formato inesperado é ERRO de leitura (nunca vira running=false nem gera JSON inválido).
+              if [ "$rodando" != "true" ] && [ "$rodando" != "false" ] || ! [[ "$codigo" =~ ^-?[0-9]+$ ]] || ! [[ "$fim" =~ ^[0-9T:.Z+-]+$ ]]; then
+                printf '{"t":%s,"health":null,"erro":"docker inspect com formato inesperado"}\n' "$t" >> "$2"
+                return 1
+              fi
+              if [ "$rodando" = "true" ]; then
+                printf '{"t":%s,"running":true,"exitCode":null,"finishedAt":null,"health":%s}\n' "$t" "$health" >> "$2"
+              else
+                printf '{"t":%s,"running":false,"exitCode":%s,"finishedAt":"%s","health":%s}\n' "$t" "$codigo" "$fim" "$health" >> "$2"
+              fi
               printf '%s' "$rodando"
             else
               printf '{"t":%s,"health":null,"erro":"docker inspect falhou"}\n' "$t" >> "$2"
@@ -288,7 +302,7 @@ jobs:
               for c in cenario1 api-medicao; do
                 f="$dir/$c-healthcheck-consolidado.json"
                 if [ ! -f "$f" ]; then echo "ERRO: consolidado ausente ($c) — HEALTHCHECK sem medição válida neste modo"
-                else jq -r --arg c "$c" '(if .integridade.ok then "" else "INTEGRIDADE REPROVADA: \(.integridade.problemas|join("; ")) | " end) + (if .habilitado then "HEALTHCHECK (\($c), histórico do Docker): execuções \(.execucoes) | sucessos \(.sucessos) | falhas \(.falhas) | prazo excedido \(.prazoExcedido) | duração ms \(.duracaoMs|tojson) | status final \(.statusFinal) | failing streak máx \(.failingStreakMax) | /proc (auxiliar): observadas \(.correlacaoProc.observadas), não observadas \(.correlacaoProc.naoObservadas), fora de janela \(.correlacaoProc.foraDeJanela)" else "HEALTHCHECK (\($c)): desabilitado" end)' "$f" || echo "ERRO: consolidado ilegível ($c): $f"; fi
+                else jq -r --arg c "$c" '(if .integridade.ok then "" else "INTEGRIDADE REPROVADA: \(.integridade.problemas|join("; ")) | " end) + (if .habilitado then "HEALTHCHECK (\($c), histórico do Docker): execuções \(.execucoes) | sucessos \(.sucessos) | falhas \(.falhas) | prazo excedido \(.prazoExcedido) | duração ms \(.duracaoMs|tojson) | status operacional final \(.estadoOperacional.status) | failing streak operacional final \(.estadoOperacional.failingStreak) / máx \(.estadoOperacional.failingStreakMax) | após a parada \(.estadoAposParada.status // "não observado") | /proc (auxiliar): observadas \(.correlacaoProc.observadas), não observadas \(.correlacaoProc.naoObservadas), fora de janela \(.correlacaoProc.foraDeJanela)" else "HEALTHCHECK (\($c)): desabilitado" end) + " | contêiner: encerramento \(.container.encerramento), exitCode \(.container.exitCode)"' "$f" || echo "ERRO: consolidado ilegível ($c): $f"; fi
               done
               if [ -f "$dir/resultado.json" ]; then
                 jq -r '"pico acumulado do contêiner: \(.memoriaPicoAcumuladoMiB) MiB | memory.events: \(.eventosMemoriaFinais|tojson)"' "$dir/resultado.json"
