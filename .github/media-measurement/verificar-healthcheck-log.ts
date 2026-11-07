@@ -72,5 +72,26 @@ confere("desabilitado → habilitado=false", desabilitado.habilitado, false);
 const lido = lerAmostras(`{"t":1,"health":null}\nlixo\n\n{"t":2,"health":{"Status":"starting","FailingStreak":0,"Log":[]}}\n{"sem":"t"}\n`);
 confere("NDJSON: 2 válidas, 2 inválidas", [lido.amostras.length, lido.linhasInvalidas], [2, 2]);
 
+// 9. Fase 60.4.3.4.8 — integridade: falha de leitura NUNCA vira "desabilitado"; lacuna só sobre leituras válidas.
+const integra = consolidar(amostras, [], { esperado: "habilitado" });
+confere("histórico íntegro e esperado habilitado → integridade ok", [integra.integridade.ok, integra.integridade.problemas], [true, []]);
+const soErros = consolidar([{ t: base, health: null, erro: "docker inspect falhou" }, { t: base + 2_000, health: null, erro: "docker inspect falhou" }], [], { esperado: "habilitado" });
+confere("só falhas de leitura → não é 'desabilitado' válido; integridade falha", [soErros.habilitado, soErros.integridade.ok, soErros.integridade.leiturasValidas, soErros.integridade.errosDeLeitura], [false, false, 0, 2]);
+confere("problemas registrados para leituras com erro", soErros.integridade.problemas, ["2 leitura(s) do docker inspect falharam", "nenhuma leitura válida do estado de saúde"]);
+const comBuraco = consolidar([consulta(10, "starting", 0), ...Array.from({ length: 20 }, (_, i) => ({ t: base + (20 + i * 10) * 1000, health: null, erro: "docker inspect falhou" })), consulta(250, "healthy", 0)], [], { esperado: "habilitado" });
+confere("lacuna medida só entre leituras válidas (erros no meio não 'fecham' o buraco)", "maiorLacunaEntreAmostrasMs" in comBuraco ? [comBuraco.maiorLacunaEntreAmostrasMs, comBuraco.historicoPodeEstarIncompleto, comBuraco.integridade.ok] : null, [240_000, true, false]);
+const errado = consolidar([{ t: base, health: null }, { t: base + 10_000, health: null }], [], { esperado: "habilitado" });
+confere("modo com_healthcheck mas estado desabilitado → integridade falha", [errado.habilitado, errado.integridade.ok, errado.integridade.problemas], [false, false, ["estado desabilitado diferente do esperado (habilitado)"]]);
+const semHcOk = consolidar([{ t: base, health: null }, { t: base + 10_000, health: null }], [], { esperado: "desabilitado" });
+confere("modo sem_healthcheck com estado desabilitado → integridade ok", [semHcOk.habilitado, semHcOk.integridade.ok], [false, true]);
+const comLixo = consolidar(amostras, [], { esperado: "habilitado", linhasInvalidas: 1 });
+confere("linha ilegível no NDJSON → integridade falha", [comLixo.integridade.ok, comLixo.integridade.problemas], [false, ["1 linha(s) ilegível(is) no NDJSON"]]);
+const semResultado = consolidar(amostras, [], { esperado: "habilitado", resultadoHarnessLido: false });
+confere("resultado.json exigido e não lido → integridade falha", semResultado.integridade.ok, false);
+
+// 10. Fase 60.4.3.4.9 — habilitado (Status starting) mas o Docker nunca executou o HEALTHCHECK → integridade reprova.
+const nunca = consolidar([{ t: base, health: { Status: "starting", FailingStreak: 0, Log: [] } }, { t: base + 10_000, health: { Status: "starting", FailingStreak: 0, Log: [] } }], [], { esperado: "habilitado" });
+confere("habilitado sem nenhuma execução → integridade falha", [nunca.habilitado, nunca.integridade.ok, nunca.integridade.problemas], [true, false, ["HEALTHCHECK habilitado sem nenhuma execução registrada pelo Docker"]]);
+
 console.log(falhas ? `\n${falhas} verificação(ões) FALHARAM` : "\nTodas as verificações passaram.");
 process.exit(falhas ? 1 : 0);

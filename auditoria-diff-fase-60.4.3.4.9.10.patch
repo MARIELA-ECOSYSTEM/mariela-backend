@@ -1,0 +1,321 @@
+diff --git a/.github/media-measurement/healthcheck-log.ts b/.github/media-measurement/healthcheck-log.ts
+index 5fe1c25..7e04a11 100644
+--- a/.github/media-measurement/healthcheck-log.ts
++++ b/.github/media-measurement/healthcheck-log.ts
+@@ -6,12 +6,17 @@
+ // A observação pelo /proc (harness) vira métrica AUXILIAR: cada execução do Docker é classificada como observada ou
+ // não observada no /proc, ou como ocorrida fora das janelas de medição.
+ //
+-// Uso (CLI): bun --no-env-file healthcheck-log.ts <amostras.ndjson> <saida.json> [resultado.json do harness]
++// Uso (CLI): bun --no-env-file healthcheck-log.ts <amostras.ndjson> <saida.json> <habilitado|desabilitado> [resultado.json do harness]
++// Fase 60.4.3.4.8 — o JSON SEMPRE é gravado (inclusive com problemas, para diagnóstico), mas a CLI sai com código 2
++// quando a integridade falha: amostra ilegível, falha de `docker inspect`, nenhuma leitura válida, estado diferente do
++// esperado para o modo, histórico possivelmente incompleto ou `resultado.json` do harness exigido e não lido.
+ import { readFileSync, writeFileSync } from "node:fs";
+ 
+ export interface EntradaDocker { Start: string; End: string; ExitCode: number; Output?: string }
+ export interface SaudeDocker { Status: string; FailingStreak: number; Log?: EntradaDocker[] | null }
+-export interface Amostra { t: number; health: SaudeDocker | null }
++/** `erro` presente = a LEITURA falhou (ex.: `docker inspect` com erro) — nunca confundir com HEALTHCHECK desabilitado. */
++export interface Amostra { t: number; health: SaudeDocker | null; erro?: string }
++export type Esperado = "habilitado" | "desabilitado";
+ 
+ export interface Execucao {
+   inicio: number;
+@@ -41,9 +46,9 @@ export function lerAmostras(texto: string): { amostras: Amostra[]; linhasInvalid
+   for (const linha of texto.split(/\r?\n/)) {
+     if (!linha.trim()) continue;
+     try {
+-      const obj = JSON.parse(linha) as { t?: unknown; health?: unknown };
++      const obj = JSON.parse(linha) as { t?: unknown; health?: unknown; erro?: unknown };
+       if (typeof obj.t !== "number") throw new Error("sem t");
+-      amostras.push({ t: obj.t, health: obj.health && typeof obj.health === "object" ? (obj.health as SaudeDocker) : null });
++      amostras.push({ t: obj.t, health: obj.health && typeof obj.health === "object" ? (obj.health as SaudeDocker) : null, ...(typeof obj.erro === "string" ? { erro: obj.erro } : {}) });
+     } catch {
+       linhasInvalidas += 1;
+     }
+@@ -94,20 +99,47 @@ export function correlacionarComProc(execucoes: Execucao[], janelas: JanelaHarne
+   });
+ }
+ 
+-export function consolidar(amostras: Amostra[], janelas: JanelaHarness[] = [], linhasInvalidas = 0) {
+-  const habilitado = amostras.some((a) => a.health !== null);
+-  if (!habilitado) return { habilitado: false, amostras: amostras.length, linhasInvalidas, observacao: "sem .State.Health: HEALTHCHECK desabilitado neste contêiner (esperado no modo sem_healthcheck)" };
+-  const execucoes = unirExecucoes(amostras);
++export interface OpcoesConsolidacao {
++  linhasInvalidas?: number;
++  /** Estado que o modo de medição exige (com_healthcheck → habilitado; sem_healthcheck → desabilitado). */
++  esperado?: Esperado;
++  /** false quando o `resultado.json` do harness era exigido mas não pôde ser lido. */
++  resultadoHarnessLido?: boolean;
++}
++
++export function consolidar(amostras: Amostra[], janelas: JanelaHarness[] = [], opcoes: OpcoesConsolidacao = {}) {
++  const linhasInvalidas = opcoes.linhasInvalidas ?? 0;
++  // Só leituras VÁLIDAS (sem `erro`) contam para estado e lacuna: uma falha de leitura não é "desabilitado".
++  const validas = amostras.filter((a) => a.erro === undefined);
++  const errosDeLeitura = amostras.length - validas.length;
++  const habilitado = validas.some((a) => a.health !== null);
++  const lacuna = maiorLacunaMs(validas);
++  const problemas: string[] = [];
++  if (linhasInvalidas > 0) problemas.push(`${linhasInvalidas} linha(s) ilegível(is) no NDJSON`);
++  if (errosDeLeitura > 0) problemas.push(`${errosDeLeitura} leitura(s) do docker inspect falharam`);
++  if (validas.length === 0) problemas.push("nenhuma leitura válida do estado de saúde");
++  if (opcoes.esperado && validas.length > 0 && (opcoes.esperado === "habilitado") !== habilitado) problemas.push(`estado ${habilitado ? "habilitado" : "desabilitado"} diferente do esperado (${opcoes.esperado})`);
++  if (habilitado && lacuna >= 5 * 30_000) problemas.push(`lacuna de ${lacuna} ms entre leituras válidas: o histórico pode ter perdido execuções`);
++  if (opcoes.resultadoHarnessLido === false) problemas.push("resultado.json do harness exigido e não lido: correlação com o /proc indisponível");
++  const integridade = { ok: problemas.length === 0, problemas, amostras: amostras.length, leiturasValidas: validas.length, errosDeLeitura, linhasInvalidas, esperado: opcoes.esperado ?? null };
++  if (!habilitado) return { habilitado: false, integridade, amostras: amostras.length, linhasInvalidas, observacao: "sem .State.Health nas leituras válidas: HEALTHCHECK desabilitado neste contêiner (esperado no modo sem_healthcheck)" };
++  const execucoes = unirExecucoes(validas);
++  // Fase 60.4.3.4.9 — habilitado mas SEM nenhuma execução registrada não prova que o HEALTHCHECK rodou: reprova.
++  if (opcoes.esperado === "habilitado" && execucoes.length === 0) {
++    integridade.problemas.push("HEALTHCHECK habilitado sem nenhuma execução registrada pelo Docker");
++    integridade.ok = false;
++  }
+   const correlacionadas = correlacionarComProc(execucoes, janelas);
+   const duracoes = execucoes.map((e) => e.duracaoMs).sort((a, b) => a - b);
+-  const ultima = [...amostras].sort((a, b) => b.t - a.t).find((a) => a.health)?.health ?? null;
++  const ultima = [...validas].sort((a, b) => b.t - a.t).find((a) => a.health)?.health ?? null;
+   const conta = (c: string) => correlacionadas.filter((e) => e.classificacao === c).length;
+   return {
+     habilitado: true,
++    integridade,
+     amostras: amostras.length,
+     linhasInvalidas,
+-    maiorLacunaEntreAmostrasMs: maiorLacunaMs(amostras),
+-    historicoPodeEstarIncompleto: maiorLacunaMs(amostras) >= 5 * 30_000,
++    maiorLacunaEntreAmostrasMs: lacuna,
++    historicoPodeEstarIncompleto: lacuna >= 5 * 30_000,
+     execucoes: execucoes.length,
+     sucessos: execucoes.filter((e) => e.sucesso).length,
+     falhas: execucoes.filter((e) => !e.sucesso).length,
+@@ -115,22 +147,35 @@ export function consolidar(amostras: Amostra[], janelas: JanelaHarness[] = [], l
+     duracaoMs: duracoes.length ? { min: duracoes[0], mediana: duracoes[Math.floor(duracoes.length / 2)], max: duracoes[duracoes.length - 1] } : null,
+     statusFinal: ultima?.Status ?? null,
+     failingStreakFinal: ultima?.FailingStreak ?? null,
+-    failingStreakMax: Math.max(0, ...amostras.map((a) => a.health?.FailingStreak ?? 0)),
+-    transicoesDeStatus: transicoesDeStatus(amostras),
++    failingStreakMax: Math.max(0, ...validas.map((a) => a.health?.FailingStreak ?? 0)),
++    transicoesDeStatus: transicoesDeStatus(validas),
+     correlacaoProc: { observadas: conta("observada_no_proc"), naoObservadas: conta("nao_observada_no_proc"), foraDeJanela: conta("fora_de_janela_de_medicao") },
+     detalhes: correlacionadas,
+   };
+ }
+ 
+ if (import.meta.main) {
+-  const [arquivoAmostras, arquivoSaida, arquivoResultado] = process.argv.slice(2);
+-  if (!arquivoAmostras || !arquivoSaida) throw new Error("uso: healthcheck-log.ts <amostras.ndjson> <saida.json> [resultado.json]");
+-  const { amostras, linhasInvalidas } = lerAmostras(readFileSync(arquivoAmostras, "utf8"));
++  const [arquivoAmostras, arquivoSaida, esperado, arquivoResultado] = process.argv.slice(2);
++  if (!arquivoAmostras || !arquivoSaida || (esperado !== "habilitado" && esperado !== "desabilitado")) {
++    console.error("uso: healthcheck-log.ts <amostras.ndjson> <saida.json> <habilitado|desabilitado> [resultado.json]");
++    process.exit(64);
++  }
++  // Arquivo de amostras ausente é falha de coleta (código 2), registrada no JSON — nunca vira "0 execuções".
++  let texto = "";
++  let erroLeitura: string | null = null;
++  try { texto = readFileSync(arquivoAmostras, "utf8"); } catch (e) { erroLeitura = e instanceof Error ? e.message : String(e); }
++  const { amostras, linhasInvalidas } = lerAmostras(texto);
+   let janelas: JanelaHarness[] = [];
++  let resultadoHarnessLido: boolean | undefined;
+   if (arquivoResultado) {
+-    try { janelas = (JSON.parse(readFileSync(arquivoResultado, "utf8")) as { janelas?: JanelaHarness[] }).janelas ?? []; } catch { janelas = []; }
++    try { janelas = (JSON.parse(readFileSync(arquivoResultado, "utf8")) as { janelas?: JanelaHarness[] }).janelas ?? []; resultadoHarnessLido = true; } catch { resultadoHarnessLido = false; }
+   }
+-  const resultado = consolidar(amostras, janelas, linhasInvalidas);
++  const resultado = consolidar(amostras, janelas, { linhasInvalidas, esperado, ...(resultadoHarnessLido === undefined ? {} : { resultadoHarnessLido }) });
++  if (erroLeitura) { resultado.integridade.ok = false; resultado.integridade.problemas.unshift(`arquivo de amostras ilegível: ${erroLeitura}`); }
+   writeFileSync(arquivoSaida, JSON.stringify(resultado, null, 2));
+   console.log(JSON.stringify({ ...resultado, detalhes: undefined }));
++  if (!resultado.integridade.ok) {
++    console.error(`INTEGRIDADE FALHOU (${arquivoSaida}): ${resultado.integridade.problemas.join("; ")}`);
++    process.exit(2);
++  }
+ }
+diff --git a/.github/media-measurement/verificar-healthcheck-log.ts b/.github/media-measurement/verificar-healthcheck-log.ts
+index b7ecc8c..f5453fd 100644
+--- a/.github/media-measurement/verificar-healthcheck-log.ts
++++ b/.github/media-measurement/verificar-healthcheck-log.ts
+@@ -72,5 +72,26 @@ confere("desabilitado → habilitado=false", desabilitado.habilitado, false);
+ const lido = lerAmostras(`{"t":1,"health":null}\nlixo\n\n{"t":2,"health":{"Status":"starting","FailingStreak":0,"Log":[]}}\n{"sem":"t"}\n`);
+ confere("NDJSON: 2 válidas, 2 inválidas", [lido.amostras.length, lido.linhasInvalidas], [2, 2]);
+ 
++// 9. Fase 60.4.3.4.8 — integridade: falha de leitura NUNCA vira "desabilitado"; lacuna só sobre leituras válidas.
++const integra = consolidar(amostras, [], { esperado: "habilitado" });
++confere("histórico íntegro e esperado habilitado → integridade ok", [integra.integridade.ok, integra.integridade.problemas], [true, []]);
++const soErros = consolidar([{ t: base, health: null, erro: "docker inspect falhou" }, { t: base + 2_000, health: null, erro: "docker inspect falhou" }], [], { esperado: "habilitado" });
++confere("só falhas de leitura → não é 'desabilitado' válido; integridade falha", [soErros.habilitado, soErros.integridade.ok, soErros.integridade.leiturasValidas, soErros.integridade.errosDeLeitura], [false, false, 0, 2]);
++confere("problemas registrados para leituras com erro", soErros.integridade.problemas, ["2 leitura(s) do docker inspect falharam", "nenhuma leitura válida do estado de saúde"]);
++const comBuraco = consolidar([consulta(10, "starting", 0), ...Array.from({ length: 20 }, (_, i) => ({ t: base + (20 + i * 10) * 1000, health: null, erro: "docker inspect falhou" })), consulta(250, "healthy", 0)], [], { esperado: "habilitado" });
++confere("lacuna medida só entre leituras válidas (erros no meio não 'fecham' o buraco)", "maiorLacunaEntreAmostrasMs" in comBuraco ? [comBuraco.maiorLacunaEntreAmostrasMs, comBuraco.historicoPodeEstarIncompleto, comBuraco.integridade.ok] : null, [240_000, true, false]);
++const errado = consolidar([{ t: base, health: null }, { t: base + 10_000, health: null }], [], { esperado: "habilitado" });
++confere("modo com_healthcheck mas estado desabilitado → integridade falha", [errado.habilitado, errado.integridade.ok, errado.integridade.problemas], [false, false, ["estado desabilitado diferente do esperado (habilitado)"]]);
++const semHcOk = consolidar([{ t: base, health: null }, { t: base + 10_000, health: null }], [], { esperado: "desabilitado" });
++confere("modo sem_healthcheck com estado desabilitado → integridade ok", [semHcOk.habilitado, semHcOk.integridade.ok], [false, true]);
++const comLixo = consolidar(amostras, [], { esperado: "habilitado", linhasInvalidas: 1 });
++confere("linha ilegível no NDJSON → integridade falha", [comLixo.integridade.ok, comLixo.integridade.problemas], [false, ["1 linha(s) ilegível(is) no NDJSON"]]);
++const semResultado = consolidar(amostras, [], { esperado: "habilitado", resultadoHarnessLido: false });
++confere("resultado.json exigido e não lido → integridade falha", semResultado.integridade.ok, false);
++
++// 10. Fase 60.4.3.4.9 — habilitado (Status starting) mas o Docker nunca executou o HEALTHCHECK → integridade reprova.
++const nunca = consolidar([{ t: base, health: { Status: "starting", FailingStreak: 0, Log: [] } }, { t: base + 10_000, health: { Status: "starting", FailingStreak: 0, Log: [] } }], [], { esperado: "habilitado" });
++confere("habilitado sem nenhuma execução → integridade falha", [nunca.habilitado, nunca.integridade.ok, nunca.integridade.problemas], [true, false, ["HEALTHCHECK habilitado sem nenhuma execução registrada pelo Docker"]]);
++
+ console.log(falhas ? `\n${falhas} verificação(ões) FALHARAM` : "\nTodas as verificações passaram.");
+ process.exit(falhas ? 1 : 0);
+diff --git a/.github/workflows/media-container-measurement.yml b/.github/workflows/media-container-measurement.yml
+index 4a0ba7b..733a72e 100644
+--- a/.github/workflows/media-container-measurement.yml
++++ b/.github/workflows/media-container-measurement.yml
+@@ -136,17 +136,64 @@ jobs:
+           # Fase 60.4.3.4.7 — histórico do Docker HEALTHCHECK: `.State.Health.Log` guarda só as 5 últimas execuções, então
+           # ele é consultado periodicamente (NDJSON { t, health }) e consolidado depois (healthcheck-log.ts). Com o
+           # HEALTHCHECK desabilitado, `.State.Health` é null.
+-          amostrar_saude() { printf '{"t":%s,"health":%s}\n' "$(date +%s%3N)" "$(docker inspect -f '{{json .State.Health}}' "$1" 2>/dev/null || echo null)" >> "$2"; }
+-          consolidar_saude() {
++          # Fase 60.4.3.4.8 — falha de `docker inspect` é registrada como ERRO de leitura (campo `erro`), nunca como
++          # `health: null` (que significa HEALTHCHECK desabilitado).
++          amostrar_saude() {
++            local t estado rodando health
++            t=$(date +%s%3N)
++            # Uma única chamada obtém Running e Health: evita uma segunda leitura que poderia falhar sem registro.
++            if estado=$(docker inspect -f '{{.State.Running}}|{{json .State.Health}}' "$1" 2>/dev/null); then
++              rodando=${estado%%|*}
++              health=${estado#*|}
++              printf '{"t":%s,"health":%s}\\n' "$t" "$health" >> "$2"
++              printf '%s' "$rodando"
++            else
++              printf '{"t":%s,"health":null,"erro":"docker inspect falhou"}\\n' "$t" >> "$2"
++              return 1
++            fi
++          }
++          # Coletor periódico com parada COOPERATIVA: cria o arquivo-sinal e espera (`wait`) a iteração em curso terminar —
++          # sem `kill` no meio de uma escrita, sem coletor vivo durante a coleta final e a consolidação.
++          iniciar_coletor() {  # $1 contêiner, $2 ndjson, $3 sinal de parada, $4 intervalo (s), $5 (opcional) arquivo de docker stats
++            rm -f "$3"
++            # Fase 60.4.3.4.9 — Running e Health vêm da MESMA leitura do inspect feita por amostrar_saude.
++            # Falha fica registrada no NDJSON e não encerra o coletor; teto de 30 falhas consecutivas.
++            ( falhas_seguidas=0
++              while [ ! -e "$3" ]; do
++                if [ -n "${5:-}" ]; then docker stats --no-stream --format "$(date -u +%T) {{.MemUsage}} {{.CPUPerc}}" "$1" >> "$5" 2>/dev/null || true; fi
++                if rodando=$(amostrar_saude "$1" "$2"); then
++                  falhas_seguidas=0
++                  [ "$rodando" = "true" ] || break
++                else
++                  falhas_seguidas=$((falhas_seguidas + 1))
++                  [ "$falhas_seguidas" -le 30 ] || break
++                fi
++                sleep "$4"
++              done ) &
++            COLETOR_PID=$!
++          }
++          parar_coletor() { touch "$2"; wait "$1" 2>/dev/null || true; }
++          # Consolidação SEM `|| true`: código ≠ 0 (inclusive integridade falha) é propagado e registrado como erro do modo.
++          consolidar_saude() {  # $1 dir, $2 ndjson, $3 saída, $4 habilitado|desabilitado, $5 (opcional) resultado.json
+             docker run --rm --no-healthcheck --network none --label "$ROTULO" \
+               -v "$MEDICAO:/app/medicao:ro" -v "$1:/saida" -e BUN_RUNTIME_TRANSPILER_CACHE_PATH=0 \
+-              "$IMAGEM" bun --no-env-file /app/medicao/healthcheck-log.ts "/saida/$2" "/saida/$3" ${4:+"/saida/$4"} || true
++              "$IMAGEM" bun --no-env-file /app/medicao/healthcheck-log.ts "/saida/$2" "/saida/$3" "$4" ${5:+"/saida/$5"}
++          }
++          # Artefatos OBRIGATÓRIOS de cada modo: existem, não estão vazios e (os .json) são JSON válido.
++          verificar_artefatos() {  # $1 dir
++            local faltando=0 f
++            for f in cenario1.txt cenario1-health.ndjson cenario1-healthcheck-consolidado.json sonda.ndjson resultado.json api-medicao-estado.json api-medicao-health.ndjson api-medicao-healthcheck-consolidado.json; do
++              if [ ! -s "$1/$f" ]; then echo "::error::artefato obrigatório ausente ou vazio: $(basename "$1")/$f"; faltando=1
++              elif [[ "$f" == *.json ]] && ! jq empty "$1/$f" 2>/dev/null; then echo "::error::artefato obrigatório com JSON inválido: $(basename "$1")/$f"; faltando=1
++              fi
++            done
++            [ "$faltando" -eq 0 ]
+           }
+ 
+           executar_modo() {
+             local modo="$1" dir="$SAIDA/$1" rede="medicao-$1" api1="api-repouso-$1" api2="api-medicao-$1" sonda="sonda-$1" mongo="mongo-$1"
+-            local flags_hc=()
+-            if [ "$modo" = "sem_healthcheck" ]; then flags_hc=(--no-healthcheck); fi
++            local flags_hc=() esperado=habilitado erro_modo=0 coletor rc
++            if [ "$modo" = "sem_healthcheck" ]; then flags_hc=(--no-healthcheck); esperado=desabilitado; fi
+             mkdir -p "$dir" && chmod 777 "$dir"
+             echo "=== modo=$modo | flags de HEALTHCHECK na API: ${flags_hc[*]:-<nenhuma: HEALTHCHECK da imagem ativo>} | inicio=$(date -u +%FT%TZ)" | tee "$dir/modo.txt"
+ 
+@@ -158,9 +205,8 @@ jobs:
+               --memory="$LIMITE_MEMORIA" --memory-swap="$LIMITE_MEMORIA" --cpus="$LIMITE_CPU" \
+               --env-file "$RUNNER_TEMP/medicao.env" "$IMAGEM"
+             docker inspect "$api1" --format '{{json .Config.Healthcheck}}' > "$dir/cenario1-healthcheck-config.json"
+-            ( while [ "$(docker inspect -f '{{.State.Running}}' "$api1" 2>/dev/null)" = "true" ]; do
+-                amostrar_saude "$api1" "$dir/cenario1-health.ndjson"; sleep 10
+-              done ) &
++            iniciar_coletor "$api1" "$dir/cenario1-health.ndjson" "$RUNNER_TEMP/parar-coletor1-$modo" 10
++            coletor=$COLETOR_PID
+             local pronta=0 inicio_boot
+             inicio_boot=$(date +%s)
+             for i in $(seq 1 120); do
+@@ -181,9 +227,14 @@ jobs:
+             docker inspect "$api1" --format '{{json .State}}' > "$dir/cenario1-estado.json"
+             docker inspect "$api1" --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} RestartCount={{.RestartCount}} Health={{if .State.Health}}{{.State.Health.Status}}/falhas={{.State.Health.FailingStreak}}/execucoes_no_log={{len .State.Health.Log}}{{else}}desabilitado{{end}}' | tee -a "$dir/cenario1.txt"
+             docker logs "$api1" > "$dir/cenario1-api.log" 2>&1 || true
++            # Ordem garantida: para o coletor (espera a iteração em curso) → amostra FINAL (contêiner ainda existe) → remove → consolida.
++            parar_coletor "$coletor" "$RUNNER_TEMP/parar-coletor1-$modo"
+             amostrar_saude "$api1" "$dir/cenario1-health.ndjson"
+             docker rm -f "$api1"
+-            consolidar_saude "$dir" cenario1-health.ndjson cenario1-healthcheck-consolidado.json
++            consolidar_saude "$dir" cenario1-health.ndjson cenario1-healthcheck-consolidado.json "$esperado"; rc=$?
++            if [ "$rc" -ne 0 ]; then
++              echo "::error::HEALTHCHECK $modo/cenario1: $( [ "$rc" -eq 2 ] && echo "integridade reprovada (código 2)" || echo "consolidação falhou (código $rc)")"; erro_modo=1
++            fi
+ 
+             # ---- Cenários 2 a 6: harness (API do dist + validações + falhas) e sonda externa de /health ----
+             docker run -d --name "$sonda" --label "$ROTULO" --no-healthcheck --network "$rede" \
+@@ -197,27 +248,29 @@ jobs:
+               -v "$MEDICAO:/app/medicao:ro" -v "$SAIDA/arquivos:/arquivos:ro" -v "$dir:/saida" \
+               "$IMAGEM" bun --no-env-file /app/medicao/harness.ts
+             docker inspect "$api2" --format '{{json .Config.Healthcheck}}' > "$dir/api-medicao-healthcheck-config.json"
+-            ( while [ "$(docker inspect -f '{{.State.Running}}' "$api2" 2>/dev/null)" = "true" ]; do
+-                docker stats --no-stream --format "$(date -u +%T) {{.MemUsage}} {{.CPUPerc}}" "$api2" >> "$dir/docker-stats-api-medicao.txt" 2>/dev/null || true
+-                amostrar_saude "$api2" "$dir/api-medicao-health.ndjson"
+-                sleep 2
+-              done ) &
++            iniciar_coletor "$api2" "$dir/api-medicao-health.ndjson" "$RUNNER_TEMP/parar-coletor2-$modo" 2 "$dir/docker-stats-api-medicao.txt"
++            coletor=$COLETOR_PID
+             local codigo
+             codigo=$(timeout 3000 docker wait "$api2" || echo "timeout")
+             echo "codigo_saida_harness=$codigo" | tee "$dir/cenarios-2-6.txt"
+             docker inspect "$api2" --format '{{json .State}}' > "$dir/api-medicao-estado.json"
+             docker inspect "$api2" --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} RestartCount={{.RestartCount}} Health={{if .State.Health}}{{.State.Health.Status}}/falhas={{.State.Health.FailingStreak}}/execucoes_no_log={{len .State.Health.Log}}{{else}}desabilitado{{end}}' | tee -a "$dir/cenarios-2-6.txt"
+             docker logs "$api2" > "$dir/api-medicao.log" 2>&1 || true
++            parar_coletor "$coletor" "$RUNNER_TEMP/parar-coletor2-$modo"
+             amostrar_saude "$api2" "$dir/api-medicao-health.ndjson"
+             docker rm -f "$sonda" "$api2" "$mongo" || true
+-            consolidar_saude "$dir" api-medicao-health.ndjson api-medicao-healthcheck-consolidado.json resultado.json
++            consolidar_saude "$dir" api-medicao-health.ndjson api-medicao-healthcheck-consolidado.json "$esperado" resultado.json; rc=$?
++            if [ "$rc" -ne 0 ]; then
++              echo "::error::HEALTHCHECK $modo/api-medicao: $( [ "$rc" -eq 2 ] && echo "integridade reprovada (código 2)" || echo "consolidação falhou (código $rc)")"; erro_modo=1
++            fi
+             docker network rm "$rede" || true
+-            echo "fim=$(date -u +%FT%TZ)" >> "$dir/modo.txt"
+-            [ "$codigo" = "0" ]
++            verificar_artefatos "$dir" || erro_modo=1
++            echo "fim=$(date -u +%FT%TZ) codigo_harness=$codigo erro_instrumentacao=$erro_modo" >> "$dir/modo.txt"
++            [ "$codigo" = "0" ] && [ "$erro_modo" -eq 0 ]
+           }
+ 
+           for modo in $MODOS; do
+-            if ! executar_modo "$modo"; then falhas=$((falhas + 1)); echo "::warning::modo $modo terminou com falha (ver $modo/cenarios-2-6.txt)"; fi
++            if ! executar_modo "$modo"; then falhas=$((falhas + 1)); echo "::error::modo $modo terminou com falha (harness ou instrumentação; ver $modo/modo.txt e $modo/cenarios-2-6.txt)"; fi
+           done
+           test "$falhas" -eq 0
+ 
+@@ -234,11 +287,12 @@ jobs:
+               cat "$dir/cenarios-2-6.txt" 2>/dev/null || true
+               for c in cenario1 api-medicao; do
+                 f="$dir/$c-healthcheck-consolidado.json"
+-                if [ -f "$f" ]; then jq -r --arg c "$c" 'if .habilitado then "HEALTHCHECK (\($c), histórico do Docker): execuções \(.execucoes) | sucessos \(.sucessos) | falhas \(.falhas) | prazo excedido \(.prazoExcedido) | duração ms \(.duracaoMs|tojson) | status final \(.statusFinal) | failing streak máx \(.failingStreakMax) | /proc: observadas \(.correlacaoProc.observadas), não observadas \(.correlacaoProc.naoObservadas), fora de janela \(.correlacaoProc.foraDeJanela) | histórico possivelmente incompleto: \(.historicoPodeEstarIncompleto)" else "HEALTHCHECK (\($c)): desabilitado" end' "$f" || true; fi
++                if [ ! -f "$f" ]; then echo "ERRO: consolidado ausente ($c) — HEALTHCHECK sem medição válida neste modo"
++                else jq -r --arg c "$c" '(if .integridade.ok then "" else "INTEGRIDADE REPROVADA: \(.integridade.problemas|join("; ")) | " end) + (if .habilitado then "HEALTHCHECK (\($c), histórico do Docker): execuções \(.execucoes) | sucessos \(.sucessos) | falhas \(.falhas) | prazo excedido \(.prazoExcedido) | duração ms \(.duracaoMs|tojson) | status final \(.statusFinal) | failing streak máx \(.failingStreakMax) | /proc (auxiliar): observadas \(.correlacaoProc.observadas), não observadas \(.correlacaoProc.naoObservadas), fora de janela \(.correlacaoProc.foraDeJanela)" else "HEALTHCHECK (\($c)): desabilitado" end)' "$f" || echo "ERRO: consolidado ilegível ($c): $f"; fi
+               done
+               if [ -f "$dir/resultado.json" ]; then
+                 jq -r '"pico acumulado do contêiner: \(.memoriaPicoAcumuladoMiB) MiB | memory.events: \(.eventosMemoriaFinais|tojson)"' "$dir/resultado.json"
+-                jq -r '.janelas[] | "\(.rotulo) | contêiner máx \(.containerMaxAmostradoMiB) MiB | API RSS máx \(.apiRssMaxMiB) MiB | validadores máx \(.subprocessosAtivosMax) | HEALTHCHECK vistos \(.healthcheckDocker.execucoesVistas) (pico \(.healthcheckDocker.picoRssMiB) MiB) | \(.duracaoMs) ms | oom Δ \(.eventosMemoriaDelta.oom // 0) oom_kill Δ \(.eventosMemoriaDelta.oom_kill // 0)"' "$dir/resultado.json"
++                jq -r '.janelas[] | "\(.rotulo) | contêiner máx \(.containerMaxAmostradoMiB) MiB | API RSS máx \(.apiRssMaxMiB) MiB | validadores máx \(.subprocessosAtivosMax) | HEALTHCHECK no /proc (auxiliar) \(.healthcheckDocker.execucoesVistas) (pico \(.healthcheckDocker.picoRssMiB) MiB) | \(.duracaoMs) ms | oom Δ \(.eventosMemoriaDelta.oom // 0) oom_kill Δ \(.eventosMemoriaDelta.oom_kill // 0)"' "$dir/resultado.json"
+               fi
+               echo '```'
+             done
