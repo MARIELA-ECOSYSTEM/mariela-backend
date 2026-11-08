@@ -1,4 +1,5 @@
 import { Injectable } from "@nestjs/common";
+import type { ClientSession } from "mongoose";
 import { SequenciasRepository } from "./sequencias.repository.js";
 
 @Injectable()
@@ -23,8 +24,9 @@ export class SequenciasService {
    * precisa do mesmo número em mais de uma representação (`numero` de 6
    * dígitos exibido ao operador do PDV + sufixo de 4 dígitos do `codigo`).
    */
-  async proximoValor(chave: string): Promise<number> {
-    return this.sequenciasRepository.proximoValor(chave);
+  /** Fase 60.4.3.4.15 (F04) — `sessao` opcional: incremento dentro da transação de quem chama. */
+  async proximoValor(chave: string, sessao?: ClientSession): Promise<number> {
+    return this.sequenciasRepository.proximoValor(chave, sessao);
   }
 
   /**

@@ -1,6 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
-import { Error as MongooseErrors, isValidObjectId, type Model, type PipelineStage } from "mongoose";
+import { Error as MongooseErrors, isValidObjectId, type ClientSession, type Model, type PipelineStage } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, FacetOption } from "../../common/types/api-response.interface.js";
 import { COM_ESTOQUE, EH_NOVIDADE, EM_PROMOCAO, FACETAS_PRODUTO, SEM_ESTOQUE, SEM_NOVIDADE, SEM_PROMOCAO } from "./produtos.constants.js";
@@ -38,13 +38,14 @@ export class ProdutosRepository {
     return this.produtoModel.create(dados);
   }
 
-  async encontrarPorId(id: string): Promise<ProdutoDocument | null> {
+  /** Fase 60.4.3.4.15 — `sessao` opcional: dentro de uma transação a leitura usa o snapshot dela. */
+  async encontrarPorId(id: string, sessao?: ClientSession): Promise<ProdutoDocument | null> {
     if (!isValidObjectId(id)) return null;
-    return this.produtoModel.findOne({ _id: id, excluidoEm: null }).exec();
+    return this.produtoModel.findOne({ _id: id, excluidoEm: null }).session(sessao ?? null).exec();
   }
 
-  async encontrarPorIdOuFalhar(id: string): Promise<ProdutoDocument> {
-    const produto = await this.encontrarPorId(id);
+  async encontrarPorIdOuFalhar(id: string, sessao?: ClientSession): Promise<ProdutoDocument> {
+    const produto = sessao ? await this.encontrarPorId(id, sessao) : await this.encontrarPorId(id);
     if (!produto) throw ApiException.notFound("Produto não encontrado.");
     return produto;
   }
@@ -80,12 +81,22 @@ export class ProdutosRepository {
    * operação termina com o conflito de negócio abaixo (HTTP 409), nunca com o
    * `VersionError` cru (que o filtro global transformava em HTTP 500).
    * Qualquer outro erro continua sendo relançado na hora, sem retentativa.
+   *
+   * Fase 60.4.3.4.15 (F04) — com `sessao` (dentro de `executarEmTransacao`): UMA leitura e UMA gravação na sessão,
+   * sem laço interno e sem capturar nada. Um `VersionError` ou `WriteConflict` sobe para o executor da transação, que
+   * repete a transação INTEIRA — repetir só esta gravação dentro de uma transação já abortada no servidor é inválido.
    */
   async salvarComRetentativa(
     id: string,
     mutar: (produto: ProdutoDocument) => void,
     tentativas = 3,
+    sessao?: ClientSession,
   ): Promise<ProdutoDocument> {
+    if (sessao) {
+      const produto = await this.encontrarPorIdOuFalhar(id, sessao);
+      mutar(produto);
+      return produto.save({ session: sessao });
+    }
     for (let tentativa = 1; tentativa <= tentativas; tentativa += 1) {
       const produto = await this.encontrarPorIdOuFalhar(id);
       mutar(produto);

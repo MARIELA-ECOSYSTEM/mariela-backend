@@ -2,6 +2,7 @@ import { Module } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { MongooseModule } from "@nestjs/mongoose";
 import { mongooseConfigFactory } from "./mongoose.config.js";
+import { VerificacaoTopologiaMongo } from "./verificacao-topologia.service.js";
 
 /**
  * Único ponto de configuração da conexão com o MongoDB. Módulos de negócio
@@ -19,6 +20,8 @@ import { mongooseConfigFactory } from "./mongoose.config.js";
       useFactory: mongooseConfigFactory,
     }),
   ],
+  // Fase 60.4.3.4.15 (F04) — aviso no boot quando o MongoDB não suporta transações.
+  providers: [VerificacaoTopologiaMongo],
   exports: [MongooseModule],
 })
 export class DatabaseModule {}

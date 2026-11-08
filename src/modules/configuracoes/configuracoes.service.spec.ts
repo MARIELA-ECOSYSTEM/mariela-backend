@@ -1090,12 +1090,14 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
     function pausarInsercaoDeVenda(ponto: PontoDeParada) {
       const sequencias = moduleRef.get(SequenciasService, { strict: false });
       const original = sequencias.proximoValor.bind(sequencias);
-      return spyOn(sequencias, "proximoValor").mockImplementation(async (chave) => {
+      // Fase 60.4.3.4.15 (F04) — a criação de venda chama `proximoValor` DENTRO da transação: a sessão recebida é
+      // repassada ao original (sem ela, o incremento sairia da transação e o teste não exercitaria o fluxo real).
+      return spyOn(sequencias, "proximoValor").mockImplementation(async (chave, sessao) => {
         if (chave === "venda") {
           ponto.chegou.liberar();
           await ponto.liberacao.promessa;
         }
-        return original(chave);
+        return original(chave, sessao);
       });
     }
 

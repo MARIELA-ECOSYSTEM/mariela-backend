@@ -1,6 +1,6 @@
 import { forwardRef, Inject, Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
-import type { Model, Types } from "mongoose";
+import type { ClientSession, Model, Types } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
 import { CampanhasRepository } from "../campanhas/campanhas.repository.js";
@@ -472,6 +472,8 @@ export class ProdutosService {
     produtoId: string,
     varianteId: string,
     ajuste: { tamanhoId?: string; tamanho?: string; delta: number; exigirExistente: boolean; exigirTamanhoCadastrado?: boolean },
+    /** Fase 60.4.3.4.15 (F04) — quando informada, a leitura e a gravação do produto fazem parte desta transação. */
+    sessao?: ClientSession,
   ): Promise<{ produto: ProdutoDocument; tamanhoId: string; saldoResultante: number }> {
     if (ajuste.exigirTamanhoCadastrado && ajuste.tamanho && !ajuste.tamanhoId) {
       const produtoAtual = await this.produtosRepository.encontrarPorIdOuFalhar(produtoId);
@@ -527,7 +529,7 @@ export class ProdutosService {
       tamanhoIdAfetado = String(tamanho!._id);
       saldoResultante = resultado;
       this.recalcularDerivados(documento);
-    });
+    }, 3, sessao);
 
     return { produto, tamanhoId: tamanhoIdAfetado, saldoResultante };
   }

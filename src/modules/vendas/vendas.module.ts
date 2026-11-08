@@ -6,6 +6,7 @@ import { ClientesModule } from "../clientes/clientes.module.js";
 import { ConfiguracoesModule } from "../configuracoes/configuracoes.module.js";
 import { ProdutosModule } from "../produtos/produtos.module.js";
 import { SequenciasModule } from "../sequencias/sequencias.module.js";
+import { MovimentacaoEstoque, MovimentacaoEstoqueSchema } from "../estoque/schemas/movimentacao-estoque.schema.js";
 import { VendedoresModule } from "../vendedores/vendedores.module.js";
 import { VendasController } from "./vendas.controller.js";
 import { VendasRepository } from "./vendas.repository.js";
@@ -18,6 +19,8 @@ import { Venda, VendaSchema } from "./schemas/venda.schema.js";
     MongooseModule.forFeature([
       { name: Venda.name, schema: VendaSchema },
       { name: EventoVenda.name, schema: EventoVendaSchema },
+      // Fase 60.4.3.4.15 (F04) — ledger de estoque gravado na mesma transação da venda/restauração.
+      { name: MovimentacaoEstoque.name, schema: MovimentacaoEstoqueSchema },
     ]),
     SequenciasModule,
     // Reutilizados pelo domínio de Vendas: preço/estoque (Produtos), snapshot

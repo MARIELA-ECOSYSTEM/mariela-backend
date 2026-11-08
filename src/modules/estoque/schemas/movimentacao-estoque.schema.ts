@@ -3,6 +3,8 @@ import { SchemaTypes, type HydratedDocument, type Types } from "mongoose";
 import { aplicarSerializacaoPadrao } from "../../../database/mongoose-json.util.js";
 
 export type TipoMovimentacaoEstoque = "entrada" | "saida";
+export const ORIGENS_MOVIMENTACAO_ESTOQUE = ["manual", "venda", "cancelamento"] as const;
+export type OrigemMovimentacaoEstoque = (typeof ORIGENS_MOVIMENTACAO_ESTOQUE)[number];
 
 /**
  * Collection própria (decisão de negócio já aprovada) — o estoque em si
@@ -37,6 +39,19 @@ export class MovimentacaoEstoque {
   /** `null` enquanto a autenticação não existir — nunca inventar identidade. */
   @Prop({ type: String, default: null })
   usuarioId!: string | null;
+
+  /**
+   * Fase 60.4.3.4.15 (F04) — rastreabilidade do saldo: de onde veio a movimentação. `manual` = entrada/saída do
+   * módulo Estoque (padrão — registros anteriores a esta fase não têm o campo e são lidos como manuais); `venda` e
+   * `cancelamento` são gravados NA MESMA TRANSAÇÃO que altera o saldo do produto, então saldo e histórico nunca
+   * divergem por falha parcial.
+   */
+  @Prop({ type: String, enum: ORIGENS_MOVIMENTACAO_ESTOQUE, default: "manual" })
+  origem!: OrigemMovimentacaoEstoque;
+
+  /** Venda que originou a movimentação (`origem` = `venda` ou `cancelamento`); `null` nas manuais. */
+  @Prop({ type: String, default: null, index: true })
+  vendaId!: string | null;
 }
 
 export type MovimentacaoEstoqueDocument = HydratedDocument<MovimentacaoEstoque>;

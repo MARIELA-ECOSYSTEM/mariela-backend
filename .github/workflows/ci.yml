@@ -47,6 +47,12 @@ jobs:
       # Banco DESCARTÁVEL exclusivo da prova de transação (passo "Prova de
       # transação"); apagado pelo próprio verificador ao final.
       MONGODB_URI_PROVA_TRANSACAO: mongodb://127.0.0.1:27017/mariela_ci_prova_transacao?replicaSet=rs0
+      # Fase 60.4.3.4.15 (F04) — liga a suíte de integridade venda × estoque
+      # (`vendas-integridade-estoque.caracterizacao.spec.ts`, T1/T3/T5/T7/
+      # T10a/T10b), que sem esta variável fica "skip". Banco EXCLUSIVO e
+      # descartável no replica set local do runner (o próprio teste limpa as
+      # coleções dele); nunca um banco do Atlas.
+      MONGODB_URI_E2E_F04: mongodb://127.0.0.1:27017/mariela_e2e_f04?replicaSet=rs0
       JWT_ACCESS_SECRET: ci-fake-jwt-access-secret-nunca-usar-fora-do-runner
       JWT_REFRESH_SECRET: ci-fake-jwt-refresh-secret-nunca-usar-fora-do-runner
       PDV_JWT_ACCESS_SECRET: ci-fake-pdv-access-secret-nunca-usar-fora-do-runner

@@ -1,6 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
-import type { Model } from "mongoose";
+import type { ClientSession, Model } from "mongoose";
 import { Sequencia, type SequenciaDocument } from "./schemas/sequencia.schema.js";
 
 @Injectable()
@@ -14,12 +14,16 @@ export class SequenciasRepository {
    * mesmo valor — ao contrário de `countDocuments() + 1`, que lê e escreve em
    * passos separados e pode colidir sob concorrência.
    */
-  async proximoValor(chave: string): Promise<number> {
+  /**
+   * Fase 60.4.3.4.15 (F04) — com `sessao`, o incremento faz parte da transação: se ela abortar, o valor não é
+   * consumido (sem lacuna) e nenhuma venda usa um número que não foi confirmado.
+   */
+  async proximoValor(chave: string, sessao?: ClientSession): Promise<number> {
     const documento = await this.sequenciaModel
       .findOneAndUpdate(
         { _id: chave },
         { $inc: { valor: 1 } },
-        { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
+        { upsert: true, returnDocument: "after", setDefaultsOnInsert: true, session: sessao ?? null },
       )
       .exec();
     return documento!.valor;

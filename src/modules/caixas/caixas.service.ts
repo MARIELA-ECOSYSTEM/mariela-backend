@@ -1,6 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
-import type { Model, Types } from "mongoose";
+import type { ClientSession, Model, Types } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
 import { ConfiguracoesRepository } from "../configuracoes/configuracoes.repository.js";
@@ -389,8 +389,11 @@ export class CaixasService {
     valor: number;
     observacao: string;
     idempotencyKey?: string | null;
-  }): Promise<void> {
-    const caixa = await this.caixasRepository.encontrarPorIdOuFalhar(dados.caixaId);
+  }, sessao?: ClientSession): Promise<void> {
+    // Fase 60.4.3.4.15 (F04) — com `sessao` (criação de venda): leitura e gravação na transação da venda; quem chama
+    // já travou o caixa aberto nela (`CaixasRepository.travarAbertoNaTransacao`), então a verificação posterior com
+    // compensação (`garantirCaixaAindaAbertoOuReverter`) não se aplica — a atomicidade é da transação.
+    const caixa = sessao ? await this.caixasRepository.encontrarPorIdOuFalhar(dados.caixaId, sessao) : await this.caixasRepository.encontrarPorIdOuFalhar(dados.caixaId);
     this.exigirAberto(caixa);
 
     const { movimento, duplicado } = await this.movimentosRepository.criar({
@@ -408,9 +411,9 @@ export class CaixasService {
       observacao: dados.observacao,
       motivo: dados.tipo === "cancelamento" ? dados.observacao || null : null,
       idempotencyKey: dados.idempotencyKey ?? null,
-    });
+    }, sessao);
 
-    await this.garantirCaixaAindaAbertoOuReverter(dados.caixaId, movimento, duplicado);
+    if (!sessao) await this.garantirCaixaAindaAbertoOuReverter(dados.caixaId, movimento, duplicado);
   }
 
   /**

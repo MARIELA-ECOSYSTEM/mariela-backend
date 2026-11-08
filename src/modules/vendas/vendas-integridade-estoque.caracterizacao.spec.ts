@@ -1,11 +1,12 @@
 /**
- * Fase 60.4.3.4.11.1 — TESTES DE CARACTERIZAÇÃO (F04 / E7 / E8) — INTENCIONALMENTE VERMELHOS.
- * Fase 60.4.3.4.11.3 — adaptados para execução E2E no MongoDB Atlas, num banco EXCLUSIVO.
+ * Fase 60.4.3.4.11.1 — TESTES DE CARACTERIZAÇÃO (F04 / E7 / E8).
+ * Fase 60.4.3.4.11.3 — adaptados para execução E2E (Atlas ou replica set local), num banco EXCLUSIVO.
+ * Fase 60.4.3.4.15 — com a correção transacional, passam a ser os testes de REGRESSÃO do F04: devem ficar VERDES.
  *
- * Cada teste reproduz um defeito de integridade entre venda e estoque descrito em
+ * Cada teste reproduz um cenário de falha de integridade entre venda e estoque descrito em
  * `auditorias/Fase-60.4.3.4.11-Diagnostico-Integridade-Venda-Estoque.md` e termina com a verificação do comportamento
- * CORRETO (o que a correção da subetapa 11.5/11.6 deve garantir). Enquanto o defeito existir, essa verificação final
- * falha com `[CARACTERIZAÇÃO F04]` e mostra o estado real persistido (a evidência do defeito).
+ * CORRETO, inclusive no ledger `movimentacoes_estoque`. Se o defeito voltar, essa verificação final falha com
+ * `[CARACTERIZAÇÃO F04]` e mostra o estado real persistido. Exige MongoDB com transações (replica set).
  *
  * BANCO E CONEXÃO
  *   - A URI vem EXCLUSIVAMENTE de `MONGODB_URI_E2E_F04`, definida só no ambiente do processo que executa o teste.
@@ -48,6 +49,7 @@ import { liberarTudo, novoPonto } from "../../test-utils/barreira.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { CaixasService } from "../caixas/caixas.service.js";
 import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
+import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
 import type { CancelamentoDto } from "./dto/cancelamento.dto.js";
@@ -58,7 +60,7 @@ import { VendasService } from "./vendas.service.js";
 import type { DadosCriarVenda } from "./vendas.types.js";
 
 const JWT_MODULO_DE_TESTE = JwtModule.register({ global: true, secret: "segredo-de-teste", signOptions: { expiresIn: "15m" } });
-const PREFIXO = "[CARACTERIZAÇÃO F04 — VERMELHO ESPERADO]";
+const PREFIXO = "[F04 — integridade venda × estoque]";
 const PRECO = 100;
 const ESTOQUE_INICIAL = 10;
 const QUANTIDADE = 2;
@@ -394,6 +396,11 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
     return vendedor?.vendas ?? -1;
   }
 
+  /** Fase 60.4.3.4.15 — registros do ledger (`movimentacoes_estoque`) gerados por venda ou cancelamento deste produto. */
+  async function ledger(produtoId: string, origem: "venda" | "cancelamento"): Promise<number> {
+    return connection.collection("movimentacoes_estoque").countDocuments({ produtoId: new Types.ObjectId(produtoId), origem });
+  }
+
   async function flagsDoPrimeiroItemCancelado(vendaId: string): Promise<{ restaurado: boolean; restaurando: boolean } | null> {
     const venda = await connection.collection<VendaBruta>("vendas").findOne({ _id: new Types.ObjectId(vendaId) });
     const item = venda?.cancelamentos?.[0]?.itens[0];
@@ -402,8 +409,8 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
 
   /**
    * Injeção por ESTADO REAL: pré-insere um documento em `vendas` com o `numero` que a sequência vai gerar na próxima
-   * venda. O insert da venda real (etapa 6, DEPOIS da baixa) recebe E11000 em `numero` — uma chave única que NÃO é
-   * `idempotencyKey`, portanto relançada por `VendasRepository.criar` sem compensação.
+   * venda. O insert da venda real (DEPOIS da baixa, na mesma transação) recebe E11000 em `numero` — uma chave única que
+   * NÃO é `idempotencyKey`: a transação inteira é abortada e o erro é propagado.
    */
   async function bloquearProximoNumero(marca: string): Promise<{ bloqueioId: Types.ObjectId; numero: string }> {
     const indices = await connection.collection("vendas").indexes();
@@ -440,10 +447,10 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
       const resultado = await capturar(service.criar(dadosVenda(cenario, chave), null));
       exigirE11000EmNumero(resultado);
 
-      const observado = { saldo: await saldo(cenario.produtoId, cenario.tamanhoId), vendasComAChave: await vendasDaChave(chave) };
-      // Correto: a venda não existe, então nenhuma unidade pode ter saído do estoque.
-      // Hoje (defeito): saldo = ESTOQUE_INICIAL − QUANTIDADE, sem venda e sem registro da baixa.
-      caracterizar(observado, { saldo: ESTOQUE_INICIAL, vendasComAChave: 0 });
+      const observado = { saldo: await saldo(cenario.produtoId, cenario.tamanhoId), vendasComAChave: await vendasDaChave(chave), saidasNoLedger: await ledger(cenario.produtoId, "venda") };
+      // Correto: a venda não existe, então nenhuma unidade pode ter saído do estoque nem do ledger.
+      // (Antes da correção: saldo = ESTOQUE_INICIAL − QUANTIDADE, sem venda e sem registro da baixa.)
+      caracterizar(observado, { saldo: ESTOQUE_INICIAL, vendasComAChave: 0, saidasNoLedger: 0 });
     } finally {
       await connection.collection("vendas").deleteOne({ _id: bloqueioId });
       await fecharCaixa(cenario.caixaId);
@@ -470,9 +477,11 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
         saldo: await saldo(cenario.produtoId, cenario.tamanhoId),
         vendasComAChave: await vendasDaChave(chave),
         movimentosDeCaixaDaChave: await movimentosDaChave(chave),
+        saidasNoLedger: await ledger(cenario.produtoId, "venda"),
       };
-      // Correto: UMA venda, UMA baixa, UM movimento. Hoje (defeito): saldo = ESTOQUE_INICIAL − 2 × QUANTIDADE.
-      caracterizar(observado, { saldo: ESTOQUE_INICIAL - QUANTIDADE, vendasComAChave: 1, movimentosDeCaixaDaChave: 1 });
+      // Correto: UMA venda, UMA baixa, UMA saída no ledger, UM movimento.
+      // (Antes da correção: saldo = ESTOQUE_INICIAL − 2 × QUANTIDADE.)
+      caracterizar(observado, { saldo: ESTOQUE_INICIAL - QUANTIDADE, vendasComAChave: 1, movimentosDeCaixaDaChave: 1, saidasNoLedger: 1 });
     } finally {
       await connection.collection("vendas").deleteOne({ _id: bloqueioId });
       await fecharCaixa(cenario.caixaId);
@@ -502,31 +511,36 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
       exigir(serviceB !== service && repositorioB !== repositorio, "[SETUP]", "os dois contextos deveriam ter instâncias distintas");
       exigir(conexaoB !== connection && conexaoB.name === BANCO_E2E && connection.name === BANCO_E2E, "[SETUP]", "os dois contextos deveriam ter conexões distintas no mesmo banco E2E");
 
-      // Cada instância pausa no insert da venda (etapa 6) — DEPOIS de já ter baixado o estoque (etapa 4).
+      // Fase 60.4.3.4.15 — coordenação adaptada à criação TRANSACIONAL:
+      //   - A pausa no insert da venda, DENTRO da transação e depois de baixar o estoque (baixa ainda não confirmada);
+      //   - B começa (não encontra a venda pela chave, porque A não confirmou) e tenta baixar o MESMO estoque: a escrita
+      //     de B conflita com a transação aberta de A (`WriteConflict`) e B repete a transação inteira com espera;
+      //   - A é liberada e confirma; na repetição, B baixa o estoque, recebe E11000 de `idempotencyKey` no insert, a
+      //     transação de B é ABORTADA (com a baixa dela) e B devolve a venda de A.
+      // A pré-condição antiga ("as duas instâncias baixaram antes do insert") descrevia exatamente o defeito: com a
+      // transação, o saldo CONFIRMADO durante a pausa de A continua o inicial.
       const criarA = repositorio.criar.bind(repositorio);
-      const criarB = repositorioB.criar.bind(repositorioB);
-      espioes.push(spyOn(repositorio, "criar").mockImplementation(async (dados) => {
+      espioes.push(spyOn(repositorio, "criar").mockImplementation(async (dados, sessao) => {
         pontoA.chegou.liberar();
         await pontoA.liberacao.promessa;
-        return criarA(dados);
+        return criarA(dados, sessao);
       }));
-      espioes.push(spyOn(repositorioB, "criar").mockImplementation(async (dados) => {
-        pontoB.chegou.liberar();
-        await pontoB.liberacao.promessa;
-        return criarB(dados);
+      const produtosRepositorioB = moduloB.get(ProdutosRepository);
+      const salvarProdutoB = produtosRepositorioB.salvarComRetentativa.bind(produtosRepositorioB);
+      espioes.push(spyOn(produtosRepositorioB, "salvarComRetentativa").mockImplementation(async (id, mutar, tentativas, sessao) => {
+        pontoB.chegou.liberar(); // B chegou à baixa de estoque enquanto a transação de A ainda está aberta.
+        return salvarProdutoB(id, mutar, tentativas, sessao);
       }));
 
-      // A baixa e para antes do insert; só então B começa (A ainda não gravou: B não encontra a venda pela chave).
       const execucaoA = capturar(service.criar(dadosVenda(cenario, chave), null));
       await pontoA.chegou.promessa;
+      exigir((await saldo(cenario.produtoId, cenario.tamanhoId)) === ESTOQUE_INICIAL, "[PRÉ-CONDIÇÃO]", "com A pausada dentro da transação, o saldo CONFIRMADO deveria continuar o inicial");
       const execucaoB = capturar(serviceB.criar(dadosVenda(cenario, chave), null));
       await pontoB.chegou.promessa;
-      exigir((await saldo(cenario.produtoId, cenario.tamanhoId)) === ESTOQUE_INICIAL - 2 * QUANTIDADE, "[PRÉ-CONDIÇÃO]", "as duas instâncias deveriam ter baixado antes do insert");
 
-      // A grava primeiro; B grava depois e recebe E11000 de idempotencyKey → devolve a venda de A.
+      // A confirma; B termina sozinha (repete, recebe E11000 de idempotencyKey e devolve a venda de A).
       pontoA.liberacao.liberar();
       const resultadoA = await execucaoA;
-      pontoB.liberacao.liberar();
       const resultadoB = await execucaoB;
       exigir(resultadoA.ok && resultadoB.ok, "[PRÉ-CONDIÇÃO]", `as duas chamadas deveriam concluir; A=${resultadoA.ok ? "ok" : descrever(resultadoA.erro)} B=${resultadoB.ok ? "ok" : descrever(resultadoB.erro)}`);
       exigir(resultadoA.ok && resultadoB.ok && resultadoA.valor.id === resultadoB.valor.id, "[PRÉ-CONDIÇÃO]", "B deveria devolver a mesma venda de A");
@@ -536,10 +550,11 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
         vendasComAChave: await vendasDaChave(chave),
         movimentosDeCaixaDaChave: await movimentosDaChave(chave),
         vendasNoAgregadoDoVendedor: await vendasDoVendedor(cenario.vendedorId),
+        saidasNoLedger: await ledger(cenario.produtoId, "venda"),
       };
-      // Correto: uma venda ⇒ uma baixa e uma contagem no agregado. Hoje (defeito): a baixa de B não é desfeita
-      // (saldo = ESTOQUE_INICIAL − 2 × QUANTIDADE) e o agregado do vendedor também é incrementado duas vezes.
-      caracterizar(observado, { saldo: ESTOQUE_INICIAL - QUANTIDADE, vendasComAChave: 1, movimentosDeCaixaDaChave: 1, vendasNoAgregadoDoVendedor: 1 });
+      // Correto: uma venda ⇒ uma baixa, uma saída no ledger e uma contagem no agregado. (Antes da correção: a baixa de B
+      // não era desfeita — saldo = ESTOQUE_INICIAL − 2 × QUANTIDADE — e o agregado do vendedor contava duas vezes.)
+      caracterizar(observado, { saldo: ESTOQUE_INICIAL - QUANTIDADE, vendasComAChave: 1, movimentosDeCaixaDaChave: 1, vendasNoAgregadoDoVendedor: 1, saidasNoLedger: 1 });
     } finally {
       liberarTudo(pontoA, pontoB);
       for (const espiao of espioes.splice(0)) espiao.mockRestore();
@@ -567,9 +582,9 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
         exigir(codigoMongo(resultado.erro) === 14, "[INJEÇÃO]", `esperado TypeMismatch (14) do $inc; recebido ${descrever(resultado.erro)}`);
       }
 
-      const observado = { saldo: await saldo(cenario.produtoId, cenario.tamanhoId), vendasComAChave: await vendasDaChave(chave) };
-      // Correto: sem venda, sem baixa. Hoje (defeito): saldo = ESTOQUE_INICIAL − QUANTIDADE.
-      caracterizar(observado, { saldo: ESTOQUE_INICIAL, vendasComAChave: 0 });
+      const observado = { saldo: await saldo(cenario.produtoId, cenario.tamanhoId), vendasComAChave: await vendasDaChave(chave), saidasNoLedger: await ledger(cenario.produtoId, "venda") };
+      // Correto: sem venda, sem baixa, sem saída no ledger. (Antes da correção: saldo = ESTOQUE_INICIAL − QUANTIDADE.)
+      caracterizar(observado, { saldo: ESTOQUE_INICIAL, vendasComAChave: 0, saidasNoLedger: 0 });
     } finally {
       if (original) await sequencias.updateOne({ _id: CHAVE_SEQUENCIA_VENDA }, { $set: { valor: original.valor } });
       else await sequencias.deleteOne({ _id: CHAVE_SEQUENCIA_VENDA });
@@ -588,25 +603,29 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
       exigir((await saldo(cenario.produtoId, cenario.tamanhoId)) === ESTOQUE_INICIAL - QUANTIDADE, "[PRÉ-CONDIÇÃO]", "a venda deveria ter baixado o estoque");
       const cancelamento: CancelamentoDto = { tipo: "integral", motivo: "caracterização T10a", idempotencyKey: `caract-t10a-cancel-${unico()}` };
 
-      // Falha pontual e controlada: SÓ a primeira chamada a `marcarItemRestaurado` falha, depois de
-      // `devolverAoEstoque` já ter gravado a devolução no produto (simula erro transitório nessa escrita).
+      // Falha pontual e controlada: SÓ a primeira chamada a `marcarItemRestaurado` falha, DEPOIS de `devolverAoEstoque`
+      // ter executado a devolução (simula erro transitório nessa escrita). A sessão recebida é repassada ao original.
       let falhasInjetadas = 0;
       const marcarOriginal = repositorio.marcarItemRestaurado.bind(repositorio);
-      espioes.push(spyOn(repositorio, "marcarItemRestaurado").mockImplementation(async (vendaId, eventoId, itemId) => {
+      espioes.push(spyOn(repositorio, "marcarItemRestaurado").mockImplementation(async (vendaId, eventoId, itemId, sessao) => {
         if (falhasInjetadas === 0) {
           falhasInjetadas += 1;
           throw new Error("[INJETADO] falha transitória simulada em marcarItemRestaurado");
         }
-        return marcarOriginal(vendaId, eventoId, itemId);
+        return marcarOriginal(vendaId, eventoId, itemId, sessao);
       }));
 
       const primeira = await capturar(service.cancelar(venda.id, cancelamento, null));
       for (const espiao of espioes.splice(0)) espiao.mockRestore();
       exigir(falhasInjetadas === 1, "[INJEÇÃO]", `esperada 1 falha injetada em marcarItemRestaurado; ocorreram ${falhasInjetadas}`);
       exigir(primeira.ok, "[PRÉ-CONDIÇÃO]", `o cancelamento deveria concluir (a falha de restauração é só logada); ${primeira.ok ? "" : descrever(primeira.erro)}`);
+      // Fase 60.4.3.4.15 — pré-condição ATÔMICA: devolução física, ledger e marcação estão na mesma transação; a falha
+      // na marcação desfaz a devolução. (Antes da correção a devolução ficava gravada aqui — saldo = ESTOQUE_INICIAL —
+      // e a reconciliação a repetia.)
       const saldoAposPrimeira = await saldo(cenario.produtoId, cenario.tamanhoId);
       const flagsAposPrimeira = await flagsDoPrimeiroItemCancelado(venda.id);
-      exigir(saldoAposPrimeira === ESTOQUE_INICIAL, "[PRÉ-CONDIÇÃO]", `a devolução deveria ter sido gravada uma vez (saldo ${ESTOQUE_INICIAL}); saldo ${saldoAposPrimeira}`);
+      const entradasAposPrimeira = await ledger(cenario.produtoId, "cancelamento");
+      exigir(saldoAposPrimeira === ESTOQUE_INICIAL - QUANTIDADE && entradasAposPrimeira === 0, "[PRÉ-CONDIÇÃO]", `a falha deveria ter desfeito a devolução (saldo ${ESTOQUE_INICIAL - QUANTIDADE}, 0 entradas no ledger); saldo ${saldoAposPrimeira}, entradas ${entradasAposPrimeira}`);
       exigir(
         flagsAposPrimeira?.restaurado === false && flagsAposPrimeira.restaurando === false,
         "[PRÉ-CONDIÇÃO]",
@@ -617,9 +636,9 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
       const reconciliacao = await capturar(service.cancelar(venda.id, cancelamento, null));
       exigir(reconciliacao.ok, "[PRÉ-CONDIÇÃO]", `a reconciliação deveria concluir; ${reconciliacao.ok ? "" : descrever(reconciliacao.erro)}`);
 
-      const observado = { saldo: await saldo(cenario.produtoId, cenario.tamanhoId), flags: await flagsDoPrimeiroItemCancelado(venda.id) };
-      // Correto: a devolução já gravada não se repete. Hoje (defeito): saldo = ESTOQUE_INICIAL + QUANTIDADE.
-      caracterizar(observado, { saldo: ESTOQUE_INICIAL, flags: { restaurado: true, restaurando: false } });
+      const observado = { saldo: await saldo(cenario.produtoId, cenario.tamanhoId), flags: await flagsDoPrimeiroItemCancelado(venda.id), entradasNoLedger: await ledger(cenario.produtoId, "cancelamento") };
+      // Correto: a devolução acontece UMA vez, com uma entrada no ledger. (Antes da correção: saldo = ESTOQUE_INICIAL + QUANTIDADE.)
+      caracterizar(observado, { saldo: ESTOQUE_INICIAL, flags: { restaurado: true, restaurando: false }, entradasNoLedger: 1 });
     } finally {
       for (const espiao of espioes.splice(0)) espiao.mockRestore();
       await fecharCaixa(cenario.caixaId);
@@ -637,28 +656,29 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
       exigir((await saldo(cenario.produtoId, cenario.tamanhoId)) === ESTOQUE_INICIAL - QUANTIDADE, "[PRÉ-CONDIÇÃO]", "a venda deveria ter baixado o estoque");
       const cancelamento: CancelamentoDto = { tipo: "integral", motivo: "caracterização T10b", idempotencyKey: `caract-t10b-cancel-${unico()}` };
 
-      // Simula a queda do processo LOGO DEPOIS de a reivindicação ser gravada (antes da devolução física):
-      // a reivindicação real é persistida e, em seguida, a operação é interrompida.
-      // Revisão estática (vendas.service.ts): `reivindicarRestauracaoDeItem` é chamada FORA do `try` de
-      // `restaurarEstoquePendente` (linha 1177; o `try` começa na 1181), e nem `cancelar` (1084) nem
-      // `reconciliarCancelamento` (1147) capturam erros desse ponto — então esta exceção sobe sem passar por
-      // `liberarReivindicacaoDeItem`, e `restaurando:true` permanece gravado, como numa queda real. O mesmo caminho
-      // ocorre numa falha de rede cuja escrita foi aplicada mas cuja resposta se perdeu.
+      // Fase 60.4.3.4.15 — a restauração não usa mais a reivindicação em duas fases, então o estado órfão não pode ser
+      // produzido pelo código atual (era o defeito). O cenário passa a ser o de DADOS LEGADOS: uma linha deixada em
+      // `restaurando: true` pela versão anterior (queda entre reivindicar e devolver). Para chegar a ele:
+      //   1. a primeira restauração falha (injeção pontual na marcação, dentro da transação) → nada é gravado;
+      //   2. o campo legado `restaurando: true` é gravado diretamente no banco, como a versão anterior deixaria.
+      // A reconciliação precisa retomar a linha mesmo assim.
       let quedasInjetadas = 0;
-      const reivindicarOriginal = repositorio.reivindicarRestauracaoDeItem.bind(repositorio);
-      espioes.push(spyOn(repositorio, "reivindicarRestauracaoDeItem").mockImplementation(async (vendaId, eventoId, itemId) => {
-        const reivindicado = await reivindicarOriginal(vendaId, eventoId, itemId);
+      const marcarOriginal = repositorio.marcarItemRestaurado.bind(repositorio);
+      espioes.push(spyOn(repositorio, "marcarItemRestaurado").mockImplementation(async (vendaId, eventoId, itemId, sessao) => {
         if (quedasInjetadas === 0) {
           quedasInjetadas += 1;
-          throw new Error("[INJETADO] queda simulada do processo logo após a reivindicação");
+          throw new Error("[INJETADO] queda simulada durante a restauração");
         }
-        return reivindicado;
+        return marcarOriginal(vendaId, eventoId, itemId, sessao);
       }));
 
       const primeira = await capturar(service.cancelar(venda.id, cancelamento, null));
       for (const espiao of espioes.splice(0)) espiao.mockRestore();
       exigir(quedasInjetadas === 1, "[INJEÇÃO]", `esperada 1 queda injetada; ocorreram ${quedasInjetadas}`);
-      exigir(!primeira.ok && descrever(primeira.erro).includes("[INJETADO]"), "[INJEÇÃO]", "a primeira tentativa deveria terminar pela queda injetada");
+      exigir(primeira.ok, "[PRÉ-CONDIÇÃO]", `o cancelamento deveria concluir com a restauração pendente; ${primeira.ok ? "" : descrever(primeira.erro)}`);
+      await connection
+        .collection("vendas")
+        .updateOne({ _id: new Types.ObjectId(venda.id) }, { $set: { "cancelamentos.0.itens.0.restaurando": true } });
       const flagsOrfaos = await flagsDoPrimeiroItemCancelado(venda.id);
       exigir(
         flagsOrfaos?.restaurado === false && flagsOrfaos.restaurando === true,
@@ -671,10 +691,10 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
       const reconciliacao = await capturar(service.cancelar(venda.id, cancelamento, null));
       exigir(reconciliacao.ok, "[PRÉ-CONDIÇÃO]", `a reconciliação deveria concluir; ${reconciliacao.ok ? "" : descrever(reconciliacao.erro)}`);
 
-      const observado = { saldo: await saldo(cenario.produtoId, cenario.tamanhoId), flags: await flagsDoPrimeiroItemCancelado(venda.id) };
-      // Correto: a reconciliação retoma a linha órfã e devolve o estoque uma vez.
-      // Hoje (defeito): o item continua restaurando=true para sempre e o saldo fica em ESTOQUE_INICIAL − QUANTIDADE.
-      caracterizar(observado, { saldo: ESTOQUE_INICIAL, flags: { restaurado: true, restaurando: false } });
+      const observado = { saldo: await saldo(cenario.produtoId, cenario.tamanhoId), flags: await flagsDoPrimeiroItemCancelado(venda.id), entradasNoLedger: await ledger(cenario.produtoId, "cancelamento") };
+      // Correto: a reconciliação retoma a linha órfã e devolve o estoque uma vez, com uma entrada no ledger.
+      // (Antes da correção: o item ficava restaurando=true para sempre e o saldo em ESTOQUE_INICIAL − QUANTIDADE.)
+      caracterizar(observado, { saldo: ESTOQUE_INICIAL, flags: { restaurado: true, restaurando: false }, entradasNoLedger: 1 });
     } finally {
       for (const espiao of espioes.splice(0)) espiao.mockRestore();
       await fecharCaixa(cenario.caixaId);

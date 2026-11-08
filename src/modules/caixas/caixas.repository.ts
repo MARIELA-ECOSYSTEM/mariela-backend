@@ -1,6 +1,6 @@
 import { Injectable, Logger, type OnModuleInit } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
-import { isValidObjectId, type Model } from "mongoose";
+import { isValidObjectId, type ClientSession, type Model } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { DadosCriarCaixa, DadosFecharCaixa } from "./caixas.types.js";
 import { Caixa, type CaixaDocument } from "./schemas/caixa.schema.js";
@@ -45,15 +45,33 @@ export class CaixasRepository implements OnModuleInit {
     }
   }
 
-  async encontrarPorId(id: string): Promise<CaixaDocument | null> {
+  async encontrarPorId(id: string, sessao?: ClientSession): Promise<CaixaDocument | null> {
     if (!isValidObjectId(id)) return null;
-    return this.caixaModel.findById(id).exec();
+    return this.caixaModel.findById(id).session(sessao ?? null).exec();
   }
 
-  async encontrarPorIdOuFalhar(id: string): Promise<CaixaDocument> {
-    const caixa = await this.encontrarPorId(id);
+  async encontrarPorIdOuFalhar(id: string, sessao?: ClientSession): Promise<CaixaDocument> {
+    const caixa = sessao ? await this.encontrarPorId(id, sessao) : await this.encontrarPorId(id);
     if (!caixa) throw ApiException.notFound("Caixa não encontrado.");
     return caixa;
+  }
+
+  /**
+   * Fase 60.4.3.4.15 (F04) — "trava" o caixa ABERTO dentro da transação da venda com uma gravação real no próprio
+   * documento do caixa (`atualizadoEm`). Efeitos:
+   *   - caixa já fechado no snapshot da transação → `false` (a venda é recusada e nada é gravado);
+   *   - fechamento confirmado entre o início da transação e esta gravação → `WriteConflict`, a transação é repetida e
+   *     passa a ver o caixa fechado;
+   *   - fechamento que chega DEPOIS desta gravação espera a transação terminar (escrita fora de transação num documento
+   *     com escrita transacional pendente).
+   * Assim uma venda nunca é confirmada num caixa que já estava fechado. Só usada com sessão.
+   */
+  async travarAbertoNaTransacao(id: string, sessao: ClientSession): Promise<boolean> {
+    if (!isValidObjectId(id)) return false;
+    const resultado = await this.caixaModel
+      .updateOne({ _id: id, status: "aberto" }, { $set: { atualizadoEm: new Date() } }, { session: sessao })
+      .exec();
+    return resultado.matchedCount === 1;
   }
 
   async encontrarAberto(): Promise<CaixaDocument | null> {

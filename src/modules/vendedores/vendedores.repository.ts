@@ -1,6 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
-import { Error as MongooseErrors, isValidObjectId, type Model, type PipelineStage } from "mongoose";
+import { Error as MongooseErrors, isValidObjectId, type ClientSession, type Model, type PipelineStage } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets } from "../../common/types/api-response.interface.js";
 import {
@@ -77,13 +77,13 @@ export class VendedoresRepository {
     return mensagem.includes("telefoneNormalizado");
   }
 
-  async encontrarPorId(id: string): Promise<VendedorDocument | null> {
+  async encontrarPorId(id: string, sessao?: ClientSession): Promise<VendedorDocument | null> {
     if (!isValidObjectId(id)) return null;
-    return this.vendedorModel.findOne({ _id: id, excluidoEm: null }).exec();
+    return this.vendedorModel.findOne({ _id: id, excluidoEm: null }).session(sessao ?? null).exec();
   }
 
-  async encontrarPorIdOuFalhar(id: string): Promise<VendedorDocument> {
-    const vendedor = await this.encontrarPorId(id);
+  async encontrarPorIdOuFalhar(id: string, sessao?: ClientSession): Promise<VendedorDocument> {
+    const vendedor = sessao ? await this.encontrarPorId(id, sessao) : await this.encontrarPorId(id);
     if (!vendedor) throw ApiException.notFound("Vendedor(a) não encontrado(a).");
     return vendedor;
   }
@@ -129,7 +129,14 @@ export class VendedoresRepository {
    * confirmado por teste (`vendedores.service.spec.ts`, "duas atualizações
    * concorrentes… para o MESMO telefone novo") antes desta correção.
    */
-  async salvarComRetentativa(id: string, mutar: (vendedor: VendedorDocument) => void, tentativas = 3): Promise<VendedorDocument> {
+  async salvarComRetentativa(id: string, mutar: (vendedor: VendedorDocument) => void, tentativas = 3, sessao?: ClientSession): Promise<VendedorDocument> {
+    // Fase 60.4.3.4.15 (F04) — com `sessao` (agregados da criação de venda): uma leitura e uma gravação na transação,
+    // sem laço nem captura; conflitos sobem para o executor, que repete a transação inteira.
+    if (sessao) {
+      const vendedor = await this.encontrarPorIdOuFalhar(id, sessao);
+      mutar(vendedor);
+      return vendedor.save({ session: sessao });
+    }
     for (let tentativa = 1; tentativa <= tentativas; tentativa += 1) {
       const vendedor = await this.encontrarPorIdOuFalhar(id);
       mutar(vendedor);

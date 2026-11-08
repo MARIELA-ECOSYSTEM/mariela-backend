@@ -1,6 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
-import { Error as MongooseErrors, isValidObjectId, Types, type Model, type PipelineStage } from "mongoose";
+import { Error as MongooseErrors, isValidObjectId, Types, type ClientSession, type Model, type PipelineStage } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, FacetOption } from "../../common/types/api-response.interface.js";
 import { normalizarFormaPagamento } from "../produtos/utils/normalizacao.util.js";
@@ -64,7 +64,15 @@ export class VendasRepository {
    * traduzido na venda que efetivamente venceu a corrida, em vez de propagar
    * um 500. Mesmo padrão de `CaixasRepository.criar` para "só um caixa aberto".
    */
-  async criar(dados: DadosPersistirVenda): Promise<VendaDocument> {
+  async criar(dados: DadosPersistirVenda, sessao?: ClientSession): Promise<VendaDocument> {
+    // Fase 60.4.3.4.15 (F04) — dentro da transação NADA é capturado: um E11000 (inclusive o de `idempotencyKey`)
+    // aborta a transação inteira — com a baixa de estoque feita nela — e quem chama trata a chave duplicada FORA da
+    // transação (`VendasService.criarInterno`). Capturar aqui deixaria a transação abortada no servidor.
+    if (sessao) {
+      const [venda] = await this.vendaModel.create([dados as never], { session: sessao });
+      if (!venda) throw new Error("Falha ao criar a venda: o MongoDB não devolveu o documento inserido.");
+      return venda;
+    }
     try {
       return await this.vendaModel.create(dados as never);
     } catch (erro) {
@@ -101,13 +109,13 @@ export class VendasRepository {
     return this.vendaModel.find().exec();
   }
 
-  async encontrarPorId(id: string): Promise<VendaDocument | null> {
+  async encontrarPorId(id: string, sessao?: ClientSession): Promise<VendaDocument | null> {
     if (!isValidObjectId(id)) return null;
-    return this.vendaModel.findById(id).exec();
+    return this.vendaModel.findById(id).session(sessao ?? null).exec();
   }
 
-  async encontrarPorIdOuFalhar(id: string): Promise<VendaDocument> {
-    const venda = await this.encontrarPorId(id);
+  async encontrarPorIdOuFalhar(id: string, sessao?: ClientSession): Promise<VendaDocument> {
+    const venda = sessao ? await this.encontrarPorId(id, sessao) : await this.encontrarPorId(id);
     if (!venda) throw ApiException.notFound("Venda não encontrada.");
     return venda;
   }
@@ -200,6 +208,12 @@ export class VendasRepository {
    * concorrentes disputando o MESMO item, o Mongo garante que só uma delas
    * terá `modifiedCount === 1`.
    */
+  /**
+   * Fase 60.4.3.4.15 (F04) — NÃO é mais usado por `VendasService`: a restauração passou a ser transacional
+   * (devolução + `restaurado: true` confirmados juntos), sem reivindicação em duas fases. Mantido (com
+   * `liberarReivindicacaoDeItem`) só por compatibilidade com o campo `restaurando` de dados antigos e com os testes
+   * que exercitam o próprio CAS.
+   */
   async reivindicarRestauracaoDeItem(vendaId: string, eventoId: string, itemId: string): Promise<boolean> {
     const resultado = await this.vendaModel
       .updateOne(
@@ -229,12 +243,13 @@ export class VendasRepository {
    * reivindicação (nenhuma outra chamada consegue estar processando o mesmo
    * item ao mesmo tempo).
    */
-  async marcarItemRestaurado(vendaId: string, eventoId: string, itemId: string): Promise<void> {
+  /** Fase 60.4.3.4.15 (F04) — com `sessao`, a marcação é confirmada junto com a devolução física (mesma transação). */
+  async marcarItemRestaurado(vendaId: string, eventoId: string, itemId: string, sessao?: ClientSession): Promise<void> {
     await this.vendaModel
       .updateOne(
         { _id: vendaId },
         { $set: { "cancelamentos.$[evt].itens.$[item].restaurado": true, "cancelamentos.$[evt].itens.$[item].restaurando": false } },
-        { arrayFilters: [{ "evt._id": new Types.ObjectId(eventoId) }, { "item.itemId": itemId }] },
+        { arrayFilters: [{ "evt._id": new Types.ObjectId(eventoId) }, { "item.itemId": itemId }], ...(sessao ? { session: sessao } : {}) },
       )
       .exec();
   }
@@ -430,7 +445,8 @@ export class VendasRepository {
    * `codigo`/`numero` (nunca deveria acontecer, dado o gerador atômico de
    * sequência) é um erro real e deve propagar, não ser mascarada como retry.
    */
-  private ehErroDeIdempotencyKeyDuplicada(erro: unknown): boolean {
+  /** Fase 60.4.3.4.15 — público: `VendasService` o usa para tratar a corrida de chave DEPOIS do abort da transação. */
+  ehErroDeIdempotencyKeyDuplicada(erro: unknown): boolean {
     if (typeof erro !== "object" || erro === null || !("code" in erro) || (erro as { code: unknown }).code !== 11000) {
       return false;
     }

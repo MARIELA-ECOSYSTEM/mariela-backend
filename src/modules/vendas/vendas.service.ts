@@ -1,6 +1,8 @@
 import { HttpStatus, Injectable, Logger } from "@nestjs/common";
-import { InjectModel } from "@nestjs/mongoose";
-import type { Model, Types } from "mongoose";
+import { InjectConnection, InjectModel } from "@nestjs/mongoose";
+import { Types, type ClientSession, type Connection, type Model } from "mongoose";
+import { executarEmTransacao } from "../../database/transacao.util.js";
+import { MovimentacaoEstoque, type MovimentacaoEstoqueDocument } from "../estoque/schemas/movimentacao-estoque.schema.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
 import { AdquirentesService, type AdquirenteRespostaPublica } from "../adquirentes/adquirentes.service.js";
@@ -84,6 +86,9 @@ export class VendasService {
     // Fase 55.2 — validar `forma` contra `configuracoes.formasPagamento`.
     private readonly configuracoesRepository: ConfiguracoesRepository,
     @InjectModel(EventoVenda.name) private readonly eventoModel: Model<EventoVendaDocument>,
+    // Fase 60.4.3.4.15 (F04) — ledger de estoque e conexão (sessões/transações).
+    @InjectModel(MovimentacaoEstoque.name) private readonly movimentacaoEstoqueModel: Model<MovimentacaoEstoqueDocument>,
+    @InjectConnection() private readonly conexao: Connection,
   ) {}
 
   /**
@@ -275,55 +280,9 @@ export class VendasService {
 
     const parcelas = valorPendente > 0 ? this.montarParcelas(valorPendente, dados.totalParcelas ?? 1, dataVenda) : [];
 
-    // Baixa o estoque item a item; se algum falhar (corrida entre a
-    // pré-checagem e agora), desfaz (devolve) o que já foi baixado nesta
-    // mesma tentativa antes de propagar o erro — nunca deixa a venda "meio
-    // baixada". Ver "Pendências" no relatório sobre o limite desta estratégia
-    // sem transações multi-documento. Deliberadamente a ÚLTIMA validação
-    // antes de qualquer escrita (Etapa 10.4, seção 19/21 do pedido): todos os
-    // dados (itens, descontos, pagamentos/adquirente/parcelamento) já foram
-    // validados acima sem nenhum efeito colateral no banco.
-    const baixados: { produtoId: string; varianteId: string; tamanhoId: string; quantidade: number }[] = [];
-    try {
-      for (const solicitado of dados.itens) {
-        await this.produtosService.ajustarQuantidadeTamanho(solicitado.produtoId, solicitado.varianteId, {
-          tamanhoId: solicitado.tamanhoId,
-          delta: -solicitado.quantidade,
-          exigirExistente: true,
-        });
-        baixados.push(solicitado);
-      }
-    } catch (erro) {
-      // Etapa 10.22 — CORREÇÃO: uma falha do PRÓPRIO rollback nunca pode ser
-      // engolida silenciosamente (era `.catch(() => undefined)` até esta
-      // etapa) — se isso acontecer, o estoque de `item` fica permanentemente
-      // decrementado sem nenhuma venda correspondente, e sem log nenhum
-      // ninguém saberia. Registrado com detalhe suficiente para reconciliação
-      // manual; o erro ORIGINAL (`erro`, a causa de ter chegado aqui) é
-      // sempre o que se propaga — o erro do rollback nunca o substitui.
-      for (const item of baixados) {
-        try {
-          await this.produtosService.ajustarQuantidadeTamanho(item.produtoId, item.varianteId, {
-            tamanhoId: item.tamanhoId,
-            delta: item.quantidade,
-            exigirExistente: true,
-          });
-        } catch (erroRollback) {
-          this.logger.error(
-            `Falha ao desfazer a baixa de estoque do produto ${item.produtoId} (variante ${item.varianteId}, tamanho ${item.tamanhoId}, quantidade ${item.quantidade}) após erro na criação da venda — estoque pode estar permanentemente decrementado sem venda correspondente; requer reconciliação manual.`,
-            erroRollback instanceof Error ? erroRollback.stack : String(erroRollback),
-          );
-        }
-      }
-      throw erro;
-    }
-
-    const valor = await this.sequenciasService.proximoValor(CHAVE_SEQUENCIA_VENDA);
     // Data no fuso local do servidor (America/Sao_Paulo, ver `main.ts`) — não `toISOString()`, que é UTC e
     // rotularia como "amanhã" uma venda feita à noite, divergindo do dia usado por Dashboard/Relatórios.
     const dataCodigo = `${dataVenda.getFullYear()}-${String(dataVenda.getMonth() + 1).padStart(2, "0")}-${String(dataVenda.getDate()).padStart(2, "0")}`;
-    const codigo = `${PREFIXO_CODIGO_VENDA}-${dataCodigo}-${String(valor).padStart(DIGITOS_CODIGO_VENDA, "0")}`;
-    const numero = String(valor).padStart(DIGITOS_NUMERO_VENDA, "0");
 
     const historico = [
       { dataHora: dataVenda, tipo: "criacao" as const, descricao: `Venda registrada no PDV com ${itensMontados.length} item(ns) · estoque baixado`, autor: vendedor.nome },
@@ -335,54 +294,122 @@ export class VendasService {
       })),
     ];
 
-    const venda = await this.vendasRepository.criar({
-      codigo,
-      numero,
-      dataVenda,
-      clienteId: dados.clienteId ?? null,
-      clienteNome,
-      vendedorId: vendedor.id,
-      vendedorNome: vendedor.nome,
-      caixaId: caixa.id,
-      caixaCodigo: caixa.codigo,
-      itens: itensMontados,
-      totalItens: itensMontados.reduce((total, item) => total + item.quantidade, 0),
-      valorBruto,
-      descontoPromocional,
-      descontoVenda,
-      // Agora soma as TRÊS fontes de desconto (promocional + item + venda) —
-      // generalização direta da fórmula já existente (antes só promocional +
-      // venda, porque desconto de item não existia). Preserva o invariante
-      // `valorFinal = valorBruto - descontoTotal` usado pelo Backoffice
-      // (`descontoConcedido` em `estatisticas()`).
-      descontoTotal: arredondar(descontoPromocional + descontoItensTotal + descontoVenda),
-      valorFinal,
-      valorPago,
-      valorPendente,
-      valorDevolvido: 0,
-      temPromocao: descontoPromocional > 0,
-      // Passa a refletir QUALQUER desconto manual (item OU venda), não só o
-      // da venda — mesmo princípio de `temPromocao`, mas para desconto
-      // operado pelo vendedor em vez de automático.
-      temDesconto: descontoItensTotal > 0 || descontoVenda > 0,
-      formaPagamento: pagamentos[0]?.forma ?? "A definir",
-      totalParcelas: parcelas.length || 1,
-      parcelasPagas: 0,
-      observacao: dados.observacao?.trim() ?? "",
-      pagamentos,
-      parcelas,
-      historico,
-      cancelamentos: [],
-      status: valorPendente > 0 ? "em_pagamento" : "concluida",
-      idempotencyKey: dados.idempotencyKey ?? null,
-    } satisfies DadosPersistirVenda);
+    // Fase 60.4.3.4.15 (F04) — TODA escrita da criação acontece numa ÚNICA transação (`executarEmTransacao`):
+    // baixa de cada item → trava do caixa aberto → sequência → venda → `movimentacoes_estoque` (saída) → movimentos de
+    // caixa → agregados de vendedor/cliente → evento. Ou tudo é confirmado, ou nada fica gravado:
+    //   - falha em qualquer etapa (inclusive no insert da venda ou na sequência) aborta a transação e DESFAZ a baixa —
+    //     não existe mais a compensação manual que podia falhar ou ser interrompida;
+    //   - um retry do PDV com a mesma chave depois de um erro não encontra baixa "órfã" para repetir;
+    //   - duas instâncias com a mesma `idempotencyKey`: a perdedora recebe E11000 no insert, sua transação inteira
+    //     (incluindo a baixa) é abortada, e ela devolve a venda vencedora (tratado abaixo, FORA da transação);
+    //   - conflitos de escrita com vendas concorrentes repetem a transação inteira (limitado; esgotado → 409).
+    // As validações acima continuam ANTES da transação, sem efeito no banco; a checagem de saldo é refeita dentro dela
+    // (`ajustarQuantidadeTamanho` recusa saldo negativo sobre o snapshot da transação).
+    let venda: VendaDocument;
+    try {
+      venda = await executarEmTransacao(this.conexao, async (sessao) => {
+        const baixas: { produtoId: string; varianteId: string; tamanhoId: string; quantidade: number; saldoResultante: number }[] = [];
+        for (const solicitado of dados.itens) {
+          const { tamanhoId, saldoResultante } = await this.produtosService.ajustarQuantidadeTamanho(
+            solicitado.produtoId,
+            solicitado.varianteId,
+            { tamanhoId: solicitado.tamanhoId, delta: -solicitado.quantidade, exigirExistente: true },
+            sessao,
+          );
+          baixas.push({ produtoId: solicitado.produtoId, varianteId: solicitado.varianteId, tamanhoId, quantidade: solicitado.quantidade, saldoResultante });
+        }
 
-    // Etapa 10.6: 1 movimento de caixa POR PAGAMENTO (nunca mais um único
-    // agregado usando só a primeira forma) — ver `garantirMovimentosDeCaixa`.
-    await this.garantirMovimentosDeCaixa(venda);
+        if (!(await this.caixasRepository.travarAbertoNaTransacao(caixa.id, sessao))) {
+          throw ApiException.validation("O caixa informado não está aberto.");
+        }
 
-    await this.atualizarAgregadosNaCriacao(venda);
-    await this.registrarEvento(venda.id, "venda.criada", usuarioId, { codigo: venda.codigo, valorFinal });
+        const valor = await this.sequenciasService.proximoValor(CHAVE_SEQUENCIA_VENDA, sessao);
+        const codigo = `${PREFIXO_CODIGO_VENDA}-${dataCodigo}-${String(valor).padStart(DIGITOS_CODIGO_VENDA, "0")}`;
+        const numero = String(valor).padStart(DIGITOS_NUMERO_VENDA, "0");
+
+        const criada = await this.vendasRepository.criar(
+          {
+            codigo,
+            numero,
+            dataVenda,
+            clienteId: dados.clienteId ?? null,
+            clienteNome,
+            vendedorId: vendedor.id,
+            vendedorNome: vendedor.nome,
+            caixaId: caixa.id,
+            caixaCodigo: caixa.codigo,
+            itens: itensMontados,
+            totalItens: itensMontados.reduce((total, item) => total + item.quantidade, 0),
+            valorBruto,
+            descontoPromocional,
+            descontoVenda,
+            // Agora soma as TRÊS fontes de desconto (promocional + item + venda) —
+            // generalização direta da fórmula já existente (antes só promocional +
+            // venda, porque desconto de item não existia). Preserva o invariante
+            // `valorFinal = valorBruto - descontoTotal` usado pelo Backoffice
+            // (`descontoConcedido` em `estatisticas()`).
+            descontoTotal: arredondar(descontoPromocional + descontoItensTotal + descontoVenda),
+            valorFinal,
+            valorPago,
+            valorPendente,
+            valorDevolvido: 0,
+            temPromocao: descontoPromocional > 0,
+            // Passa a refletir QUALQUER desconto manual (item OU venda), não só o
+            // da venda — mesmo princípio de `temPromocao`, mas para desconto
+            // operado pelo vendedor em vez de automático.
+            temDesconto: descontoItensTotal > 0 || descontoVenda > 0,
+            formaPagamento: pagamentos[0]?.forma ?? "A definir",
+            totalParcelas: parcelas.length || 1,
+            parcelasPagas: 0,
+            observacao: dados.observacao?.trim() ?? "",
+            pagamentos,
+            parcelas,
+            historico,
+            cancelamentos: [],
+            status: valorPendente > 0 ? "em_pagamento" : "concluida",
+            idempotencyKey: dados.idempotencyKey ?? null,
+          } satisfies DadosPersistirVenda,
+          sessao,
+        );
+
+        // Ledger de estoque: uma saída por item, com o saldo resultante da MESMA transação.
+        await this.movimentacaoEstoqueModel.create(
+          baixas.map((baixa) => ({
+            produtoId: new Types.ObjectId(baixa.produtoId),
+            varianteId: baixa.varianteId,
+            tamanhoId: baixa.tamanhoId,
+            tipo: "saida" as const,
+            quantidade: baixa.quantidade,
+            saldoResultante: baixa.saldoResultante,
+            motivo: `Venda ${codigo}`,
+            usuarioId,
+            origem: "venda" as const,
+            vendaId: criada.id,
+          })),
+          { session: sessao },
+        );
+
+        // Etapa 10.6: 1 movimento de caixa POR PAGAMENTO (nunca mais um único
+        // agregado usando só a primeira forma) — ver `garantirMovimentosDeCaixa`.
+        await this.garantirMovimentosDeCaixa(criada, sessao);
+        await this.atualizarAgregadosNaCriacao(criada, sessao);
+        await this.registrarEvento(criada.id, "venda.criada", usuarioId, { codigo, valorFinal }, sessao);
+        return criada;
+      });
+    } catch (erro) {
+      // Corrida de `idempotencyKey` entre instâncias (ou processos): a transação desta chamada já foi abortada — com
+      // a baixa dela — e a venda vencedora está confirmada. Mesmo critério do replay do início da função: só devolve a
+      // vencedora se for a MESMA operação; e re-garante os movimentos dela (idempotente, fora de transação).
+      if (dados.idempotencyKey && this.vendasRepository.ehErroDeIdempotencyKeyDuplicada(erro)) {
+        const vencedora = await this.vendasRepository.encontrarPorIdempotencyKey(dados.idempotencyKey);
+        if (vencedora) {
+          this.verificarMesmaOperacaoDeCriacao(dados, vencedora);
+          await this.garantirMovimentosDeCaixa(vencedora);
+          return vencedora;
+        }
+      }
+      throw erro;
+    }
     return venda;
   }
 
@@ -1169,33 +1196,45 @@ export class VendasService {
    * etapa, preservado deliberadamente.
    */
   private async restaurarEstoquePendente(venda: VendaDocument): Promise<void> {
+    // Fase 60.4.3.4.15 (F04) — cada linha pendente é restaurada numa TRANSAÇÃO própria que confirma JUNTAS a devolução
+    // física (`ajustarQuantidadeTamanho`), a entrada no ledger (`movimentacoes_estoque`) e `restaurado: true`.
+    // Substitui a reivindicação em duas fases (`restaurando`), que tinha duas lacunas: (i) falha ao marcar DEPOIS de
+    // devolver liberava a reivindicação e a reconciliação devolvia de novo; (ii) queda entre reivindicar e marcar
+    // deixava `restaurando: true` para sempre. Agora:
+    //   - falha em qualquer ponto → nada é confirmado; a linha continua `restaurado: false` e a próxima chamada a
+    //     `cancelar()`/reconciliação a restaura uma única vez;
+    //   - duas chamadas concorrentes na mesma linha → a segunda conflita na escrita da venda, repete a transação, lê
+    //     `restaurado: true` e não faz nada;
+    //   - `restaurando` deixa de ser consultado: uma linha legada presa em `restaurando: true` é retomada normalmente.
     const atual = await this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
     for (const evento of atual.cancelamentos) {
       const eventoId = String(evento._id);
       for (const devolvido of evento.itens) {
         if (devolvido.restaurado) continue;
-        const reivindicado = await this.vendasRepository.reivindicarRestauracaoDeItem(venda.id, eventoId, devolvido.itemId);
-        if (!reivindicado) continue; // outra chamada já reivindicou (ou já concluiu) este item.
-
-        const item = atual.itens.find((registro) => String(registro._id) === devolvido.itemId);
         try {
-          if (item) await this.devolverAoEstoque(item, devolvido.quantidade);
-          await this.vendasRepository.marcarItemRestaurado(venda.id, eventoId, devolvido.itemId);
+          await executarEmTransacao(this.conexao, async (sessao) => {
+            const fresca = await this.vendasRepository.encontrarPorIdOuFalhar(venda.id, sessao);
+            const linha = fresca.cancelamentos.find((registro) => String(registro._id) === eventoId)?.itens.find((registro) => registro.itemId === devolvido.itemId);
+            if (!linha || linha.restaurado) return; // já restaurada por outra chamada (confirmada antes deste snapshot).
+
+            const item = fresca.itens.find((registro) => String(registro._id) === linha.itemId);
+            if (item) {
+              try {
+                await this.devolverAoEstoque(item, linha.quantidade, fresca, sessao);
+              } catch (erro) {
+                // Produto/variante não existe mais — nada a restaurar fisicamente; aceito como concluído (mesmo
+                // comportamento histórico). É uma `ApiException` do próprio código, não um erro do servidor: a
+                // transação continua válida.
+                if (!this.erroDeProdutoOuVarianteExcluido(erro)) throw erro;
+              }
+            }
+            await this.vendasRepository.marcarItemRestaurado(venda.id, eventoId, linha.itemId, sessao);
+          });
         } catch (erro) {
-          if (this.erroDeProdutoOuVarianteExcluido(erro)) {
-            // Produto/variante não existe mais — nada a restaurar fisicamente;
-            // aceita como concluído (mesmo comportamento histórico já existente).
-            await this.vendasRepository.marcarItemRestaurado(venda.id, eventoId, devolvido.itemId);
-            continue;
-          }
-          // Falha genuína (ex.: conflito de concorrência esgotando os retries
-          // de `ProdutosRepository.salvarComRetentativa`) — NUNCA marca
-          // restaurado, libera a reivindicação para uma tentativa futura, e
-          // NUNCA engole o erro silenciosamente: fica registrado para
-          // investigação/reconciliação manual.
-          await this.vendasRepository.liberarReivindicacaoDeItem(venda.id, eventoId, devolvido.itemId);
+          // Falha genuína: NADA foi confirmado (a transação abortou) — a linha permanece pendente para a próxima
+          // tentativa, e o erro fica registrado para investigação; nunca engolido em silêncio.
           this.logger.error(
-            `Falha ao restaurar estoque da venda ${atual.codigo} (evento ${eventoId}, item ${devolvido.itemId}, quantidade ${devolvido.quantidade}) — item permanece pendente para nova tentativa.`,
+            `Falha ao restaurar estoque da venda ${atual.codigo} (evento ${eventoId}, item ${devolvido.itemId}, quantidade ${devolvido.quantidade}) — nada foi gravado; item permanece pendente para nova tentativa.`,
             erro instanceof Error ? erro.stack : String(erro),
           );
         }
@@ -1503,7 +1542,9 @@ export class VendasService {
    * nunca o valor líquido pós-tarifa — o Caixa reflete o que o cliente
    * efetivamente pagou, não a liquidação da adquirente.
    */
-  private async garantirMovimentosDeCaixa(venda: VendaDocument): Promise<void> {
+  private async garantirMovimentosDeCaixa(venda: VendaDocument, sessao?: ClientSession): Promise<void> {
+    // Fase 60.4.3.4.15 (F04) — com `sessao`: dentro da transação de criação (movimentos nascem com a venda); sem
+    // `sessao`: replay de uma venda já confirmada (idempotente pela chave determinística, como sempre).
     if (!venda.caixaId) return;
     const chaveBase = venda.idempotencyKey ?? venda.id;
 
@@ -1522,7 +1563,7 @@ export class VendasService {
         valor: pagamento.valor,
         observacao: "",
         idempotencyKey: `${chaveBase}:pagamento:${indice}`,
-      });
+      }, sessao);
     }
   }
 
@@ -1599,13 +1640,32 @@ export class VendasService {
    * fazer com uma falha (produto/variante excluído → aceita como concluído;
    * qualquer outro erro → registra e mantém pendente para retry).
    */
-  private async devolverAoEstoque(item: ItemVenda, quantidade: number): Promise<void> {
+  /** Fase 60.4.3.4.15 (F04) — sempre dentro da transação da restauração: devolução + entrada no ledger juntas. */
+  private async devolverAoEstoque(item: ItemVenda, quantidade: number, venda: VendaDocument, sessao: ClientSession): Promise<void> {
     if (!item.varianteId) return;
-    await this.produtosService.ajustarQuantidadeTamanho(item.produtoId, item.varianteId, {
-      tamanho: item.tamanho ?? undefined,
-      delta: quantidade,
-      exigirExistente: false,
-    });
+    const { tamanhoId, saldoResultante } = await this.produtosService.ajustarQuantidadeTamanho(
+      item.produtoId,
+      item.varianteId,
+      { tamanho: item.tamanho ?? undefined, delta: quantidade, exigirExistente: false },
+      sessao,
+    );
+    await this.movimentacaoEstoqueModel.create(
+      [
+        {
+          produtoId: new Types.ObjectId(item.produtoId),
+          varianteId: item.varianteId,
+          tamanhoId,
+          tipo: "entrada" as const,
+          quantidade,
+          saldoResultante,
+          motivo: `Cancelamento/devolução da venda ${venda.codigo}`,
+          usuarioId: null,
+          origem: "cancelamento" as const,
+          vendaId: venda.id,
+        },
+      ],
+      { session: sessao },
+    );
   }
 
   private montarParcelas(valorPendente: number, totalParcelas: number, dataVenda: Date) {
@@ -1620,18 +1680,19 @@ export class VendasService {
     }) as never[];
   }
 
-  private async atualizarAgregadosNaCriacao(venda: VendaDocument): Promise<void> {
+  /** Fase 60.4.3.4.15 (F04) — dentro da transação de criação: o agregado só conta a venda se ela for confirmada. */
+  private async atualizarAgregadosNaCriacao(venda: VendaDocument, sessao: ClientSession): Promise<void> {
     await this.vendedoresRepository.salvarComRetentativa(venda.vendedorId, (documento) => {
       documento.vendas += 1;
       documento.totalVendido = arredondar(documento.totalVendido + venda.valorFinal);
       documento.ultimaVenda = venda.dataVenda;
-    });
+    }, 3, sessao);
     if (venda.clienteId) {
       await this.clientesRepository.salvarComRetentativa(venda.clienteId, (documento) => {
         documento.compras += 1;
         documento.totalComprado = arredondar(documento.totalComprado + venda.valorFinal);
         documento.ultimaCompra = venda.dataVenda;
-      });
+      }, 3, sessao);
     }
   }
 
@@ -1658,7 +1719,19 @@ export class VendasService {
     }
   }
 
-  private async registrarEvento(vendaId: string | Types.ObjectId, tipo: string, usuarioId: string | null, detalhes: Record<string, unknown>): Promise<void> {
+  private async registrarEvento(
+    vendaId: string | Types.ObjectId,
+    tipo: string,
+    usuarioId: string | null,
+    detalhes: Record<string, unknown>,
+    sessao?: ClientSession,
+  ): Promise<void> {
+    // Fase 60.4.3.4.15 (F04) — com `sessao`, o evento só existe se a operação for confirmada (nunca um evento de uma
+    // venda abortada); `create` com sessão exige a forma de lista.
+    if (sessao) {
+      await this.eventoModel.create([{ vendaId, tipo, usuarioId, detalhes }], { session: sessao });
+      return;
+    }
     await this.eventoModel.create({ vendaId, tipo, usuarioId, detalhes });
   }
 }

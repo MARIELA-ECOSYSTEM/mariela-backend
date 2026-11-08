@@ -1,6 +1,6 @@
 import { Injectable, Logger, type OnModuleInit } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
-import { isValidObjectId, type Model } from "mongoose";
+import { isValidObjectId, type ClientSession, type Model } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import { normalizarFormaPagamento } from "../produtos/utils/normalizacao.util.js";
 import type { DadosCriarMovimento } from "./caixas.types.js";
@@ -112,7 +112,14 @@ export class MovimentosCaixaRepository implements OnModuleInit {
    * vez de ser rejeitada. Reusa `ApiException.conflict` (mesmo código já
    * usado para os demais conflitos de idempotência do domínio).
    */
-  async criar(dados: DadosCriarMovimento): Promise<ResultadoCriarMovimento> {
+  async criar(dados: DadosCriarMovimento, sessao?: ClientSession): Promise<ResultadoCriarMovimento> {
+    // Fase 60.4.3.4.15 (F04) — dentro da transação da venda nada é capturado: um E11000 aborta a transação inteira
+    // (a venda e o movimento nascem juntos; uma chave já existente só aparece no replay, que roda FORA da transação).
+    if (sessao) {
+      const [movimento] = await this.movimentoModel.create([dados], { session: sessao });
+      if (!movimento) throw new Error("Falha ao criar o movimento de caixa: o MongoDB não devolveu o documento inserido.");
+      return { movimento, duplicado: false };
+    }
     try {
       const movimento = await this.movimentoModel.create(dados);
       return { movimento, duplicado: false };
