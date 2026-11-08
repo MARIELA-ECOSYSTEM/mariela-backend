@@ -21,17 +21,14 @@ jobs:
     # (`src/test-utils/mongo-teste.util.ts`): a suíte valida comportamento
     # genuíno do MongoDB (concorrência, índices, agregação), nunca um dublê
     # em memória. Mesma tag `mongo:7` já usada em `docker-compose.yml`.
-    services:
-      mongodb:
-        image: mongo:7
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd "mongosh --eval 'db.adminCommand({ping:1})'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-          --health-start-period 10s
+    #
+    # Fase 60.4.3.4.14 — REPLICA SET de 1 nó (`rs0`), não mais standalone:
+    # transações multi-documento (pré-requisito da correção F04) só existem
+    # em replica set. Um contêiner de serviço do GitHub Actions não aceita
+    # argumentos de comando (`--replSet`), por isso o MongoDB é iniciado por
+    # um passo explícito (ver "MongoDB 7 — replica set de 1 nó"). O membro é
+    # anunciado como `127.0.0.1:27017`: alcançável pelo processo de testes no
+    # runner (porta publicada) e pelo próprio mongod dentro do contêiner.
 
     # Etapa 25 — TODOS os valores abaixo são fictícios, existem só para
     # satisfazer `validateEnv` (src/config/env.validation.ts) dentro do
@@ -42,8 +39,14 @@ jobs:
     # `secrets.*` do GitHub — não há segredo real algum nesta etapa.
     env:
       NODE_ENV: test
-      MONGODB_URI: mongodb://127.0.0.1:27017/mariela_test
-      MONGODB_URI_TESTE: mongodb://127.0.0.1:27017/mariela_test
+      # Fase 60.4.3.4.14 — `replicaSet=rs0`: o driver descobre a topologia de
+      # replica set (sessões, transações, retryable writes) em vez de tratar o
+      # nó como standalone. Sem `directConnection=true` de propósito.
+      MONGODB_URI: mongodb://127.0.0.1:27017/mariela_test?replicaSet=rs0
+      MONGODB_URI_TESTE: mongodb://127.0.0.1:27017/mariela_test?replicaSet=rs0
+      # Banco DESCARTÁVEL exclusivo da prova de transação (passo "Prova de
+      # transação"); apagado pelo próprio verificador ao final.
+      MONGODB_URI_PROVA_TRANSACAO: mongodb://127.0.0.1:27017/mariela_ci_prova_transacao?replicaSet=rs0
       JWT_ACCESS_SECRET: ci-fake-jwt-access-secret-nunca-usar-fora-do-runner
       JWT_REFRESH_SECRET: ci-fake-jwt-refresh-secret-nunca-usar-fora-do-runner
       PDV_JWT_ACCESS_SECRET: ci-fake-pdv-access-secret-nunca-usar-fora-do-runner
@@ -55,6 +58,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Fase 60.4.3.4.14 — inicia o MongoDB 7 como replica set de 1 nó e só
+      # libera os passos seguintes quando o nó for PRIMÁRIO gravável. Contêiner
+      # ativo não significa replica set pronto: cada etapa espera a anterior com
+      # tentativas limitadas e falha o workflow se o prazo esgotar.
+      - name: MongoDB 7 — replica set de 1 nó
+        run: |
+          set -euo pipefail
+          docker run -d --name mongodb -p 127.0.0.1:27017:27017 mongo:7 --replSet rs0 --bind_ip_all
+
+          esperar() { # $1 descrição, $2 comando mongosh que imprime "true" quando pronto
+            for tentativa in $(seq 1 60); do
+              if [ "$(docker exec mongodb mongosh --quiet --eval "$2" 2>/dev/null || true)" = "true" ]; then
+                echo "$1: pronto (tentativa $tentativa)"; return 0
+              fi
+              sleep 2
+            done
+            echo "::error::$1: não ficou pronto em 120 s"; docker logs --tail 50 mongodb; return 1
+          }
+
+          esperar "ping" 'db.adminCommand({ ping: 1 }).ok === 1'
+          docker exec mongodb mongosh --quiet --eval 'printjson(rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "127.0.0.1:27017" }] }))'
+          esperar "primário gravável" 'db.hello().isWritablePrimary === true'
+
+          # Validação explícita do replica set (falha o passo se algo divergir).
+          docker exec mongodb mongosh --quiet --eval '
+            const s = rs.status();
+            const h = db.hello();
+            print(`setName=${h.setName} isWritablePrimary=${h.isWritablePrimary} membros=${s.members.length} estado=${s.members[0].stateStr} host=${s.members[0].name}`);
+            if (s.ok !== 1 || h.setName !== "rs0" || h.isWritablePrimary !== true || s.members.length !== 1 || s.members[0].stateStr !== "PRIMARY" || s.members[0].name !== "127.0.0.1:27017") {
+              throw new Error("replica set fora do estado esperado");
+            }'
+
       - name: Instala o Bun (versão pinada, igual ao ambiente de desenvolvimento)
         uses: oven-sh/setup-bun@v2
         with:
@@ -62,6 +97,12 @@ jobs:
 
       - name: Instala dependências (lockfile congelado — instalação determinística)
         run: bun install --frozen-lockfile
+
+      # Fase 60.4.3.4.14 — prova REAL de transação (sessão, gravação, isolamento,
+      # abort sem persistência e contraprova com commit) num banco descartável.
+      # Falha aqui reprova o workflow antes dos testes. Ver o próprio script.
+      - name: Prova de transação no MongoDB do CI
+        run: bun --no-env-file .github/ci/verificar-transacao-mongo.ts
 
       - name: Typecheck
         run: bun run typecheck
