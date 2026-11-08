@@ -69,7 +69,8 @@ export class VendasRepository {
     // aborta a transação inteira — com a baixa de estoque feita nela — e quem chama trata a chave duplicada FORA da
     // transação (`VendasService.criarInterno`). Capturar aqui deixaria a transação abortada no servidor.
     if (sessao) {
-      const [venda] = await this.vendaModel.create([dados as never], { session: sessao });
+      // `ordered: true`: exigido pelo Mongoose para `create()` em lista com sessão (Fase 60.4.3.4.16; uniforme no projeto).
+      const [venda] = await this.vendaModel.create([dados as never], { session: sessao, ordered: true });
       if (!venda) throw new Error("Falha ao criar a venda: o MongoDB não devolveu o documento inserido.");
       return venda;
     }

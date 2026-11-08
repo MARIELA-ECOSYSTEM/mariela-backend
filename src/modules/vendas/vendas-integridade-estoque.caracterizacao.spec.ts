@@ -218,6 +218,15 @@ async function contarColecoes(conexao: Connection): Promise<number> {
   return colecoes.filter((colecao) => !colecao.name.startsWith("system.")).length;
 }
 
+/**
+ * Fase 60.4.3.4.16 — a instância de `VendasRepository` que o `VendasService` usa é a do `VendasModule`. O mesmo
+ * repositório também é provido por `CaixasModule`, `VendedoresModule` e `ClientesModule`; espionar a instância errada
+ * deixa a injeção sem efeito (no T5, o teste esperava para sempre um ponto de parada que nunca era alcançado).
+ */
+function repositorioDoVendasModule(modulo: TestingModule): VendasRepository {
+  return modulo.select(VendasModule).get(VendasRepository, { strict: true });
+}
+
 let contador = 0;
 function unico(): string {
   contador += 1;
@@ -288,7 +297,10 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
       });
 
       service = contexto.get(VendasService);
-      repositorio = contexto.get(VendasRepository);
+      // Fase 60.4.3.4.16 — `VendasRepository` é provido em QUATRO módulos (vendas, caixas, vendedores, clientes); um
+      // `get()` sem escopo pode devolver a instância de outro módulo, e o espião nunca interceptaria o `VendasService`
+      // (causa do T5 parado no CI). A instância usada pelo serviço é a do `VendasModule`.
+      repositorio = repositorioDoVendasModule(contexto);
       produtosService = contexto.get(ProdutosService);
       vendedoresService = contexto.get(VendedoresService);
       caixasService = contexto.get(CaixasService);
@@ -348,6 +360,11 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
     const vendedor = await vendedoresService.criar({ nome: `Vendedor Caracterização ${s}`, telefone, ativo: true, senha: "senha123" }, null);
     vendedorIds.push(vendedor.id);
 
+    // Fase 60.4.3.4.16 — independência entre cenários: um caixa deixado aberto por um cenário anterior interrompido
+    // (ex.: estouro de prazo antes do `finally`) é fechado aqui. Só no banco E2E (`connection` validada em `beforeAll`).
+    const residuais = await connection.collection<{ _id: Types.ObjectId }>("caixas").find({ status: "aberto" }).toArray();
+    for (const residual of residuais) await fecharCaixa(String(residual._id));
+
     const aberto = await capturar(caixasService.abrir({ valorInicial: 0, observacao: "caracterização F04" }, null));
     if (!aberto.ok) throw new Error(`[SETUP] abrir caixa (outro caixa aberto no banco E2E?): ${descrever(aberto.erro)}`);
     caixaIds.push(aberto.valor.id);
@@ -357,6 +374,19 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
   }
 
   type Cenario = Awaited<ReturnType<typeof prepararCenario>>;
+
+  /**
+   * Fase 60.4.3.4.16 — espera um ponto de parada SEM risco de espera infinita: se a execução terminar antes de chegar
+   * ao ponto (o espião não interceptou a instância usada pelo serviço, ou a operação falhou antes), o teste falha na hora
+   * com `[INJEÇÃO]`, em vez de ficar parado até o prazo do teste e deixar caixa/contexto pendentes.
+   */
+  async function aguardarPonto(ponto: { chegou: { promessa: Promise<void> } }, execucao: Promise<Resultado<unknown>>, rotulo: string): Promise<void> {
+    const primeiro = await Promise.race([ponto.chegou.promessa.then(() => "chegou" as const), execucao.then(() => "terminou" as const)]);
+    if (primeiro === "terminou") {
+      const resultado = await execucao;
+      exigir(false, "[INJEÇÃO]", `${rotulo}: a execução terminou sem passar pelo ponto de parada (${resultado.ok ? "concluída" : descrever(resultado.erro)})`);
+    }
+  }
 
   function dadosVenda(cenario: Cenario, idempotencyKey: string): DadosCriarVenda {
     return {
@@ -498,6 +528,8 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
     const pontoA = novoPonto();
     const pontoB = novoPonto();
     const espioes: { mockRestore(): void }[] = [];
+    let execucaoA: Promise<Resultado<Awaited<ReturnType<VendasService["criar"]>>>> | null = null;
+    let execucaoB: Promise<Resultado<Awaited<ReturnType<VendasService["criar"]>>>> | null = null;
     try {
       try {
         moduloB = await Test.createTestingModule({ imports: [MongooseModule.forRoot(uriE2E, OPCOES_CONTEXTO_NEST), JWT_MODULO_DE_TESTE, VendasModule] }).compile();
@@ -505,8 +537,8 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
         if (ehErroDeInfraestrutura(erro)) throw new Error(`[INFRAESTRUTURA] segundo contexto Nest: ${descrever(erro)}`);
         throw new Error(`[SETUP] segundo contexto Nest: ${descrever(erro)}`);
       }
-      const serviceB = moduloB.get(VendasService);
-      const repositorioB = moduloB.get(VendasRepository);
+      const serviceB = moduloB.select(VendasModule).get(VendasService, { strict: true });
+      const repositorioB = repositorioDoVendasModule(moduloB);
       const conexaoB: Connection = moduloB.get(getConnectionToken());
       exigir(serviceB !== service && repositorioB !== repositorio, "[SETUP]", "os dois contextos deveriam ter instâncias distintas");
       exigir(conexaoB !== connection && conexaoB.name === BANCO_E2E && connection.name === BANCO_E2E, "[SETUP]", "os dois contextos deveriam ter conexões distintas no mesmo banco E2E");
@@ -532,11 +564,11 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
         return salvarProdutoB(id, mutar, tentativas, sessao);
       }));
 
-      const execucaoA = capturar(service.criar(dadosVenda(cenario, chave), null));
-      await pontoA.chegou.promessa;
+      execucaoA = capturar(service.criar(dadosVenda(cenario, chave), null));
+      await aguardarPonto(pontoA, execucaoA, "A (insert da venda dentro da transação)");
       exigir((await saldo(cenario.produtoId, cenario.tamanhoId)) === ESTOQUE_INICIAL, "[PRÉ-CONDIÇÃO]", "com A pausada dentro da transação, o saldo CONFIRMADO deveria continuar o inicial");
-      const execucaoB = capturar(serviceB.criar(dadosVenda(cenario, chave), null));
-      await pontoB.chegou.promessa;
+      execucaoB = capturar(serviceB.criar(dadosVenda(cenario, chave), null));
+      await aguardarPonto(pontoB, execucaoB, "B (baixa de estoque com a transação de A aberta)");
 
       // A confirma; B termina sozinha (repete, recebe E11000 de idempotencyKey e devolve a venda de A).
       pontoA.liberacao.liberar();
@@ -557,6 +589,10 @@ describe.skipIf(!SUITE_E2E_HABILITADA)(`${PREFIXO} integridade entre venda e est
       caracterizar(observado, { saldo: ESTOQUE_INICIAL - QUANTIDADE, vendasComAChave: 1, movimentosDeCaixaDaChave: 1, vendasNoAgregadoDoVendedor: 1, saidasNoLedger: 1 });
     } finally {
       liberarTudo(pontoA, pontoB);
+      // Fase 60.4.3.4.16 — espera as duas operações terminarem (sucesso, erro ou abort) ANTES de restaurar espiões,
+      // fechar o segundo contexto e o caixa: nenhuma transação fica aberta segurando o caixa para o próximo cenário.
+      // `capturar` nunca rejeita, então `allSettled` só aguarda.
+      await Promise.allSettled([execucaoA, execucaoB].filter((execucao) => execucao !== null));
       for (const espiao of espioes.splice(0)) espiao.mockRestore();
       if (moduloB) await moduloB.close();
       await fecharCaixa(cenario.caixaId);

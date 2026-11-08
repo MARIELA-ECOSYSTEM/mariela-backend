@@ -386,7 +386,10 @@ export class VendasService {
             origem: "venda" as const,
             vendaId: criada.id,
           })),
-          { session: sessao },
+          // Fase 60.4.3.4.16 — o Mongoose recusa `create()` com sessão e VÁRIOS documentos sem `ordered: true`
+          // (venda com mais de um item). Com `ordered: true` os inserts são sequenciais e o primeiro erro interrompe e
+          // propaga — abortando a transação inteira, como as demais escritas dela.
+          { session: sessao, ordered: true },
         );
 
         // Etapa 10.6: 1 movimento de caixa POR PAGAMENTO (nunca mais um único
@@ -1664,7 +1667,7 @@ export class VendasService {
           vendaId: venda.id,
         },
       ],
-      { session: sessao },
+      { session: sessao, ordered: true },
     );
   }
 
@@ -1729,7 +1732,7 @@ export class VendasService {
     // Fase 60.4.3.4.15 (F04) — com `sessao`, o evento só existe se a operação for confirmada (nunca um evento de uma
     // venda abortada); `create` com sessão exige a forma de lista.
     if (sessao) {
-      await this.eventoModel.create([{ vendaId, tipo, usuarioId, detalhes }], { session: sessao });
+      await this.eventoModel.create([{ vendaId, tipo, usuarioId, detalhes }], { session: sessao, ordered: true });
       return;
     }
     await this.eventoModel.create({ vendaId, tipo, usuarioId, detalhes });

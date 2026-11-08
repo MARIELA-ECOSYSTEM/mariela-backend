@@ -116,7 +116,8 @@ export class MovimentosCaixaRepository implements OnModuleInit {
     // Fase 60.4.3.4.15 (F04) — dentro da transação da venda nada é capturado: um E11000 aborta a transação inteira
     // (a venda e o movimento nascem juntos; uma chave já existente só aparece no replay, que roda FORA da transação).
     if (sessao) {
-      const [movimento] = await this.movimentoModel.create([dados], { session: sessao });
+      // `ordered: true`: exigido pelo Mongoose para `create()` em lista com sessão (Fase 60.4.3.4.16; uniforme no projeto).
+      const [movimento] = await this.movimentoModel.create([dados], { session: sessao, ordered: true });
       if (!movimento) throw new Error("Falha ao criar o movimento de caixa: o MongoDB não devolveu o documento inserido.");
       return { movimento, duplicado: false };
     }
