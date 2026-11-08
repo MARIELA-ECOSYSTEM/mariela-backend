@@ -230,4 +230,47 @@ describe("validateEnv", () => {
       }
     });
   });
+
+  describe("reconciliação de estoque (Fase 60.4.3.4.18)", () => {
+    it("ausentes ou vazias (como no .env.example) são aceitas", () => {
+      expect(() => validateEnv(baseEnv())).not.toThrow();
+      const validado = validateEnv(
+        baseEnv({
+          RECONCILIACAO_ESTOQUE_HABILITADA: "",
+          RECONCILIACAO_ESTOQUE_INTERVALO_MS: "",
+          RECONCILIACAO_ESTOQUE_LOTE: "",
+          RECONCILIACAO_ESTOQUE_MAX_ITENS_POR_CICLO: "",
+          RECONCILIACAO_ESTOQUE_MAX_TENTATIVAS: "",
+          RECONCILIACAO_ESTOQUE_BACKOFF_BASE_MS: "",
+          RECONCILIACAO_ESTOQUE_BACKOFF_MAX_MS: "",
+        }),
+      );
+      expect(validado.RECONCILIACAO_ESTOQUE_INTERVALO_MS).toBeUndefined();
+      expect(validado.RECONCILIACAO_ESTOQUE_MAX_TENTATIVAS).toBeUndefined();
+    });
+
+    it("valores válidos são aceitos e convertidos para número", () => {
+      const validado = validateEnv(
+        baseEnv({ RECONCILIACAO_ESTOQUE_HABILITADA: "false", RECONCILIACAO_ESTOQUE_INTERVALO_MS: "30000", RECONCILIACAO_ESTOQUE_MAX_TENTATIVAS: "5" }),
+      );
+      expect(validado.RECONCILIACAO_ESTOQUE_HABILITADA).toBe("false");
+      expect(validado.RECONCILIACAO_ESTOQUE_INTERVALO_MS).toBe(30_000);
+      expect(validado.RECONCILIACAO_ESTOQUE_MAX_TENTATIVAS).toBe(5);
+    });
+
+    it("rejeita valores fora da faixa (laço agressivo, lote ilimitado) ou inválidos", () => {
+      for (const [nome, valor] of [
+        ["RECONCILIACAO_ESTOQUE_HABILITADA", "sim"],
+        ["RECONCILIACAO_ESTOQUE_INTERVALO_MS", "1000"],
+        ["RECONCILIACAO_ESTOQUE_LOTE", "0"],
+        ["RECONCILIACAO_ESTOQUE_LOTE", "501"],
+        ["RECONCILIACAO_ESTOQUE_MAX_ITENS_POR_CICLO", "5001"],
+        ["RECONCILIACAO_ESTOQUE_MAX_TENTATIVAS", "0"],
+        ["RECONCILIACAO_ESTOQUE_BACKOFF_BASE_MS", "10"],
+        ["RECONCILIACAO_ESTOQUE_BACKOFF_MAX_MS", "abc"],
+      ] as const) {
+        expect(() => validateEnv(baseEnv({ [nome]: valor }))).toThrow(new RegExp(nome));
+      }
+    });
+  });
 });

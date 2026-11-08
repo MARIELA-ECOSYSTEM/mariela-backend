@@ -2,7 +2,17 @@ import { Prop, Schema, SchemaFactory } from "@nestjs/mongoose";
 import type { HydratedDocument, Types } from "mongoose";
 import { aplicarSerializacaoPadrao } from "../../../database/mongoose-json.util.js";
 import { MODALIDADES_TARIFA, type ModalidadeTarifa } from "../../adquirentes/adquirentes.constants.js";
-import { STATUS_VENDA, TIPOS_EVENTO_VENDA, MODALIDADES_PAGAMENTO, type ModalidadePagamento, type StatusVenda, type TipoEventoVenda } from "../vendas.constants.js";
+import {
+  ESTADOS_RESTAURACAO,
+  STATUS_VENDA,
+  TIPOS_EVENTO_VENDA,
+  MODALIDADES_PAGAMENTO,
+  type EstadoRestauracao,
+  type ModalidadePagamento,
+  type StatusVenda,
+  type TipoEventoVenda,
+} from "../vendas.constants.js";
+import { resumoRestauracao, type ResumoRestauracaoVenda } from "../restauracao-estoque.util.js";
 
 /**
  * Item vendido — SNAPSHOT histórico: preços, nome e categoria são copiados no
@@ -201,6 +211,24 @@ export class EventoHistoricoVenda {
 }
 export const EventoHistoricoVendaSchema = SchemaFactory.createForClass(EventoHistoricoVenda);
 
+/** Fase 60.4.3.4.18 — resumo seguro da última falha de restauração de uma linha. */
+@Schema({ _id: false })
+export class UltimaFalhaRestauracao {
+  @Prop({ type: String, required: true })
+  classe!: string;
+
+  @Prop({ type: String, default: null })
+  codigo!: string | null;
+
+  /** Mensagem truncada e sem URIs (ver `descreverFalhaDeRestauracao`). */
+  @Prop({ type: String, required: true })
+  mensagem!: string;
+
+  @Prop({ type: Date, required: true })
+  em!: Date;
+}
+export const UltimaFalhaRestauracaoSchema = SchemaFactory.createForClass(UltimaFalhaRestauracao);
+
 @Schema({ _id: false })
 export class ItemDevolvido {
   @Prop({ type: String, required: true })
@@ -235,8 +263,13 @@ export class ItemDevolvido {
    * como acontecia até esta etapa). Ver `restaurando` abaixo para a
    * reivindicação que torna isso seguro sob concorrência.
    */
-  @Prop({ type: Boolean, default: true })
-  restaurado!: boolean;
+  /**
+   * Fase 60.4.3.4.18 — SEM `default`. Até esta fase o padrão era `true`, o que fazia um documento SEM o campo ser lido
+   * como "estoque já restaurado" — uma restauração nunca confirmada podia ficar invisível. Agora ausência = pendente
+   * (`estadoEfetivoDaRestauracao`). Toda linha criada pelo código atual grava `false` explicitamente.
+   */
+  @Prop({ type: Boolean })
+  restaurado?: boolean;
 
   /**
    * Etapa 10.22 — reivindicação EM ANDAMENTO desta linha: `true` entre o
@@ -258,6 +291,31 @@ export class ItemDevolvido {
    */
   @Prop({ type: Boolean, default: false })
   restaurando!: boolean;
+
+  /**
+   * Fase 60.4.3.4.18 — estado explícito da restauração (ver `ESTADOS_RESTAURACAO`). Sem `default` de propósito: um
+   * evento legado sem o campo tem o estado DERIVADO de `restaurado` (`estadoEfetivoDaRestauracao`), nunca presumido.
+   */
+  @Prop({ type: String, enum: ESTADOS_RESTAURACAO })
+  estadoRestauracao?: EstadoRestauracao;
+
+  /** Tentativas de restauração já feitas (sucesso ou falha). */
+  @Prop({ type: Number, default: 0 })
+  tentativas!: number;
+
+  @Prop({ type: Date, default: null })
+  ultimaTentativaEm!: Date | null;
+
+  /** Quando a reconciliação automática pode tentar de novo (`null` = imediatamente / não agendada). */
+  @Prop({ type: Date, default: null })
+  proximaTentativaEm!: Date | null;
+
+  @Prop({ type: Date, default: null })
+  restauradoEm!: Date | null;
+
+  /** Dados SEGUROS da última falha (classe/código/mensagem curta) — nunca stack trace, segredo ou dado pessoal. */
+  @Prop({ type: UltimaFalhaRestauracaoSchema, default: null })
+  ultimaFalha!: UltimaFalhaRestauracao | null;
 }
 export const ItemDevolvidoSchema = SchemaFactory.createForClass(ItemDevolvido);
 
@@ -455,6 +513,16 @@ export class Venda {
 
 export type VendaDocument = HydratedDocument<Venda>;
 export const VendaSchema = SchemaFactory.createForClass(Venda);
+
+/**
+ * Fase 60.4.3.4.18 — resumo DERIVADO (nunca persistido) da restauração de estoque, serializado em toda venda (`toJSON`
+ * com `virtuals: true`). Aditivo: nenhum campo existente muda. Quando a consulta exclui `cancelamentos` (projeções
+ * enxutas de listagem/dashboard), o virtual devolve `undefined` e some do JSON — nunca um "concluído" inventado.
+ */
+VendaSchema.virtual("restauracaoEstoque").get(function (this: VendaDocument): ResumoRestauracaoVenda | undefined {
+  if (!this.isSelected("cancelamentos")) return undefined;
+  return resumoRestauracao(this.cancelamentos);
+});
 aplicarSerializacaoPadrao(VendaSchema);
 
 VendaSchema.index({ status: 1 });

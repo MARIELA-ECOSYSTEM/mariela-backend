@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import configuration from "./configuration.js";
 
-const VARIAVEIS_R2 = [
+const VARIAVEIS_ISOLADAS = [
   "R2_ACCOUNT_ID",
   "R2_ACCESS_KEY_ID",
   "R2_SECRET_ACCESS_KEY",
@@ -10,11 +10,19 @@ const VARIAVEIS_R2 = [
   "R2_CONNECTION_TIMEOUT_MS",
   "R2_REQUEST_TIMEOUT_MS",
   "R2_MAX_ATTEMPTS",
+  "NODE_ENV",
+  "RECONCILIACAO_ESTOQUE_HABILITADA",
+  "RECONCILIACAO_ESTOQUE_INTERVALO_MS",
+  "RECONCILIACAO_ESTOQUE_LOTE",
+  "RECONCILIACAO_ESTOQUE_MAX_ITENS_POR_CICLO",
+  "RECONCILIACAO_ESTOQUE_MAX_TENTATIVAS",
+  "RECONCILIACAO_ESTOQUE_BACKOFF_BASE_MS",
+  "RECONCILIACAO_ESTOQUE_BACKOFF_MAX_MS",
 ] as const;
-const originais = Object.fromEntries(VARIAVEIS_R2.map((nome) => [nome, process.env[nome]]));
+const originais = Object.fromEntries(VARIAVEIS_ISOLADAS.map((nome) => [nome, process.env[nome]]));
 
 afterEach(() => {
-  for (const nome of VARIAVEIS_R2) {
+  for (const nome of VARIAVEIS_ISOLADAS) {
     if (originais[nome] === undefined) delete process.env[nome];
     else process.env[nome] = originais[nome];
   }
@@ -22,7 +30,7 @@ afterEach(() => {
 
 describe("configuration — storage.r2 (Fase 40)", () => {
   it("sem nenhuma variável R2: tudo vazio (upload desabilitado, o boot não é afetado)", () => {
-    for (const nome of VARIAVEIS_R2) delete process.env[nome];
+    for (const nome of VARIAVEIS_ISOLADAS) delete process.env[nome];
     expect(configuration().storage.r2).toEqual({ accountId: "", accessKeyId: "", secretAccessKey: "", bucketName: "", publicBaseUrl: "" });
   });
 
@@ -44,7 +52,7 @@ describe("configuration — storage.r2 (Fase 40)", () => {
 
 describe("configuration — storage.transporte (Fase 60.4.1)", () => {
   it("sem as variáveis de transporte: padrões do projeto (3 s, 10 s, 2 tentativas)", () => {
-    for (const nome of VARIAVEIS_R2) delete process.env[nome];
+    for (const nome of VARIAVEIS_ISOLADAS) delete process.env[nome];
     expect(configuration().storage.transporte).toEqual({ timeoutConexaoMs: 3_000, timeoutRequisicaoMs: 10_000, maxTentativas: 2 });
   });
 
@@ -60,5 +68,33 @@ describe("configuration — storage.transporte (Fase 60.4.1)", () => {
     process.env["R2_REQUEST_TIMEOUT_MS"] = "4000";
     process.env["R2_MAX_ATTEMPTS"] = "3";
     expect(configuration().storage.transporte).toEqual({ timeoutConexaoMs: 1_500, timeoutRequisicaoMs: 4_000, maxTentativas: 3 });
+  });
+});
+
+describe("configuration — reconciliacaoEstoque (Fase 60.4.3.4.18)", () => {
+  const PADRAO = { intervaloMs: 60_000, loteVendas: 20, maxItensPorCiclo: 50, maxTentativas: 8, esperaBaseMs: 30_000, esperaMaximaMs: 3_600_000 };
+
+  it("sem variáveis, fora de teste: worker LIGADO com os padrões", () => {
+    process.env["NODE_ENV"] = "production";
+    for (const nome of VARIAVEIS_ISOLADAS) if (nome.startsWith("RECONCILIACAO_")) delete process.env[nome];
+    expect(configuration().reconciliacaoEstoque).toEqual({ habilitada: true, ...PADRAO });
+  });
+
+  it("NODE_ENV=test sem a variável: worker DESLIGADO (testes o acionam explicitamente)", () => {
+    process.env["NODE_ENV"] = "test";
+    process.env["RECONCILIACAO_ESTOQUE_HABILITADA"] = "";
+    expect(configuration().reconciliacaoEstoque.habilitada).toBe(false);
+  });
+
+  it("a variável explícita prevalece sobre o ambiente; números sobrescrevem os padrões", () => {
+    process.env["NODE_ENV"] = "production";
+    process.env["RECONCILIACAO_ESTOQUE_HABILITADA"] = "false";
+    process.env["RECONCILIACAO_ESTOQUE_INTERVALO_MS"] = "15000";
+    process.env["RECONCILIACAO_ESTOQUE_MAX_TENTATIVAS"] = "4";
+    const config = configuration().reconciliacaoEstoque;
+    expect(config.habilitada).toBe(false);
+    expect(config.intervaloMs).toBe(15_000);
+    expect(config.maxTentativas).toBe(4);
+    expect(config.loteVendas).toBe(20);
   });
 });

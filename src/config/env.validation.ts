@@ -221,6 +221,58 @@ class EnvironmentVariables {
   @IsInt()
   @Min(1000)
   RATE_LIMIT_GLOBAL_TTL_MS = 60000;
+
+  /**
+   * Fase 60.4.3.4.18 — reconciliação automática de estoque em cancelamentos (`ReconciliacaoEstoqueWorker`). Todas
+   * opcionais (vazias = padrão de `RECONCILIACAO_ESTOQUE_PADRAO`). `RECONCILIACAO_ESTOQUE_HABILITADA` ausente liga o
+   * worker fora de `NODE_ENV=test` (testes o acionam explicitamente). Faixas impedem um laço agressivo (intervalo
+   * mínimo de 5 s, espera mínima de 1 s) ou um ciclo que carregue a coleção inteira.
+   */
+  @IsOptional()
+  @IsIn(["true", "false", ""], { message: "RECONCILIACAO_ESTOQUE_HABILITADA deve ser \"true\", \"false\" ou vazia (padrão)." })
+  RECONCILIACAO_ESTOQUE_HABILITADA?: string;
+
+  @IsOptional()
+  @Transform(vazioComoAusente)
+  @IsInt({ message: "RECONCILIACAO_ESTOQUE_INTERVALO_MS deve ser um número inteiro de milissegundos." })
+  @Min(5_000)
+  @Max(86_400_000)
+  RECONCILIACAO_ESTOQUE_INTERVALO_MS?: number;
+
+  @IsOptional()
+  @Transform(vazioComoAusente)
+  @IsInt({ message: "RECONCILIACAO_ESTOQUE_LOTE deve ser um número inteiro." })
+  @Min(1)
+  @Max(500)
+  RECONCILIACAO_ESTOQUE_LOTE?: number;
+
+  @IsOptional()
+  @Transform(vazioComoAusente)
+  @IsInt({ message: "RECONCILIACAO_ESTOQUE_MAX_ITENS_POR_CICLO deve ser um número inteiro." })
+  @Min(1)
+  @Max(5_000)
+  RECONCILIACAO_ESTOQUE_MAX_ITENS_POR_CICLO?: number;
+
+  @IsOptional()
+  @Transform(vazioComoAusente)
+  @IsInt({ message: "RECONCILIACAO_ESTOQUE_MAX_TENTATIVAS deve ser um número inteiro." })
+  @Min(1)
+  @Max(100)
+  RECONCILIACAO_ESTOQUE_MAX_TENTATIVAS?: number;
+
+  @IsOptional()
+  @Transform(vazioComoAusente)
+  @IsInt({ message: "RECONCILIACAO_ESTOQUE_BACKOFF_BASE_MS deve ser um número inteiro de milissegundos." })
+  @Min(1_000)
+  @Max(86_400_000)
+  RECONCILIACAO_ESTOQUE_BACKOFF_BASE_MS?: number;
+
+  @IsOptional()
+  @Transform(vazioComoAusente)
+  @IsInt({ message: "RECONCILIACAO_ESTOQUE_BACKOFF_MAX_MS deve ser um número inteiro de milissegundos." })
+  @Min(1_000)
+  @Max(604_800_000)
+  RECONCILIACAO_ESTOQUE_BACKOFF_MAX_MS?: number;
 }
 
 const CAMPOS_SEGREDO_JWT = [

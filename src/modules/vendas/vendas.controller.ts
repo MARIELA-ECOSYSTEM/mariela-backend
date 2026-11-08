@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Query, Req, UseGuards } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Query, Req, UseGuards } from "@nestjs/common";
 import { ApiBearerAuth, ApiOperation, ApiTags } from "@nestjs/swagger";
 import type { Request } from "express";
 import { CurrentUser } from "../../common/decorators/current-user.decorator.js";
@@ -61,6 +61,17 @@ export class VendasController {
     return { data: await this.vendasService.estatisticas() };
   }
 
+  /**
+   * Fase 60.4.3.4.18 — consulta do operador: linhas de cancelamento/devolução cujo estoque AINDA não foi devolvido
+   * (pendente, em nova tentativa ou requerendo intervenção). Somente leitura; ADMIN (guards da classe). Até
+   * `LIMITE_VENDAS_PENDENCIAS` vendas por consulta (`totalVendas` informa o total real).
+   */
+  @Get("restauracoes-estoque/pendentes")
+  @ApiOperation({ summary: "Lista itens de cancelamentos/devoluções com estoque ainda não restaurado (operador)." })
+  async pendenciasRestauracaoEstoque() {
+    return { data: await this.vendasService.listarPendenciasDeRestauracao(LIMITE_VENDAS_PENDENCIAS) };
+  }
+
   @Get(":id")
   @ApiOperation({ summary: "Detalhe da venda: itens, pagamentos, parcelas e histórico." })
   async obter(@Param("id") id: string) {
@@ -89,4 +100,20 @@ export class VendasController {
   async cancelar(@Param("id") id: string, @Body() dto: CancelamentoDto, @CurrentUser("sub") usuarioId: string) {
     return { data: await this.vendasService.cancelar(id, dto, usuarioId) };
   }
+
+  /**
+   * Fase 60.4.3.4.18 — nova tentativa SOLICITADA pelo operador de devolver o estoque ainda pendente da venda (inclusive
+   * linhas `requer_intervencao`). Não repete o cancelamento, não exige chave, não toca caixa nem agregados; seguro
+   * para repetir (cada linha é devolvida no máximo uma vez). Responde 200 com a venda atualizada — o resultado está em
+   * `restauracaoEstoque` (pode continuar `pendente`/`requer_intervencao` se a falha persistir).
+   */
+  @Post(":id/restauracao-estoque/reconciliacao")
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: "Tenta novamente devolver ao estoque os itens cancelados/devolvidos ainda pendentes (operador)." })
+  async reconciliarRestauracaoEstoque(@Param("id") id: string, @CurrentUser("sub") usuarioId: string) {
+    return { data: await this.vendasService.reconciliarRestauracaoEstoque(id, usuarioId) };
+  }
 }
+
+/** Fase 60.4.3.4.18 — máximo de vendas listadas por consulta de pendências de restauração. */
+const LIMITE_VENDAS_PENDENCIAS = 100;

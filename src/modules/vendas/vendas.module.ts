@@ -8,6 +8,8 @@ import { ProdutosModule } from "../produtos/produtos.module.js";
 import { SequenciasModule } from "../sequencias/sequencias.module.js";
 import { MovimentacaoEstoque, MovimentacaoEstoqueSchema } from "../estoque/schemas/movimentacao-estoque.schema.js";
 import { VendedoresModule } from "../vendedores/vendedores.module.js";
+import { reconciliacaoEstoqueConfigProvider } from "./reconciliacao-estoque.config.js";
+import { ReconciliacaoEstoqueWorker } from "./reconciliacao-estoque.worker.js";
 import { VendasController } from "./vendas.controller.js";
 import { VendasRepository } from "./vendas.repository.js";
 import { VendasService } from "./vendas.service.js";
@@ -58,7 +60,8 @@ import { Venda, VendaSchema } from "./schemas/venda.schema.js";
     forwardRef(() => ConfiguracoesModule),
   ],
   controllers: [VendasController],
-  providers: [VendasService, VendasRepository],
+  // Fase 60.4.3.4.18 — configuração e worker da reconciliação persistente de estoque em cancelamentos.
+  providers: [VendasService, VendasRepository, reconciliacaoEstoqueConfigProvider, ReconciliacaoEstoqueWorker],
   exports: [VendasService, VendasRepository],
 })
 export class VendasModule {}

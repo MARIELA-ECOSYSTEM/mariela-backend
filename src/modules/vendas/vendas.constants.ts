@@ -64,3 +64,30 @@ export const FAIXAS_VALOR: { valor: string; min: number; max: number }[] = [
 ];
 
 export const DIFERENCA_TOLERANCIA = 0.005;
+
+/**
+ * Fase 60.4.3.4.18 — estado PERSISTIDO da restauração de estoque de cada linha de um evento de cancelamento/devolução
+ * (`Venda.cancelamentos[].itens[].estadoRestauracao`):
+ *   - `pendente`: ainda não houve tentativa confirmada (estado inicial de toda linha nova);
+ *   - `falha_recuperavel`: a última tentativa falhou e será repetida a partir de `proximaTentativaEm`;
+ *   - `requer_intervencao`: excedeu o limite de tentativas — o worker não a repete; só um operador (rota ADMIN de
+ *     reconciliação) a reabre;
+ *   - `concluida`: estoque, ledger e marcação confirmados na MESMA transação.
+ * Fonte de verdade de "concluída" continua sendo `restaurado === true` (compatível com eventos antigos, que só têm o
+ * booleano). Ausência de `restaurado` NUNCA é tratada como concluída. Ver `restauracao-estoque.util.ts`.
+ */
+export const ESTADOS_RESTAURACAO = ["pendente", "falha_recuperavel", "requer_intervencao", "concluida"] as const;
+export type EstadoRestauracao = (typeof ESTADOS_RESTAURACAO)[number];
+
+/**
+ * Fase 60.4.3.4.18 — parâmetros PADRÃO da reconciliação automática de estoque (sobrescrevíveis por ambiente, ver
+ * `configuration.ts#reconciliacaoEstoque`). Espera entre tentativas = `base × 2^(tentativas−1)`, limitada a `maximo`.
+ */
+export const RECONCILIACAO_ESTOQUE_PADRAO = {
+  intervaloMs: 60_000,
+  loteVendas: 20,
+  maxItensPorCiclo: 50,
+  maxTentativas: 8,
+  esperaBaseMs: 30_000,
+  esperaMaximaMs: 3_600_000,
+} as const;

@@ -1,4 +1,5 @@
 import { TRANSPORTE_R2_PADRAO } from "../modules/media/media.constants.js";
+import { RECONCILIACAO_ESTOQUE_PADRAO } from "../modules/vendas/vendas.constants.js";
 import { lerOrigensCors } from "./cors.config.js";
 
 /**
@@ -97,6 +98,23 @@ export interface RateLimitConfig {
   globalTtlMs: number;
 }
 
+/**
+ * Fase 60.4.3.4.18 — reconciliação automática de estoque em cancelamentos/devoluções (`ReconciliacaoEstoqueWorker`).
+ * Padrões em `RECONCILIACAO_ESTOQUE_PADRAO` (`vendas.constants.ts`).
+ */
+export interface ReconciliacaoEstoqueConfig {
+  habilitada: boolean;
+  intervaloMs: number;
+  /** Máximo de vendas lidas por ciclo. */
+  loteVendas: number;
+  /** Máximo de linhas tentadas por ciclo (somadas todas as vendas do lote). */
+  maxItensPorCiclo: number;
+  /** Ao atingir este número de tentativas falhas, a linha vira `requer_intervencao` (o worker para de tentar). */
+  maxTentativas: number;
+  esperaBaseMs: number;
+  esperaMaximaMs: number;
+}
+
 export interface Configuration {
   app: AppConfig;
   database: DatabaseConfig;
@@ -106,11 +124,13 @@ export interface Configuration {
   whatsapp: WhatsappConfig;
   storage: StorageConfig;
   rateLimit: RateLimitConfig;
+  reconciliacaoEstoque: ReconciliacaoEstoqueConfig;
 }
 
 export default (): Configuration => {
   const nodeEnv = process.env["NODE_ENV"] ?? "development";
   const swaggerEnabledRaw = process.env["SWAGGER_ENABLED"];
+  const reconciliacaoHabilitadaRaw = process.env["RECONCILIACAO_ESTOQUE_HABILITADA"];
 
   return {
     app: {
@@ -163,6 +183,15 @@ export default (): Configuration => {
     rateLimit: {
       globalLimit: Number(process.env["RATE_LIMIT_GLOBAL_LIMIT"] ?? 300),
       globalTtlMs: Number(process.env["RATE_LIMIT_GLOBAL_TTL_MS"] ?? 60000),
+    },
+    reconciliacaoEstoque: {
+      habilitada: reconciliacaoHabilitadaRaw === undefined || reconciliacaoHabilitadaRaw.trim() === "" ? nodeEnv !== "test" : reconciliacaoHabilitadaRaw === "true",
+      intervaloMs: Number(process.env["RECONCILIACAO_ESTOQUE_INTERVALO_MS"] || RECONCILIACAO_ESTOQUE_PADRAO.intervaloMs),
+      loteVendas: Number(process.env["RECONCILIACAO_ESTOQUE_LOTE"] || RECONCILIACAO_ESTOQUE_PADRAO.loteVendas),
+      maxItensPorCiclo: Number(process.env["RECONCILIACAO_ESTOQUE_MAX_ITENS_POR_CICLO"] || RECONCILIACAO_ESTOQUE_PADRAO.maxItensPorCiclo),
+      maxTentativas: Number(process.env["RECONCILIACAO_ESTOQUE_MAX_TENTATIVAS"] || RECONCILIACAO_ESTOQUE_PADRAO.maxTentativas),
+      esperaBaseMs: Number(process.env["RECONCILIACAO_ESTOQUE_BACKOFF_BASE_MS"] || RECONCILIACAO_ESTOQUE_PADRAO.esperaBaseMs),
+      esperaMaximaMs: Number(process.env["RECONCILIACAO_ESTOQUE_BACKOFF_MAX_MS"] || RECONCILIACAO_ESTOQUE_PADRAO.esperaMaximaMs),
     },
   };
 };

@@ -1,4 +1,4 @@
-import { HttpStatus, Injectable, Logger } from "@nestjs/common";
+import { HttpStatus, Inject, Injectable, Logger } from "@nestjs/common";
 import { InjectConnection, InjectModel } from "@nestjs/mongoose";
 import { Types, type ClientSession, type Connection, type Model } from "mongoose";
 import { executarEmTransacao } from "../../database/transacao.util.js";
@@ -23,8 +23,18 @@ import {
   DIGITOS_NUMERO_VENDA,
   MODALIDADES_PAGAMENTO,
   PREFIXO_CODIGO_VENDA,
+  type EstadoRestauracao,
   type ModalidadePagamento,
 } from "./vendas.constants.js";
+import type { ReconciliacaoEstoqueConfig } from "../../config/configuration.js";
+import { RECONCILIACAO_ESTOQUE_CONFIG } from "./reconciliacao-estoque.config.js";
+import {
+  calcularEsperaDeRestauracao,
+  descreverFalhaDeRestauracao,
+  estadoEfetivoDaRestauracao,
+  linhaElegivelParaReconciliacaoAutomatica,
+  type DescricaoFalhaRestauracao,
+} from "./restauracao-estoque.util.js";
 import type { SelecaoFacetas } from "./vendas-filtros.util.js";
 import { calcularFaturamento } from "./faturamento.util.js";
 import { VendasRepository } from "./vendas.repository.js";
@@ -39,6 +49,73 @@ export interface ResultadoListaVendas {
   data: VendaDocument[];
   meta: ApiMeta;
   facets: ApiFacets;
+}
+
+/**
+ * Fase 60.4.3.4.18 — como uma restauração foi disparada:
+ *   - `manual`: pela própria requisição (cancelamento, replay com a mesma chave, rota ADMIN de reconciliação) — tenta
+ *     toda linha não concluída, sem esperar o backoff;
+ *   - `automatico`: pelo `ReconciliacaoEstoqueWorker` — só linhas elegíveis (agenda vencida, sem `requer_intervencao`).
+ */
+export type ModoRestauracao = "manual" | "automatico";
+
+interface OpcoesRestauracao {
+  modo: ModoRestauracao;
+  /** Máximo de linhas TENTADAS nesta chamada (ciclo do worker). Ausente = sem limite. */
+  limiteLinhas?: number;
+}
+
+type DesfechoRestauracaoLinha = "concluida" | "ja_concluida" | "adiada" | "falha";
+
+export interface ResultadoRestauracaoEstoque {
+  tentadas: number;
+  concluidas: number;
+  jaConcluidas: number;
+  falhas: number;
+  adiadas: number;
+}
+
+export interface ResultadoCicloReconciliacao extends ResultadoRestauracaoEstoque {
+  vendas: number;
+  vendasComErro: number;
+}
+
+export interface PendenciaRestauracaoEstoque {
+  vendaId: string;
+  vendaCodigo: string;
+  vendaStatus: string;
+  eventoId: string;
+  eventoTipo: "integral" | "parcial";
+  eventoDataHora: Date;
+  itemId: string;
+  codProduto: string;
+  nome: string;
+  quantidade: number;
+  estado: EstadoRestauracao;
+  tentativas: number;
+  ultimaTentativaEm: Date | null;
+  proximaTentativaEm: Date | null;
+  ultimaFalha: { classe: string; codigo: string | null; mensagem: string; em: Date } | null;
+}
+
+export interface PendenciasRestauracaoEstoque {
+  /** Vendas com ao menos uma linha não restaurada (total no banco). */
+  totalVendas: number;
+  /** Quantas dessas vendas foram listadas (limitado pela consulta). */
+  vendasListadas: number;
+  itens: PendenciaRestauracaoEstoque[];
+}
+
+/**
+ * Fase 60.4.3.4.18 — sinal interno: a marcação condicional não alterou a linha porque outra execução já a concluiu.
+ * Lançado DENTRO da transação para abortá-la (desfazendo a devolução física desta tentativa). Não é transitório:
+ * `executarEmTransacao` não repete; `restaurarLinha` o traduz em `ja_concluida`.
+ */
+class LinhaJaRestauradaErro extends Error {
+  constructor() {
+    super("Linha de restauração já concluída por outra execução.");
+    this.name = "LinhaJaRestauradaErro";
+  }
 }
 
 /**
@@ -89,6 +166,8 @@ export class VendasService {
     // Fase 60.4.3.4.15 (F04) — ledger de estoque e conexão (sessões/transações).
     @InjectModel(MovimentacaoEstoque.name) private readonly movimentacaoEstoqueModel: Model<MovimentacaoEstoqueDocument>,
     @InjectConnection() private readonly conexao: Connection,
+    // Fase 60.4.3.4.18 — limites/backoff da reconciliação de estoque (ver `reconciliacao-estoque.config.ts`).
+    @Inject(RECONCILIACAO_ESTOQUE_CONFIG) private readonly configReconciliacao: ReconciliacaoEstoqueConfig,
   ) {}
 
   /**
@@ -1037,6 +1116,10 @@ export class VendasService {
             quantidade: restante,
             valor: this.calcularValorDevolucaoItem(documento, item, restante),
             restaurado: false,
+            // Fase 60.4.3.4.18 — estado explícito desde a gravação: a linha nasce PENDENTE e assim fica, visível no
+            // banco, até uma transação de restauração confirmá-la.
+            estadoRestauracao: "pendente",
+            tentativas: 0,
           } as ItemDevolvido);
         }
       } else {
@@ -1053,6 +1136,10 @@ export class VendasService {
             quantidade,
             valor: this.calcularValorDevolucaoItem(documento, item, quantidade),
             restaurado: false,
+            // Fase 60.4.3.4.18 — estado explícito desde a gravação: a linha nasce PENDENTE e assim fica, visível no
+            // banco, até uma transação de restauração confirmá-la.
+            estadoRestauracao: "pendente",
+            tentativas: 0,
           } as ItemDevolvido);
         }
         if (!devolvidosDaTentativa.length) throw ApiException.validation("Nenhuma quantidade disponível para devolução.");
@@ -1111,7 +1198,10 @@ export class VendasService {
     // agora opera sobre o evento ESPECÍFICO capturado acima — nunca mais
     // "o" cancelamento (que deixou de existir como conceito único).
     const eventoFinal: CancelamentoVenda | null = eventoAplicado;
-    await this.restaurarEstoquePendente(venda);
+    // Fase 60.4.3.4.18 — modo "manual": a própria requisição tenta restaurar AGORA todas as linhas não concluídas da
+    // venda (sem respeitar o backoff do worker). Falha não interrompe o cancelamento: fica registrada na linha e o
+    // `ReconciliacaoEstoqueWorker` a retoma.
+    await this.restaurarEstoquePendente(venda.id, { modo: "manual" });
     if (eventoFinal) {
       await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, eventoFinal);
     }
@@ -1126,7 +1216,9 @@ export class VendasService {
     await this.registrarEvento(venda.id, dto.tipo === "integral" ? "venda.cancelada" : "venda.devolvida", usuarioId, {
       valorDevolvido: valorDevolvidoDoEvento,
     });
-    return venda;
+    // Fase 60.4.3.4.18 — devolve a venda RELIDA depois da restauração: o `restauracaoEstoque` serializado reflete o
+    // estado real (concluída × pendente), nunca o snapshot anterior à devolução de estoque.
+    return this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
   }
 
   /**
@@ -1174,7 +1266,7 @@ export class VendasService {
     if (!caixaAtual) {
       throw ApiException.validation("Nenhum caixa aberto. Abra o caixa antes de concluir o cancelamento.");
     }
-    await this.restaurarEstoquePendente(venda);
+    await this.restaurarEstoquePendente(venda.id, { modo: "manual" });
     await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, evento);
     return this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
   }
@@ -1198,7 +1290,12 @@ export class VendasService {
    * concluído — mesmo comportamento histórico já existente antes desta
    * etapa, preservado deliberadamente.
    */
-  private async restaurarEstoquePendente(venda: VendaDocument): Promise<void> {
+  private async restaurarEstoquePendente(vendaId: string, opcoes: OpcoesRestauracao): Promise<ResultadoRestauracaoEstoque> {
+    // Fase 60.4.3.4.18 — passou a: (i) receber o id (sempre relê a venda), (ii) registrar PERSISTENTEMENTE cada falha
+    // na própria linha (estado, tentativas, agenda, falha segura) para o `ReconciliacaoEstoqueWorker` retomá-la mesmo
+    // após um restart, (iii) no modo "automatico", respeitar backoff e `requer_intervencao`, e (iv) devolver um
+    // resultado contável. A transação por linha (Fase 60.4.3.4.15) é a mesma — ver `restaurarLinha`.
+    //
     // Fase 60.4.3.4.15 (F04) — cada linha pendente é restaurada numa TRANSAÇÃO própria que confirma JUNTAS a devolução
     // física (`ajustarQuantidadeTamanho`), a entrada no ledger (`movimentacoes_estoque`) e `restaurado: true`.
     // Substitui a reivindicação em duas fases (`restaurando`), que tinha duas lacunas: (i) falha ao marcar DEPOIS de
@@ -1209,40 +1306,241 @@ export class VendasService {
     //   - duas chamadas concorrentes na mesma linha → a segunda conflita na escrita da venda, repete a transação, lê
     //     `restaurado: true` e não faz nada;
     //   - `restaurando` deixa de ser consultado: uma linha legada presa em `restaurando: true` é retomada normalmente.
-    const atual = await this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
+    const resultado: ResultadoRestauracaoEstoque = { tentadas: 0, concluidas: 0, jaConcluidas: 0, falhas: 0, adiadas: 0 };
+    const atual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
     for (const evento of atual.cancelamentos) {
       const eventoId = String(evento._id);
       for (const devolvido of evento.itens) {
-        if (devolvido.restaurado) continue;
-        try {
-          await executarEmTransacao(this.conexao, async (sessao) => {
-            const fresca = await this.vendasRepository.encontrarPorIdOuFalhar(venda.id, sessao);
-            const linha = fresca.cancelamentos.find((registro) => String(registro._id) === eventoId)?.itens.find((registro) => registro.itemId === devolvido.itemId);
-            if (!linha || linha.restaurado) return; // já restaurada por outra chamada (confirmada antes deste snapshot).
+        if (estadoEfetivoDaRestauracao(devolvido) === "concluida") continue;
+        if (opcoes.modo === "automatico" && !linhaElegivelParaReconciliacaoAutomatica(devolvido, new Date())) {
+          resultado.adiadas += 1;
+          continue;
+        }
+        if (opcoes.limiteLinhas !== undefined && resultado.tentadas >= opcoes.limiteLinhas) return resultado;
+        resultado.tentadas += 1;
+        const desfecho = await this.restaurarLinha(atual.id, atual.codigo, eventoId, devolvido, opcoes.modo);
+        if (desfecho === "concluida") resultado.concluidas += 1;
+        else if (desfecho === "ja_concluida") resultado.jaConcluidas += 1;
+        else if (desfecho === "adiada") resultado.adiadas += 1;
+        else resultado.falhas += 1;
+      }
+    }
+    return resultado;
+  }
 
-            const item = fresca.itens.find((registro) => String(registro._id) === linha.itemId);
-            if (item) {
-              try {
-                await this.devolverAoEstoque(item, linha.quantidade, fresca, sessao);
-              } catch (erro) {
-                // Produto/variante não existe mais — nada a restaurar fisicamente; aceito como concluído (mesmo
-                // comportamento histórico). É uma `ApiException` do próprio código, não um erro do servidor: a
-                // transação continua válida.
-                if (!this.erroDeProdutoOuVarianteExcluido(erro)) throw erro;
-              }
-            }
-            await this.vendasRepository.marcarItemRestaurado(venda.id, eventoId, linha.itemId, sessao);
+  /**
+   * Fase 60.4.3.4.18 — restaura UMA linha numa transação própria (releitura → checagem → devolução física → ledger →
+   * marcação condicional, tudo na mesma sessão: confirmados juntos ou abortados juntos). Segurança entre instâncias:
+   *   - duas transações na mesma linha escrevem o mesmo produto e a mesma venda → o MongoDB aborta uma com
+   *     `WriteConflict` (`TransientTransactionError`); `executarEmTransacao` a repete, ela relê `restaurado: true` e
+   *     devolve `ja_concluida` — nunca uma segunda devolução;
+   *   - defesa adicional: `marcarItemRestaurado` é condicional (`restaurado ≠ true`); se não alterar nada, a transação
+   *     é ABORTADA (`LinhaJaRestauradaErro`), desfazendo a devolução física desta tentativa;
+   *   - commit ambíguo (`UnknownTransactionCommitResult` esgotado): a falha é registrada com CAS que exige
+   *     `restaurado ≠ true` — se o commit tiver sido aplicado, o registro não casa e nada muda; se não, a linha
+   *     continua pendente e a próxima tentativa relê o estado real. Nunca há devolução dupla.
+   */
+  private async restaurarLinha(
+    vendaId: string,
+    vendaCodigo: string,
+    eventoId: string,
+    linhaLida: ItemDevolvido,
+    modo: ModoRestauracao,
+  ): Promise<DesfechoRestauracaoLinha> {
+    const estadoAnterior = estadoEfetivoDaRestauracao(linhaLida);
+    const tentativasLidas = linhaLida.tentativas ?? 0;
+    try {
+      const desfecho = await executarEmTransacao(this.conexao, async (sessao): Promise<DesfechoRestauracaoLinha> => {
+        const fresca = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId, sessao);
+        const linha = fresca.cancelamentos
+          .find((registro) => String(registro._id) === eventoId)
+          ?.itens.find((registro) => registro.itemId === linhaLida.itemId);
+        if (!linha || linha.restaurado === true) return "ja_concluida"; // confirmada por outra execução.
+        // No automático, outra instância pode ter acabado de registrar uma falha (nova agenda): respeita-a.
+        if (modo === "automatico" && !linhaElegivelParaReconciliacaoAutomatica(linha, new Date())) return "adiada";
+
+        const item = fresca.itens.find((registro) => String(registro._id) === linha.itemId);
+        if (item) {
+          try {
+            await this.devolverAoEstoque(item, linha.quantidade, fresca, sessao);
+          } catch (erro) {
+            // Produto/variante não existe mais — nada a restaurar fisicamente; aceito como concluído (mesmo
+            // comportamento histórico). É uma `ApiException` do próprio código, não um erro do servidor: a
+            // transação continua válida.
+            if (!this.erroDeProdutoOuVarianteExcluido(erro)) throw erro;
+          }
+        }
+        const marcou = await this.vendasRepository.marcarItemRestaurado(vendaId, eventoId, linha.itemId, sessao);
+        if (!marcou) throw new LinhaJaRestauradaErro();
+        return "concluida";
+      });
+      if (desfecho === "concluida") {
+        this.registrarLogRestauracao("log", {
+          evento: "restauracao_estoque.concluida",
+          modo,
+          vendaId,
+          vendaCodigo,
+          eventoId,
+          itemId: linhaLida.itemId,
+          quantidade: linhaLida.quantidade,
+          tentativa: tentativasLidas + 1,
+          estadoAnterior,
+          estadoNovo: "concluida",
+        });
+      }
+      return desfecho;
+    } catch (erro) {
+      if (erro instanceof LinhaJaRestauradaErro) return "ja_concluida";
+      await this.registrarFalhaDeRestauracao(vendaId, vendaCodigo, eventoId, linhaLida, estadoAnterior, tentativasLidas, modo, erro);
+      return "falha";
+    }
+  }
+
+  /**
+   * Fase 60.4.3.4.18 — persiste a falha de UMA linha (fora de transação — a da restauração já abortou): incrementa
+   * `tentativas`, agenda `proximaTentativaEm` com backoff exponencial ou, ao atingir `maxTentativas`, marca
+   * `requer_intervencao` (o worker para de tentar; só a rota ADMIN de reconciliação a retoma). Nunca lança: uma falha
+   * ao REGISTRAR a falha só é logada — a linha continua não restaurada e elegível, e o próximo ciclo a encontra.
+   */
+  private async registrarFalhaDeRestauracao(
+    vendaId: string,
+    vendaCodigo: string,
+    eventoId: string,
+    linha: ItemDevolvido,
+    estadoAnterior: EstadoRestauracao,
+    tentativasLidas: number,
+    modo: ModoRestauracao,
+    erro: unknown,
+  ): Promise<void> {
+    const agora = new Date();
+    const tentativa = tentativasLidas + 1;
+    const estadoNovo = tentativa >= this.configReconciliacao.maxTentativas ? "requer_intervencao" : "falha_recuperavel";
+    const proximaTentativaEm =
+      estadoNovo === "falha_recuperavel"
+        ? new Date(agora.getTime() + calcularEsperaDeRestauracao(tentativa, this.configReconciliacao.esperaBaseMs, this.configReconciliacao.esperaMaximaMs))
+        : null;
+    const falha = descreverFalhaDeRestauracao(erro);
+    let registrada = false;
+    let falhaAoRegistrar: DescricaoFalhaRestauracao | null = null;
+    try {
+      registrada = await this.vendasRepository.registrarFalhaDeRestauracao(vendaId, eventoId, linha.itemId, {
+        tentativasLidas,
+        estado: estadoNovo,
+        em: agora,
+        proximaTentativaEm,
+        falha,
+      });
+    } catch (erroAoRegistrar) {
+      falhaAoRegistrar = descreverFalhaDeRestauracao(erroAoRegistrar);
+    }
+    this.registrarLogRestauracao(estadoNovo === "requer_intervencao" ? "error" : "warn", {
+      evento: estadoNovo === "requer_intervencao" ? "restauracao_estoque.requer_intervencao" : "restauracao_estoque.falha",
+      modo,
+      vendaId,
+      vendaCodigo,
+      eventoId,
+      itemId: linha.itemId,
+      quantidade: linha.quantidade,
+      tentativa,
+      estadoAnterior,
+      estadoNovo,
+      erroClasse: falha.classe,
+      erroCodigo: falha.codigo,
+      erroMensagem: falha.mensagem,
+      proximaTentativaEm: proximaTentativaEm ? proximaTentativaEm.toISOString() : null,
+      // `false` sem `falhaAoRegistrar`: outra execução alterou a linha antes (concluiu ou registrou esta tentativa).
+      falhaRegistrada: registrada,
+      ...(falhaAoRegistrar ? { erroAoRegistrarClasse: falhaAoRegistrar.classe, erroAoRegistrarCodigo: falhaAoRegistrar.codigo } : {}),
+    });
+  }
+
+  /** Fase 60.4.3.4.18 — log estruturado (JSON na mensagem): só ids, quantidades, estados e dados seguros do erro. */
+  private registrarLogRestauracao(nivel: "log" | "warn" | "error", dados: Record<string, unknown>): void {
+    const mensagem = JSON.stringify(dados);
+    if (nivel === "error") this.logger.error(mensagem);
+    else if (nivel === "warn") this.logger.warn(mensagem);
+    else this.logger.log(mensagem);
+  }
+
+  /**
+   * Fase 60.4.3.4.18 — reconciliação SOLICITADA por um operador (rota ADMIN `POST /vendas/:id/restauracao-estoque/
+   * reconciliacao`): tenta agora TODAS as linhas não concluídas da venda, inclusive as em backoff e as
+   * `requer_intervencao` — sem repetir o cancelamento, sem chave nova, sem tocar caixa ou agregados. Uma linha que
+   * falhar de novo continua registrada (e, se já tinha esgotado o limite, permanece `requer_intervencao`).
+   */
+  async reconciliarRestauracaoEstoque(vendaId: string, usuarioId: string | null): Promise<VendaDocument> {
+    const venda = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
+    const resultado = await this.restaurarEstoquePendente(venda.id, { modo: "manual" });
+    await this.registrarEvento(venda.id, "venda.restauracao_estoque_reconciliada", usuarioId, { ...resultado });
+    return this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
+  }
+
+  /**
+   * Fase 60.4.3.4.18 — um ciclo da reconciliação AUTOMÁTICA (chamado pelo `ReconciliacaoEstoqueWorker`). Descobre no
+   * BANCO (nunca em memória) as vendas com linhas elegíveis, em lote limitado, e tenta no máximo
+   * `maxItensPorCiclo` linhas. Seguro com várias instâncias rodando ao mesmo tempo (ver `restaurarLinha`). Uma falha
+   * numa venda não interrompe as demais.
+   */
+  async reconciliarAutomaticamente(): Promise<ResultadoCicloReconciliacao> {
+    const { loteVendas, maxItensPorCiclo } = this.configReconciliacao;
+    const ciclo: ResultadoCicloReconciliacao = { vendas: 0, tentadas: 0, concluidas: 0, jaConcluidas: 0, falhas: 0, adiadas: 0, vendasComErro: 0 };
+    const vendas = await this.vendasRepository.buscarVendasComRestauracaoElegivel(new Date(), loteVendas);
+    for (const venda of vendas) {
+      const restantes = maxItensPorCiclo - ciclo.tentadas;
+      if (restantes <= 0) break;
+      ciclo.vendas += 1;
+      try {
+        const resultado = await this.restaurarEstoquePendente(venda.id, { modo: "automatico", limiteLinhas: restantes });
+        ciclo.tentadas += resultado.tentadas;
+        ciclo.concluidas += resultado.concluidas;
+        ciclo.jaConcluidas += resultado.jaConcluidas;
+        ciclo.falhas += resultado.falhas;
+        ciclo.adiadas += resultado.adiadas;
+      } catch (erro) {
+        // Ex.: falha de leitura da venda — nada foi alterado; o próximo ciclo a encontra de novo.
+        ciclo.vendasComErro += 1;
+        const falha = descreverFalhaDeRestauracao(erro);
+        this.registrarLogRestauracao("warn", { evento: "restauracao_estoque.erro_venda", vendaId: venda.id, erroClasse: falha.classe, erroCodigo: falha.codigo });
+      }
+    }
+    return ciclo;
+  }
+
+  /**
+   * Fase 60.4.3.4.18 — consulta do operador (rota ADMIN `GET /vendas/restauracoes-estoque/pendentes`): toda linha
+   * ainda não restaurada, com estado, tentativas, agenda e falha segura. Somente leitura.
+   */
+  async listarPendenciasDeRestauracao(limite: number): Promise<PendenciasRestauracaoEstoque> {
+    const { vendas, total } = await this.vendasRepository.listarVendasComRestauracaoNaoConcluida(limite);
+    const itens: PendenciaRestauracaoEstoque[] = [];
+    for (const venda of vendas) {
+      for (const evento of venda.cancelamentos) {
+        for (const linha of evento.itens) {
+          const estado = estadoEfetivoDaRestauracao(linha);
+          if (estado === "concluida") continue;
+          itens.push({
+            vendaId: venda.id,
+            vendaCodigo: venda.codigo,
+            vendaStatus: venda.status,
+            eventoId: String(evento._id),
+            eventoTipo: evento.tipo,
+            eventoDataHora: evento.dataHora,
+            itemId: linha.itemId,
+            codProduto: linha.codProduto,
+            nome: linha.nome,
+            quantidade: linha.quantidade,
+            estado,
+            tentativas: linha.tentativas ?? 0,
+            ultimaTentativaEm: linha.ultimaTentativaEm ?? null,
+            proximaTentativaEm: linha.proximaTentativaEm ?? null,
+            ultimaFalha: linha.ultimaFalha
+              ? { classe: linha.ultimaFalha.classe, codigo: linha.ultimaFalha.codigo ?? null, mensagem: linha.ultimaFalha.mensagem, em: linha.ultimaFalha.em }
+              : null,
           });
-        } catch (erro) {
-          // Falha genuína: NADA foi confirmado (a transação abortou) — a linha permanece pendente para a próxima
-          // tentativa, e o erro fica registrado para investigação; nunca engolido em silêncio.
-          this.logger.error(
-            `Falha ao restaurar estoque da venda ${atual.codigo} (evento ${eventoId}, item ${devolvido.itemId}, quantidade ${devolvido.quantidade}) — nada foi gravado; item permanece pendente para nova tentativa.`,
-            erro instanceof Error ? erro.stack : String(erro),
-          );
         }
       }
     }
+    return { totalVendas: total, vendasListadas: vendas.length, itens };
   }
 
   /** `ApiException` com status 404 — único caso em que uma falha de restauração de estoque é aceita como "nada a fazer" (produto/variante genuinamente excluído). */

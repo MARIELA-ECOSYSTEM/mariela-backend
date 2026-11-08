@@ -244,15 +244,113 @@ export class VendasRepository {
    * reivindicação (nenhuma outra chamada consegue estar processando o mesmo
    * item ao mesmo tempo).
    */
-  /** Fase 60.4.3.4.15 (F04) — com `sessao`, a marcação é confirmada junto com a devolução física (mesma transação). */
-  async marcarItemRestaurado(vendaId: string, eventoId: string, itemId: string, sessao?: ClientSession): Promise<void> {
-    await this.vendaModel
+  /**
+   * Fase 60.4.3.4.15 (F04) — com `sessao`, a marcação é confirmada junto com a devolução física (mesma transação).
+   *
+   * Fase 60.4.3.4.18 — também grava o estado explícito (`concluida`), a contagem de tentativas e limpa agenda/falha.
+   * CONDICIONAL: só altera uma linha ainda NÃO restaurada (`restaurado ≠ true`) e devolve `true` apenas quando de fato
+   * alterou. `false` = outra execução já concluiu esta linha — o chamador deve ABORTAR a transação (desfazendo a
+   * devolução física desta tentativa), nunca confirmá-la.
+   */
+  async marcarItemRestaurado(vendaId: string, eventoId: string, itemId: string, sessao?: ClientSession, agora: Date = new Date()): Promise<boolean> {
+    const caminho = "cancelamentos.$[evt].itens.$[item]";
+    const resultado = await this.vendaModel
       .updateOne(
         { _id: vendaId },
-        { $set: { "cancelamentos.$[evt].itens.$[item].restaurado": true, "cancelamentos.$[evt].itens.$[item].restaurando": false } },
-        { arrayFilters: [{ "evt._id": new Types.ObjectId(eventoId) }, { "item.itemId": itemId }], ...(sessao ? { session: sessao } : {}) },
+        {
+          $set: {
+            [`${caminho}.restaurado`]: true,
+            [`${caminho}.restaurando`]: false,
+            [`${caminho}.estadoRestauracao`]: "concluida",
+            [`${caminho}.restauradoEm`]: agora,
+            [`${caminho}.ultimaTentativaEm`]: agora,
+            [`${caminho}.proximaTentativaEm`]: null,
+            [`${caminho}.ultimaFalha`]: null,
+          },
+          $inc: { [`${caminho}.tentativas`]: 1 },
+        },
+        {
+          arrayFilters: [{ "evt._id": new Types.ObjectId(eventoId) }, { "item.itemId": itemId, "item.restaurado": { $ne: true } }],
+          ...(sessao ? { session: sessao } : {}),
+        },
       )
       .exec();
+    return resultado.modifiedCount === 1;
+  }
+
+  /**
+   * Fase 60.4.3.4.18 — registra uma tentativa de restauração que FALHOU (a transação da restauração já abortou: nada
+   * de estoque/ledger foi confirmado). Escrita própria, FORA de transação — precisa persistir justamente quando a
+   * transação não pôde.
+   *
+   * Compare-and-swap em `tentativas`: só grava se a linha ainda tem o MESMO número de tentativas lido pelo chamador e
+   * continua não restaurada. Se outra instância registrou antes (ou concluiu a linha), devolve `false` e nada muda —
+   * duas instâncias falhando ao mesmo tempo nunca contam a mesma tentativa duas vezes nem sobrescrevem um sucesso.
+   */
+  async registrarFalhaDeRestauracao(
+    vendaId: string,
+    eventoId: string,
+    itemId: string,
+    dados: {
+      tentativasLidas: number;
+      estado: "falha_recuperavel" | "requer_intervencao";
+      em: Date;
+      proximaTentativaEm: Date | null;
+      falha: { classe: string; codigo: string | null; mensagem: string };
+    },
+  ): Promise<boolean> {
+    if (!isValidObjectId(vendaId) || !isValidObjectId(eventoId)) return false;
+    const caminho = "cancelamentos.$[evt].itens.$[item]";
+    // Linha legada sem o campo: `tentativas` ausente equivale a 0 (`null` casa com campo ausente).
+    const filtroTentativas = dados.tentativasLidas === 0 ? { $in: [0, null] } : dados.tentativasLidas;
+    const resultado = await this.vendaModel
+      .updateOne(
+        { _id: vendaId },
+        {
+          $set: {
+            [`${caminho}.estadoRestauracao`]: dados.estado,
+            [`${caminho}.tentativas`]: dados.tentativasLidas + 1,
+            [`${caminho}.ultimaTentativaEm`]: dados.em,
+            [`${caminho}.proximaTentativaEm`]: dados.proximaTentativaEm,
+            [`${caminho}.ultimaFalha`]: { ...dados.falha, em: dados.em },
+          },
+        },
+        {
+          arrayFilters: [
+            { "evt._id": new Types.ObjectId(eventoId) },
+            { "item.itemId": itemId, "item.restaurado": { $ne: true }, "item.tentativas": filtroTentativas },
+          ],
+        },
+      )
+      .exec();
+    return resultado.modifiedCount === 1;
+  }
+
+  /**
+   * Fase 60.4.3.4.18 — vendas com ao menos UMA linha que a reconciliação automática pode tentar AGORA: não restaurada
+   * (`restaurado ≠ true` — inclui `false` e campo ausente), sem `requer_intervencao`, e com agenda vencida ou nula
+   * (`proximaTentativaEm: null` também casa com campo ausente). Mesma regra de `linhaElegivelParaReconciliacaoAutomatica`.
+   * Ordem estável por `_id` e lote limitado — o worker nunca carrega a coleção inteira.
+   */
+  async buscarVendasComRestauracaoElegivel(agora: Date, limite: number): Promise<VendaDocument[]> {
+    return this.vendaModel
+      .find({ cancelamentos: { $elemMatch: { itens: { $elemMatch: filtroLinhaElegivel(agora) } } } })
+      .sort({ _id: 1 })
+      .limit(limite)
+      .exec();
+  }
+
+  /**
+   * Fase 60.4.3.4.18 — vendas com QUALQUER linha não restaurada (inclusive `requer_intervencao` e as que aguardam
+   * backoff) — consulta do operador (`GET /vendas/restauracoes-estoque/pendentes`). Projeção mínima.
+   */
+  async listarVendasComRestauracaoNaoConcluida(limite: number): Promise<{ vendas: VendaDocument[]; total: number }> {
+    const filtro = { cancelamentos: { $elemMatch: { itens: { $elemMatch: { restaurado: { $ne: true } } } } } };
+    const [vendas, total] = await Promise.all([
+      this.vendaModel.find(filtro).select("codigo status cancelamentos").sort({ _id: 1 }).limit(limite).exec(),
+      this.vendaModel.countDocuments(filtro).exec(),
+    ]);
+    return { vendas, total };
   }
 
   /**
@@ -465,6 +563,15 @@ export interface VendaResumoFinanceiro {
   valorDevolvido: number;
   vendedorId: string;
   clienteId: string | null;
+}
+
+/** Fase 60.4.3.4.18 — filtro Mongo de uma linha elegível à reconciliação automática (ver `buscarVendasComRestauracaoElegivel`). */
+function filtroLinhaElegivel(agora: Date): Record<string, unknown> {
+  return {
+    restaurado: { $ne: true },
+    estadoRestauracao: { $ne: "requer_intervencao" },
+    $or: [{ proximaTentativaEm: null }, { proximaTentativaEm: { $lte: agora } }],
+  };
 }
 
 function contarValor(resultado: Record<string, { valor: number }[]> | undefined, chave: string): number {

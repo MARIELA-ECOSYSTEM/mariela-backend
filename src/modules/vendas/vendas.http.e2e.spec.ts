@@ -234,6 +234,59 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
     expect(resposta.status).toBe(404);
   });
 
+  describe("Fase 60.4.3.4.18 — restauração de estoque (rotas ADMIN e campo aditivo)", () => {
+    it("GET /vendas/:id expõe `restauracaoEstoque` (nao_aplicavel numa venda sem devolução), sem alterar os demais campos", async () => {
+      const { venda } = await criarVendaFiadaViaHttpSetup(80, 80);
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}`, { headers: authHeaders() });
+      const corpo = (await resposta.json()) as { data: { codigo: string; restauracaoEstoque: { status: string; totalItens: number } } };
+      expect(resposta.status).toBe(200);
+      expect(corpo.data.codigo).toBe(venda.codigo);
+      expect(corpo.data.restauracaoEstoque.status).toBe("nao_aplicavel");
+      expect(corpo.data.restauracaoEstoque.totalItens).toBe(0);
+    });
+
+    it("POST /vendas/:id/cancelamento responde `restauracaoEstoque.status = concluida` quando o estoque foi devolvido", async () => {
+      const { venda } = await criarVendaFiadaViaHttpSetup(90, 90);
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ tipo: "integral", motivo: "Teste restauração HTTP", idempotencyKey: `http-restauracao-${Date.now()}` }),
+      });
+      const corpo = (await resposta.json()) as { data: { status: string; restauracaoEstoque: { status: string; concluidos: number; totalItens: number } } };
+      expect(resposta.status).toBe(201);
+      expect(corpo.data.status).toBe("cancelada");
+      expect(corpo.data.restauracaoEstoque).toMatchObject({ status: "concluida", concluidos: 1, totalItens: 1 });
+    });
+
+    it("rotas de pendências e de reconciliação exigem autenticação (401 sem token)", async () => {
+      const pendencias = await fetch(`${baseUrl}/api/v1/vendas/restauracoes-estoque/pendentes`);
+      expect(pendencias.status).toBe(401);
+      const reconciliacao = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/restauracao-estoque/reconciliacao`, { method: "POST" });
+      expect(reconciliacao.status).toBe(401);
+    });
+
+    it("GET /vendas/restauracoes-estoque/pendentes responde a lista (ADMIN), sem stack trace", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/restauracoes-estoque/pendentes`, { headers: authHeaders() });
+      const texto = await resposta.text();
+      expect(resposta.status).toBe(200);
+      const corpo = JSON.parse(texto) as { data: { totalVendas: number; vendasListadas: number; itens: unknown[] } };
+      expect(typeof corpo.data.totalVendas).toBe("number");
+      expect(Array.isArray(corpo.data.itens)).toBe(true);
+      expect(texto).not.toContain("stack");
+    });
+
+    it("POST /vendas/:id/restauracao-estoque/reconciliacao responde 200 com a venda (idempotente) e 404 para venda inexistente", async () => {
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${vendaId}/restauracao-estoque/reconciliacao`, { method: "POST", headers: authHeaders() });
+      const corpo = (await resposta.json()) as { data: { codigo: string; restauracaoEstoque: { status: string } } };
+      expect(resposta.status).toBe(200);
+      expect(corpo.data.codigo).toBe(vendaCodigo);
+      expect(typeof corpo.data.restauracaoEstoque.status).toBe("string");
+
+      const inexistente = await fetch(`${baseUrl}/api/v1/vendas/65f1a2b3c4d5e6f7a8b9c0d1/restauracao-estoque/reconciliacao`, { method: "POST", headers: authHeaders() });
+      expect(inexistente.status).toBe(404);
+    });
+  });
+
   // Fase 55.4 — os testes que ALTERAM uma venda (baixa, cancelamento) ou
   // dependem de um estado específico dela criam a própria venda, em vez de
   // mutar a seedada em `beforeAll` — com `--randomize` a ordem entre eles
