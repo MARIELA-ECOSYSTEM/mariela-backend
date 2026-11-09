@@ -1,93 +1,94 @@
 ﻿<#
 .SYNOPSIS
-  Restaura um backup do MARIELA num banco de TESTE local — nunca em produção.
+  Restore de TESTE, isolado: só em 127.0.0.1:27118 (MongoDB 8.0.x local), num banco mariela_restore_<carimbo>.
 
 .DESCRIPTION
-  Ferramenta OPERACIONAL, fora do backend. Ver docs/backup-mongodb.md
-  (Fase 29-FI.1/29-FI.2) para o procedimento completo e o critério de
-  PASSOU/FALHOU.
-
-  Restaura sempre contra localhost, num banco cujo nome é explicitamente
-  "mariela_restore_test_<timestamp>" — nunca aceita apontar para um host
-  remoto, exatamente para tornar impossível, por engano, restaurar sobre
-  produção com este script.
+  Fases 60.4.3.4.21.1/21.2. Nunca aponta para o Atlas, para marielaDB nem para test. Ordem (falha FECHADA):
+    1. Antes de QUALQUER escrita: SHA-256 do archive = manifesto = .sha256; manifesto VALIDO_LOCAL; archive com
+       exatamente os 27 namespaces de marielaDB e as contagens do manifesto; destino na porta 27118 com a MESMA
+       série de versão da origem (8.0); banco de destino inexistente.
+    2. mongorestore --nsInclude (as 27 coleções, explícitas) --nsFrom marielaDB.* --nsTo <destino>.* --stopOnError,
+       SEM --drop. Aviso "Cross-version" ou qualquer documento com falha ⇒ FALHOU.
+    3. Depois: coleções exatas, contagens, índices, referências (órfãos iguais aos da origem) e sequências
+       idênticos ao manifesto.
+  Não conecta o backend a nada (o smoke test do backend é de fase posterior, com autorização própria).
 
 .PARAMETER ArquivoBackup
-  Caminho do arquivo .archive.gz gerado por backup-mongo.ps1.
+  Caminho do .archive.gz (com <base>.manifest.json e <base>.archive.gz.sha256 ao lado).
+.PARAMETER Porta
+  Só 27118 é aceita (parâmetro explícito para que qualquer outra porta seja recusada, não ignorada).
+.PARAMETER BancoDestino
+  Padrão mariela_restore_<yyyyMMdd_HHmmss>. Nunca marielaDB.
+.PARAMETER RemoverAoFinal
+  Derruba o banco restaurado ao final (padrão: mantém, para inspeção; derrube depois com o mesmo guarda de nome).
 #>
-
 param(
-  [Parameter(Mandatory = $true)]
-  [string]$ArquivoBackup
+  [Parameter(Mandatory = $true)][string]$ArquivoBackup,
+  [string]$Manifesto = "",
+  [int]$Porta = 27118,
+  [string]$BancoDestino = "",
+  [string]$Mongorestore = "",
+  [string]$DiretorioRelatorio = (Join-Path $env:USERPROFILE "mariela-restore-isolado\relatorios"),
+  [switch]$RemoverAoFinal
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "comum.ps1")
 
-if (-not (Test-Path $ArquivoBackup)) {
-  Write-Error "Arquivo de backup não encontrado: $ArquivoBackup"
-  exit 1
+$inicio = Get-Date
+if ($Porta -ne 27118) { Write-Error "Porta $Porta recusada: o restore isolado só usa 127.0.0.1:27118."; exit 1 }
+if (-not (Test-Path -LiteralPath $ArquivoBackup -PathType Leaf)) { Write-Error "Archive não encontrado."; exit 1 }
+if (-not $Manifesto) { $Manifesto = $ArquivoBackup -replace '\.archive\.gz$', '.manifest.json' }
+if (-not (Test-Path -LiteralPath $Manifesto -PathType Leaf)) { Write-Error "Manifesto não encontrado ($Manifesto) — sem manifesto não há restore."; exit 1 }
+if (-not $BancoDestino) { $BancoDestino = "mariela_restore_" + $inicio.ToString("yyyyMMdd_HHmmss") }
+if ($BancoDestino -eq "marielaDB" -or $BancoDestino -notmatch '^mariela_restore_\d{8}_\d{6}$') { Write-Error "Banco de destino '$BancoDestino' recusado (exigido mariela_restore_yyyyMMdd_HHmmss; nunca marielaDB)."; exit 1 }
+if (-not $Mongorestore) {
+  $cmd = Get-Command mongorestore -ErrorAction SilentlyContinue
+  if (-not $cmd) { Write-Error "mongorestore não encontrado no PATH."; exit 1 }
+  $Mongorestore = $cmd.Source
 }
 
-$mongorestore = Get-Command mongorestore -ErrorAction SilentlyContinue
-if (-not $mongorestore) {
-  Write-Error "mongorestore não encontrado no PATH. Instale o MongoDB Database Tools oficial antes de continuar."
-  exit 1
+$relatorio = [ordered]@{ archive = (Split-Path -Leaf $ArquivoBackup); destino = "127.0.0.1:27118/$BancoDestino"; inicio = $inicio.ToString("o"); etapas = @(); resultado = "FALHOU" }
+function Encerrar([string]$Resultado, [int]$Codigo) {
+  $relatorio.resultado = $Resultado
+  $relatorio.fim = (Get-Date).ToString("o")
+  $relatorio.duracaoSegundos = [math]::Round(((Get-Date) - $inicio).TotalSeconds, 2)
+  if (-not (Test-Path -LiteralPath $DiretorioRelatorio)) { New-Item -ItemType Directory -Path $DiretorioRelatorio | Out-Null }
+  $arq = Join-Path $DiretorioRelatorio "restore_$BancoDestino.json"
+  [System.IO.File]::WriteAllText($arq, ($relatorio | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
+  Write-Host "[$Resultado] relatório: $arq"
+  exit $Codigo
+}
+function Etapa([string]$Nome, $Resposta) {
+  $ok = [bool]($Resposta.ok -and ($null -eq $Resposta.resultado.ok -or $Resposta.resultado.ok))
+  $relatorio.etapas += @{ etapa = $Nome; ok = $ok; verificacoes = @($Resposta.resultado.verificacoes); erro = $Resposta.mensagem }
+  return $ok
 }
 
-# Destino SEMPRE local e SEMPRE um banco novo/descartável — nunca configurável
-# para um host remoto neste script, de propósito (ver seção 3 do pedido:
-# "se houver qualquer dúvida sobre o destino, NÃO executar").
-$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$bancoDestino = "mariela_restore_test_$stamp"
-$destinoUri = "mongodb://127.0.0.1:27017"
-# Banco de PRODUÇÃO de onde o archive foi gerado (definido pela MONGODB_BACKUP_URI do backup-mongo.ps1).
-$bancoOrigem = "marielaDB"
+# --- 1. Validações ANTES de qualquer escrita -----------------------------------------------------------------
+if (-not (Etapa "validar-archive" (Invoke-CliBackup -Argumentos @("validar-para-restore", "--arquivo", $ArquivoBackup, "--manifesto", $Manifesto)))) { Encerrar "FALHOU" 1 }
+if (-not (Etapa "preparar-destino" (Invoke-CliBackup -Argumentos @("preparar-restore", "--porta", "$Porta", "--banco", $BancoDestino, "--manifesto", $Manifesto)))) { Encerrar "FALHOU" 1 }
+$politica = Invoke-CliBackup -Argumentos @("politica")
+$colecoes = @($politica.resultado.colecoesIncluidas)
+if ($colecoes.Count -ne 27) { $relatorio.etapas += @{ etapa = "politica"; ok = $false; erro = "lista positiva com $($colecoes.Count) coleções" }; Encerrar "FALHOU" 1 }
 
-# Confere, ANTES de qualquer escrita, que o archive tem o namespace de origem esperado. O mongorestore NÃO avisa: para um
-# archive válido de outro banco ele sai com exit 0 e "0 documentos restaurados", e ainda restauraria esse banco sob o seu
-# nome ORIGINAL (o --nsFrom só renomeia o que casa). Lê só o começo do archive descompactado (o prelude, com os namespaces,
-# vem primeiro) e procura o elemento BSON string "db" = banco de origem — checagem binária, sem parsing de texto de log.
-# Arquivo que não é gzip legível não é julgado aqui: o próprio mongorestore o recusa (exit != 0) sem gravar nada.
-$latin1 = [System.Text.Encoding]::GetEncoding(28591)
-$prelude = $null
-try {
-  $entrada = [System.IO.File]::OpenRead($ArquivoBackup)
-  try {
-    $gz = New-Object System.IO.Compression.GzipStream($entrada, [System.IO.Compression.CompressionMode]::Decompress)
-    $buffer = New-Object byte[] 1048576
-    $lidos = 0
-    while ($lidos -lt $buffer.Length) {
-      $n = $gz.Read($buffer, $lidos, $buffer.Length - $lidos)
-      if ($n -le 0) { break }
-      $lidos += $n
-    }
-    $prelude = $latin1.GetString($buffer, 0, $lidos)
-  } finally {
-    $entrada.Close()
-  }
-} catch {
-  $prelude = $null
+# --- 2. mongorestore ---------------------------------------------------------------------------------------------
+$argsRestore = @("--uri=mongodb://127.0.0.1:27118/?directConnection=true", "--gzip", "--archive=$ArquivoBackup", "--nsFrom=marielaDB.*", "--nsTo=$BancoDestino.*", "--stopOnError")
+foreach ($c in $colecoes) { $argsRestore += "--nsInclude=marielaDB.$c" }
+$tRestore = Get-Date
+$r = Invoke-Nativo -Programa $Mongorestore -Argumentos $argsRestore
+$textoRestore = "$($r.Saida)`n$($r.Erro)"
+$falhados = if ($textoRestore -match '(\d+) document\(s\) failed to restore') { [int]$Matches[1] } else { -1 }
+$restaurados = if ($textoRestore -match '(\d+) document\(s\) restored successfully') { [int]$Matches[1] } else { -1 }
+$crossVersion = $textoRestore -match 'Cross-version'
+$okRestore = ($r.Codigo -eq 0) -and ($falhados -eq 0) -and (-not $crossVersion)
+$relatorio.etapas += @{ etapa = "mongorestore"; ok = $okRestore; codigo = $r.Codigo; documentosRestaurados = $restaurados; documentosComFalha = $falhados; avisoCrossVersion = $crossVersion; duracaoSegundos = [math]::Round(((Get-Date) - $tRestore).TotalSeconds, 2) }
+if (-not $okRestore) { Encerrar "FALHOU" 1 }
+
+# --- 3. Validação do banco restaurado ------------------------------------------------------------------------
+$okFinal = Etapa "validar-restaurado" (Invoke-CliBackup -Argumentos @("validar-restaurado", "--porta", "$Porta", "--banco", $BancoDestino, "--manifesto", $Manifesto))
+if ($RemoverAoFinal) {
+  $d = Invoke-CliBackup -Argumentos @("derrubar-restore", "--porta", "$Porta", "--banco", $BancoDestino)
+  $relatorio.etapas += @{ etapa = "remover-banco-restaurado"; ok = [bool]$d.ok }
 }
-if ($null -ne $prelude) {
-  # elemento BSON string: 0x02 "db" 0x00, int32 (tamanho do nome + 1), nome, 0x00
-  $marcador = [string][char]2 + "db" + [string][char]0 + $latin1.GetString([BitConverter]::GetBytes([int]($bancoOrigem.Length + 1))) + $bancoOrigem + [string][char]0
-  if ($prelude.IndexOf($marcador, [System.StringComparison]::Ordinal) -lt 0) {
-    Write-Error "O archive não contém o namespace de origem esperado '$bancoOrigem.*' (é de outro banco, ou está corrompido/truncado). Nada foi restaurado."
-    exit 1
-  }
-}
-
-Write-Host "Restaurando '$ArquivoBackup' em '$bancoDestino' (localhost, banco descartável)..."
-& mongorestore --uri="$destinoUri" --gzip --archive="$ArquivoBackup" --nsFrom="$bancoOrigem.*" --nsTo="$bancoDestino.*"
-$exitCode = $LASTEXITCODE
-
-if ($exitCode -ne 0) {
-  Write-Error "mongorestore terminou com código $exitCode. Restore FALHOU."
-  exit $exitCode
-}
-
-Write-Host ""
-Write-Host "Restore concluído em '$bancoDestino'. Rode a validação de collections/índices/documentos"
-Write-Host "críticos (ver docs/backup-mongodb.md, seção 'Validação pós-restore') antes de considerar"
-Write-Host "este teste como PASSOU. Ao terminar, derrube o banco de teste '$bancoDestino' usando o driver MongoDB do"
-Write-Host "projeto (o mongosh não é necessário): ver 'Alternativa ao mongosh' em docs/backup-mongodb.md."
+if ($okFinal) { Encerrar "PASSOU" 0 } else { Encerrar "FALHOU" 1 }
