@@ -7,6 +7,7 @@ import { COLECOES_BACKUP, COLECOES_EXCLUIDAS } from "../lib/politica.js";
  *
  * Uso: bun --no-env-file ops/backup/testes/origem-sintetica.ts <cenario>
  *   base | escrita-recente | caixa-aberto | colecao-desconhecida | reconciliacao-pendente | outro-banco | contagens
+ *   | volume [n]  (Fase 21.2.4: acrescenta n documentos sintéticos a um eventos_*, para alongar o mongorestore)
  */
 
 const URI = "mongodb://127.0.0.1:27119/?directConnection=true";
@@ -100,6 +101,15 @@ async function principal(): Promise<void> {
         await c.db("outroDB").dropDatabase();
         await c.db("outroDB").collection("vendas").insertOne({ sintetico: true });
         break;
+      case "volume": {
+        // Fase 21.2.4: mais documentos (sintéticos) para que o mongorestore dure o bastante para os testes de concorrência.
+        const ev = COLECOES_BACKUP.find((n) => n.startsWith("eventos_"))!;
+        const n = Number(process.argv[3] ?? 200_000);
+        for (let i = 0; i < n; i += 10_000) {
+          await db.collection(ev).insertMany(Array.from({ length: Math.min(10_000, n - i) }, (_, k) => ({ tipo: "volume-sintetico", seq: i + k, carga: "x".repeat(64), criadoEm: antigo })), { ordered: false });
+        }
+        break;
+      }
       case "contagens": {
         const r: Record<string, number> = {};
         for (const n of COLECOES_BACKUP) r[n] = await db.collection(n).countDocuments({});

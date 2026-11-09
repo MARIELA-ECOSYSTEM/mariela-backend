@@ -129,6 +129,13 @@ export const RESTORE = {
   replicaSet: "rs-restore",
   subdiretorioDados: "data-27118",
   marcador: ".mariela-restore-isolado",
+  /**
+   * Fase 60.4.3.4.21.2.4 (R21-2.3-01) — POSSE do destino: coleção de controle criada ATOMICAMENTE (`create` falha com
+   * NamespaceExists se já existir) antes do mongorestore, com o `execucaoId` da execução dona.
+   */
+  colecaoPosse: "_mariela_restore_posse",
+  /** Trava de exclusão mútua LOCAL (arquivo aberto com FileShare.Read durante TODA a execução), relativa à raiz. */
+  arquivoTrava: "locks/restore.lock",
 } as const;
 
 /**

@@ -55,7 +55,13 @@ function Invoke-CliBackup {
   $cmd = $Argumentos[0]
   $o = @{}
   for ($i = 1; $i -lt $Argumentos.Count; $i += 2) { $o[$Argumentos[$i].TrimStart('-')] = $(if ($i + 1 -lt $Argumentos.Count) { $Argumentos[$i + 1] } else { $null }) }
-  [System.IO.File]::AppendAllText($env:MARIELA_TESTE_CHAMADAS, (@{ cmd = $cmd; o = $o } | ConvertTo-Json -Compress -Depth 4) + "`n")
+  # A trava do restore (se houver -raiz) está SEGURA no momento desta chamada? (abrir para escrita tem de falhar)
+  $travaSegura = $null
+  if ($o["raiz"]) {
+    $tp = Join-Path $o["raiz"] "locks\restore.lock"
+    try { $fs = [System.IO.File]::Open($tp, "Open", "ReadWrite", "ReadWrite"); $fs.Close(); $travaSegura = $false } catch { $travaSegura = $true }
+  }
+  [System.IO.File]::AppendAllText($env:MARIELA_TESTE_CHAMADAS, (@{ cmd = $cmd; o = $o; travaSegura = $travaSegura } | ConvertTo-Json -Compress -Depth 4) + "`n")
   if ($c.lancarEm -eq $cmd) { throw "falha de I/O simulada em mongodb+srv://usuario:senha@cluster0.abcde.mongodb.net/marielaDB via 10.1.2.3:27017" }
   $json = switch ($cmd) {
     "pre-backup" { [System.IO.File]::WriteAllText($o["saida"], "{}"); '{"ok":true,"resultado":{"elegivel":true,"motivo":"ELEGIVEL","verificacoes":[],"exclusoes":["refresh_tokens","vendedor_refresh_tokens"]}}' }
@@ -77,6 +83,13 @@ function Invoke-CliBackup {
     "preparar-restore" { '{"ok":true,"resultado":' + ($c.preparar | ConvertTo-Json -Compress -Depth 5) + '}' }
     "politica" { '{"ok":true,"resultado":{"colecoesIncluidas":[' + ((1..27 | ForEach-Object { '"c' + $_ + '"' }) -join ",") + ']}}' }
     "validar-restaurado" { if ($c.validarRestauradoOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"verificacoes":[{"id":"restaurado.contagens","ok":false,"detalhe":"x"}]}}' } else { '{"ok":true,"resultado":{"ok":true,"verificacoes":[]}}' } }
+    "adquirir-posse" { if ($c.posseFalha) { '{"ok":true,"resultado":{"ok":false,"adquirida":false,"motivo":"' + $c.posseFalha + '","colecoesAlheias":["x"],"controleRemovido":true}}' } else { '{"ok":true,"resultado":{"ok":true,"adquirida":true}}' } }
+    "finalizar-posse" { if ($c.finalizarOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"finalizada":false,"detalhe":"posse de outra execução"}}' } else { '{"ok":true,"resultado":{"ok":true,"finalizada":true,"detalhe":"coleção de controle removida"}}' } }
+    "limpar-destino" {
+      if ($c.limparOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"limpo":false,"motivo":"DADOS_ALHEIOS","detalhe":"produtos: 1 documento fora do archive","removidas":[],"preservadas":["produtos"]}}' }
+      elseif ($c.lancarEmLimpeza) { '{"ok":false,"codigo":"UsoInvalidoErro","mensagem":"trava de restore não comprovada"}' }
+      else { '{"ok":true,"resultado":{"ok":true,"limpo":true,"removidas":["c1","_mariela_restore_posse"]}}' }
+    }
     "derrubar-restore" { if ($c.derrubarOk -eq $false) { '{"ok":false,"codigo":"Error","mensagem":"falha simulada ao remover"}' } else { '{"ok":true,"resultado":{"existia":true,"removido":true,"aindaExiste":false}}' } }
     default { throw "stub: comando inesperado $cmd" }
   }
@@ -279,8 +292,10 @@ Write-Output "redirecionado=$redir bytes=[$hex]"
     $rel = if (Test-Path -LiteralPath $relArq) { Get-Content -LiteralPath $relArq -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
     if (Test-Path -LiteralPath $relArq) { Remove-Item -LiteralPath $relArq }
     $cmds = @($r.Chamadas | ForEach-Object { $_.cmd })
-    return [pscustomobject]@{ Codigo = $r.Codigo; Rel = $rel; Cmds = $cmds; Derrubadas = @($r.Chamadas | Where-Object { $_.cmd -eq "derrubar-restore" } | ForEach-Object { $_.o.banco }); Erro = $r.Erro }
+    # "Derrubadas" = destinos para os quais a LIMPEZA SEGURA foi pedida (limpar-destino; derrubar-restore nunca é usado pelo restore).
+    return [pscustomobject]@{ Codigo = $r.Codigo; Rel = $rel; Cmds = $cmds; Derrubadas = @($r.Chamadas | Where-Object { $_.cmd -eq "limpar-destino" -or $_.cmd -eq "derrubar-restore" } | ForEach-Object { $_.o.banco }); Chamadas = $r.Chamadas; Erro = $r.Erro }
   }
+  $travaArq = Join-Path $raizIsolada "locks\restore.lock"
 
   Caso "R11-b" "restore: processo desconhecido, bind aberto ou instância parada → recusa ANTES de qualquer operação" {
     foreach ($ev in @(@{ Enderecos = @("127.0.0.1"); Processos = @(@{ Pid = 9; Caminho = "C:\Program Files\MongoDB\Server\8.2\bin\mongod.exe" }) }, @{ Enderecos = @("0.0.0.0"); Processos = @(@{ Pid = 1; Caminho = $mongodEsperado }) }, @{ Enderecos = @(); Processos = @() })) {
@@ -330,14 +345,68 @@ Write-Output "redirecionado=$redir bytes=[$hex]"
     "ambos FALHOU com remoção; relatório sanitizado"
   }
   Caso "R07-f" "falha NA LIMPEZA → FALHOU_DESTINO_PARCIAL, exige intervenção, nunca PASSOU" {
-    $x = Restore @{ restoreCodigo = 1; derrubarOk = $false }
-    Exigir ($x.Codigo -eq 1 -and $x.Rel.resultado -eq "FALHOU_DESTINO_PARCIAL" -and $x.Rel.exigeIntervencao) "resultado $($x.Rel.resultado)"
-    "FALHOU_DESTINO_PARCIAL; exigeIntervencao=true"
+    $x = Restore @{ restoreCodigo = 1; limparOk = $false }
+    Exigir ($x.Codigo -eq 1 -and $x.Rel.resultado -eq "FALHOU_DESTINO_PARCIAL" -and $x.Rel.exigeIntervencao -and $x.Rel.limpeza.recusa -eq "DADOS_ALHEIOS") "resultado $($x.Rel.resultado)"
+    $y = Restore @{ restoreCodigo = 1; lancarEmLimpeza = $true }
+    Exigir ($y.Codigo -eq 1 -and $y.Rel.resultado -eq "FALHOU_DESTINO_PARCIAL" -and $y.Rel.exigeIntervencao) "erro da CLI: $($y.Rel.resultado)"
+    "recusa (DADOS_ALHEIOS) e erro da CLI → FALHOU_DESTINO_PARCIAL; exigeIntervencao=true"
   }
-  Caso "R07-g" "controle: restore que PASSA não remove nada (sem -RemoverAoFinal)" {
+  Caso "R07-g" "controle: restore que PASSA não remove nada (sem -RemoverAoFinal); só finaliza a posse" {
     $x = Restore @{}
     Exigir ($x.Codigo -eq 0 -and $x.Rel.resultado -eq "PASSOU" -and $x.Derrubadas.Count -eq 0) "resultado $($x.Rel.resultado) código $($x.Codigo)"
-    "PASSOU"
+    Exigir (@($x.Cmds | Where-Object { $_ -eq "finalizar-posse" }).Count -eq 1) "finalizar-posse não chamado uma vez"
+    "PASSOU; finalizar-posse 1x; nenhuma limpeza"
+  }
+
+  # ================================ R21-2.3-01 (Fase 21.2.4): trava e posse ================================
+  Caso "P-a" "trava OCUPADA por outro detentor → recusa sem NENHUMA chamada e sem relatório" {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $travaArq) | Out-Null
+    $fs = [System.IO.File]::Open($travaArq, "OpenOrCreate", "ReadWrite", "Read")
+    try { $x = Restore @{} } finally { $fs.Close() }
+    Exigir ($x.Codigo -eq 1 -and $x.Cmds.Count -eq 0 -and -not $x.Rel -and $x.Erro -match "Trava") "não recusou: $($x.Codigo) $($x.Erro)"
+    "recusado (1); 0 chamadas"
+  }
+  Caso "P-b" "caminho da trava é um DIRETÓRIO → recusa sem chamadas" {
+    $alt = Join-Path $raiz "isolado-dir"; New-Item -ItemType Directory -Force -Path (Join-Path $alt "locks\restore.lock") | Out-Null
+    $r = Rodar "restore-test.ps1" @{ evidencia = $evOk; preparar = $prepOk } @("-ArquivoBackup", $arq, "-BancoDestino", "mariela_restore_20260101_000009", "-Raiz", $alt, "-Mongorestore", (Join-Path $raiz "mongorestore-stub.cmd"), "-DiretorioRelatorio", (Join-Path $raiz "relatorios"))
+    Exigir ($r.Codigo -eq 1 -and @($r.Chamadas).Count -eq 0) "não recusou: $($r.Codigo)"
+    "recusado (1); 0 chamadas"
+  }
+  Caso "P-c" "posse NÃO adquirida (destino com dados / posse de outra execução) → FALHOU, sem mongorestore, sem limpeza" {
+    foreach ($m in "DESTINO_COM_DADOS", "POSSE_JA_EXISTE") {
+      $x = Restore @{ posseFalha = $m }
+      Exigir ($x.Codigo -eq 1 -and $x.Rel.resultado -eq "FALHOU" -and $x.Cmds -notcontains "mongorestore" -and $x.Derrubadas.Count -eq 0 -and -not $x.Rel.posseAdquirida) "$m : $($x.Rel.resultado)"
+    }
+    "2 motivos: FALHOU; nada escrito; nada removido"
+  }
+  Caso "P-d" "toda operação de destino ocorre COM a trava segura; mesma execução na posse e na limpeza; trava liberada ao fim" {
+    $x = Restore @{ restoreCodigo = 1 }
+    $comRaiz = @($x.Chamadas | Where-Object { $null -ne $_.travaSegura })
+    Exigir ($comRaiz.Count -ge 3 -and @($comRaiz | Where-Object { -not $_.travaSegura }).Count -eq 0) "chamada sem trava segura"
+    $ad = @($x.Chamadas | Where-Object { $_.cmd -eq "adquirir-posse" })[0]
+    $li = @($x.Chamadas | Where-Object { $_.cmd -eq "limpar-destino" })[0]
+    Exigir ($ad.o.execucao -eq $x.Rel.execucaoId -and $li.o.'trava-execucao' -eq $x.Rel.execucaoId -and $li.o.'posse-execucao' -eq $x.Rel.execucaoId) "execucaoId divergente"
+    $conteudo = Get-Content -LiteralPath $travaArq -Raw -Encoding UTF8 | ConvertFrom-Json
+    Exigir ($conteudo.livre -eq $true -and $conteudo.ultimaExecucao -eq $x.Rel.execucaoId) "trava não liberada: $($conteudo | ConvertTo-Json -Compress)"
+    $fs = [System.IO.File]::Open($travaArq, "Open", "ReadWrite", "None"); $fs.Close()
+    "$($comRaiz.Count) chamadas com trava segura; execucaoId único; trava 'livre' e abrível"
+  }
+  Caso "P-e" "trava deixada por execução INTERROMPIDA → registrada; o destino antigo NÃO é tocado" {
+    Escrever $travaArq '{"execucaoId":"11111111-2222-3333-4444-555555555555","pid":999999,"banco":"mariela_restore_20200101_000000"}'
+    $x = Restore @{}
+    Exigir ($x.Codigo -eq 0 -and $x.Rel.execucaoAnteriorInterrompida.execucaoId -eq "11111111-2222-3333-4444-555555555555") "não registrou a interrompida"
+    Exigir (@($x.Chamadas | Where-Object { $_.o.banco -eq "mariela_restore_20200101_000000" }).Count -eq 0) "tocou o destino antigo"
+    "registrada; 0 chamadas para o destino antigo"
+  }
+  Caso "P-f" "-RemoverAoFinal com limpeza RECUSADA → FALHOU_DESTINO_PARCIAL (nunca PASSOU)" {
+    $x = Restore @{ limparOk = $false } "mariela_restore_20260101_000001" @("-RemoverAoFinal")
+    Exigir ($x.Codigo -eq 1 -and $x.Rel.resultado -eq "FALHOU_DESTINO_PARCIAL" -and $x.Rel.exigeIntervencao) "resultado $($x.Rel.resultado) código $($x.Codigo)"
+    "FALHOU_DESTINO_PARCIAL (1)"
+  }
+  Caso "P-g" "finalizar-posse recusado (posse trocada) → FALHOU_DESTINO_PARCIAL" {
+    $x = Restore @{ finalizarOk = $false }
+    Exigir ($x.Codigo -eq 1 -and $x.Rel.resultado -eq "FALHOU_DESTINO_PARCIAL" -and $x.Derrubadas.Count -eq 0) "resultado $($x.Rel.resultado)"
+    "FALHOU_DESTINO_PARCIAL; nada removido"
   }
 } finally {
   Remove-Item Env:MARIELA_TESTE_CENARIO, Env:MARIELA_TESTE_CHAMADAS -ErrorAction SilentlyContinue

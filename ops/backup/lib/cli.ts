@@ -1,7 +1,9 @@
 import { existsSync, linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { MongoClient } from "mongodb";
-import { ArchiveInvalidoErro, lerArchiveGzipDoArquivo, sha256DoArquivo, type ArchiveLido } from "./archive.js";
+import { ArchiveInvalidoErro, idsDoArchiveGzipDoArquivo, lerArchiveGzipDoArquivo, sha256DoArquivo, type ArchiveLido } from "./archive.js";
+import { adquirirPosse, COLECAO_POSSE, finalizarPosse, limparDestinoComPosse, posseAtual } from "./posse.js";
+import { caminhoTrava, verificarTrava } from "./trava.js";
 import { ConfigMongoErro, lerConfigMongo, sanitizarMensagem } from "./config-mongo.js";
 import {
   avaliarDevido,
@@ -304,8 +306,9 @@ async function validarRestauradoCmd(o: Record<string, string>) {
 }
 
 /**
- * Remove SÓ o banco de destino de um restore (nome `mariela_restore_<carimbo>`, nunca `marielaDB`), SÓ na instância
- * isolada, e confirma que ele não existe mais depois.
+ * Remoção MANUAL de um restore JÁ CONCLUÍDO (nome `mariela_restore_<carimbo>`, nunca `marielaDB`), SÓ na instância
+ * isolada. Fase 60.4.3.4.21.2.4: RECUSA destino com coleção de posse (execução em andamento ou interrompida — use
+ * `recuperar-destino.ps1`). O fluxo do restore nunca usa este comando (usa `limpar-destino`, que não faz dropDatabase).
  */
 async function derrubarRestore(o: Record<string, string>) {
   const banco = exigir(o, "banco");
@@ -314,10 +317,112 @@ async function derrubarRestore(o: Record<string, string>) {
     await exigirInstanciaIsolada(c, o["raiz"]);
     const listar = async () => (await c.db("admin").admin().listDatabases({ nameOnly: true })).databases.map((d) => d.name);
     const existia = (await listar()).includes(banco);
-    if (existia) await c.db(banco).dropDatabase();
+    if (existia) {
+      const comPosse = (await c.db(banco).listCollections({ name: COLECAO_POSSE }, { nameOnly: true }).toArray()).length > 0;
+      if (comPosse) throw new UsoInvalidoErro(`o banco ${banco} tem posse de uma execução (em andamento ou interrompida) — nada removido; use recuperar-destino.ps1`);
+      await c.db(banco).dropDatabase();
+    }
     const aindaExiste = (await listar()).includes(banco);
     if (aindaExiste) throw new Error(`o banco ${banco} continua existindo depois da remoção`);
     return { existia, removido: existia, aindaExiste };
+  });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Fase 60.4.3.4.21.2.4 (R21-2.3-01) — POSSE exclusiva do destino (trava local + coleção de controle atômica)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Trava segura por QUEM chamou esta CLI, nomeando a execução informada. Senão: recusa. */
+function exigirTrava(o: Record<string, string>, execucao: string): void {
+  const falhas = verificarTrava(caminhoTrava(o["raiz"]), execucao, process.ppid).filter((v) => !v.ok);
+  if (falhas.length) throw new UsoInvalidoErro(`trava de restore não comprovada para a execução: ${falhas.map((f) => `${f.id} (${f.detalhe})`).join("; ")}`);
+}
+
+function exigirExecucao(valor: string): string {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(valor)) throw new UsoInvalidoErro("identificador de execução inválido (GUID exigido)");
+  return valor.toLowerCase();
+}
+
+async function adquirirPosseCmd(o: Record<string, string>) {
+  const banco = exigir(o, "banco");
+  exigirBancoRestore(banco);
+  const execucaoId = exigirExecucao(exigir(o, "execucao"));
+  const arquivo = exigir(o, "arquivo");
+  return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
+    await exigirInstanciaIsolada(c, o["raiz"]);
+    exigirTrava(o, execucaoId);
+    const r = await adquirirPosse(c.db(banco), {
+      execucaoId,
+      pid: process.ppid,
+      processoInicio: exigir(o, "processo-inicio"),
+      banco,
+      archive: arquivo,
+      archiveSha256: await sha256DoArquivo(arquivo),
+      manifesto: exigir(o, "manifesto"),
+    });
+    return { ok: r.adquirida, ...r };
+  });
+}
+
+async function finalizarPosseCmd(o: Record<string, string>) {
+  const banco = exigir(o, "banco");
+  exigirBancoRestore(banco);
+  const execucaoId = exigirExecucao(exigir(o, "execucao"));
+  return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
+    await exigirInstanciaIsolada(c, o["raiz"]);
+    exigirTrava(o, execucaoId);
+    const r = await finalizarPosse(c.db(banco), execucaoId);
+    return { ok: r.finalizada, ...r };
+  });
+}
+
+/**
+ * Limpeza segura. `--trava-execucao` = execução que MANTÉM a trava agora (o restore, ou o recuperar-destino);
+ * `--posse-execucao` = dona do destino (igual no fluxo normal; a execução interrompida na recuperação).
+ */
+async function limparDestinoCmd(o: Record<string, string>) {
+  const banco = exigir(o, "banco");
+  exigirBancoRestore(banco);
+  const travaExecucao = exigirExecucao(exigir(o, "trava-execucao"));
+  const posseExecucao = exigirExecucao(exigir(o, "posse-execucao"));
+  const arquivo = exigir(o, "arquivo");
+  const manifesto = lerJson<Manifesto>(exigir(o, "manifesto"));
+  return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
+    await exigirInstanciaIsolada(c, o["raiz"]);
+    exigirTrava(o, travaExecucao);
+    const db = c.db(banco);
+    const posse = await posseAtual(db, posseExecucao);
+    if (!posse.ok) return { ok: false, limpo: false, motivo: "POSSE_NAO_COMPROVADA", detalhe: posse.detalhe };
+    // O archive usado para provar o conteúdo tem de ser o MESMO que foi restaurado.
+    if (posse.documento?.["archiveSha256"] !== (await sha256DoArquivo(arquivo))) {
+      return { ok: false, limpo: false, motivo: "ARCHIVE_DIVERGENTE", detalhe: "o archive informado não é o que foi restaurado neste destino" };
+    }
+    const todos = idsDoArchiveGzipDoArquivo(arquivo);
+    const idsPorColecao = new Map<string, Set<string>>();
+    for (const [ns, ids] of todos) if (ns.startsWith(`${BANCO_ORIGEM}.`)) idsPorColecao.set(ns.slice(BANCO_ORIGEM.length + 1), ids);
+    const r = await limparDestinoComPosse(db, posseExecucao, { idsPorColecao, indicesPorColecao: manifesto.indices?.porColecao ?? {} });
+    return { ok: r.limpo, ...r };
+  });
+}
+
+/** Somente leitura: estado de um destino (posse, coleções, trava) — base da recuperação de execução interrompida. */
+async function inspecionarDestinoCmd(o: Record<string, string>) {
+  const banco = exigir(o, "banco");
+  exigirBancoRestore(banco);
+  return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
+    await exigirInstanciaIsolada(c, o["raiz"]);
+    const db = c.db(banco);
+    const existe = (await c.db("admin").admin().listDatabases({ nameOnly: true })).databases.some((d) => d.name === banco);
+    const colecoes = existe ? (await db.listCollections({}, { nameOnly: true }).toArray()).map((x) => x.name).sort() : [];
+    const docs = colecoes.includes(COLECAO_POSSE) ? await db.collection(COLECAO_POSSE).find({}).limit(10).toArray() : [];
+    const p = docs.length === 1 ? docs[0]! : null;
+    return {
+      ok: true,
+      existe,
+      colecoes,
+      posse: p ? { execucaoId: p["execucaoId"], pid: p["pid"], processoInicio: p["processoInicio"], archive: p["archive"], archiveSha256: p["archiveSha256"], manifesto: p["manifesto"], criadoEm: p["criadoEm"] } : null,
+      documentosDePosse: docs.length,
+    };
   });
 }
 
@@ -435,6 +540,18 @@ async function principal(): Promise<number> {
         break;
       case "registrar-cifrado":
         resultado = await registrarCifradoCmd(o);
+        break;
+      case "adquirir-posse":
+        resultado = await adquirirPosseCmd(o);
+        break;
+      case "finalizar-posse":
+        resultado = await finalizarPosseCmd(o);
+        break;
+      case "limpar-destino":
+        resultado = await limparDestinoCmd(o);
+        break;
+      case "inspecionar-destino":
+        resultado = await inspecionarDestinoCmd(o);
         break;
       case "politica":
         resultado = { banco: BANCO_ORIGEM, colecoesIncluidas: [...COLECOES_BACKUP], colecoesExcluidas: [...COLECOES_EXCLUIDAS], restore: { host: RESTORE.host, porta: RESTORE.porta } };

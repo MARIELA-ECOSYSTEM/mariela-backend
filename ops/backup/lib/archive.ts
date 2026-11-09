@@ -193,6 +193,99 @@ export function lerArchiveGzipDoArquivo(caminho: string): ArchiveLido {
   return lerArchive(descompactar(readFileSync(caminho)));
 }
 
+/** Tamanho do VALOR de um elemento BSON a partir de `p` (início do valor); `null` = tipo não suportado como _id. */
+function tamanhoDoValorBson(tipo: number, dados: Buffer, p: number): number | null {
+  switch (tipo) {
+    case 0x01: // double
+    case 0x09: // date
+    case 0x11: // timestamp
+    case 0x12: // int64
+      return 8;
+    case 0x02: // string
+    case 0x0d: // javascript
+    case 0x0e: // symbol
+      return 4 + dados.readInt32LE(p);
+    case 0x03: // documento
+    case 0x04: // array
+      return dados.readInt32LE(p);
+    case 0x05: // binário
+      return 4 + 1 + dados.readInt32LE(p);
+    case 0x07: // ObjectId
+      return 12;
+    case 0x08: // booleano
+      return 1;
+    case 0x0a: // null
+      return 0;
+    case 0x10: // int32
+      return 4;
+    case 0x13: // decimal128
+      return 16;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Fase 60.4.3.4.21.2.4 (R21-2.3-01) — conjunto de `_id` de cada namespace do archive, como CHAVE CANÔNICA = bytes BSON
+ * do elemento `_id` (tipo + nome + valor) em hex. Lê SÓ o primeiro elemento de cada documento (o `_id`, que o MongoDB
+ * sempre grava primeiro); nenhum outro campo é lido. Documento cujo primeiro campo não é `_id` ⇒ ArchiveInvalidoErro
+ * (falha fechada: sem a lista exata de `_id`, nenhuma limpeza é autorizada).
+ */
+export function idsDoArchive(dados: Buffer): Map<string, Set<string>> {
+  if (dados.length < 4 || dados.readUInt32LE(0) !== MAGIC_ARCHIVE) throw new ArchiveInvalidoErro("MAGIC_INVALIDO", "assinatura de archive do mongodump ausente");
+  let pos = 4;
+  const ids = new Map<string, Set<string>>();
+  const tamanhoDoc = (): number => {
+    if (pos + 4 > dados.length) throw new ArchiveInvalidoErro("TRUNCADO", "fim inesperado do archive");
+    const t = dados.readInt32LE(pos);
+    if (t < 5 || pos + t > dados.length) throw new ArchiveInvalidoErro("TRUNCADO", "documento BSON truncado");
+    return t;
+  };
+  const ehTerminador = () => pos + 4 <= dados.length && dados.readInt32LE(pos) === TERMINADOR;
+  const controle = (): Document => {
+    const t = tamanhoDoc();
+    const doc = deserialize(dados.subarray(pos, pos + t));
+    pos += t;
+    return doc;
+  };
+  controle(); // cabeçalho
+  while (!ehTerminador()) {
+    if (pos >= dados.length) throw new ArchiveInvalidoErro("TRUNCADO", "prelude sem terminador");
+    controle();
+  }
+  pos += 4;
+  while (pos < dados.length) {
+    const cab = controle();
+    const ns = `${cab["db"]}.${cab["collection"]}`;
+    if (cab["EOF"] === true) {
+      pos += 4;
+      continue;
+    }
+    const conjunto = ids.get(ns) ?? new Set<string>();
+    ids.set(ns, conjunto);
+    while (!ehTerminador()) {
+      if (pos >= dados.length) throw new ArchiveInvalidoErro("TRUNCADO", "bloco de dados sem terminador");
+      const t = tamanhoDoc();
+      const fimDoc = pos + t - 1;
+      const tipo = dados[pos + 4]!;
+      const fimNome = dados.indexOf(0, pos + 5);
+      if (fimNome < 0 || fimNome >= fimDoc || dados.toString("latin1", pos + 5, fimNome) !== "_id") {
+        throw new ArchiveInvalidoErro("ESTRUTURA_INVALIDA", "documento cujo primeiro campo não é _id");
+      }
+      const tamanhoValor = tamanhoDoValorBson(tipo, dados, fimNome + 1);
+      if (tamanhoValor === null || fimNome + 1 + tamanhoValor > fimDoc) throw new ArchiveInvalidoErro("ESTRUTURA_INVALIDA", `_id de tipo BSON 0x${tipo.toString(16)} não suportado`);
+      conjunto.add(dados.toString("hex", pos + 4, fimNome + 1 + tamanhoValor));
+      pos += t;
+    }
+    pos += 4;
+  }
+  return ids;
+}
+
+export function idsDoArchiveGzipDoArquivo(caminho: string): Map<string, Set<string>> {
+  return idsDoArchive(descompactar(readFileSync(caminho)));
+}
+
 export interface Verificacao {
   id: string;
   ok: boolean;

@@ -1,7 +1,7 @@
 import type { Db } from "mongodb";
 import { partesDaVersao, verificarArchiveContraPolitica, type ArchiveLido, type IndiceNormalizado, type Verificacao } from "./archive.js";
 import { compararAssinaturas, lerIndices, lerReferencias, lerSequencias, type Assinatura, type EstadoSequencia } from "./janela.js";
-import { BANCO_ORIGEM, COLECOES_BACKUP, COLECOES_EXCLUIDAS, DECLARACAO_CONSISTENCIA, INDICES_REFERENCIA, JANELA } from "./politica.js";
+import { BANCO_ORIGEM, COLECOES_BACKUP, COLECOES_EXCLUIDAS, DECLARACAO_CONSISTENCIA, INDICES_REFERENCIA, JANELA, RESTORE } from "./politica.js";
 
 /**
  * Fase 60.4.3.4.21.2 — manifesto de um backup. Estado `VALIDO_LOCAL` SÓ se TODAS as validações passam (falha
@@ -154,7 +154,11 @@ export function verificarVersaoDestino(versaoOrigem: string | null, versaoDestin
 /** Depois do restore: coleções, contagens, índices, referências e sequências idênticos ao manifesto. */
 export async function validarRestaurado(db: Db, manifesto: Manifesto): Promise<Verificacao[]> {
   const v: Verificacao[] = [];
-  const nomes = (await db.listCollections({}, { nameOnly: true }).toArray()).map((c) => c.name).filter((n) => !n.startsWith("system.")).sort();
+  // A coleção de POSSE (Fase 21.2.4) é da execução, não do archive: fora da comparação (qualquer OUTRA coleção conta).
+  const nomes = (await db.listCollections({}, { nameOnly: true }).toArray())
+    .map((c) => c.name)
+    .filter((n) => !n.startsWith("system.") && n !== RESTORE.colecaoPosse)
+    .sort();
   const esperadas = [...COLECOES_BACKUP].sort();
   v.push({ id: "restaurado.colecoes_exatas", ok: iguaisJson(nomes, esperadas), detalhe: `${nomes.length} coleções; esperadas ${esperadas.length}` });
 

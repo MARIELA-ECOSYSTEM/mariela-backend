@@ -168,6 +168,49 @@ function Test-EvidenciaInstancia($Evidencia, [string]$MongodEsperado) {
   return [pscustomobject]@{ Ok = ($problemas.Count -eq 0); Detalhe = ($problemas -join "; ") }
 }
 
+<#
+  R21-2.3-01 — TRAVA de exclusão mútua LOCAL do restore. Abre <raiz>\locks\restore.lock com FileShare.Read e a
+  MANTÉM aberta até Exit-TravaRestore (ou até o processo morrer — o SO libera). Enquanto isso nenhum outro processo
+  consegue abri-la para escrita: a aquisição é atômica pelo próprio SO (comprovado entre processos independentes).
+  O conteúdo nomeia a execução dona (execucaoId, pid, início do processo) — a CLI confere isso antes de cada operação
+  de posse/limpeza. Se a execução anterior não deixou "livre", ela foi interrompida: isso é devolvido em .Anterior.
+  Lança se a trava estiver ocupada (outro restore em andamento) ou não puder ser criada.
+#>
+function Enter-TravaRestore([string]$Caminho, [string]$ExecucaoId, [string]$Banco) {
+  $pasta = Split-Path -Parent $Caminho
+  if (-not (Test-Path -LiteralPath $pasta -PathType Container)) { New-Item -ItemType Directory -Path $pasta | Out-Null }
+  $fluxo = [System.IO.File]::Open($Caminho, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+  try {
+    $buffer = New-Object byte[] ([int]$fluxo.Length)
+    $lidos = if ($buffer.Length) { $fluxo.Read($buffer, 0, $buffer.Length) } else { 0 }
+    $anterior = $null
+    if ($lidos -gt 0) { try { $anterior = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $lidos) | ConvertFrom-Json } catch { $anterior = [pscustomobject]@{ ilegivel = $true } } }
+    $inicio = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o")
+    $conteudo = [System.Text.Encoding]::UTF8.GetBytes((@{ execucaoId = $ExecucaoId; pid = $PID; processoInicio = $inicio; banco = $Banco; adquiridaEm = (Get-Date).ToString("o") } | ConvertTo-Json -Compress))
+    $fluxo.SetLength(0)
+    $fluxo.Position = 0
+    $fluxo.Write($conteudo, 0, $conteudo.Length)
+    $fluxo.Flush($true)
+  } catch {
+    $fluxo.Close()
+    throw
+  }
+  return [pscustomobject]@{ Fluxo = $fluxo; Caminho = $Caminho; ExecucaoId = $ExecucaoId; ProcessoInicio = $inicio; Anterior = $anterior }
+}
+
+function Exit-TravaRestore($Trava) {
+  if (-not $Trava -or -not $Trava.Fluxo) { return }
+  try {
+    $livre = [System.Text.Encoding]::UTF8.GetBytes((@{ livre = $true; ultimaExecucao = $Trava.ExecucaoId; liberadaEm = (Get-Date).ToString("o") } | ConvertTo-Json -Compress))
+    $Trava.Fluxo.SetLength(0)
+    $Trava.Fluxo.Position = 0
+    $Trava.Fluxo.Write($livre, 0, $livre.Length)
+    $Trava.Fluxo.Flush($true)
+  } finally {
+    $Trava.Fluxo.Close()
+  }
+}
+
 <# Uma linha JSON por evento (UTF-8 sem BOM). Nunca recebe URI, senha ou documento. #>
 function Write-LogJson([string]$Arquivo, [hashtable]$Dados) {
   $pasta = Split-Path -Parent $Arquivo
