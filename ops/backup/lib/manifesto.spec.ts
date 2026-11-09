@@ -9,7 +9,9 @@ import { montarArchive } from "./teste-archive.util.js";
 
 const ID: IndiceNormalizado = { nome: "_id_", chave: '{"_id":1}', unique: false, parcial: null, sparse: false, ttl: null };
 const assinatura = (produtos = 2): Assinatura =>
-  Object.fromEntries(COLECOES_BACKUP.map((c) => [c, { contagem: c === "produtos" ? produtos : 0, maiorTimestamp: c === "produtos" ? "2026-11-09T20:00:00.000Z" : null, hashConteudo: null }]));
+  Object.fromEntries(
+    COLECOES_BACKUP.map((c) => [c, { estrategia: "timestamp" as const, contagem: c === "produtos" ? produtos : 0, maiorTimestamp: c === "produtos" ? "2026-11-09T20:00:00.000Z" : null, hashConteudo: null }]),
+  );
 
 function pre(parcial: Partial<PreBackup> = {}): PreBackup {
   return {

@@ -55,18 +55,34 @@ $registro = @{ execucaoId = $execucaoId; tipo = $tipo; inicio = $inicio.ToString
 $trava = $null
 $preJson = $null
 $manifestoTmp = $null
+$temporario = $null
+# R21-2.1-05 — etapa corrente: registrada em QUALQUER desfecho, inclusive exceção inesperada.
+$etapa = "inicio"
 
+<#
+  Registra o desfecho e encerra. Falha do PRÓPRIO log nunca vira sucesso: a mensagem (sanitizada) vai para o stderr e
+  um código 0 passa a 1 — a execução fica visível como falha. O log não cria a pasta de backup se ela não existir.
+#>
 function Finalizar([string]$Resultado, [string]$Motivo, [int]$Codigo) {
   $registro.resultado = $Resultado
   $registro.motivo = $Motivo
+  $registro.etapa = $etapa
   $registro.fim = (Get-Date).ToString("o")
-  try { Write-LogJson -Arquivo $logArquivo -Dados $registro } catch { Write-Warning "não foi possível gravar o log: $($_.Exception.Message)" }
+  $logOk = $false
+  if (Test-Path -LiteralPath $BackupDir -PathType Container) {
+    try { Write-LogJson -Arquivo $logArquivo -Dados $registro; $logOk = $true }
+    catch { [Console]::Error.WriteLine("[LOG] não foi possível gravar o registro da execução $execucaoId — " + (ConvertTo-MensagemSegura $_)) }
+  } else {
+    [Console]::Error.WriteLine("[LOG] pasta de backup inexistente: registro da execução $execucaoId só no stderr")
+  }
+  if (-not $logOk -and $Codigo -eq 0) { $Codigo = 1 }
   Write-Host "[$Resultado] $Motivo"
   exit $Codigo
 }
 
 try {
   # --- 1. Pré-condições locais ---------------------------------------------------------------------------------
+  $etapa = "pre-condicoes"
   if (-not (Test-Path -LiteralPath $BackupDir -PathType Container)) { Finalizar "FALHA" "pasta de destino inexistente" 1 }
   if (-not (Test-Path -LiteralPath $ConfigMongo -PathType Leaf)) { Finalizar "FALHA" "arquivo de configuração do mongodump inexistente" 1 }
   $aclConfig = Test-AclRestrita $ConfigMongo
@@ -89,7 +105,8 @@ try {
   }
 
   # --- 2. Pré-backup (somente leitura na origem) ---------------------------------------------------------------
-  $preJson = Join-Path $BackupDir "trabalho_$execucaoId.pre.json"
+  $etapa = "pre-backup"
+  $preJson =Join-Path $BackupDir "trabalho_$execucaoId.pre.json"
   $argsPre = @("pre-backup", "--config", $ConfigMongo, "--dir", $BackupDir, "--tipo", $tipo, "--saida", $preJson)
   if ($Agora) { $argsPre += @("--agora", $Agora) }
   $pre = Invoke-CliBackup -Argumentos $argsPre
@@ -103,7 +120,8 @@ try {
   if (-not (Test-Path -LiteralPath $preJson)) { Finalizar "FALHA" "pré-backup elegível sem arquivo de trabalho" 1 }
 
   # --- 3. Dump para um temporário --------------------------------------------------------------------------------
-  $base = "$prefixo$carimbo"
+  $etapa = "mongodump"
+  $base ="$prefixo$carimbo"
   $baseInvalido = "mariela_invalido_$carimbo"
   $final = Join-Path $BackupDir "$base.archive.gz"
   $finalInvalido = Join-Path $BackupDir "$baseInvalido.archive.gz"
@@ -123,7 +141,8 @@ try {
   }
 
   # --- 4. Pós-backup: assinaturas, estrutura, contagens, índices, SHA-256, manifesto -----------------------------
-  $manifestoTmp = Join-Path $BackupDir "trabalho_$execucaoId.manifest.json"
+  $etapa = "pos-backup"
+  $manifestoTmp =Join-Path $BackupDir "trabalho_$execucaoId.manifest.json"
   $pos = Invoke-CliBackup -Argumentos @(
     "pos-backup", "--config", $ConfigMongo, "--pre", $preJson, "--tmp", $temporario, "--saida", $manifestoTmp,
     "--tipo", $tipo, "--execucao-id", $execucaoId, "--iniciado-em", $inicio.ToString("o"), "--data-local", $inicio.ToString("yyyy-MM-dd"),
@@ -137,15 +156,21 @@ try {
   $alvoArchive = Join-Path $BackupDir "$alvoBase.archive.gz"
 
   # --- 5. Promoção sem sobrescrita ----------------------------------------------------------------------------
+  # Ordem (R21-2.1-05): archive → .sha256 → MANIFESTO por último. O manifesto é o "commit" da cópia (a retenção só
+  # reconhece como válida a base com manifesto VALIDO_LOCAL + archive); falha antes dele deixa, no máximo, um archive
+  # sem manifesto — classificado como "conflito" (preservado, nunca válido).
+  $etapa = "promocao-archive"
   $prom = Invoke-CliBackup -Argumentos @("promover", "--origem", $temporario, "--destino", $alvoArchive)
   if (-not $prom.ok) {
     Remove-Item -LiteralPath $temporario -Force -ErrorAction SilentlyContinue
     Finalizar "FALHA" "não foi possível dar o nome definitivo: $($prom.mensagem) — temporário descartado, retenção NÃO executada" 1
   }
-  $promMan = Invoke-CliBackup -Argumentos @("promover", "--origem", $manifestoTmp, "--destino", (Join-Path $BackupDir "$alvoBase.manifest.json"))
-  if (-not $promMan.ok) { Finalizar "FALHA" "manifesto não pôde ser promovido: $($promMan.mensagem)" 1 }
-  $manifestoTmp = $null
+  $etapa = "hash"
   [System.IO.File]::WriteAllText("$alvoArchive.sha256", "$($pos.resultado.sha256)  $alvoBase.archive.gz`n", (New-Object System.Text.UTF8Encoding($false)))
+  $etapa = "promocao-manifesto"
+  $promMan = Invoke-CliBackup -Argumentos @("promover", "--origem", $manifestoTmp, "--destino", (Join-Path $BackupDir "$alvoBase.manifest.json"))
+  if (-not $promMan.ok) { Finalizar "FALHA" "manifesto não pôde ser promovido: $($promMan.mensagem) — a cópia NÃO é válida (sem manifesto)" 1 }
+  $manifestoTmp = $null
   $registro.arquivo = "$alvoBase.archive.gz"
   $registro.sha256 = $pos.resultado.sha256
   $registro.tamanhoBytes = (Get-Item -LiteralPath $alvoArchive).Length
@@ -157,7 +182,8 @@ try {
   }
 
   # --- 6. Retenção (só depois de um backup novo VÁLIDO) -------------------------------------------------------
-  $ret = Invoke-CliBackup -Argumentos @("retencao", "--dir", $BackupDir, "--novo", $base, "--aplicar")
+  $etapa = "retencao"
+  $ret =Invoke-CliBackup -Argumentos @("retencao", "--dir", $BackupDir, "--novo", $base, "--aplicar")
   if ($ret.ok) {
     $registro.retencao = @{ removidos = @($ret.resultado.apagados) }
   } else {
@@ -175,9 +201,16 @@ try {
     } catch { }
   }
 
+  $etapa = "conclusao"
   Finalizar "VALIDO_LOCAL" "backup $base.archive.gz validado (SHA-256 $($pos.resultado.sha256))" 0
+} catch {
+  # R21-2.1-05 — exceção INESPERADA (o `exit` de Finalizar não passa por aqui — conferido no 5.1 e no 7): registra a
+  # FALHA com a etapa e a mensagem SANITIZADA, e sai com código não zero. Nunca registra sucesso.
+  Finalizar "FALHA" ("falha inesperada na etapa '$etapa': " + (ConvertTo-MensagemSegura $_)) 1
 } finally {
   if ($preJson -and (Test-Path -LiteralPath $preJson)) { Remove-Item -LiteralPath $preJson -Force -ErrorAction SilentlyContinue }
   if ($manifestoTmp -and (Test-Path -LiteralPath $manifestoTmp)) { Remove-Item -LiteralPath $manifestoTmp -Force -ErrorAction SilentlyContinue }
+  # Temporário que não chegou a ser promovido nunca é uma cópia válida (falha em qualquer etapa anterior à promoção).
+  if ($temporario -and (Test-Path -LiteralPath $temporario)) { Remove-Item -LiteralPath $temporario -Force -ErrorAction SilentlyContinue }
   if ($trava) { $trava.Close() }
 }

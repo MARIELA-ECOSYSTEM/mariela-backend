@@ -43,6 +43,52 @@ export const COLECOES_BACKUP = [
   "vendedores",
 ] as const;
 
+export type ColecaoBackup = (typeof COLECOES_BACKUP)[number];
+
+/**
+ * Fase 60.4.3.4.21.2.2 (R21-2.1-01) — COMO a assinatura detecta escrita em cada coleção (decidido pelo schema e pelos
+ * escritores reais do código, nunca deduzido só pela presença de um timestamp):
+ *   - `timestamp`: schema com `timestamps.updatedAt = "atualizadoEm"` — toda inserção/atualização pelo Mongoose mexe em
+ *     `atualizadoEm`; assinatura = contagem + maior `atualizadoEm`/`criadoEm`;
+ *   - `insercao`: só `criadoEm` (`updatedAt: false`) e NENHUMA atualização no código (append-only: trilhas `eventos_*`,
+ *     ledger, movimentos de caixa) — assinatura = contagem + maior `criadoEm`;
+ *   - `conteudo`: há atualização que NÃO mexe em timestamp (ex.: `uploads_midia` — reservar/descartar/limpar mudam
+ *     `estado`/`tokenReserva` sem tocar `criadoEm`) ou não há timestamp (`sequencias`) — assinatura = contagem + SHA-256
+ *     do conteúdo inteiro (determinístico, por `_id`), com limite de documentos (acima dele: falha fechada).
+ * `camposData` alimentam a janela de 15 min (quando uma escrita aconteceu); atualizações sem data só são detectadas pela
+ * comparação antes/depois do dump.
+ */
+export const ASSINATURA_POR_COLECAO: Record<ColecaoBackup, { estrategia: "timestamp" | "insercao" | "conteudo"; camposData: string[] }> = {
+  adquirentes: { estrategia: "timestamp", camposData: ["atualizadoEm", "criadoEm"] },
+  caixas: { estrategia: "timestamp", camposData: ["atualizadoEm", "criadoEm"] },
+  campanhas: { estrategia: "timestamp", camposData: ["atualizadoEm", "criadoEm"] },
+  clientes: { estrategia: "timestamp", camposData: ["atualizadoEm", "criadoEm"] },
+  colecoes: { estrategia: "timestamp", camposData: ["atualizadoEm", "criadoEm"] },
+  configuracoes: { estrategia: "timestamp", camposData: ["atualizadoEm", "criadoEm"] },
+  fornecedores: { estrategia: "timestamp", camposData: ["atualizadoEm", "criadoEm"] },
+  produtos: { estrategia: "timestamp", camposData: ["atualizadoEm", "criadoEm"] },
+  usuarios: { estrategia: "timestamp", camposData: ["atualizadoEm", "criadoEm"] },
+  vendas: { estrategia: "timestamp", camposData: ["atualizadoEm", "criadoEm"] },
+  vendedores: { estrategia: "timestamp", camposData: ["atualizadoEm", "criadoEm"] },
+  eventos_adquirente: { estrategia: "insercao", camposData: ["criadoEm"] },
+  eventos_auth: { estrategia: "insercao", camposData: ["criadoEm"] },
+  eventos_caixa: { estrategia: "insercao", camposData: ["criadoEm"] },
+  eventos_campanha: { estrategia: "insercao", camposData: ["criadoEm"] },
+  eventos_cliente: { estrategia: "insercao", camposData: ["criadoEm"] },
+  eventos_colecao: { estrategia: "insercao", camposData: ["criadoEm"] },
+  eventos_configuracao: { estrategia: "insercao", camposData: ["criadoEm"] },
+  eventos_fornecedor: { estrategia: "insercao", camposData: ["criadoEm"] },
+  eventos_pdv_auth: { estrategia: "insercao", camposData: ["criadoEm"] },
+  eventos_produto: { estrategia: "insercao", camposData: ["criadoEm"] },
+  eventos_venda: { estrategia: "insercao", camposData: ["criadoEm"] },
+  eventos_vendedor: { estrategia: "insercao", camposData: ["criadoEm"] },
+  movimentacoes_estoque: { estrategia: "insercao", camposData: ["criadoEm"] },
+  movimentos_caixa: { estrategia: "insercao", camposData: ["criadoEm"] },
+  // Datas que EXISTEM em uploads_midia (melhoram a janela), mas reservar/descartar/limpar não as atualizam — por isso hash.
+  uploads_midia: { estrategia: "conteudo", camposData: ["criadoEm", "reservadoEm", "confirmadoEm", "removidoEm", "limpezaIniciadaEm"] },
+  sequencias: { estrategia: "conteudo", camposData: [] },
+};
+
 /** Sessões: nunca entram no backup. O backend recria as coleções e os índices (inclusive TTL) no boot; todos fazem login de novo. */
 export const COLECOES_EXCLUIDAS = ["refresh_tokens", "vendedor_refresh_tokens"] as const;
 
@@ -71,8 +117,19 @@ export const RETENCAO = {
 /** Prefixos de arquivo — a classe de um backup também é visível no nome, para nunca confundir um inválido com um válido. */
 export const PREFIXOS = { diario: "mariela_prod_", extraordinario: "mariela_extra_", invalido: "mariela_invalido_" } as const;
 
-/** Instância ISOLADA de restore: só esta porta, só loopback. */
-export const RESTORE = { host: "127.0.0.1", porta: 27118, padraoBanco: /^mariela_restore_\d{8}_\d{6}$/ } as const;
+/**
+ * Instância ISOLADA de restore: só esta porta, só loopback. Fase 60.4.3.4.21.2.2 (R21-2.1-11) — a IDENTIDADE da
+ * instância (não só a porta) é exigida antes de qualquer operação: `dbPath` = `<raiz>\data-27118` com o marcador,
+ * bind só `127.0.0.1`, replica set `rs-restore`, processo = o `mongod.exe` instalado em `<raiz>`.
+ */
+export const RESTORE = {
+  host: "127.0.0.1",
+  porta: 27118,
+  padraoBanco: /^mariela_restore_\d{8}_\d{6}$/,
+  replicaSet: "rs-restore",
+  subdiretorioDados: "data-27118",
+  marcador: ".mariela-restore-isolado",
+} as const;
 
 /**
  * Sequência → campo de código da entidade (para conferir que `sequencias.valor` ≥ maior código já emitido; senão a

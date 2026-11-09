@@ -22,9 +22,12 @@ function Invoke-Nativo {
   param(
     [Parameter(Mandatory = $true)][string]$Programa,
     [string[]]$Argumentos = @(),
-    [string]$Entrada = $null,
+    # SEM tipo [string] de propósito (R21-2.1-04): um parâmetro [string] converte $null em "" e a entrada AUSENTE
+    # ficaria indistinguível da entrada VAZIA. $null = stdin não redirecionado; "" = stdin redirecionado e vazio.
+    [AllowNull()]$Entrada = $null,
     [string]$DiretorioTrabalho = $null
   )
+  if ($null -ne $Entrada -and $Entrada -isnot [string]) { throw "Invoke-Nativo: -Entrada precisa ser texto ou nula." }
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $Programa
   $psi.Arguments = (@($Argumentos) | ForEach-Object { ConvertTo-ArgumentoProcesso $_ }) -join ' '
@@ -66,7 +69,8 @@ function Invoke-Nativo {
     $processo.StandardInput.Close()
   }
   $processo.WaitForExit()
-  return [pscustomobject]@{ Codigo = $processo.ExitCode; Saida = $tarefaSaida.Result; Erro = $tarefaErro.Result }
+  # StdinRedirecionado: a decisão efetivamente tomada (R21-2.1-04) — informativa, para diagnóstico e testes.
+  return [pscustomobject]@{ Codigo = $processo.ExitCode; Saida = $tarefaSaida.Result; Erro = $tarefaErro.Result; StdinRedirecionado = $psi.RedirectStandardInput }
 }
 
 function Get-CaminhoBun {
@@ -116,6 +120,52 @@ function Set-AclRestrita([string]$Caminho) {
   $heranca = if ($ehPasta) { '(OI)(CI)' } else { '' }
   $r = Invoke-Nativo -Programa 'icacls.exe' -Argumentos @($Caminho, '/inheritance:r', '/grant:r', "${eu}:${heranca}F", '/grant:r', "*S-1-5-18:${heranca}F")
   if ($r.Codigo -ne 0) { throw "icacls falhou ($($r.Codigo))." }
+}
+
+<#
+  R21-2.1-05 — texto SEGURO de uma exceção para log/stderr: tipo + mensagem sem URI, host, IP nem caminhos de
+  configuração, truncada. Nunca a pilha.
+#>
+function ConvertTo-MensagemSegura($Erro) {
+  $tipo = if ($Erro -is [System.Management.Automation.ErrorRecord]) { $Erro.Exception.GetType().Name } elseif ($Erro -is [Exception]) { $Erro.GetType().Name } else { "Erro" }
+  $texto = if ($Erro -is [System.Management.Automation.ErrorRecord]) { $Erro.Exception.Message } elseif ($Erro -is [Exception]) { $Erro.Message } else { "$Erro" }
+  $texto = $texto -replace 'mongodb(\+srv)?://\S+', '[uri-removida]'
+  $texto = $texto -replace '\b[a-z0-9-]+(\.[a-z0-9-]+)+\.(mongodb\.net|com|net|org|br|io)(:\d+)?\b', '[host-removido]'
+  $texto = $texto -replace '\b\d{1,3}(\.\d{1,3}){3}(:\d+)?\b', '[ip-removido]'
+  $texto = ($texto -replace '\s+', ' ').Trim()
+  if ($texto.Length -gt 200) { $texto = $texto.Substring(0, 200) + "…" }
+  return "${tipo}: $texto"
+}
+
+<#
+  R21-2.1-11 — identidade do PROCESSO que escuta na porta da instância isolada. Coleta (Get-EvidenciaPorta, só
+  leitura do sistema) separada da decisão (Test-EvidenciaInstancia, PURA — testável com fixtures).
+#>
+function Get-EvidenciaPorta([int]$Porta) {
+  $conexoes = @(Get-NetTCPConnection -LocalPort $Porta -State Listen -ErrorAction SilentlyContinue)
+  $processos = @($conexoes | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object {
+      $p = Get-Process -Id $_ -ErrorAction SilentlyContinue
+      [pscustomobject]@{ Pid = $_; Caminho = $(if ($p) { $p.Path } else { $null }) }
+    })
+  return [pscustomobject]@{
+    Enderecos = @($conexoes | Select-Object -ExpandProperty LocalAddress -Unique)
+    Processos = $processos
+  }
+}
+
+function Test-EvidenciaInstancia($Evidencia, [string]$MongodEsperado) {
+  $problemas = @()
+  $enderecos = @($Evidencia.Enderecos)
+  $processos = @($Evidencia.Processos)
+  if ($enderecos.Count -eq 0) { $problemas += "nenhum processo escuta na porta (instância isolada parada)" }
+  elseif (@($enderecos | Where-Object { $_ -ne "127.0.0.1" }).Count -gt 0) { $problemas += "a porta também escuta fora de 127.0.0.1 ($($enderecos -join ', '))" }
+  if ($processos.Count -gt 1) { $problemas += "mais de um processo na porta" }
+  elseif ($processos.Count -eq 1) {
+    $caminho = $processos[0].Caminho
+    if (-not $caminho) { $problemas += "processo da porta sem caminho identificável" }
+    elseif ([System.IO.Path]::GetFullPath($caminho) -ne [System.IO.Path]::GetFullPath($MongodEsperado)) { $problemas += "processo da porta não é o mongod da instância isolada" }
+  }
+  return [pscustomobject]@{ Ok = ($problemas.Count -eq 0); Detalhe = ($problemas -join "; ") }
 }
 
 <# Uma linha JSON por evento (UTF-8 sem BOM). Nunca recebe URI, senha ou documento. #>

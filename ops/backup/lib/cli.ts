@@ -15,6 +15,7 @@ import {
 } from "./janela.js";
 import { montarManifesto, validarArchiveParaRestore, validarBackup, validarRestaurado, verificarVersaoDestino, type Manifesto, type PreBackup } from "./manifesto.js";
 import { BANCO_ORIGEM, COLECOES_BACKUP, COLECOES_EXCLUIDAS, JANELA, MARGEM_RECONCILIACAO_MINUTOS, RESTORE } from "./politica.js";
+import { verificarInstanciaConectada } from "./instancia.js";
 import { aplicarRetencao, listarBackups, planejarRetencao } from "./retencao.js";
 import { iniciarRegistro, registrarCifrado } from "./segunda-copia.js";
 
@@ -264,18 +265,30 @@ function exigirBancoRestore(banco: string): void {
   if (banco === BANCO_ORIGEM || !RESTORE.padraoBanco.test(banco)) throw new UsoInvalidoErro(`banco de destino '${banco}' recusado (exigido: mariela_restore_yyyyMMdd_HHmmss; nunca ${BANCO_ORIGEM})`);
 }
 
+/** Fase 60.4.3.4.21.2.2 (R21-2.1-11) — recusa qualquer operação se a instância não for a isolada. */
+async function exigirInstanciaIsolada(c: MongoClient, raiz: string | undefined): Promise<void> {
+  const falhas = (await verificarInstanciaConectada(c.db("admin"), raiz)).filter((v) => !v.ok);
+  if (falhas.length) throw new UsoInvalidoErro(`instância em ${RESTORE.host}:${RESTORE.porta} NÃO é a isolada de restore: ${falhas.map((f) => f.id).join(", ")}`);
+}
+
 async function prepararRestore(o: Record<string, string>) {
   const banco = exigir(o, "banco");
   exigirBancoRestore(banco);
   const manifesto = lerJson<Manifesto>(exigir(o, "manifesto"));
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
+    // A identidade vem PRIMEIRO; com ela falhando, as demais verificações nem são executadas.
+    const identidade = await verificarInstanciaConectada(c.db("admin"), o["raiz"]);
+    if (identidade.some((v) => !v.ok)) return { ok: false, destinoExclusivo: false, versaoDestino: null, verificacoes: identidade };
     const versao = String((await c.db("admin").command({ buildInfo: 1 }))["version"] ?? "") || null;
     const bancos = (await c.db("admin").admin().listDatabases({ nameOnly: true })).databases.map((d) => d.name);
+    const destinoExclusivo = !bancos.includes(banco);
     const verificacoes = [
+      ...identidade,
       verificarVersaoDestino(manifesto.archive?.versaoServidor ?? null, versao),
-      { id: "restore.destino_inexistente", ok: !bancos.includes(banco), detalhe: bancos.includes(banco) ? `o banco ${banco} já existe — nada será sobrescrito` : "destino livre" },
+      { id: "restore.destino_inexistente", ok: destinoExclusivo, detalhe: destinoExclusivo ? "destino livre (criado por esta execução)" : `o banco ${banco} já existe — nada será sobrescrito nem removido` },
     ];
-    return { ok: verificacoes.every((v) => v.ok), versaoDestino: versao, verificacoes };
+    // `destinoExclusivo` é a PROVA usada pelo restore para poder remover o destino depois de uma falha.
+    return { ok: verificacoes.every((v) => v.ok), destinoExclusivo, versaoDestino: versao, verificacoes };
   });
 }
 
@@ -284,15 +297,28 @@ async function validarRestauradoCmd(o: Record<string, string>) {
   exigirBancoRestore(banco);
   const manifesto = lerJson<Manifesto>(exigir(o, "manifesto"));
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
+    await exigirInstanciaIsolada(c, o["raiz"]);
     const verificacoes = await validarRestaurado(c.db(banco), manifesto);
     return { ok: verificacoes.every((v) => v.ok), verificacoes };
   });
 }
 
+/**
+ * Remove SÓ o banco de destino de um restore (nome `mariela_restore_<carimbo>`, nunca `marielaDB`), SÓ na instância
+ * isolada, e confirma que ele não existe mais depois.
+ */
 async function derrubarRestore(o: Record<string, string>) {
   const banco = exigir(o, "banco");
   exigirBancoRestore(banco);
-  return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => ({ removido: await c.db(banco).dropDatabase() }));
+  return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
+    await exigirInstanciaIsolada(c, o["raiz"]);
+    const listar = async () => (await c.db("admin").admin().listDatabases({ nameOnly: true })).databases.map((d) => d.name);
+    const existia = (await listar()).includes(banco);
+    if (existia) await c.db(banco).dropDatabase();
+    const aindaExiste = (await listar()).includes(banco);
+    if (aindaExiste) throw new Error(`o banco ${banco} continua existindo depois da remoção`);
+    return { existia, removido: existia, aindaExiste };
+  });
 }
 
 async function localEstado(o: Record<string, string>) {

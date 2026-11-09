@@ -90,11 +90,27 @@ ao fim de cada teste e mantenha o BitLocker do disco ativo.
    ```
    O banco **tem** de estar no caminho e ser `marielaDB`.
 3. **ACL restrita** (conta Windows atual + SYSTEM, sem herança) no arquivo de configuração **e** na pasta de backup — o
-   script se recusa a rodar (BLOQUEADO) sem isso:
+   script se recusa a rodar (BLOQUEADO) sem isso. **Revise os comandos antes de executar** (eles removem a herança;
+   um erro de digitação pode deixar a conta sem acesso). Forma recomendada — a mesma função usada e testada pelos
+   scripts (remove a herança e concede à conta atual e a SYSTEM na MESMA chamada do `icacls`, com o nome da conta
+obtido do Windows — sem expansão de variável de ambiente):
    ```powershell
-   icacls "C:\caminho\mongodump-config.yaml" /inheritance:r /grant:r "$env:USERDOMAIN\$env:USERNAME:F" /grant:r "*S-1-5-18:F"
-   icacls "M:\Backup-sistema-mariela" /inheritance:r /grant:r "$env:USERDOMAIN\$env:USERNAME:(OI)(CI)F" /grant:r "*S-1-5-18:(OI)(CI)F"
+   . "<repositório>\ops\backup\comum.ps1"
+   Set-AclRestrita "C:\caminho\mongodump-config.yaml"
+   Set-AclRestrita "M:\Backup-sistema-mariela"
+   Test-AclRestrita "M:\Backup-sistema-mariela"      # Ok = True
    ```
+   Equivalente com `icacls` — as variáveis PRECISAM de chaves (`${env:USERNAME}`): sem elas o PowerShell lê
+   `$env:USERNAME:F` como OUTRA variável (vazia) e o comando concede acesso a `DOMINIO\` em vez da conta (defeito
+   R21-2.1-02, corrigido aqui):
+   ```powershell
+   icacls "C:\caminho\mongodump-config.yaml" /inheritance:r /grant:r "${env:USERDOMAIN}\${env:USERNAME}:F" /grant:r "*S-1-5-18:F"
+   icacls "M:\Backup-sistema-mariela" /inheritance:r /grant:r "${env:USERDOMAIN}\${env:USERNAME}:(OI)(CI)F" /grant:r "*S-1-5-18:(OI)(CI)F"
+   icacls "M:\Backup-sistema-mariela"                 # conferir: só a conta e SYSTEM, sem "(I)" (herdado)
+   ```
+   **Recuperar o acesso** (se a conta ficou de fora): o dono do objeto sempre pode reescrever a ACL —
+   `icacls "<caminho>" /grant:r "${env:USERDOMAIN}\${env:USERNAME}:F"` (pasta: `:(OI)(CI)F`); se a conta não for a
+   dona, um administrador assume a posse com `takeown /F "<caminho>"` e concede de novo.
    A pasta `M:\Backup-sistema-mariela` hoje **herda** "Usuários autenticados: Modificar" e "Usuários: Leitura" — precisa
    ser restringida antes do primeiro backup real. **BitLocker** em `M:` precisa ser confirmado (exige administrador).
 
@@ -109,8 +125,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\backup-mongo.
 Fluxo (falha FECHADA em cada etapa): ACL e trava → **pré-backup só de leitura** (banco, coleções, devido, janela,
 assinaturas, índices, referências, sequências) → `mongodump --config --db=marielaDB --readPreference=primary --gzip
 --archive=<tmp> --excludeCollection=…` → **pós-backup** (assinaturas de novo, leitura estrutural do archive, 27
-namespaces, contagens = origem, índices = origem, versão, SHA-256, manifesto) → nome definitivo **sem sobrescrever** →
+namespaces, contagens = origem, índices = origem, versão, SHA-256, manifesto) → nome definitivo **sem sobrescrever**,
+na ordem archive → `.sha256` → **manifesto por último** (o manifesto é o "commit": sem ele a cópia nunca é válida) →
 retenção. A saída do `mongodump` **não** é registrada (mensagens de conexão podem conter host).
+
+Falhas (Fase 21.2.2, R21-2.1-05): toda execução registra a **etapa** em que terminou. Uma exceção inesperada vira
+`FALHA` com a etapa e a mensagem **sanitizada** (sem URI, host, IP; truncada) — nunca sucesso. Se o próprio log não
+puder ser gravado, a mensagem vai para o stderr e o código de saída nunca é 0. Temporário não promovido é apagado.
 
 | Resultado | Código | Significado |
 | --- | --- | --- |
@@ -127,8 +148,8 @@ SHA-256, tamanho, retenção). Retenção: `<BackupDir>\logs\retencao_<carimbo>.
 ### Manifesto (`<base>.manifest.json`)
 
 Execução (`execucaoId`, tipo, início/fim com fuso, `dataLocal`), versões (mongodump, servidor), banco, política (27 +
-2), verificações da janela, **assinaturas antes e depois** (por coleção: contagem, maior `atualizadoEm`/`criadoEm`,
-SHA-256 do conteúdo para coleções sem timestamp — `sequencias`, `configuracoes`), índices normalizados por coleção,
+2), verificações da janela, **assinaturas antes e depois** (por coleção, conforme a estratégia — ver "Assinatura por
+coleção"), índices normalizados por coleção,
 referências (número de ids órfãos por regra), sequências (`valor` × maior código emitido), dados do archive (SHA-256,
 tamanho, documentos por coleção), validações e avisos. **Limite declarado no próprio manifesto:** a consistência é
 OPERACIONAL — o `mongodump` de um banco lê uma coleção por vez (não é snapshot transacional); a coerência depende da
@@ -137,13 +158,34 @@ escrita feita e desfeita durante o dump não seria detectada).
 
 Limite técnico: a leitura estrutural descompacta o archive em memória até **1 GiB** (acima disso, falha fechada).
 
+### Assinatura por coleção (Fase 21.2.2, R21-2.1-01)
+
+A estratégia de cada uma das 27 coleções é **declarada** em `ASSINATURA_POR_COLECAO` (`politica.ts`), conferida contra
+os schemas por teste unitário — nunca deduzida só pela presença de um timestamp:
+
+| Estratégia | Coleções | Assinatura |
+| --- | --- | --- |
+| `timestamp` | adquirentes, caixas, campanhas, clientes, colecoes, configuracoes, fornecedores, produtos, usuarios, vendas, vendedores (schema com `atualizadoEm`) | contagem + maior `atualizadoEm`/`criadoEm` |
+| `insercao` | os 12 `eventos_*`, movimentacoes_estoque, movimentos_caixa (só `criadoEm`, sem atualização no código) | contagem + maior `criadoEm` |
+| `conteudo` | **uploads_midia** (reservar/descartar/limpar alteram `estado`/`tokenReserva` sem tocar em data), sequencias (sem data) | contagem + maior data disponível + **SHA-256 do conteúdo inteiro** |
+
+O hash é determinístico (ordem por `_id`, EJSON canônico), calculado **em fluxo** (memória constante) e limitado a
+**5.000 documentos** por coleção: acima disso, ou se a contagem mudar durante a leitura, a assinatura é **não
+confiável** e o backup FALHA (nunca "estável" presumido). Custo: uma leitura completa de cada coleção `conteudo` por
+assinatura (duas por backup). Quando `uploads_midia` se aproximar do limite, a política precisa ser revista.
+**Limite da janela:** atualizações SEM data (ex.: descartar um upload pendente) não podem ser datadas — a verificação
+`janela.sem_escrita` declara isso no detalhe; elas são detectadas pela comparação **antes/depois** do dump (hash), que
+invalida o backup se houver mudança durante a coleta. Escritores que gravam direto no driver sem atualizar
+`atualizadoEm` numa coleção `timestamp` continuam fora do alcance da assinatura (nenhum conhecido no código).
+
 ## Janela sem escrita e retomada
 
 - **Devido:** a partir do último 23:45. Já existe diário VÁLIDO depois dele → `JA_REALIZADO`.
 - **Computador ligado depois das 23:45** (ou execução perdida): continua devido, mas **só coleta se a janela passar** —
   nunca "imediatamente".
-- **Verificações (todas leituras; qualquer falha → ADIADO):** caixas abertos = 0; maior timestamp de **todas** as 27
-  coleções ≥ 15 min atrás (timestamp no futuro também adia); nenhuma linha de reconciliação `pendente`/
+- **Verificações (todas leituras; qualquer falha → ADIADO; erro de leitura ou assinatura não confiável → FALHA):**
+  caixas abertos = 0; maior data **registrada** das 27 coleções ≥ 15 min atrás (data no futuro também adia; atualizações
+  sem data — estratégia `conteudo` — são cobertas pela comparação antes/depois, ver "Assinatura por coleção"); nenhuma linha de reconciliação `pendente`/
   `falha_recuperavel` com retry vencido ou em até 60 min (o worker poderia escrever durante o dump); vendas
   `em_pagamento` e linhas `requer_intervencao` são registradas.
 - **O backup não desliga o worker, não para a API e não bloqueia nada.** Scripts administrativos (`seed-admin`,
@@ -209,14 +251,27 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\mongod-isolad
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\restore-test.ps1 -ArquivoBackup "<base>.archive.gz" [-RemoverAoFinal]
 ```
 
+0. **Identidade da instância (Fase 21.2.2, R21-2.1-11), antes de qualquer conexão de escrita:** o único processo que
+   escuta em 27118 é o `mongod.exe` de `<Raiz>\mongodb-8.0.37\bin`, e só em `127.0.0.1`; já conectado, a própria
+   instância informa `dbPath` = `<Raiz>\data-27118` com o marcador `.mariela-restore-isolado`, bind só `127.0.0.1` e
+   replica set `rs-restore`. Qualquer divergência (outro processo, outro `dbPath`, marcador ausente, bind aberto,
+   replica set diferente) ⇒ nada é feito; nenhuma outra porta é tentada. A mesma conferência é repetida antes de
+   validar e antes de remover qualquer banco.
 1. **Antes de qualquer escrita:** SHA-256 = manifesto = `.sha256`; manifesto `VALIDO_LOCAL`; archive com exatamente os 27
-   namespaces de `marielaDB` e as contagens do manifesto; destino **só** `127.0.0.1:27118`, mesma série de versão da
-   origem (8.0; correção diferente é registrada); banco `mariela_restore_yyyyMMdd_HHmmss` **inexistente** (nunca
-   `marielaDB`, nunca sobrescreve).
+   namespaces de `marielaDB` e as contagens do manifesto; mesma série de versão da origem (8.0; correção diferente é
+   registrada); banco `mariela_restore_yyyyMMdd_HHmmss` **inexistente** (nunca `marielaDB`, nunca sobrescreve) — é essa
+   inexistência que prova que o destino pertence à execução.
 2. `mongorestore --nsInclude marielaDB.<cada uma das 27> --nsFrom "marielaDB.*" --nsTo "<destino>.*" --stopOnError`
    (**sem `--drop`**). Aviso `Cross-version` ou documento com falha → FALHOU.
 3. **Depois:** coleções exatas, contagens, índices, referências (órfãos iguais aos da origem) e sequências idênticos ao
-   manifesto. Relatório: `%USERPROFILE%\mariela-restore-isolado\relatorios\restore_<destino>.json` (com duração).
+   manifesto. Relatório: `%USERPROFILE%\mariela-restore-isolado\relatorios\restore_<destino>.json` (com duração; a
+   pasta é criada no primeiro restore).
+
+**Falha depois de iniciar a escrita (Fase 21.2.2, R21-2.1-07):** `mongorestore` com falha, validação pós-restore com
+falha ou exceção ⇒ o destino é **inválido**. Ele é removido automaticamente só se a exclusividade foi provada no passo 1
+(e a remoção é confirmada: o banco não existe mais); senão — ou se a remoção falhar — o resultado é
+`FALHOU_DESTINO_PARCIAL` com `exigeIntervencao: true` no relatório (remover à mão, conferindo o nome). Falha **antes**
+da escrita não remove nada. Um restore parcial nunca é `PASSOU`.
 
 O smoke test do backend sobre uma cópia restaurada (e a recriação das 2 coleções de token) é de fase posterior, com
 autorização própria. **Recuperação real** (incidente): restaurar num banco/cluster NOVO, validar como acima, trocar a

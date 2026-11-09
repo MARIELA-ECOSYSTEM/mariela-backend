@@ -4,7 +4,7 @@ import { BSON, ObjectId, type Db, type Document } from "mongodb";
 
 const { EJSON } = BSON;
 import { normalizarIndice, ordenarIndices, type IndiceNormalizado, type Verificacao } from "./archive.js";
-import { COLECOES_BACKUP, COLECOES_EXCLUIDAS, SEQUENCIAS_E_CODIGOS } from "./politica.js";
+import { ASSINATURA_POR_COLECAO, COLECOES_BACKUP, COLECOES_EXCLUIDAS, SEQUENCIAS_E_CODIGOS } from "./politica.js";
 
 /**
  * Fase 60.4.3.4.21.2 — elegibilidade da janela sem escrita e "assinaturas" do banco de origem. TUDO aqui é LEITURA
@@ -37,10 +37,12 @@ export function avaliarDevido(agora: Date, ultimoDiarioValidoEm: Date | null, ho
 }
 
 export interface AssinaturaColecao {
+  /** Como a escrita é detectada nesta coleção (`ASSINATURA_POR_COLECAO`). */
+  estrategia: "timestamp" | "insercao" | "conteudo";
   contagem: number;
-  /** Maior `atualizadoEm`/`criadoEm` (ISO) — `null` se a coleção não tem esses campos. */
+  /** Maior data entre os `camposData` da coleção (ISO) — `null` se nenhum documento os tem. */
   maiorTimestamp: string | null;
-  /** SHA-256 do conteúdo, só para coleções SEM timestamp (pequenas: `sequencias`, `configuracoes`). */
+  /** SHA-256 do conteúdo inteiro: sempre na estratégia `conteudo`; nas demais, só se houver documentos sem data. */
   hashConteudo: string | null;
 }
 export type Assinatura = Record<string, AssinaturaColecao>;
@@ -55,12 +57,16 @@ export function verificarPeriodoSemEscrita(assinatura: Assinatura, agora: Date, 
     .map((a) => (a.maiorTimestamp ? Date.parse(a.maiorTimestamp) : 0))
     .reduce((x, y) => Math.max(x, y), 0);
   const minutos = maior ? Math.floor((agora.getTime() - maior) / 60_000) : null;
+  // Atualizações SEM data (estratégia `conteudo`) não podem ser datadas pela janela: são cobertas pela comparação
+  // antes/depois do dump (hash). A janela declara isso em vez de afirmar ausência de escrita nessas coleções.
+  const semData = Object.entries(assinatura).filter(([, a]) => a.estrategia === "conteudo").map(([n]) => n);
+  const ressalva = semData.length ? `; atualizações sem data em [${semData.join(", ")}] só são detectadas pela comparação antes/depois (hash)` : "";
   return {
     id: "janela.sem_escrita",
     ok: recentes.length === 0,
     detalhe: recentes.length
       ? `escrita nos últimos ${quietMinutos} min: ${recentes.join(", ")}`
-      : `última escrita registrada há ${minutos === null ? "∞ (sem timestamps)" : `${minutos} min`} (mínimo ${quietMinutos})`,
+      : `última escrita DATADA há ${minutos === null ? "∞ (sem datas)" : `${minutos} min`} (mínimo ${quietMinutos})${ressalva}`,
   };
 }
 
@@ -75,31 +81,73 @@ export function compararAssinaturas(antes: Assinatura, depois: Assinatura): { ig
 // Leituras (somente leitura)
 // ---------------------------------------------------------------------------------------------------------------
 
-/** Limite para hash de conteúdo (coleções sem timestamp). Acima disso não há assinatura confiável → falha fechada. */
+/**
+ * Limite de documentos para o hash de conteúdo (custo: 1 leitura completa da coleção por assinatura, 2 por backup;
+ * memória constante — o hash é calculado em fluxo). Acima dele NÃO há assinatura confiável → falha FECHADA (o backup
+ * não é feito; nunca um "estável" presumido). Rever a política se `uploads_midia` se aproximar dele.
+ */
 export const LIMITE_DOCS_HASH = 5000;
 
 export class AssinaturaNaoConfiavelErro extends Error {
-  constructor(colecao: string) {
-    super(`coleção '${colecao}' sem timestamps e grande demais para hash de conteúdo`);
+  constructor(colecao: string, motivo: string) {
+    super(`assinatura da coleção '${colecao}' não é confiável: ${motivo}`);
     this.name = "AssinaturaNaoConfiavelErro";
   }
 }
 
-export async function lerAssinatura(db: Db, colecoes: readonly string[]): Promise<Assinatura> {
+/** Subconjunto do `Db` do driver que a assinatura usa (só leituras) — permite testar sem MongoDB. */
+export interface FonteAssinatura {
+  collection(nome: string): {
+    countDocuments(filtro: Document): Promise<number>;
+    aggregate(pipeline: Document[]): { toArray(): Promise<Document[]> };
+    find(filtro: Document): { sort(ordem: Document): AsyncIterable<Document> };
+  };
+}
+
+type RegraAssinatura = (typeof ASSINATURA_POR_COLECAO)[keyof typeof ASSINATURA_POR_COLECAO];
+/** Coleção fora da política (não deveria chegar aqui — o pré-backup a bloqueia): tratada pelo modo mais estrito. */
+const REGRA_DESCONHECIDA: RegraAssinatura = { estrategia: "conteudo", camposData: ["atualizadoEm", "criadoEm"] };
+
+async function hashDoConteudo(col: ReturnType<FonteAssinatura["collection"]>, nome: string, contagem: number, limite: number): Promise<string> {
+  if (contagem > limite) throw new AssinaturaNaoConfiavelErro(nome, `${contagem} documentos excedem o limite de ${limite} para hash de conteúdo`);
+  const hash = createHash("sha256");
+  let lidos = 0;
+  // Ordem estável por _id e EJSON canônico (tipos preservados): mesmo conteúdo ⇒ mesmo hash.
+  for await (const doc of col.find({}).sort({ _id: 1 })) {
+    lidos += 1;
+    if (lidos > limite) throw new AssinaturaNaoConfiavelErro(nome, `mais de ${limite} documentos durante a leitura`);
+    hash.update(EJSON.stringify(doc, { relaxed: false }));
+    hash.update("\n");
+  }
+  // Contagem diferente do que foi lido ⇒ alguém escreveu durante a medição: não há estabilidade a afirmar.
+  if (lidos !== contagem) throw new AssinaturaNaoConfiavelErro(nome, `contagem mudou durante a leitura (${contagem} → ${lidos})`);
+  return hash.digest("hex").toUpperCase();
+}
+
+/**
+ * Fase 60.4.3.4.21.2.2 (R21-2.1-01) — assinatura POR ESTRATÉGIA (`ASSINATURA_POR_COLECAO`): `conteudo` sempre tem hash
+ * (detecta atualização de qualquer campo, remoção lógica e física); `timestamp`/`insercao` usam contagem + maior data,
+ * e caem para hash se houver documentos sem nenhuma data. Qualquer falha de leitura PROPAGA (janela não elegível).
+ */
+export async function lerAssinatura(db: FonteAssinatura, colecoes: readonly string[], limiteDocsHash: number = LIMITE_DOCS_HASH): Promise<Assinatura> {
   const assinatura: Assinatura = {};
   for (const nome of colecoes) {
+    const regra = (ASSINATURA_POR_COLECAO as Record<string, RegraAssinatura>)[nome] ?? REGRA_DESCONHECIDA;
     const col = db.collection(nome);
     const contagem = await col.countDocuments({});
-    const [maximos] = await col.aggregate<{ a: Date | null; c: Date | null }>([{ $group: { _id: null, a: { $max: "$atualizadoEm" }, c: { $max: "$criadoEm" } } }]).toArray();
-    const datas = [maximos?.a, maximos?.c].filter((d): d is Date => d instanceof Date);
-    const maiorTimestamp = datas.length ? new Date(Math.max(...datas.map((d) => d.getTime()))).toISOString() : null;
-    let hashConteudo: string | null = null;
-    if (contagem > 0 && maiorTimestamp === null) {
-      if (contagem > LIMITE_DOCS_HASH) throw new AssinaturaNaoConfiavelErro(nome);
-      const docs = await col.find({}).sort({ _id: 1 }).toArray();
-      hashConteudo = createHash("sha256").update(EJSON.stringify(docs, { relaxed: false })).digest("hex").toUpperCase();
+    let maiorTimestamp: string | null = null;
+    if (regra.camposData.length > 0) {
+      const grupo: Document = { _id: null };
+      regra.camposData.forEach((campo, i) => {
+        grupo[`d${i}`] = { $max: `$${campo}` };
+      });
+      const [maximos] = await col.aggregate([{ $group: grupo }]).toArray();
+      const datas = regra.camposData.map((_, i) => maximos?.[`d${i}`]).filter((d): d is Date => d instanceof Date);
+      maiorTimestamp = datas.length ? new Date(Math.max(...datas.map((d) => d.getTime()))).toISOString() : null;
     }
-    assinatura[nome] = { contagem, maiorTimestamp, hashConteudo };
+    const precisaHash = regra.estrategia === "conteudo" || (contagem > 0 && maiorTimestamp === null);
+    const hashConteudo = precisaHash ? await hashDoConteudo(col, nome, contagem, limiteDocsHash) : null;
+    assinatura[nome] = { estrategia: regra.estrategia, contagem, maiorTimestamp, hashConteudo };
   }
   return assinatura;
 }
