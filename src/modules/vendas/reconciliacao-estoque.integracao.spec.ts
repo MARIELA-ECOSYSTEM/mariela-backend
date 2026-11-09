@@ -100,6 +100,18 @@ async function criarInstancia(config: ReconciliacaoEstoqueConfig = CONFIG_TESTE)
 }
 
 /**
+ * Fase 60.4.3.4.18.6A — fecha um caixa com o saldo ESPERADO real, sem diferença artificial.
+ * `CaixasService.fechar` recusa diferença ≥ tolerância sem justificativa, e o antigo `valorInformado: 0` era sempre
+ * recusado (esperado 1000), deixando o caixa aberto e derrubando todo `caixas.abrir` seguinte. O valor vem de
+ * `obterDetalhe(id).resumo.saldoEsperado`: a MESMA função (`calcularResumo`) sobre as MESMAS movimentações
+ * (`listarTodosPorCaixa`) que o próprio `fechar` usa para conferir. Nenhum erro é engolido.
+ */
+async function fecharCaixa(inst: Instancia, caixaId: string): Promise<void> {
+  const detalhe = await inst.caixas.obterDetalhe(caixaId);
+  await inst.caixas.fechar(caixaId, { valorInformado: detalhe.resumo.saldoEsperado }, null);
+}
+
+/**
  * Fase 60.4.3.4.18.3 — encerra um contexto SÓ se ele chegou a existir. Usado no `afterAll`: se o `beforeAll` falhar,
  * a falha original é a única reportada (sem uma segunda falha por acesso a `undefined`, como a falha 2 do CI).
  */
@@ -171,10 +183,21 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
     while (extras.length) await extras.pop()?.moduleRef.close();
     if (!principal) return;
     // Nenhum teste pode deixar caixa aberto (só um caixa aberto por vez, sistema afora).
-    const aberto = await p().caixas.obterAtual();
-    if (aberto) await p().caixas.fechar(aberto.id, { valorInformado: 0 }, null);
+    // Fase 60.4.3.4.18.6A — fecha com o valor ESPERADO real (`fecharCaixa`). Se o fechamento falhar, a falha é
+    // PROPAGADA (o Bun a reporta neste teste) com a indicação explícita de que o caixa ficou aberto — nunca ignorada.
+    const aberto = await principal.caixas.obterAtual();
+    if (aberto) {
+      try {
+        await fecharCaixa(principal, aberto.id);
+      } catch (erro) {
+        throw new Error(
+          `[LIMPEZA] não foi possível fechar o caixa ${aberto.id}; ele PERMANECEU ABERTO e os testes seguintes que abrem caixa vão falhar. Causa: ${erro instanceof Error ? erro.message : String(erro)}`,
+          { cause: erro },
+        );
+      }
+    }
     // Isolamento: o worker varre TODAS as vendas; pendências deixadas por um teste não podem entrar no ciclo do próximo.
-    await p().conexao.collection("vendas").deleteMany({});
+    await principal.conexao.collection("vendas").deleteMany({});
   });
 
   afterAll(async () => {
@@ -301,7 +324,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
     await quebrarProduto(inst.conexao, produtoId);
     const chave = `reconciliacao-${Date.now()}-${contador}`;
     const cancelada = await inst.service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Teste reconciliação", idempotencyKey: chave }, null);
-    await inst.caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+    await fecharCaixa(inst, cenario.caixa.id);
     return { ...cenario, produtoId, chave, cancelada };
   }
 
@@ -346,7 +369,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
     it("cancelamento bem-sucedido grava `concluida`, `restauradoEm`, 1 tentativa e responde `concluida`", async () => {
       const cenario = await prepararVenda(p());
       const cancelada = await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Sucesso", idempotencyKey: `ok-${Date.now()}` }, null);
-      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      await fecharCaixa(p(), cenario.caixa.id);
 
       expect(resumoSerializado(cancelada).status).toBe("concluida");
       const linha = await primeiraLinha(p().conexao, cenario.venda.id);
@@ -517,7 +540,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
         }),
       );
       const cancelada = await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Ledger", idempotencyKey: `ledger-${Date.now()}` }, null);
-      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      await fecharCaixa(p(), cenario.caixa.id);
 
       expect(resumoSerializado(cancelada).status).toBe("pendente");
       expect(await saldo(p(), produtoId)).toBe(3); // a devolução da transação abortada não ficou
@@ -538,7 +561,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
         }),
       );
       await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Marcar", idempotencyKey: `marcar-${Date.now()}` }, null);
-      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      await fecharCaixa(p(), cenario.caixa.id);
 
       expect(await saldo(p(), produtoId)).toBe(3);
       expect(await entradasNoLedger(p().conexao, cenario.venda.id)).toBe(0);
@@ -559,7 +582,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
         }),
       );
       const cancelada = await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Transitório", idempotencyKey: `transitorio-${Date.now()}` }, null);
-      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      await fecharCaixa(p(), cenario.caixa.id);
 
       expect(resumoSerializado(cancelada).status).toBe("concluida");
       expect(await saldo(p(), produtoId)).toBe(5); // nunca 7: a 1ª tentativa (abortada) não deixou devolução
@@ -610,7 +633,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
       const produtoId = cenario.produtos[0]!.produtoId;
       const chave = `legado-${formato}-${Date.now()}`;
       await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Legado", idempotencyKey: chave }, null);
-      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      await fecharCaixa(p(), cenario.caixa.id);
       const camposNovos = { estadoRestauracao: "", tentativas: "", ultimaTentativaEm: "", proximaTentativaEm: "", restauradoEm: "", ultimaFalha: "" };
       const unset = Object.fromEntries(Object.keys(camposNovos).map((campo) => [`cancelamentos.$[].itens.$[].${campo}`, ""]));
       const filtro = { _id: new Types.ObjectId(cenario.venda.id) };
@@ -654,7 +677,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
         const repetida = await p().service.cancelar(vendaId, { tipo: "integral", motivo: "Repetição", idempotencyKey: chave }, null);
         expect(resumoSerializado(repetida).status).toBe("indeterminado");
       } finally {
-        await p().caixas.fechar(caixa.id, { valorInformado: 0 }, null);
+        await fecharCaixa(p(), caixa.id);
       }
       // 3. Reconciliação solicitada pelo operador.
       const reconciliada = await p().service.reconciliarRestauracaoEstoque(vendaId, null);
@@ -714,7 +737,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
       const cenario = await prepararVenda(p(), [2, 1]);
       const [produtoA, produtoB] = cenario.produtos;
       await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Parcial", idempotencyKey: `parcial-${Date.now()}` }, null);
-      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      await fecharCaixa(p(), cenario.caixa.id);
       // Desfaz SÓ a linha B (como se tivesse falhado).
       await p().conexao.collection("produtos").updateOne({ _id: new Types.ObjectId(produtoB!.produtoId) }, { $inc: { "variantes.0.tamanhos.0.quantidade": -1 } });
       await p().conexao.collection("movimentacoes_estoque").deleteMany({ vendaId: cenario.venda.id, produtoId: new Types.ObjectId(produtoB!.produtoId) });
@@ -848,7 +871,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
 
       const caixa = await p().caixas.abrir({ valorInicial: 1000, observacao: "" }, null); // replay exige caixa aberto
       const repetida = await p().service.cancelar(venda.id, { tipo: "integral", motivo: "Repetição", idempotencyKey: chave }, null);
-      await p().caixas.fechar(caixa.id, { valorInformado: 0 }, null);
+      await fecharCaixa(p(), caixa.id);
 
       expect(resumoSerializado(repetida).status).toBe("concluida");
       expect(await saldo(p(), produtoId)).toBe(2);
@@ -868,7 +891,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
           "Esta venda já está cancelada.",
         );
       } finally {
-        await p().caixas.fechar(caixa.id, { valorInformado: 0 }, null);
+        await fecharCaixa(p(), caixa.id);
       }
       expect(await vendaBruta(p().conexao, venda.id)).toEqual(antes);
       expect(await saldo(p(), produtoId)).toBe(-100);
