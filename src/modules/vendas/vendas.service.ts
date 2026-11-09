@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from "@nestjs/common";
 import { InjectConnection, InjectModel } from "@nestjs/mongoose";
 import { Types, type ClientSession, type Connection, type Model } from "mongoose";
 import { executarEmTransacao } from "../../database/transacao.util.js";
+import { emitirSeguro } from "./reconciliacao-estoque.observabilidade.js";
 import { MovimentacaoEstoque, type MovimentacaoEstoqueDocument } from "../estoque/schemas/movimentacao-estoque.schema.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
@@ -67,21 +68,75 @@ interface OpcoesRestauracao {
   limiteLinhas?: number;
 }
 
-type DesfechoRestauracaoLinha = "concluida" | "ja_concluida" | "adiada" | "indeterminada" | "falha";
+/**
+ * Fase 60.4.3.4.19.5 — `falha` foi SEPARADO em três desfechos só para contagem (observabilidade); a decisão do estado
+ * continua sendo de `registrarFalhaDeRestauracao`, exatamente como antes:
+ *   - `falha_recuperavel` / `requer_intervencao`: falha registrada (CAS aplicado) com esse estado;
+ *   - `falha_nao_registrada`: o CAS do registro não casou (outra execução alterou a linha) ou a gravação falhou.
+ */
+type DesfechoRestauracaoLinha =
+  | "concluida"
+  | "ja_concluida"
+  | "adiada"
+  | "indeterminada"
+  | "falha_recuperavel"
+  | "requer_intervencao"
+  | "falha_nao_registrada";
 
 export interface ResultadoRestauracaoEstoque {
   tentadas: number;
   concluidas: number;
   jaConcluidas: number;
+  /** Soma de todos os desfechos de falha (`falhasRecuperaveis + requeremIntervencao + falhasNaoRegistradas`). */
   falhas: number;
+  /** Total: pré-checagem + releitura transacional (ver `adiadasNaTransacao`). */
   adiadas: number;
   /** Fase 60.4.3.4.18.3 — linhas históricas indeterminadas encontradas e DEIXADAS intactas (nenhum caminho as devolve). */
   indeterminadas: number;
 }
 
-export interface ResultadoCicloReconciliacao extends ResultadoRestauracaoEstoque {
+/**
+ * Fase 60.4.3.4.19.5 — detalhamento SÓ para observabilidade (contadores do worker). Não é gravado em lugar nenhum:
+ * o evento de auditoria da reconciliação manual continua recebendo apenas `ResultadoRestauracaoEstoque`.
+ */
+export interface DetalheRestauracaoEstoque extends ResultadoRestauracaoEstoque {
+  falhasRecuperaveis: number;
+  requeremIntervencao: number;
+  falhasNaoRegistradas: number;
+  /** Subconjunto de `adiadas`: linhas tentadas que a releitura transacional adiou. */
+  adiadasNaTransacao: number;
+  /** Subconjunto de `indeterminadas`: linhas tentadas que a releitura transacional encontrou indeterminadas. */
+  indeterminadasNaTransacao: number;
+}
+
+export interface ResultadoCicloReconciliacao extends DetalheRestauracaoEstoque {
+  /** Vendas efetivamente percorridas no ciclo. */
   vendas: number;
+  /** Fase 60.4.3.4.19.5 — vendas devolvidas pela consulta inicial. */
+  vendasConsultadas: number;
   vendasComErro: number;
+}
+
+function detalheVazio(): DetalheRestauracaoEstoque {
+  return {
+    tentadas: 0,
+    concluidas: 0,
+    jaConcluidas: 0,
+    falhas: 0,
+    adiadas: 0,
+    indeterminadas: 0,
+    falhasRecuperaveis: 0,
+    requeremIntervencao: 0,
+    falhasNaoRegistradas: 0,
+    adiadasNaTransacao: 0,
+    indeterminadasNaTransacao: 0,
+  };
+}
+
+/** Fase 60.4.3.4.19.5 — só os campos históricos: o payload do evento de auditoria (`eventos_venda`) não muda. */
+function resumoDeRestauracao(detalhe: DetalheRestauracaoEstoque): ResultadoRestauracaoEstoque {
+  const { tentadas, concluidas, jaConcluidas, falhas, adiadas, indeterminadas } = detalhe;
+  return { tentadas, concluidas, jaConcluidas, falhas, adiadas, indeterminadas };
 }
 
 export interface PendenciaRestauracaoEstoque {
@@ -1296,7 +1351,7 @@ export class VendasService {
    * Fase 60.4.3.4.18.3 — REMOVIDA a antiga exceção "produto/variante excluído (404) = concluído sem devolver": toda
    * referência ausente agora vai para `requer_intervencao` com código específico (`resolverDestinoDaDevolucao`).
    */
-  private async restaurarEstoquePendente(vendaId: string, opcoes: OpcoesRestauracao): Promise<ResultadoRestauracaoEstoque> {
+  private async restaurarEstoquePendente(vendaId: string, opcoes: OpcoesRestauracao): Promise<DetalheRestauracaoEstoque> {
     // Fase 60.4.3.4.18 — passou a: (i) receber o id (sempre relê a venda), (ii) registrar PERSISTENTEMENTE cada falha
     // na própria linha (estado, tentativas, agenda, falha segura) para o `ReconciliacaoEstoqueWorker` retomá-la mesmo
     // após um restart, (iii) no modo "automatico", respeitar backoff e `requer_intervencao`, e (iv) devolver um
@@ -1317,7 +1372,7 @@ export class VendasService {
     // são tentadas, em TODOS os modos (worker, cancelamento, repetição com a mesma chave, rota ADMIN). Linhas
     // `indeterminado` (ex.: `restaurado:false` gravado antes de `78194a7`, quando ele não provava pendência) são
     // contadas e deixadas intactas: sem estoque, sem ledger, sem marcação, sem gravação de estado.
-    const resultado: ResultadoRestauracaoEstoque = { tentadas: 0, concluidas: 0, jaConcluidas: 0, falhas: 0, adiadas: 0, indeterminadas: 0 };
+    const resultado = detalheVazio();
     const atual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
     for (const evento of atual.cancelamentos) {
       const eventoId = String(evento._id);
@@ -1335,11 +1390,21 @@ export class VendasService {
         if (opcoes.limiteLinhas !== undefined && resultado.tentadas >= opcoes.limiteLinhas) return resultado;
         resultado.tentadas += 1;
         const desfecho = await this.restaurarLinha(atual.id, atual.codigo, eventoId, devolvido, opcoes.modo);
+        // Fase 60.4.3.4.19.5 — exatamente UM desfecho por linha tentada (contagem; nenhuma decisão muda aqui).
         if (desfecho === "concluida") resultado.concluidas += 1;
         else if (desfecho === "ja_concluida") resultado.jaConcluidas += 1;
-        else if (desfecho === "adiada") resultado.adiadas += 1;
-        else if (desfecho === "indeterminada") resultado.indeterminadas += 1;
-        else resultado.falhas += 1;
+        else if (desfecho === "adiada") {
+          resultado.adiadas += 1;
+          resultado.adiadasNaTransacao += 1;
+        } else if (desfecho === "indeterminada") {
+          resultado.indeterminadas += 1;
+          resultado.indeterminadasNaTransacao += 1;
+        } else {
+          resultado.falhas += 1;
+          if (desfecho === "falha_recuperavel") resultado.falhasRecuperaveis += 1;
+          else if (desfecho === "requer_intervencao") resultado.requeremIntervencao += 1;
+          else resultado.falhasNaoRegistradas += 1;
+        }
       }
     }
     return resultado;
@@ -1405,8 +1470,8 @@ export class VendasService {
       return desfecho;
     } catch (erro) {
       if (erro instanceof LinhaJaRestauradaErro) return "ja_concluida";
-      await this.registrarFalhaDeRestauracao(vendaId, vendaCodigo, eventoId, linhaLida, estadoAnterior, tentativasLidas, modo, erro);
-      return "falha";
+      const registro = await this.registrarFalhaDeRestauracao(vendaId, vendaCodigo, eventoId, linhaLida, estadoAnterior, tentativasLidas, modo, erro);
+      return registro.registrada ? registro.estadoNovo : "falha_nao_registrada";
     }
   }
 
@@ -1442,7 +1507,7 @@ export class VendasService {
     tentativasLidas: number,
     modo: ModoRestauracao,
     erro: unknown,
-  ): Promise<void> {
+  ): Promise<{ estadoNovo: "falha_recuperavel" | "requer_intervencao"; registrada: boolean }> {
     const agora = new Date();
     const tentativa = tentativasLidas + 1;
     // Fase 60.4.3.4.18.3 — referência ausente não se resolve com nova tentativa: vai direto para intervenção.
@@ -1485,14 +1550,19 @@ export class VendasService {
       falhaRegistrada: registrada,
       ...(falhaAoRegistrar ? { erroAoRegistrarClasse: falhaAoRegistrar.classe, erroAoRegistrarCodigo: falhaAoRegistrar.codigo } : {}),
     });
+    // Fase 60.4.3.4.19.5 — informa o desfecho real ao chamador (só contagem): `registrada: false` = CAS não aplicado.
+    return { estadoNovo, registrada };
   }
 
-  /** Fase 60.4.3.4.18 — log estruturado (JSON na mensagem): só ids, quantidades, estados e dados seguros do erro. */
+  /**
+   * Fase 60.4.3.4.18 — log estruturado (JSON na mensagem): só ids, quantidades, estados e dados seguros do erro.
+   * Fase 60.4.3.4.19.5 — emissão PROTEGIDA (`emitirSeguro`): uma falha do logger nunca chega ao fluxo. Em especial,
+   * `restauracao_estoque.concluida` é emitido DEPOIS do commit, dentro do `try` de `restaurarLinha` — antes desta fase,
+   * um erro do logger ali caía no `catch` e transformava um sucesso confirmado em "falha" (sem devolução dupla: o CAS
+   * do registro não casava, mas o desfecho e o log eram enganosos).
+   */
   private registrarLogRestauracao(nivel: "log" | "warn" | "error", dados: Record<string, unknown>): void {
-    const mensagem = JSON.stringify(dados);
-    if (nivel === "error") this.logger.error(mensagem);
-    else if (nivel === "warn") this.logger.warn(mensagem);
-    else this.logger.log(mensagem);
+    emitirSeguro(this.logger, nivel, dados);
   }
 
   /**
@@ -1504,7 +1574,7 @@ export class VendasService {
   async reconciliarRestauracaoEstoque(vendaId: string, usuarioId: string | null): Promise<VendaDocument> {
     const venda = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
     const resultado = await this.restaurarEstoquePendente(venda.id, { modo: "manual" });
-    await this.registrarEvento(venda.id, "venda.restauracao_estoque_reconciliada", usuarioId, { ...resultado });
+    await this.registrarEvento(venda.id, "venda.restauracao_estoque_reconciliada", usuarioId, { ...resumoDeRestauracao(resultado) });
     return this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
   }
 
@@ -1516,17 +1586,9 @@ export class VendasService {
    */
   async reconciliarAutomaticamente(): Promise<ResultadoCicloReconciliacao> {
     const { loteVendas, maxItensPorCiclo } = this.configReconciliacao;
-    const ciclo: ResultadoCicloReconciliacao = {
-      vendas: 0,
-      tentadas: 0,
-      concluidas: 0,
-      jaConcluidas: 0,
-      falhas: 0,
-      adiadas: 0,
-      indeterminadas: 0,
-      vendasComErro: 0,
-    };
+    const ciclo: ResultadoCicloReconciliacao = { ...detalheVazio(), vendas: 0, vendasConsultadas: 0, vendasComErro: 0 };
     const vendas = await this.vendasRepository.buscarVendasComRestauracaoElegivel(new Date(), loteVendas);
+    ciclo.vendasConsultadas = vendas.length;
     for (const venda of vendas) {
       const restantes = maxItensPorCiclo - ciclo.tentadas;
       if (restantes <= 0) break;
@@ -1539,6 +1601,11 @@ export class VendasService {
         ciclo.falhas += resultado.falhas;
         ciclo.adiadas += resultado.adiadas;
         ciclo.indeterminadas += resultado.indeterminadas;
+        ciclo.falhasRecuperaveis += resultado.falhasRecuperaveis;
+        ciclo.requeremIntervencao += resultado.requeremIntervencao;
+        ciclo.falhasNaoRegistradas += resultado.falhasNaoRegistradas;
+        ciclo.adiadasNaTransacao += resultado.adiadasNaTransacao;
+        ciclo.indeterminadasNaTransacao += resultado.indeterminadasNaTransacao;
       } catch (erro) {
         // Ex.: falha de leitura da venda — nada foi alterado; o próximo ciclo a encontra de novo.
         ciclo.vendasComErro += 1;

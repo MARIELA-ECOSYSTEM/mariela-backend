@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import type { Logger } from "@nestjs/common";
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken, getModelToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
@@ -18,7 +19,7 @@ import type { ResumoRestauracaoVenda } from "./restauracao-estoque.util.js";
 import type { VendaDocument } from "./schemas/venda.schema.js";
 import { VendasModule } from "./vendas.module.js";
 import { VendasRepository } from "./vendas.repository.js";
-import { VendasService } from "./vendas.service.js";
+import { VendasService, type ResultadoCicloReconciliacao } from "./vendas.service.js";
 
 /**
  * Fase 60.4.3.4.18 — reconciliação PERSISTENTE de estoque em cancelamentos (integração — MongoDB real).
@@ -896,5 +897,278 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
       expect(await vendaBruta(p().conexao, venda.id)).toEqual(antes);
       expect(await saldo(p(), produtoId)).toBe(-100);
     });
+  });
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // Fase 60.4.3.4.19.5 — observabilidade dos ciclos (contadores e eventos com MongoDB real)
+  // ---------------------------------------------------------------------------------------------------------------
+
+  describe("observabilidade dos ciclos (Fase 60.4.3.4.19.5)", () => {
+    interface Registro {
+      nivel: "log" | "warn" | "error";
+      dados: Record<string, unknown>;
+    }
+
+    /** Captura os eventos JSON do logger de um objeto (worker ou service) sem silenciar a contagem real. */
+    function capturarLogs(alvo: object): Registro[] {
+      const logger = (alvo as { logger: Logger }).logger;
+      const registros: Registro[] = [];
+      for (const nivel of ["log", "warn", "error"] as const) {
+        espioes.push(
+          spyOn(logger, nivel).mockImplementation((mensagem: unknown) => {
+            registros.push({ nivel, dados: JSON.parse(String(mensagem)) as Record<string, unknown> });
+          }),
+        );
+      }
+      return registros;
+    }
+
+    const doEvento = (registros: Registro[], evento: string) => registros.filter((registro) => registro.dados["evento"] === evento);
+
+    /** Cada linha tentada tem exatamente UM desfecho; `falhas` é a soma dos três desfechos de falha. */
+    function exigirIdentidade(ciclo: ResultadoCicloReconciliacao | null): ResultadoCicloReconciliacao {
+      expect(ciclo).not.toBeNull();
+      const c = ciclo!;
+      expect(c.tentadas).toBe(
+        c.concluidas + c.jaConcluidas + c.falhasRecuperaveis + c.requeremIntervencao + c.falhasNaoRegistradas + c.adiadasNaTransacao + c.indeterminadasNaTransacao,
+      );
+      expect(c.falhas).toBe(c.falhasRecuperaveis + c.requeremIntervencao + c.falhasNaoRegistradas);
+      expect(c.vendas).toBeLessThanOrEqual(c.vendasConsultadas);
+      return c;
+    }
+
+    /** Linha pendente com a causa resolvida e a agenda vencida — pronta para o próximo ciclo concluir. */
+    async function pendenciaPronta(inst: Instancia) {
+      const cenario = await cancelarComFalhaDeRestauracao(inst);
+      await consertarProduto(inst.conexao, cenario.produtoId);
+      await venceAgenda(inst.conexao, cenario.venda.id);
+      return cenario;
+    }
+
+    it("8. uma linha concluída: contadores exatos e `ciclo_concluido` com resultado `processado`", async () => {
+      const { venda, produtoId } = await pendenciaPronta(p());
+      const logs = capturarLogs(p().worker);
+
+      const ciclo = exigirIdentidade(await p().worker.executarCiclo());
+      expect(ciclo).toMatchObject({ vendasConsultadas: 1, vendas: 1, tentadas: 1, concluidas: 1, jaConcluidas: 0, falhas: 0, adiadas: 0, indeterminadas: 0, vendasComErro: 0 });
+      expect(await saldo(p(), produtoId)).toBe(2);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
+
+      const [concluido] = doEvento(logs, "reconciliacao_estoque.ciclo_concluido");
+      expect(concluido!.nivel).toBe("log");
+      expect(concluido!.dados).toMatchObject({ resultado: "processado", vendasConsultadas: 1, vendasProcessadas: 1, itensElegiveis: 1, itensConcluidos: 1, falhasRecuperaveis: 0 });
+      expect(doEvento(logs, "reconciliacao_estoque.ciclo_iniciado")[0]!.dados["cicloId"]).toBe(concluido!.dados["cicloId"]);
+
+      // Ciclo seguinte: vazio, mas COMPROVADO por `ciclo_concluido`.
+      exigirIdentidade(await p().worker.executarCiclo());
+      expect(doEvento(logs, "reconciliacao_estoque.ciclo_concluido")[1]!.dados).toMatchObject({ resultado: "sem_itens_elegiveis", vendasConsultadas: 0, itensElegiveis: 0 });
+    });
+
+    it("9. várias linhas em vendas diferentes: somadas; com `maxItensPorCiclo` atingido, `vendasProcessadas < vendasConsultadas`", async () => {
+      const a = await pendenciaPronta(p());
+      const b = await pendenciaPronta(p());
+
+      const limitada = await criarInstancia({ ...CONFIG_TESTE, maxItensPorCiclo: 1 });
+      extras.push(limitada);
+      const primeiro = exigirIdentidade(await limitada.worker.executarCiclo());
+      expect(primeiro).toMatchObject({ vendasConsultadas: 2, vendas: 1, tentadas: 1, concluidas: 1 });
+
+      const segundo = exigirIdentidade(await p().worker.executarCiclo());
+      expect(segundo).toMatchObject({ vendasConsultadas: 1, vendas: 1, tentadas: 1, concluidas: 1 });
+      expect(await saldo(p(), a.produtoId)).toBe(2);
+      expect(await saldo(p(), b.produtoId)).toBe(2);
+
+      // Sem limite: duas vendas pendentes no MESMO ciclo.
+      const c = await pendenciaPronta(p());
+      const d = await pendenciaPronta(p());
+      expect(exigirIdentidade(await p().worker.executarCiclo())).toMatchObject({ vendasConsultadas: 2, vendas: 2, tentadas: 2, concluidas: 2 });
+      expect(await entradasNoLedger(p().conexao, c.venda.id)).toBe(1);
+      expect(await entradasNoLedger(p().conexao, d.venda.id)).toBe(1);
+    }, 30_000);
+
+    it("10. falha RECUPERÁVEL: `falhasRecuperaveis` (não intervenção), `ciclo_concluido` em WARN com `processado_com_falhas`", async () => {
+      const { venda } = await cancelarComFalhaDeRestauracao(p()); // produto continua quebrado
+      await venceAgenda(p().conexao, venda.id);
+      const logs = capturarLogs(p().worker);
+
+      const ciclo = exigirIdentidade(await p().worker.executarCiclo());
+      expect(ciclo).toMatchObject({ tentadas: 1, falhas: 1, falhasRecuperaveis: 1, requeremIntervencao: 0, falhasNaoRegistradas: 0, concluidas: 0 });
+      expect((await primeiraLinha(p().conexao, venda.id)).estadoRestauracao).toBe("falha_recuperavel");
+      const [concluido] = doEvento(logs, "reconciliacao_estoque.ciclo_concluido");
+      expect(concluido!.nivel).toBe("warn");
+      expect(concluido!.dados).toMatchObject({ resultado: "processado_com_falhas", falhasRecuperaveis: 1, requeremIntervencao: 0 });
+      expect(doEvento(logs, "reconciliacao_estoque.ciclo_falhou")).toHaveLength(0); // falha de LINHA ≠ falha do ciclo
+    });
+
+    it("11a. referência AUSENTE pelo worker: `requeremIntervencao` (não recuperável); o ciclo seguinte não a consulta", async () => {
+      const { venda, produtoId, produtos } = await pendenciaPronta(p());
+      await p().produtos.removerVariante(produtoId, produtos[0]!.varianteId, null);
+
+      const ciclo = exigirIdentidade(await p().worker.executarCiclo());
+      expect(ciclo).toMatchObject({ tentadas: 1, requeremIntervencao: 1, falhasRecuperaveis: 0, falhasNaoRegistradas: 0 });
+      expect((await primeiraLinha(p().conexao, venda.id)).estadoRestauracao).toBe("requer_intervencao");
+
+      await venceAgenda(p().conexao, venda.id);
+      expect(exigirIdentidade(await p().worker.executarCiclo())).toMatchObject({ vendasConsultadas: 0, tentadas: 0, requeremIntervencao: 0 });
+    });
+
+    it("11b. tentativas ESGOTADAS: a última falha conta como `requeremIntervencao`, as anteriores como `falhasRecuperaveis`", async () => {
+      const { venda } = await cancelarComFalhaDeRestauracao(p()); // tentativa 1 no cancelamento
+      const desfechos: Pick<ResultadoCicloReconciliacao, "falhasRecuperaveis" | "requeremIntervencao">[] = [];
+      for (let tentativa = 2; tentativa <= CONFIG_TESTE.maxTentativas; tentativa += 1) {
+        await venceAgenda(p().conexao, venda.id);
+        const { falhasRecuperaveis, requeremIntervencao } = exigirIdentidade(await p().worker.executarCiclo());
+        desfechos.push({ falhasRecuperaveis, requeremIntervencao });
+      }
+      expect(desfechos).toEqual([
+        { falhasRecuperaveis: 1, requeremIntervencao: 0 }, // tentativa 2
+        { falhasRecuperaveis: 0, requeremIntervencao: 1 }, // tentativa 3 = maxTentativas
+      ]);
+      expect((await primeiraLinha(p().conexao, venda.id)).estadoRestauracao).toBe("requer_intervencao");
+    });
+
+    it("11c. linhas NÃO tentadas da mesma venda: `adiados` (já em intervenção) e `indeterminados` fora de `itensElegiveis`", async () => {
+      const cenario = await prepararVenda(p(), [2, 1, 1]);
+      await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Mista", idempotencyKey: `mista-${Date.now()}` }, null);
+      await fecharCaixa(p(), cenario.caixa.id);
+      const produtoB = cenario.produtos[1]!.produtoId;
+      // Linha B volta a ser provadamente pendente (desfaz a devolução dela); A vira `requer_intervencao`; C, indeterminada.
+      await p().conexao.collection("produtos").updateOne({ _id: new Types.ObjectId(produtoB) }, { $inc: { "variantes.0.tamanhos.0.quantidade": -1 } });
+      await p().conexao.collection("movimentacoes_estoque").deleteMany({ vendaId: cenario.venda.id, produtoId: new Types.ObjectId(produtoB) });
+      await p().conexao.collection("vendas").updateOne(
+        { _id: new Types.ObjectId(cenario.venda.id) },
+        {
+          $set: {
+            "cancelamentos.0.itens.0.restaurado": false,
+            "cancelamentos.0.itens.0.estadoRestauracao": "requer_intervencao",
+            "cancelamentos.0.itens.1.restaurado": false,
+            "cancelamentos.0.itens.1.estadoRestauracao": "pendente",
+            "cancelamentos.0.itens.2.restaurado": false,
+          },
+          $unset: { "cancelamentos.0.itens.2.estadoRestauracao": "" },
+        },
+      );
+      const logs = capturarLogs(p().worker);
+
+      const ciclo = exigirIdentidade(await p().worker.executarCiclo());
+      expect(ciclo).toMatchObject({ vendasConsultadas: 1, tentadas: 1, concluidas: 1, adiadas: 1, adiadasNaTransacao: 0, indeterminadas: 1, indeterminadasNaTransacao: 0 });
+      expect(doEvento(logs, "reconciliacao_estoque.ciclo_concluido")[0]!.dados).toMatchObject({
+        resultado: "processado",
+        itensElegiveis: 1,
+        itensConcluidos: 1,
+        adiados: 1,
+        indeterminados: 1,
+        adiadosNaTransacao: 0,
+        indeterminadosNaTransacao: 0,
+      });
+      expect(await saldo(p(), produtoB)).toBe(5);
+    });
+
+    it("12. erro isolado em UMA venda: `vendasComErro`, as demais são processadas e o ciclo CONCLUI (não `ciclo_falhou`)", async () => {
+      const a = await pendenciaPronta(p());
+      const b = await pendenciaPronta(p());
+      const original = p().repositorio.encontrarPorIdOuFalhar.bind(p().repositorio);
+      espioes.push(
+        spyOn(p().repositorio, "encontrarPorIdOuFalhar").mockImplementation(async (...args: Parameters<VendasRepository["encontrarPorIdOuFalhar"]>) => {
+          const [vendaId, sessao] = args;
+          if (vendaId === a.venda.id && !sessao) throw new Error("[INJETADO] falha de leitura da venda");
+          return original(...args);
+        }),
+      );
+      const logsWorker = capturarLogs(p().worker);
+      const logsService = capturarLogs(p().service);
+
+      const ciclo = exigirIdentidade(await p().worker.executarCiclo());
+      expect(ciclo).toMatchObject({ vendasConsultadas: 2, vendas: 2, vendasComErro: 1, tentadas: 1, concluidas: 1 });
+      expect(await saldo(p(), b.produtoId)).toBe(2);
+      expect(await saldo(p(), a.produtoId)).toBe(0); // nada foi feito na venda com erro
+      expect(doEvento(logsWorker, "reconciliacao_estoque.ciclo_falhou")).toHaveLength(0);
+      expect(doEvento(logsWorker, "reconciliacao_estoque.ciclo_concluido")[0]!.dados).toMatchObject({ resultado: "processado_com_falhas", vendasComErro: 1, itensConcluidos: 1 });
+      expect(doEvento(logsService, "restauracao_estoque.erro_venda")[0]!.dados).toMatchObject({ vendaId: a.venda.id, erroClasse: "Error" });
+    });
+
+    it("13. retry TRANSITÓRIO dentro da transação: uma tentativa lógica, um commit, um ledger — sem contagem duplicada", async () => {
+      const { venda, produtoId } = await pendenciaPronta(p());
+      let chamadas = 0;
+      const original = p().repositorio.marcarItemRestaurado.bind(p().repositorio);
+      espioes.push(
+        spyOn(p().repositorio, "marcarItemRestaurado").mockImplementation(async (...args: Parameters<VendasRepository["marcarItemRestaurado"]>) => {
+          chamadas += 1;
+          if (chamadas === 1) throw erroTransitorio();
+          return original(...args);
+        }),
+      );
+
+      const ciclo = exigirIdentidade(await p().worker.executarCiclo());
+      expect(chamadas).toBe(2); // a transação foi de fato repetida
+      expect(ciclo).toMatchObject({ tentadas: 1, concluidas: 1, jaConcluidas: 0, falhas: 0 });
+      expect(await saldo(p(), produtoId)).toBe(2);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
+      expect((await primeiraLinha(p().conexao, venda.id)).tentativas).toBe(2); // 1 falha original + 1 sucesso
+    });
+
+    it("14. SHUTDOWN durante a transação: `worker_parando` antes, a transação termina íntegra, `worker_parado` depois", async () => {
+      const { venda, produtoId } = await pendenciaPronta(p());
+      const outra = await criarInstancia();
+      const logs = capturarLogs(outra.worker);
+      let entrou = false;
+      let liberar!: () => void;
+      const aberto = new Promise<void>((resolver) => {
+        liberar = resolver;
+      });
+      const createOriginal = outra.ledgerModel.create.bind(outra.ledgerModel) as (...args: unknown[]) => Promise<unknown>;
+      espioes.push(
+        spyOn(outra.ledgerModel, "create").mockImplementationOnce((async (...args: unknown[]) => {
+          entrou = true;
+          await aberto; // a transação está aberta: estoque já ajustado na sessão, ledger e marcação pendentes
+          return createOriginal(...args);
+        }) as never),
+      );
+
+      let fechamento: Promise<void> | undefined;
+      try {
+        const ciclo = outra.worker.executarCiclo();
+        const limite = Date.now() + 10_000;
+        while (!entrou && Date.now() < limite) await new Promise((resolver) => setTimeout(resolver, 10));
+        expect(entrou).toBe(true);
+
+        fechamento = outra.moduleRef.close();
+        while (!doEvento(logs, "reconciliacao_estoque.worker_parando").length && Date.now() < limite) await new Promise((resolver) => setTimeout(resolver, 10));
+        expect(doEvento(logs, "reconciliacao_estoque.worker_parando")[0]!.dados).toMatchObject({ execucaoId: outra.worker.execucaoId, cicloEmAndamento: true });
+        expect(doEvento(logs, "reconciliacao_estoque.worker_parado")).toHaveLength(0);
+        expect((await primeiraLinha(p().conexao, venda.id)).restaurado).toBe(false); // nada confirmado ainda
+
+        liberar();
+        const resultado = exigirIdentidade(await ciclo);
+        expect(resultado).toMatchObject({ tentadas: 1, concluidas: 1 });
+      } finally {
+        liberar();
+        await (fechamento ?? outra.moduleRef.close());
+      }
+
+      const ordem = logs.map((registro) => registro.dados["evento"]);
+      expect(ordem.indexOf("reconciliacao_estoque.worker_parando")).toBeLessThan(ordem.indexOf("reconciliacao_estoque.ciclo_concluido"));
+      expect(ordem.indexOf("reconciliacao_estoque.ciclo_concluido")).toBeLessThan(ordem.indexOf("reconciliacao_estoque.worker_parado"));
+      expect(doEvento(logs, "reconciliacao_estoque.worker_parado")[0]!.dados).toMatchObject({ ciclosExecutados: 1 });
+      expect(await saldo(p(), produtoId)).toBe(2); // devolução, ledger e marcação confirmados juntos — uma vez
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
+      expect(await primeiraLinha(p().conexao, venda.id)).toMatchObject({ restaurado: true, estadoRestauracao: "concluida" });
+    }, 30_000);
+
+    it("15. CONCORRÊNCIA entre dois workers: exatamente UM `itensConcluidos` no total; identidade dos contadores em cada um", async () => {
+      const { venda, produtoId } = await pendenciaPronta(p());
+      const outra = await criarInstancia();
+      extras.push(outra);
+      expect(outra.worker.execucaoId).not.toBe(p().worker.execucaoId);
+
+      const [c1, c2] = await Promise.all([p().worker.executarCiclo(), outra.worker.executarCiclo()]);
+      const a = exigirIdentidade(c1);
+      const b = exigirIdentidade(c2);
+      expect(a.concluidas + b.concluidas).toBe(1);
+      expect(a.falhasRecuperaveis + b.falhasRecuperaveis + a.requeremIntervencao + b.requeremIntervencao).toBe(0);
+      expect(await saldo(p(), produtoId)).toBe(2);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
+      expect((await primeiraLinha(p().conexao, venda.id)).tentativas).toBe(2);
+    }, 30_000);
   });
 });
