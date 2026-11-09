@@ -73,19 +73,43 @@ async function criarInstancia(config: ReconciliacaoEstoqueConfig = CONFIG_TESTE)
     .overrideProvider(RECONCILIACAO_ESTOQUE_CONFIG)
     .useValue(config)
     .compile();
-  const doVendasModule = moduleRef.select(VendasModule);
-  return {
-    moduleRef,
-    service: moduleRef.get(VendasService),
-    worker: moduleRef.get(ReconciliacaoEstoqueWorker),
-    // `VendasRepository` é provido em 4 módulos: a instância injetada em `VendasService` é a do `VendasModule`.
-    repositorio: doVendasModule.get(VendasRepository, { strict: true }),
-    ledgerModel: doVendasModule.get<Model<MovimentacaoEstoqueDocument>>(getModelToken(MovimentacaoEstoque.name), { strict: true }),
-    produtos: moduleRef.get(ProdutosService),
-    caixas: moduleRef.get(CaixasService),
-    vendedores: moduleRef.get(VendedoresService),
-    conexao: moduleRef.get<Connection>(getConnectionToken()),
-  };
+  // Fase 60.4.3.4.18.3 — se algo falhar DEPOIS de compilar (contexto parcialmente inicializado), fecha o contexto
+  // (e sua conexão) antes de propagar o erro: nada fica aberto prendendo o processo de teste.
+  try {
+    const conexao = moduleRef.get<Connection>(getConnectionToken());
+    return {
+      moduleRef,
+      service: moduleRef.get(VendasService),
+      worker: moduleRef.get(ReconciliacaoEstoqueWorker),
+      // `VendasRepository` é provido em 4 módulos: a instância injetada em `VendasService` é a do `VendasModule`.
+      repositorio: moduleRef.select(VendasModule).get(VendasRepository, { strict: true }),
+      // Fase 60.4.3.4.18.3 — CORREÇÃO do setup (falha 1 do CI de `78194a7`): o provider do model mora no módulo
+      // dinâmico do `MongooseModule.forFeature` (só EXPORTADO para `VendasModule`), então `select(VendasModule)` com
+      // `strict: true` não o encontra. O factory do `@nestjs/mongoose` reaproveita `connection.models[nome]`: o model
+      // registrado na conexão é o MESMO objeto injetado em `VendasService` (conferido no teste "setup").
+      ledgerModel: conexao.model<MovimentacaoEstoqueDocument>(MovimentacaoEstoque.name),
+      produtos: moduleRef.get(ProdutosService),
+      caixas: moduleRef.get(CaixasService),
+      vendedores: moduleRef.get(VendedoresService),
+      conexao,
+    };
+  } catch (erro) {
+    await moduleRef.close();
+    throw erro;
+  }
+}
+
+/**
+ * Fase 60.4.3.4.18.3 — encerra um contexto SÓ se ele chegou a existir. Usado no `afterAll`: se o `beforeAll` falhar,
+ * a falha original é a única reportada (sem uma segunda falha por acesso a `undefined`, como a falha 2 do CI).
+ */
+async function encerrarInstancia(inst: Instancia | undefined, limpar?: (conexao: Connection) => Promise<void>): Promise<void> {
+  if (!inst) return;
+  try {
+    if (limpar) await limpar(inst.conexao);
+  } finally {
+    await inst.moduleRef.close();
+  }
 }
 
 interface FalhaBruta {
@@ -116,7 +140,13 @@ interface VendaBruta {
 let contador = 0;
 
 describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4.18 — MongoDB real)", () => {
-  let principal: Instancia;
+  // `undefined` até o `beforeAll` concluir — os hooks de limpeza checam antes de usar.
+  let principal: Instancia | undefined;
+  /** Contexto principal, já inicializado (os testes só rodam se o `beforeAll` concluiu). */
+  function p(): Instancia {
+    if (!principal) throw new Error("[SETUP] contexto principal não inicializado (o beforeAll falhou)");
+    return principal;
+  }
   const extras: Instancia[] = [];
   const espioes: { mockRestore: () => void }[] = [];
 
@@ -126,9 +156,10 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
   }
 
   beforeAll(async () => {
-    principal = await criarInstancia();
-    await limparColecoes(principal.conexao);
-    const configuracoes = principal.moduleRef.get(ConfiguracoesService);
+    const inst = await criarInstancia();
+    principal = inst;
+    await limparColecoes(inst.conexao);
+    const configuracoes = inst.moduleRef.get(ConfiguracoesService);
     await garantirItemConfiguracao(configuracoes, "cores", "Azul");
     await garantirItemConfiguracao(configuracoes, "tamanhos", "M");
     await garantirItemConfiguracao(configuracoes, "categorias", "Vestidos");
@@ -138,16 +169,49 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
   afterEach(async () => {
     while (espioes.length) espioes.pop()?.mockRestore();
     while (extras.length) await extras.pop()?.moduleRef.close();
+    if (!principal) return;
     // Nenhum teste pode deixar caixa aberto (só um caixa aberto por vez, sistema afora).
-    const aberto = await principal.caixas.obterAtual();
-    if (aberto) await principal.caixas.fechar(aberto.id, { valorInformado: 0 }, null);
+    const aberto = await p().caixas.obterAtual();
+    if (aberto) await p().caixas.fechar(aberto.id, { valorInformado: 0 }, null);
     // Isolamento: o worker varre TODAS as vendas; pendências deixadas por um teste não podem entrar no ciclo do próximo.
-    await principal.conexao.collection("vendas").deleteMany({});
+    await p().conexao.collection("vendas").deleteMany({});
   });
 
   afterAll(async () => {
-    await limparColecoes(principal.conexao);
-    await principal.moduleRef.close();
+    // Fase 60.4.3.4.18.3 — CORREÇÃO (falha 2 do CI de `78194a7`): só encerra o que foi inicializado.
+    await encerrarInstancia(principal, limparColecoes);
+  });
+
+  describe("setup (Fase 60.4.3.4.18.3)", () => {
+    it("o model do ledger usado pelos testes é o MESMO objeto injetado no domínio (provider do `forFeature`)", () => {
+      const inst = p();
+      const doProvider = inst.moduleRef.get<Model<MovimentacaoEstoqueDocument>>(getModelToken(MovimentacaoEstoque.name), { strict: false });
+      expect(inst.ledgerModel).toBe(doProvider);
+      expect(inst.ledgerModel.collection.collectionName).toBe("movimentacoes_estoque");
+    });
+
+    it("encerramento seguro: sem contexto inicializado (beforeAll falhou) não lança nem acessa `undefined`", async () => {
+      await expect(encerrarInstancia(undefined)).resolves.toBeUndefined();
+    });
+
+    it("encerramento seguro: fecha um contexto mesmo quando a limpeza falha", async () => {
+      const temporaria = await criarInstancia();
+      let fechado = false;
+      const espiao = spyOn(temporaria.moduleRef, "close").mockImplementation(async () => {
+        fechado = true;
+      });
+      try {
+        await expect(
+          encerrarInstancia(temporaria, async () => {
+            throw new Error("[INJETADO] falha na limpeza");
+          }),
+        ).rejects.toThrow("[INJETADO] falha na limpeza");
+        expect(fechado).toBe(true);
+      } finally {
+        espiao.mockRestore();
+        await temporaria.moduleRef.close();
+      }
+    }, 30_000);
   });
 
   // ---------------------------------------------------------------------------------------------------------------
@@ -259,7 +323,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
 
   describe("cancelamento com falha de restauração", () => {
     it("a venda é cancelada, a linha fica PERSISTIDA como falha_recuperavel (tentativas, agenda, falha segura) e a resposta diz `pendente`", async () => {
-      const { cancelada, venda, produtoId } = await cancelarComFalhaDeRestauracao(principal);
+      const { cancelada, venda, produtoId } = await cancelarComFalhaDeRestauracao(p());
 
       expect(cancelada.status).toBe("cancelada");
       const resumo = resumoSerializado(cancelada);
@@ -267,7 +331,7 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
       expect(resumo).toMatchObject({ totalItens: 1, concluidos: 0, emFalhaRecuperavel: 1 });
       expect(resumo.proximaTentativaEm).not.toBeNull();
 
-      const linha = await primeiraLinha(principal.conexao, venda.id);
+      const linha = await primeiraLinha(p().conexao, venda.id);
       expect(linha.restaurado).toBe(false);
       expect(linha.estadoRestauracao).toBe("falha_recuperavel");
       expect(linha.tentativas).toBe(1);
@@ -275,20 +339,20 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
       expect(linha.proximaTentativaEm!.getTime() - linha.ultimaTentativaEm!.getTime()).toBe(CONFIG_TESTE.esperaBaseMs);
       expect(linha.ultimaFalha?.classe).toBe("ApiException");
       expect(JSON.stringify(linha.ultimaFalha)).not.toContain("    at ");
-      expect(await entradasNoLedger(principal.conexao, venda.id)).toBe(0);
-      expect(await saldo(principal, produtoId)).toBe(-100); // nada foi devolvido
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(0);
+      expect(await saldo(p(), produtoId)).toBe(-100); // nada foi devolvido
     });
 
     it("cancelamento bem-sucedido grava `concluida`, `restauradoEm`, 1 tentativa e responde `concluida`", async () => {
-      const cenario = await prepararVenda(principal);
-      const cancelada = await principal.service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Sucesso", idempotencyKey: `ok-${Date.now()}` }, null);
-      await principal.caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      const cenario = await prepararVenda(p());
+      const cancelada = await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Sucesso", idempotencyKey: `ok-${Date.now()}` }, null);
+      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
 
       expect(resumoSerializado(cancelada).status).toBe("concluida");
-      const linha = await primeiraLinha(principal.conexao, cenario.venda.id);
+      const linha = await primeiraLinha(p().conexao, cenario.venda.id);
       expect(linha).toMatchObject({ restaurado: true, estadoRestauracao: "concluida", tentativas: 1, proximaTentativaEm: null, ultimaFalha: null });
       expect(linha.restauradoEm).toBeInstanceOf(Date);
-      expect(await saldo(principal, cenario.produtos[0]!.produtoId)).toBe(5);
+      expect(await saldo(p(), cenario.produtos[0]!.produtoId)).toBe(5);
     });
   });
 
@@ -298,76 +362,76 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
 
   describe("reconciliação automática (worker)", () => {
     it("recuperação básica: depois de resolvido o problema e vencida a agenda, um ciclo devolve o estoque UMA vez, sem novo evento/caixa", async () => {
-      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(principal);
-      const movimentosCaixaAntes = await principal.conexao.collection("movimentos_caixa").countDocuments({ vendaId: venda.id });
-      const eventosAntes = await principal.conexao.collection("eventos_venda").countDocuments({ vendaId: venda.id });
+      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(p());
+      const movimentosCaixaAntes = await p().conexao.collection("movimentos_caixa").countDocuments({ vendaId: venda.id });
+      const eventosAntes = await p().conexao.collection("eventos_venda").countDocuments({ vendaId: venda.id });
 
-      await consertarProduto(principal.conexao, produtoId);
-      await venceAgenda(principal.conexao, venda.id);
-      const ciclo = await principal.worker.executarCiclo();
+      await consertarProduto(p().conexao, produtoId);
+      await venceAgenda(p().conexao, venda.id);
+      const ciclo = await p().worker.executarCiclo();
 
       expect(ciclo).toMatchObject({ concluidas: 1, falhas: 0 });
-      expect(await saldo(principal, produtoId)).toBe(2);
-      expect(await entradasNoLedger(principal.conexao, venda.id)).toBe(1);
-      expect(await primeiraLinha(principal.conexao, venda.id)).toMatchObject({ restaurado: true, estadoRestauracao: "concluida", tentativas: 2, ultimaFalha: null });
-      expect(await principal.conexao.collection("movimentos_caixa").countDocuments({ vendaId: venda.id })).toBe(movimentosCaixaAntes);
-      expect(await principal.conexao.collection("eventos_venda").countDocuments({ vendaId: venda.id })).toBe(eventosAntes);
-      expect((await vendaBruta(principal.conexao, venda.id)).cancelamentos).toHaveLength(1);
+      expect(await saldo(p(), produtoId)).toBe(2);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
+      expect(await primeiraLinha(p().conexao, venda.id)).toMatchObject({ restaurado: true, estadoRestauracao: "concluida", tentativas: 2, ultimaFalha: null });
+      expect(await p().conexao.collection("movimentos_caixa").countDocuments({ vendaId: venda.id })).toBe(movimentosCaixaAntes);
+      expect(await p().conexao.collection("eventos_venda").countDocuments({ vendaId: venda.id })).toBe(eventosAntes);
+      expect((await vendaBruta(p().conexao, venda.id)).cancelamentos).toHaveLength(1);
 
       // Ciclo seguinte: nada mais a fazer.
-      expect(await principal.worker.executarCiclo()).toMatchObject({ tentadas: 0 });
-      expect(await saldo(principal, produtoId)).toBe(2);
+      expect(await p().worker.executarCiclo()).toMatchObject({ tentadas: 0 });
+      expect(await saldo(p(), produtoId)).toBe(2);
     });
 
     it("respeita o backoff: ciclos repetidos antes da agenda não tentam (sem laço agressivo) e a espera dobra a cada falha", async () => {
-      const { venda } = await cancelarComFalhaDeRestauracao(principal);
+      const { venda } = await cancelarComFalhaDeRestauracao(p());
 
       for (let i = 0; i < 5; i += 1) {
-        expect(await principal.worker.executarCiclo()).toMatchObject({ tentadas: 0 });
+        expect(await p().worker.executarCiclo()).toMatchObject({ tentadas: 0 });
       }
-      expect((await primeiraLinha(principal.conexao, venda.id)).tentativas).toBe(1);
+      expect((await primeiraLinha(p().conexao, venda.id)).tentativas).toBe(1);
 
-      await venceAgenda(principal.conexao, venda.id);
-      expect(await principal.worker.executarCiclo()).toMatchObject({ tentadas: 1, falhas: 1 });
-      const linha = await primeiraLinha(principal.conexao, venda.id);
+      await venceAgenda(p().conexao, venda.id);
+      expect(await p().worker.executarCiclo()).toMatchObject({ tentadas: 1, falhas: 1 });
+      const linha = await primeiraLinha(p().conexao, venda.id);
       expect(linha.tentativas).toBe(2);
       expect(linha.estadoRestauracao).toBe("falha_recuperavel");
       expect(linha.proximaTentativaEm!.getTime() - linha.ultimaTentativaEm!.getTime()).toBe(CONFIG_TESTE.esperaBaseMs * 2);
     });
 
     it("falha persistente: ao atingir o limite vira `requer_intervencao`, o worker para de tentar e a API sinaliza; o operador conclui depois", async () => {
-      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(principal);
+      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(p());
 
       for (let tentativa = 2; tentativa <= CONFIG_TESTE.maxTentativas; tentativa += 1) {
-        await venceAgenda(principal.conexao, venda.id);
-        await principal.worker.executarCiclo();
+        await venceAgenda(p().conexao, venda.id);
+        await p().worker.executarCiclo();
       }
-      let linha = await primeiraLinha(principal.conexao, venda.id);
+      let linha = await primeiraLinha(p().conexao, venda.id);
       expect(linha.tentativas).toBe(CONFIG_TESTE.maxTentativas);
       expect(linha.estadoRestauracao).toBe("requer_intervencao");
       expect(linha.proximaTentativaEm).toBeNull();
 
       // Mesmo com a agenda "vencida", o worker não toca uma linha que requer intervenção.
-      await venceAgenda(principal.conexao, venda.id);
-      expect(await principal.worker.executarCiclo()).toMatchObject({ tentadas: 0 });
-      expect((await primeiraLinha(principal.conexao, venda.id)).tentativas).toBe(CONFIG_TESTE.maxTentativas);
+      await venceAgenda(p().conexao, venda.id);
+      expect(await p().worker.executarCiclo()).toMatchObject({ tentadas: 0 });
+      expect((await primeiraLinha(p().conexao, venda.id)).tentativas).toBe(CONFIG_TESTE.maxTentativas);
 
-      const detalhe = await principal.service.obterPorId(venda.id);
+      const detalhe = await p().service.obterPorId(venda.id);
       expect(resumoSerializado(detalhe).status).toBe("requer_intervencao");
-      const pendencias = await principal.service.listarPendenciasDeRestauracao(100);
+      const pendencias = await p().service.listarPendenciasDeRestauracao(100);
       const pendencia = pendencias.itens.find((item) => item.vendaId === venda.id);
       expect(pendencia).toMatchObject({ estado: "requer_intervencao", tentativas: CONFIG_TESTE.maxTentativas, quantidade: 2 });
       expect(pendencia?.ultimaFalha?.classe).toBe("ApiException");
 
       // Operador: resolve a causa e solicita a reconciliação (sem repetir o cancelamento, sem chave nova).
-      await consertarProduto(principal.conexao, produtoId);
-      const reconciliada = await principal.service.reconciliarRestauracaoEstoque(venda.id, null);
+      await consertarProduto(p().conexao, produtoId);
+      const reconciliada = await p().service.reconciliarRestauracaoEstoque(venda.id, null);
       expect(resumoSerializado(reconciliada).status).toBe("concluida");
-      linha = await primeiraLinha(principal.conexao, venda.id);
+      linha = await primeiraLinha(p().conexao, venda.id);
       expect(linha).toMatchObject({ restaurado: true, estadoRestauracao: "concluida" });
-      expect(await saldo(principal, produtoId)).toBe(2);
-      expect(await entradasNoLedger(principal.conexao, venda.id)).toBe(1);
-      expect((await principal.service.listarPendenciasDeRestauracao(100)).itens.some((item) => item.vendaId === venda.id)).toBe(false);
+      expect(await saldo(p(), produtoId)).toBe(2);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
+      expect((await p().service.listarPendenciasDeRestauracao(100)).itens.some((item) => item.vendaId === venda.id)).toBe(false);
     });
 
     it("restart: a pendência criada por uma instância destruída é concluída por um contexto Nest NOVO (descoberta pelo banco, não pela memória)", async () => {
@@ -385,50 +449,50 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
     }, 30_000);
 
     it("concorrência entre DUAS instâncias (workers + reconciliação manual simultâneos): o estoque volta exatamente uma vez", async () => {
-      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(principal);
+      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(p());
       const outra = await criarInstancia();
       extras.push(outra);
-      await consertarProduto(principal.conexao, produtoId);
-      await venceAgenda(principal.conexao, venda.id);
+      await consertarProduto(p().conexao, produtoId);
+      await venceAgenda(p().conexao, venda.id);
 
       await Promise.allSettled([
-        principal.worker.executarCiclo(),
+        p().worker.executarCiclo(),
         outra.worker.executarCiclo(),
-        principal.service.reconciliarRestauracaoEstoque(venda.id, null),
+        p().service.reconciliarRestauracaoEstoque(venda.id, null),
         outra.service.reconciliarRestauracaoEstoque(venda.id, null),
         outra.worker.executarCiclo(),
       ]);
 
-      expect(await saldo(principal, produtoId)).toBe(2); // nunca 4 ou mais
-      expect(await entradasNoLedger(principal.conexao, venda.id)).toBe(1);
-      const linha = await primeiraLinha(principal.conexao, venda.id);
+      expect(await saldo(p(), produtoId)).toBe(2); // nunca 4 ou mais
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
+      const linha = await primeiraLinha(p().conexao, venda.id);
       expect(linha.restaurado).toBe(true);
       expect(linha.tentativas).toBe(2); // 1 falha original + 1 sucesso — nenhuma contagem duplicada
     }, 30_000);
 
     it("o mesmo worker nunca roda dois ciclos sobrepostos na mesma instância", async () => {
-      const primeiro = principal.worker.executarCiclo();
-      const segundo = principal.worker.executarCiclo();
+      const primeiro = p().worker.executarCiclo();
+      const segundo = p().worker.executarCiclo();
       expect(segundo).toBe(primeiro);
       await primeiro;
     });
 
     it("habilitado, o worker é iniciado no bootstrap da aplicação, conclui uma pendência sozinho pelo temporizador e para no shutdown", async () => {
-      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(principal);
-      await consertarProduto(principal.conexao, produtoId);
-      await venceAgenda(principal.conexao, venda.id);
+      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(p());
+      await consertarProduto(p().conexao, produtoId);
+      await venceAgenda(p().conexao, venda.id);
 
       const comWorker = await criarInstancia({ ...CONFIG_TESTE, habilitada: true, intervaloMs: 100 });
       await comWorker.moduleRef.init(); // dispara `onApplicationBootstrap`, como a aplicação real
       expect(comWorker.worker.ativo).toBe(true);
       const limite = Date.now() + 10_000;
-      while (Date.now() < limite && (await primeiraLinha(principal.conexao, venda.id)).restaurado !== true) {
+      while (Date.now() < limite && (await primeiraLinha(p().conexao, venda.id)).restaurado !== true) {
         await new Promise((resolver) => setTimeout(resolver, 100));
       }
       await comWorker.moduleRef.close();
       expect(comWorker.worker.ativo).toBe(false);
-      expect(await saldo(principal, produtoId)).toBe(2);
-      expect(await entradasNoLedger(principal.conexao, venda.id)).toBe(1);
+      expect(await saldo(p(), produtoId)).toBe(2);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
     }, 30_000);
 
     it("desabilitado (padrão em teste), o bootstrap NÃO agenda ciclos", async () => {
@@ -445,67 +509,67 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
 
   describe("falhas em cada ponto da transação de restauração: nada parcial é confirmado", () => {
     it("falha no LEDGER: a devolução física é desfeita junto (abort), a linha fica pendente e a nova tentativa conclui", async () => {
-      const cenario = await prepararVenda(principal);
+      const cenario = await prepararVenda(p());
       const produtoId = cenario.produtos[0]!.produtoId;
       espioes.push(
-        spyOn(principal.ledgerModel, "create").mockImplementationOnce(async () => {
+        spyOn(p().ledgerModel, "create").mockImplementationOnce(async () => {
           throw new Error("[INJETADO] falha ao gravar o ledger");
         }),
       );
-      const cancelada = await principal.service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Ledger", idempotencyKey: `ledger-${Date.now()}` }, null);
-      await principal.caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      const cancelada = await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Ledger", idempotencyKey: `ledger-${Date.now()}` }, null);
+      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
 
       expect(resumoSerializado(cancelada).status).toBe("pendente");
-      expect(await saldo(principal, produtoId)).toBe(3); // a devolução da transação abortada não ficou
-      expect(await entradasNoLedger(principal.conexao, cenario.venda.id)).toBe(0);
-      expect(await primeiraLinha(principal.conexao, cenario.venda.id)).toMatchObject({ restaurado: false, estadoRestauracao: "falha_recuperavel", tentativas: 1 });
+      expect(await saldo(p(), produtoId)).toBe(3); // a devolução da transação abortada não ficou
+      expect(await entradasNoLedger(p().conexao, cenario.venda.id)).toBe(0);
+      expect(await primeiraLinha(p().conexao, cenario.venda.id)).toMatchObject({ restaurado: false, estadoRestauracao: "falha_recuperavel", tentativas: 1 });
 
-      await principal.service.reconciliarRestauracaoEstoque(cenario.venda.id, null);
-      expect(await saldo(principal, produtoId)).toBe(5);
-      expect(await entradasNoLedger(principal.conexao, cenario.venda.id)).toBe(1);
+      await p().service.reconciliarRestauracaoEstoque(cenario.venda.id, null);
+      expect(await saldo(p(), produtoId)).toBe(5);
+      expect(await entradasNoLedger(p().conexao, cenario.venda.id)).toBe(1);
     });
 
     it("falha ao MARCAR a linha: estoque e ledger da tentativa são desfeitos; a nova tentativa devolve uma única vez", async () => {
-      const cenario = await prepararVenda(principal);
+      const cenario = await prepararVenda(p());
       const produtoId = cenario.produtos[0]!.produtoId;
       espioes.push(
-        spyOn(principal.repositorio, "marcarItemRestaurado").mockImplementationOnce(async () => {
+        spyOn(p().repositorio, "marcarItemRestaurado").mockImplementationOnce(async () => {
           throw new Error("[INJETADO] falha ao marcar a linha");
         }),
       );
-      await principal.service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Marcar", idempotencyKey: `marcar-${Date.now()}` }, null);
-      await principal.caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Marcar", idempotencyKey: `marcar-${Date.now()}` }, null);
+      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
 
-      expect(await saldo(principal, produtoId)).toBe(3);
-      expect(await entradasNoLedger(principal.conexao, cenario.venda.id)).toBe(0);
-      expect((await primeiraLinha(principal.conexao, cenario.venda.id)).estadoRestauracao).toBe("falha_recuperavel");
+      expect(await saldo(p(), produtoId)).toBe(3);
+      expect(await entradasNoLedger(p().conexao, cenario.venda.id)).toBe(0);
+      expect((await primeiraLinha(p().conexao, cenario.venda.id)).estadoRestauracao).toBe("falha_recuperavel");
 
-      await venceAgenda(principal.conexao, cenario.venda.id);
-      await principal.worker.executarCiclo();
-      expect(await saldo(principal, produtoId)).toBe(5);
-      expect(await entradasNoLedger(principal.conexao, cenario.venda.id)).toBe(1);
+      await venceAgenda(p().conexao, cenario.venda.id);
+      await p().worker.executarCiclo();
+      expect(await saldo(p(), produtoId)).toBe(5);
+      expect(await entradasNoLedger(p().conexao, cenario.venda.id)).toBe(1);
     });
 
     it("erro TRANSITÓRIO (WriteConflict / TransientTransactionError): a transação inteira é repetida na mesma chamada e conclui sem registrar falha", async () => {
-      const cenario = await prepararVenda(principal);
+      const cenario = await prepararVenda(p());
       const produtoId = cenario.produtos[0]!.produtoId;
       espioes.push(
-        spyOn(principal.repositorio, "marcarItemRestaurado").mockImplementationOnce(async () => {
+        spyOn(p().repositorio, "marcarItemRestaurado").mockImplementationOnce(async () => {
           throw erroTransitorio();
         }),
       );
-      const cancelada = await principal.service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Transitório", idempotencyKey: `transitorio-${Date.now()}` }, null);
-      await principal.caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      const cancelada = await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Transitório", idempotencyKey: `transitorio-${Date.now()}` }, null);
+      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
 
       expect(resumoSerializado(cancelada).status).toBe("concluida");
-      expect(await saldo(principal, produtoId)).toBe(5); // nunca 7: a 1ª tentativa (abortada) não deixou devolução
-      expect(await entradasNoLedger(principal.conexao, cenario.venda.id)).toBe(1);
-      expect(await primeiraLinha(principal.conexao, cenario.venda.id)).toMatchObject({ estadoRestauracao: "concluida", tentativas: 1, ultimaFalha: null });
+      expect(await saldo(p(), produtoId)).toBe(5); // nunca 7: a 1ª tentativa (abortada) não deixou devolução
+      expect(await entradasNoLedger(p().conexao, cenario.venda.id)).toBe(1);
+      expect(await primeiraLinha(p().conexao, cenario.venda.id)).toMatchObject({ estadoRestauracao: "concluida", tentativas: 1, ultimaFalha: null });
     });
 
     it("commit AMBÍGUO (aplicado no servidor, cliente recebe UnknownTransactionCommitResult até esgotar): nenhuma devolução dupla e nenhuma falha falsa registrada", async () => {
-      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(principal);
-      await consertarProduto(principal.conexao, produtoId);
+      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(p());
+      await consertarProduto(p().conexao, produtoId);
 
       const commitOriginal = mongo.ClientSession.prototype.commitTransaction;
       espioes.push(
@@ -514,17 +578,17 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
           throw erroCommitAmbiguo();
         }),
       );
-      await principal.service.reconciliarRestauracaoEstoque(venda.id, null);
+      await p().service.reconciliarRestauracaoEstoque(venda.id, null);
       espioes.pop()?.mockRestore();
 
-      expect(await saldo(principal, produtoId)).toBe(2); // aplicado UMA vez
-      expect(await entradasNoLedger(principal.conexao, venda.id)).toBe(1);
-      const linha = await primeiraLinha(principal.conexao, venda.id);
+      expect(await saldo(p(), produtoId)).toBe(2); // aplicado UMA vez
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
+      const linha = await primeiraLinha(p().conexao, venda.id);
       expect(linha).toMatchObject({ restaurado: true, estadoRestauracao: "concluida", tentativas: 2 }); // CAS da falha não casou
 
       // Uma nova reconciliação lê o estado real e não devolve de novo.
-      await principal.service.reconciliarRestauracaoEstoque(venda.id, null);
-      expect(await saldo(principal, produtoId)).toBe(2);
+      await p().service.reconciliarRestauracaoEstoque(venda.id, null);
+      expect(await saldo(p(), produtoId)).toBe(2);
     });
   });
 
@@ -533,83 +597,240 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
   // ---------------------------------------------------------------------------------------------------------------
 
   describe("compatibilidade com eventos legados (sem migração)", () => {
-    /** Cancela normalmente e então reescreve a linha no formato legado, desfazendo (quando pedido) a devolução. */
-    async function linhaLegada(formato: "true" | "false" | "ausente") {
-      const cenario = await prepararVenda(principal);
+    /**
+     * Cancela normalmente e então reescreve a linha no formato pedido, desfazendo (quando a linha não é `true`) a
+     * devolução de estoque e o ledger — o estado físico de uma restauração "nunca feita".
+     *   - `true`: legado concluído (só o booleano);
+     *   - `false` / `ausente`: legado sem estado explícito (indeterminado — Fase 60.4.3.4.18.3);
+     *   - `invalido`: `restaurado:false` com `estadoRestauracao` fora do enum (indeterminado);
+     *   - `pendente`: estado explícito gravado pelo código atual (provadamente pendente).
+     */
+    async function linhaLegada(formato: "true" | "false" | "ausente" | "invalido" | "pendente") {
+      const cenario = await prepararVenda(p());
       const produtoId = cenario.produtos[0]!.produtoId;
-      await principal.service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Legado", idempotencyKey: `legado-${formato}-${Date.now()}` }, null);
-      await principal.caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      const chave = `legado-${formato}-${Date.now()}`;
+      await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Legado", idempotencyKey: chave }, null);
+      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
       const camposNovos = { estadoRestauracao: "", tentativas: "", ultimaTentativaEm: "", proximaTentativaEm: "", restauradoEm: "", ultimaFalha: "" };
       const unset = Object.fromEntries(Object.keys(camposNovos).map((campo) => [`cancelamentos.$[].itens.$[].${campo}`, ""]));
+      const filtro = { _id: new Types.ObjectId(cenario.venda.id) };
       if (formato === "true") {
-        await principal.conexao.collection("vendas").updateOne({ _id: new Types.ObjectId(cenario.venda.id) }, { $unset: unset });
+        await p().conexao.collection("vendas").updateOne(filtro, { $unset: unset });
       } else {
         // Simula restauração nunca feita: desfaz estoque e ledger.
-        await principal.conexao.collection("produtos").updateOne({ _id: new Types.ObjectId(produtoId) }, { $inc: { "variantes.0.tamanhos.0.quantidade": -2 } });
-        await principal.conexao.collection("movimentacoes_estoque").deleteMany({ vendaId: cenario.venda.id, origem: "cancelamento" });
+        await p().conexao.collection("produtos").updateOne({ _id: new Types.ObjectId(produtoId) }, { $inc: { "variantes.0.tamanhos.0.quantidade": -2 } });
+        await p().conexao.collection("movimentacoes_estoque").deleteMany({ vendaId: cenario.venda.id, origem: "cancelamento" });
         if (formato === "false") {
-          await principal.conexao
-            .collection("vendas")
-            .updateOne({ _id: new Types.ObjectId(cenario.venda.id) }, { $unset: unset, $set: { "cancelamentos.$[].itens.$[].restaurado": false } });
+          await p().conexao.collection("vendas").updateOne(filtro, { $unset: unset, $set: { "cancelamentos.$[].itens.$[].restaurado": false } });
+        } else if (formato === "ausente") {
+          await p().conexao.collection("vendas").updateOne(filtro, { $unset: { ...unset, "cancelamentos.$[].itens.$[].restaurado": "" } });
         } else {
-          await principal.conexao
-            .collection("vendas")
-            .updateOne({ _id: new Types.ObjectId(cenario.venda.id) }, { $unset: { ...unset, "cancelamentos.$[].itens.$[].restaurado": "" } });
+          await p().conexao.collection("vendas").updateOne(filtro, {
+            $set: {
+              "cancelamentos.$[].itens.$[].restaurado": false,
+              "cancelamentos.$[].itens.$[].estadoRestauracao": formato === "invalido" ? "estado_desconhecido" : "pendente",
+              "cancelamentos.$[].itens.$[].tentativas": 0,
+            },
+          });
         }
       }
-      return { ...cenario, produtoId };
+      return { ...cenario, produtoId, chave };
+    }
+
+    /**
+     * Fase 60.4.3.4.18.3 — prova que NENHUM caminho toca uma linha indeterminada: worker, repetição do cancelamento com a
+     * MESMA chave e rota ADMIN de reconciliação. Estoque, ledger e a própria linha ficam exatamente como estavam.
+     */
+    async function exigirIndeterminadaIntacta(vendaId: string, produtoId: string, chave: string): Promise<void> {
+      const linhaAntes = await primeiraLinha(p().conexao, vendaId);
+      const saldoAntes = await saldo(p(), produtoId);
+      expect(saldoAntes).toBe(3); // a devolução nunca foi feita
+
+      // 1. Worker.
+      expect(await p().worker.executarCiclo()).toMatchObject({ tentadas: 0, concluidas: 0 });
+      // 2. Repetição do cancelamento com a MESMA chave (replay → reconciliarCancelamento).
+      const caixa = await p().caixas.abrir({ valorInicial: 1000, observacao: "" }, null);
+      try {
+        const repetida = await p().service.cancelar(vendaId, { tipo: "integral", motivo: "Repetição", idempotencyKey: chave }, null);
+        expect(resumoSerializado(repetida).status).toBe("indeterminado");
+      } finally {
+        await p().caixas.fechar(caixa.id, { valorInformado: 0 }, null);
+      }
+      // 3. Reconciliação solicitada pelo operador.
+      const reconciliada = await p().service.reconciliarRestauracaoEstoque(vendaId, null);
+      expect(resumoSerializado(reconciliada)).toMatchObject({ status: "indeterminado", indeterminados: 1, concluidos: 0 });
+
+      expect(await saldo(p(), produtoId)).toBe(saldoAntes); // nenhuma devolução
+      expect(await entradasNoLedger(p().conexao, vendaId)).toBe(0); // nenhuma entrada no ledger
+      const linhaDepois = await primeiraLinha(p().conexao, vendaId);
+      expect(linhaDepois).toEqual(linhaAntes); // nada gravado na linha (nem estado, nem tentativa, nem conclusão)
+      expect(linhaDepois.restaurado).not.toBe(true);
+
+      const pendencia = (await p().service.listarPendenciasDeRestauracao(100)).itens.find((item) => item.vendaId === vendaId);
+      expect(pendencia?.estado).toBe("indeterminado"); // identificável para análise futura
     }
 
     it("`restaurado: true` sem os campos novos: lido como concluído; o worker não devolve de novo", async () => {
       const { venda, produtoId } = await linhaLegada("true");
-      const linha = await primeiraLinha(principal.conexao, venda.id);
+      const linha = await primeiraLinha(p().conexao, venda.id);
       expect(linha.estadoRestauracao).toBeUndefined();
-      expect(resumoSerializado(await principal.service.obterPorId(venda.id)).status).toBe("concluida");
-      await principal.worker.executarCiclo();
-      expect(await saldo(principal, produtoId)).toBe(5);
-      expect(await entradasNoLedger(principal.conexao, venda.id)).toBe(1);
+      expect(resumoSerializado(await p().service.obterPorId(venda.id)).status).toBe("concluida");
+      await p().worker.executarCiclo();
+      expect(await saldo(p(), produtoId)).toBe(5);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
     });
 
-    it("`restaurado: false` sem os campos novos: pendente e elegível; o worker conclui uma vez", async () => {
-      const { venda, produtoId } = await linhaLegada("false");
-      expect(resumoSerializado(await principal.service.obterPorId(venda.id)).status).toBe("pendente");
-      expect(await principal.worker.executarCiclo()).toMatchObject({ concluidas: 1 });
-      expect(await saldo(principal, produtoId)).toBe(5);
-      expect(await entradasNoLedger(principal.conexao, venda.id)).toBe(1);
-      expect((await primeiraLinha(principal.conexao, venda.id)).tentativas).toBe(1);
+    // Fase 60.4.3.4.18.3 — os dois testes abaixo SUBSTITUEM os de `78194a7` que esperavam devolução automática de
+    // `restaurado:false`/ausente sem estado explícito: a regra mudou (indeterminado, nunca devolvido automaticamente).
+    it("`restaurado: false` SEM estado explícito: INDETERMINADO — worker, repetição e reconciliação manual não devolvem nada", async () => {
+      const { venda, produtoId, chave } = await linhaLegada("false");
+      expect(resumoSerializado(await p().service.obterPorId(venda.id)).status).toBe("indeterminado");
+      await exigirIndeterminadaIntacta(venda.id, produtoId, chave);
     });
 
-    it("`restaurado` AUSENTE: NUNCA tratado como concluído — pendente, elegível e concluído pelo worker", async () => {
-      const { venda, produtoId } = await linhaLegada("ausente");
-      expect((await primeiraLinha(principal.conexao, venda.id)).restaurado).toBeUndefined();
-      expect(resumoSerializado(await principal.service.obterPorId(venda.id)).status).toBe("pendente");
-      expect((await principal.service.listarPendenciasDeRestauracao(100)).itens.some((item) => item.vendaId === venda.id && item.estado === "pendente")).toBe(true);
-      expect(await principal.worker.executarCiclo()).toMatchObject({ concluidas: 1 });
-      expect(await saldo(principal, produtoId)).toBe(5);
-      expect((await primeiraLinha(principal.conexao, venda.id)).restaurado).toBe(true);
+    it("`restaurado` AUSENTE e sem estado explícito: INDETERMINADO — nunca concluído, nunca devolvido", async () => {
+      const { venda, produtoId, chave } = await linhaLegada("ausente");
+      expect((await primeiraLinha(p().conexao, venda.id)).restaurado).toBeUndefined();
+      expect(resumoSerializado(await p().service.obterPorId(venda.id)).status).toBe("indeterminado");
+      await exigirIndeterminadaIntacta(venda.id, produtoId, chave);
+    });
+
+    it("estado explícito INVÁLIDO: indeterminado, nenhum caminho o processa", async () => {
+      const { venda, produtoId, chave } = await linhaLegada("invalido");
+      expect(resumoSerializado(await p().service.obterPorId(venda.id)).status).toBe("indeterminado");
+      await exigirIndeterminadaIntacta(venda.id, produtoId, chave);
+    });
+
+    it("estado explícito `pendente` (código atual): provadamente pendente — o worker devolve UMA vez e conclui", async () => {
+      const { venda, produtoId } = await linhaLegada("pendente");
+      expect(resumoSerializado(await p().service.obterPorId(venda.id)).status).toBe("pendente");
+      expect(await p().worker.executarCiclo()).toMatchObject({ tentadas: 1, concluidas: 1 });
+      expect(await saldo(p(), produtoId)).toBe(5);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
+      expect(await primeiraLinha(p().conexao, venda.id)).toMatchObject({ restaurado: true, estadoRestauracao: "concluida", tentativas: 1 });
     });
 
     it("evento PARCIALMENTE restaurado: só a linha pendente é devolvida; a concluída não é tocada", async () => {
-      const cenario = await prepararVenda(principal, [2, 1]);
+      const cenario = await prepararVenda(p(), [2, 1]);
       const [produtoA, produtoB] = cenario.produtos;
-      await principal.service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Parcial", idempotencyKey: `parcial-${Date.now()}` }, null);
-      await principal.caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
+      await p().service.cancelar(cenario.venda.id, { tipo: "integral", motivo: "Parcial", idempotencyKey: `parcial-${Date.now()}` }, null);
+      await p().caixas.fechar(cenario.caixa.id, { valorInformado: 0 }, null);
       // Desfaz SÓ a linha B (como se tivesse falhado).
-      await principal.conexao.collection("produtos").updateOne({ _id: new Types.ObjectId(produtoB!.produtoId) }, { $inc: { "variantes.0.tamanhos.0.quantidade": -1 } });
-      await principal.conexao.collection("movimentacoes_estoque").deleteMany({ vendaId: cenario.venda.id, produtoId: new Types.ObjectId(produtoB!.produtoId) });
-      await principal.conexao
+      await p().conexao.collection("produtos").updateOne({ _id: new Types.ObjectId(produtoB!.produtoId) }, { $inc: { "variantes.0.tamanhos.0.quantidade": -1 } });
+      await p().conexao.collection("movimentacoes_estoque").deleteMany({ vendaId: cenario.venda.id, produtoId: new Types.ObjectId(produtoB!.produtoId) });
+      await p().conexao
         .collection("vendas")
         .updateOne(
           { _id: new Types.ObjectId(cenario.venda.id) },
           { $set: { "cancelamentos.0.itens.1.restaurado": false, "cancelamentos.0.itens.1.estadoRestauracao": "pendente" } },
         );
-      expect(resumoSerializado(await principal.service.obterPorId(cenario.venda.id))).toMatchObject({ status: "pendente", concluidos: 1, pendentes: 1 });
+      expect(resumoSerializado(await p().service.obterPorId(cenario.venda.id))).toMatchObject({ status: "pendente", concluidos: 1, pendentes: 1 });
 
-      expect(await principal.worker.executarCiclo()).toMatchObject({ tentadas: 1, concluidas: 1 });
-      expect(await saldo(principal, produtoA!.produtoId)).toBe(5);
-      expect(await saldo(principal, produtoB!.produtoId)).toBe(5);
-      expect(await entradasNoLedger(principal.conexao, cenario.venda.id, produtoA!.produtoId)).toBe(1);
-      expect(await entradasNoLedger(principal.conexao, cenario.venda.id, produtoB!.produtoId)).toBe(1);
+      expect(await p().worker.executarCiclo()).toMatchObject({ tentadas: 1, concluidas: 1 });
+      expect(await saldo(p(), produtoA!.produtoId)).toBe(5);
+      expect(await saldo(p(), produtoB!.produtoId)).toBe(5);
+      expect(await entradasNoLedger(p().conexao, cenario.venda.id, produtoA!.produtoId)).toBe(1);
+      expect(await entradasNoLedger(p().conexao, cenario.venda.id, produtoB!.produtoId)).toBe(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // Referências ausentes (Fase 60.4.3.4.18.3)
+  // ---------------------------------------------------------------------------------------------------------------
+
+  describe("referências de estoque ausentes: requer_intervencao com código específico, nunca concluída sem devolução", () => {
+    interface ProdutoBruto {
+      excluidoEm?: Date | null;
+      variantes: { _id: Types.ObjectId; tamanhos: { _id: Types.ObjectId; tamanho: string; quantidade: number }[] }[];
+    }
+
+    async function produtoBruto(produtoId: string): Promise<ProdutoBruto> {
+      const doc = await p().conexao.collection<ProdutoBruto>("produtos").findOne({ _id: new Types.ObjectId(produtoId) });
+      if (!doc) throw new Error(`produto ${produtoId} não encontrado`);
+      return doc;
+    }
+
+    /**
+     * Linha PROVADAMENTE pendente (falha real registrada pelo código atual), com a causa original já resolvida
+     * (saldo 0); `quebrarReferencia` então remove uma referência. A reconciliação do operador é tentada.
+     */
+    async function reconciliarComReferenciaAusente(quebrarReferencia: (cenario: Awaited<ReturnType<typeof cancelarComFalhaDeRestauracao>>) => Promise<void>) {
+      const cenario = await cancelarComFalhaDeRestauracao(p());
+      await consertarProduto(p().conexao, cenario.produtoId);
+      expect((await primeiraLinha(p().conexao, cenario.venda.id)).estadoRestauracao).toBe("falha_recuperavel");
+      await quebrarReferencia(cenario);
+      const reconciliada = await p().service.reconciliarRestauracaoEstoque(cenario.venda.id, null);
+      const linha = await primeiraLinha(p().conexao, cenario.venda.id);
+      return { ...cenario, reconciliada, linha };
+    }
+
+    function exigirIntervencao(linha: LinhaBruta, codigo: string): void {
+      expect(linha.restaurado).toBe(false); // nunca marcada como concluída
+      expect(linha.estadoRestauracao).toBe("requer_intervencao"); // direto, sem esperar o limite de tentativas
+      expect(linha.tentativas).toBe(2);
+      expect(linha.proximaTentativaEm).toBeNull();
+      expect(linha.ultimaFalha).toMatchObject({ classe: "ReferenciaDeEstoqueAusenteErro", codigo });
+    }
+
+    it("item da venda inexistente → ITEM_VENDA_INEXISTENTE; nenhum estoque, nenhum ledger", async () => {
+      const { venda, produtoId, reconciliada, linha } = await reconciliarComReferenciaAusente(async ({ venda }) => {
+        await p().conexao
+          .collection("vendas")
+          .updateOne({ _id: new Types.ObjectId(venda.id) }, { $set: { "cancelamentos.0.itens.0.itemId": new Types.ObjectId().toHexString() } });
+      });
+      exigirIntervencao(linha, "ITEM_VENDA_INEXISTENTE");
+      expect(resumoSerializado(reconciliada).status).toBe("requer_intervencao");
+      expect(await saldo(p(), produtoId)).toBe(0);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(0);
+    });
+
+    it("item sem variante → ITEM_SEM_VARIANTE; nenhum estoque, nenhum ledger", async () => {
+      const { venda, produtoId, linha } = await reconciliarComReferenciaAusente(async ({ venda }) => {
+        await p().conexao.collection("vendas").updateOne({ _id: new Types.ObjectId(venda.id) }, { $set: { "itens.0.varianteId": null } });
+      });
+      exigirIntervencao(linha, "ITEM_SEM_VARIANTE");
+      expect(await saldo(p(), produtoId)).toBe(0);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(0);
+    });
+
+    it("produto excluído → PRODUTO_EXCLUIDO_OU_INEXISTENTE; o saldo do produto excluído não muda", async () => {
+      const { venda, produtoId, linha } = await reconciliarComReferenciaAusente(async ({ produtoId }) => {
+        await p().produtos.excluir(produtoId, null);
+      });
+      exigirIntervencao(linha, "PRODUTO_EXCLUIDO_OU_INEXISTENTE");
+      const bruto = await produtoBruto(produtoId);
+      expect(bruto.excluidoEm).toBeInstanceOf(Date);
+      expect(bruto.variantes[0]!.tamanhos[0]!.quantidade).toBe(0);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(0);
+    });
+
+    it("variante removida → VARIANTE_INEXISTENTE; nenhum ledger", async () => {
+      const { venda, produtoId, linha } = await reconciliarComReferenciaAusente(async ({ produtoId, produtos }) => {
+        await p().produtos.removerVariante(produtoId, produtos[0]!.varianteId, null);
+      });
+      exigirIntervencao(linha, "VARIANTE_INEXISTENTE");
+      expect((await produtoBruto(produtoId)).variantes).toHaveLength(0);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(0);
+    });
+
+    it("tamanho removido → TAMANHO_INEXISTENTE; o tamanho NÃO é recriado silenciosamente", async () => {
+      const { venda, produtoId, linha } = await reconciliarComReferenciaAusente(async ({ produtoId, produtos }) => {
+        await p().produtos.removerTamanho(produtoId, produtos[0]!.varianteId, produtos[0]!.tamanhoId, null);
+      });
+      exigirIntervencao(linha, "TAMANHO_INEXISTENTE");
+      expect((await produtoBruto(produtoId)).variantes[0]!.tamanhos).toHaveLength(0);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(0);
+    });
+
+    it("o worker não repete uma linha em intervenção por referência ausente", async () => {
+      const { venda, linha } = await reconciliarComReferenciaAusente(async ({ produtoId, produtos }) => {
+        await p().produtos.removerVariante(produtoId, produtos[0]!.varianteId, null);
+      });
+      exigirIntervencao(linha, "VARIANTE_INEXISTENTE");
+      await venceAgenda(p().conexao, venda.id); // mesmo com agenda "vencida"
+      const antesDoCiclo = await primeiraLinha(p().conexao, venda.id);
+      expect(await p().worker.executarCiclo()).toMatchObject({ tentadas: 0 });
+      expect(await primeiraLinha(p().conexao, venda.id)).toEqual(antesDoCiclo);
     });
   });
 
@@ -619,38 +840,38 @@ describe("Reconciliação persistente de estoque em cancelamentos (Fase 60.4.3.4
 
   describe("repetição do cancelamento", () => {
     it("MESMA chave com restauração pendente: conclui o estoque sem novo evento, sem novo movimento de caixa e sem nova reversão de agregados", async () => {
-      const { venda, produtoId, chave } = await cancelarComFalhaDeRestauracao(principal);
-      const vendedorAntes = await principal.conexao.collection("vendedores").findOne({ _id: new Types.ObjectId(venda.vendedorId) });
-      const movimentosAntes = await principal.conexao.collection("movimentos_caixa").countDocuments({ vendaId: venda.id });
-      const eventosAntes = await principal.conexao.collection("eventos_venda").countDocuments({ vendaId: venda.id });
-      await consertarProduto(principal.conexao, produtoId);
+      const { venda, produtoId, chave } = await cancelarComFalhaDeRestauracao(p());
+      const vendedorAntes = await p().conexao.collection("vendedores").findOne({ _id: new Types.ObjectId(venda.vendedorId) });
+      const movimentosAntes = await p().conexao.collection("movimentos_caixa").countDocuments({ vendaId: venda.id });
+      const eventosAntes = await p().conexao.collection("eventos_venda").countDocuments({ vendaId: venda.id });
+      await consertarProduto(p().conexao, produtoId);
 
-      const caixa = await principal.caixas.abrir({ valorInicial: 1000, observacao: "" }, null); // replay exige caixa aberto
-      const repetida = await principal.service.cancelar(venda.id, { tipo: "integral", motivo: "Repetição", idempotencyKey: chave }, null);
-      await principal.caixas.fechar(caixa.id, { valorInformado: 0 }, null);
+      const caixa = await p().caixas.abrir({ valorInicial: 1000, observacao: "" }, null); // replay exige caixa aberto
+      const repetida = await p().service.cancelar(venda.id, { tipo: "integral", motivo: "Repetição", idempotencyKey: chave }, null);
+      await p().caixas.fechar(caixa.id, { valorInformado: 0 }, null);
 
       expect(resumoSerializado(repetida).status).toBe("concluida");
-      expect(await saldo(principal, produtoId)).toBe(2);
-      expect(await entradasNoLedger(principal.conexao, venda.id)).toBe(1);
-      expect((await vendaBruta(principal.conexao, venda.id)).cancelamentos).toHaveLength(1);
-      expect(await principal.conexao.collection("movimentos_caixa").countDocuments({ vendaId: venda.id })).toBe(movimentosAntes);
-      expect(await principal.conexao.collection("eventos_venda").countDocuments({ vendaId: venda.id })).toBe(eventosAntes);
-      expect(await principal.conexao.collection("vendedores").findOne({ _id: new Types.ObjectId(venda.vendedorId) })).toEqual(vendedorAntes);
+      expect(await saldo(p(), produtoId)).toBe(2);
+      expect(await entradasNoLedger(p().conexao, venda.id)).toBe(1);
+      expect((await vendaBruta(p().conexao, venda.id)).cancelamentos).toHaveLength(1);
+      expect(await p().conexao.collection("movimentos_caixa").countDocuments({ vendaId: venda.id })).toBe(movimentosAntes);
+      expect(await p().conexao.collection("eventos_venda").countDocuments({ vendaId: venda.id })).toBe(eventosAntes);
+      expect(await p().conexao.collection("vendedores").findOne({ _id: new Types.ObjectId(venda.vendedorId) })).toEqual(vendedorAntes);
     });
 
     it("chave DIFERENTE numa venda já cancelada: rejeitada como antes, sem nenhuma alteração", async () => {
-      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(principal);
-      const antes = await vendaBruta(principal.conexao, venda.id);
-      const caixa = await principal.caixas.abrir({ valorInicial: 1000, observacao: "" }, null);
+      const { venda, produtoId } = await cancelarComFalhaDeRestauracao(p());
+      const antes = await vendaBruta(p().conexao, venda.id);
+      const caixa = await p().caixas.abrir({ valorInicial: 1000, observacao: "" }, null);
       try {
-        await expect(principal.service.cancelar(venda.id, { tipo: "integral", motivo: "Outra chave", idempotencyKey: `outra-${Date.now()}` }, null)).rejects.toThrow(
+        await expect(p().service.cancelar(venda.id, { tipo: "integral", motivo: "Outra chave", idempotencyKey: `outra-${Date.now()}` }, null)).rejects.toThrow(
           "Esta venda já está cancelada.",
         );
       } finally {
-        await principal.caixas.fechar(caixa.id, { valorInformado: 0 }, null);
+        await p().caixas.fechar(caixa.id, { valorInformado: 0 }, null);
       }
-      expect(await vendaBruta(principal.conexao, venda.id)).toEqual(antes);
-      expect(await saldo(principal, produtoId)).toBe(-100);
+      expect(await vendaBruta(p().conexao, venda.id)).toEqual(antes);
+      expect(await saldo(p(), produtoId)).toBe(-100);
     });
   });
 });

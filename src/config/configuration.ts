@@ -185,7 +185,8 @@ export default (): Configuration => {
       globalTtlMs: Number(process.env["RATE_LIMIT_GLOBAL_TTL_MS"] ?? 60000),
     },
     reconciliacaoEstoque: {
-      habilitada: reconciliacaoHabilitadaRaw === undefined || reconciliacaoHabilitadaRaw.trim() === "" ? nodeEnv !== "test" : reconciliacaoHabilitadaRaw === "true",
+      // Fase 60.4.3.4.18.3 — DESLIGADO por padrão em QUALQUER ambiente (inclusive produção): só `"true"` explícito liga.
+      habilitada: reconciliacaoHabilitadaRaw?.trim() === "true",
       intervaloMs: Number(process.env["RECONCILIACAO_ESTOQUE_INTERVALO_MS"] || RECONCILIACAO_ESTOQUE_PADRAO.intervaloMs),
       loteVendas: Number(process.env["RECONCILIACAO_ESTOQUE_LOTE"] || RECONCILIACAO_ESTOQUE_PADRAO.loteVendas),
       maxItensPorCiclo: Number(process.env["RECONCILIACAO_ESTOQUE_MAX_ITENS_POR_CICLO"] || RECONCILIACAO_ESTOQUE_PADRAO.maxItensPorCiclo),

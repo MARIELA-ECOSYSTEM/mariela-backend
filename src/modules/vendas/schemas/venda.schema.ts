@@ -265,8 +265,9 @@ export class ItemDevolvido {
    */
   /**
    * Fase 60.4.3.4.18 — SEM `default`. Até esta fase o padrão era `true`, o que fazia um documento SEM o campo ser lido
-   * como "estoque já restaurado" — uma restauração nunca confirmada podia ficar invisível. Agora ausência = pendente
-   * (`estadoEfetivoDaRestauracao`). Toda linha criada pelo código atual grava `false` explicitamente.
+   * como "estoque já restaurado" — uma restauração nunca confirmada podia ficar invisível. Fase 60.4.3.4.18.3 — sem
+   * `estadoRestauracao` explícito, `restaurado` falso ou ausente é histórico INDETERMINADO (`classificarRestauracao`),
+   * nunca pendente nem concluído. Toda linha criada pelo código atual grava `false` e `estadoRestauracao` explicitamente.
    */
   @Prop({ type: Boolean })
   restaurado?: boolean;
@@ -293,8 +294,9 @@ export class ItemDevolvido {
   restaurando!: boolean;
 
   /**
-   * Fase 60.4.3.4.18 — estado explícito da restauração (ver `ESTADOS_RESTAURACAO`). Sem `default` de propósito: um
-   * evento legado sem o campo tem o estado DERIVADO de `restaurado` (`estadoEfetivoDaRestauracao`), nunca presumido.
+   * Fase 60.4.3.4.18 — estado explícito da restauração (ver `ESTADOS_RESTAURACAO`). Sem `default` de propósito.
+   * Fase 60.4.3.4.18.3 — sua PRESENÇA (com valor válido) é o que prova que a linha foi gravada pelo código transacional:
+   * sem ele, a linha é indeterminada (`classificarRestauracao`) e nenhum caminho devolve seu estoque.
    */
   @Prop({ type: String, enum: ESTADOS_RESTAURACAO })
   estadoRestauracao?: EstadoRestauracao;

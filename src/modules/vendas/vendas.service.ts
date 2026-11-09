@@ -1,4 +1,4 @@
-import { HttpStatus, Inject, Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger } from "@nestjs/common";
 import { InjectConnection, InjectModel } from "@nestjs/mongoose";
 import { Types, type ClientSession, type Connection, type Model } from "mongoose";
 import { executarEmTransacao } from "../../database/transacao.util.js";
@@ -13,7 +13,7 @@ import { ConfiguracoesRepository } from "../configuracoes/configuracoes.reposito
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { ProdutosService } from "../produtos/produtos.service.js";
 import { fotoDaVariante } from "../produtos/utils/midias.util.js";
-import { normalizarFormaPagamento } from "../produtos/utils/normalizacao.util.js";
+import { normalizarFormaPagamento, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
 import { precoEfetivo } from "../produtos/utils/precos.util.js";
 import { SequenciasService } from "../sequencias/sequencias.service.js";
 import { VendedoresRepository } from "../vendedores/vendedores.repository.js";
@@ -23,16 +23,18 @@ import {
   DIGITOS_NUMERO_VENDA,
   MODALIDADES_PAGAMENTO,
   PREFIXO_CODIGO_VENDA,
-  type EstadoRestauracao,
   type ModalidadePagamento,
 } from "./vendas.constants.js";
 import type { ReconciliacaoEstoqueConfig } from "../../config/configuration.js";
 import { RECONCILIACAO_ESTOQUE_CONFIG } from "./reconciliacao-estoque.config.js";
 import {
   calcularEsperaDeRestauracao,
+  classificarRestauracao,
   descreverFalhaDeRestauracao,
-  estadoEfetivoDaRestauracao,
   linhaElegivelParaReconciliacaoAutomatica,
+  linhaRestauravel,
+  ReferenciaDeEstoqueAusenteErro,
+  type ClassificacaoRestauracao,
   type DescricaoFalhaRestauracao,
 } from "./restauracao-estoque.util.js";
 import type { SelecaoFacetas } from "./vendas-filtros.util.js";
@@ -65,7 +67,7 @@ interface OpcoesRestauracao {
   limiteLinhas?: number;
 }
 
-type DesfechoRestauracaoLinha = "concluida" | "ja_concluida" | "adiada" | "falha";
+type DesfechoRestauracaoLinha = "concluida" | "ja_concluida" | "adiada" | "indeterminada" | "falha";
 
 export interface ResultadoRestauracaoEstoque {
   tentadas: number;
@@ -73,6 +75,8 @@ export interface ResultadoRestauracaoEstoque {
   jaConcluidas: number;
   falhas: number;
   adiadas: number;
+  /** Fase 60.4.3.4.18.3 — linhas históricas indeterminadas encontradas e DEIXADAS intactas (nenhum caminho as devolve). */
+  indeterminadas: number;
 }
 
 export interface ResultadoCicloReconciliacao extends ResultadoRestauracaoEstoque {
@@ -91,7 +95,8 @@ export interface PendenciaRestauracaoEstoque {
   codProduto: string;
   nome: string;
   quantidade: number;
-  estado: EstadoRestauracao;
+  /** Inclui `indeterminado` (Fase 60.4.3.4.18.3): linha histórica sem prova do estado do estoque. */
+  estado: ClassificacaoRestauracao;
   tentativas: number;
   ultimaTentativaEm: Date | null;
   proximaTentativaEm: Date | null;
@@ -107,7 +112,8 @@ export interface PendenciasRestauracaoEstoque {
 }
 
 /**
- * Fase 60.4.3.4.18 — sinal interno: a marcação condicional não alterou a linha porque outra execução já a concluiu.
+ * Fase 60.4.3.4.18 — sinal interno: a marcação condicional não alterou a linha porque outra execução já a concluiu
+ * (ou ela deixou de estar num estado restaurável — Fase 60.4.3.4.18.3).
  * Lançado DENTRO da transação para abortá-la (desfazendo a devolução física desta tentativa). Não é transitório:
  * `executarEmTransacao` não repete; `restaurarLinha` o traduz em `ja_concluida`.
  */
@@ -1285,10 +1291,10 @@ export class VendasService {
    * (`VendasRepository.marcarItemRestaurado`) — uma falha genuína NUNCA
    * marca o item como restaurado (bug corrigido nesta etapa) e libera a
    * reivindicação (`liberarReivindicacaoDeItem`) para uma tentativa futura
-   * poder tentar de novo. A única exceção: produto/variante genuinamente
-   * excluído (`ApiException` 404) é aceito como "nada a restaurar" e marcado
-   * concluído — mesmo comportamento histórico já existente antes desta
-   * etapa, preservado deliberadamente.
+   * poder tentar de novo.
+   *
+   * Fase 60.4.3.4.18.3 — REMOVIDA a antiga exceção "produto/variante excluído (404) = concluído sem devolver": toda
+   * referência ausente agora vai para `requer_intervencao` com código específico (`resolverDestinoDaDevolucao`).
    */
   private async restaurarEstoquePendente(vendaId: string, opcoes: OpcoesRestauracao): Promise<ResultadoRestauracaoEstoque> {
     // Fase 60.4.3.4.18 — passou a: (i) receber o id (sempre relê a venda), (ii) registrar PERSISTENTEMENTE cada falha
@@ -1305,13 +1311,23 @@ export class VendasService {
     //     `cancelar()`/reconciliação a restaura uma única vez;
     //   - duas chamadas concorrentes na mesma linha → a segunda conflita na escrita da venda, repete a transação, lê
     //     `restaurado: true` e não faz nada;
-    //   - `restaurando` deixa de ser consultado: uma linha legada presa em `restaurando: true` é retomada normalmente.
-    const resultado: ResultadoRestauracaoEstoque = { tentadas: 0, concluidas: 0, jaConcluidas: 0, falhas: 0, adiadas: 0 };
+    //   - `restaurando` deixa de ser consultado.
+    //
+    // Fase 60.4.3.4.18.3 — PROTEÇÃO HISTÓRICA: só linhas com estado EXPLÍCITO restaurável (`classificarRestauracao`)
+    // são tentadas, em TODOS os modos (worker, cancelamento, repetição com a mesma chave, rota ADMIN). Linhas
+    // `indeterminado` (ex.: `restaurado:false` gravado antes de `78194a7`, quando ele não provava pendência) são
+    // contadas e deixadas intactas: sem estoque, sem ledger, sem marcação, sem gravação de estado.
+    const resultado: ResultadoRestauracaoEstoque = { tentadas: 0, concluidas: 0, jaConcluidas: 0, falhas: 0, adiadas: 0, indeterminadas: 0 };
     const atual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
     for (const evento of atual.cancelamentos) {
       const eventoId = String(evento._id);
       for (const devolvido of evento.itens) {
-        if (estadoEfetivoDaRestauracao(devolvido) === "concluida") continue;
+        const classificacao = classificarRestauracao(devolvido);
+        if (classificacao === "concluida") continue;
+        if (!linhaRestauravel(classificacao)) {
+          resultado.indeterminadas += 1;
+          continue;
+        }
         if (opcoes.modo === "automatico" && !linhaElegivelParaReconciliacaoAutomatica(devolvido, new Date())) {
           resultado.adiadas += 1;
           continue;
@@ -1322,6 +1338,7 @@ export class VendasService {
         if (desfecho === "concluida") resultado.concluidas += 1;
         else if (desfecho === "ja_concluida") resultado.jaConcluidas += 1;
         else if (desfecho === "adiada") resultado.adiadas += 1;
+        else if (desfecho === "indeterminada") resultado.indeterminadas += 1;
         else resultado.falhas += 1;
       }
     }
@@ -1347,7 +1364,7 @@ export class VendasService {
     linhaLida: ItemDevolvido,
     modo: ModoRestauracao,
   ): Promise<DesfechoRestauracaoLinha> {
-    const estadoAnterior = estadoEfetivoDaRestauracao(linhaLida);
+    const estadoAnterior = classificarRestauracao(linhaLida);
     const tentativasLidas = linhaLida.tentativas ?? 0;
     try {
       const desfecho = await executarEmTransacao(this.conexao, async (sessao): Promise<DesfechoRestauracaoLinha> => {
@@ -1356,20 +1373,17 @@ export class VendasService {
           .find((registro) => String(registro._id) === eventoId)
           ?.itens.find((registro) => registro.itemId === linhaLida.itemId);
         if (!linha || linha.restaurado === true) return "ja_concluida"; // confirmada por outra execução.
+        // Fase 60.4.3.4.18.3 — reconfere a classificação no snapshot da transação: nunca devolve uma linha indeterminada.
+        if (!linhaRestauravel(classificarRestauracao(linha))) return "indeterminada";
         // No automático, outra instância pode ter acabado de registrar uma falha (nova agenda): respeita-a.
         if (modo === "automatico" && !linhaElegivelParaReconciliacaoAutomatica(linha, new Date())) return "adiada";
 
+        // Fase 60.4.3.4.18.3 — toda referência é verificada ANTES de tocar o estoque; qualquer ausência aborta a
+        // transação com um código específico (→ `requer_intervencao`), nunca vira "concluída sem devolução".
         const item = fresca.itens.find((registro) => String(registro._id) === linha.itemId);
-        if (item) {
-          try {
-            await this.devolverAoEstoque(item, linha.quantidade, fresca, sessao);
-          } catch (erro) {
-            // Produto/variante não existe mais — nada a restaurar fisicamente; aceito como concluído (mesmo
-            // comportamento histórico). É uma `ApiException` do próprio código, não um erro do servidor: a
-            // transação continua válida.
-            if (!this.erroDeProdutoOuVarianteExcluido(erro)) throw erro;
-          }
-        }
+        if (!item) throw new ReferenciaDeEstoqueAusenteErro("ITEM_VENDA_INEXISTENTE");
+        const tamanhoId = await this.resolverDestinoDaDevolucao(item, sessao);
+        await this.devolverAoEstoque(item, tamanhoId, linha.quantidade, fresca, sessao);
         const marcou = await this.vendasRepository.marcarItemRestaurado(vendaId, eventoId, linha.itemId, sessao);
         if (!marcou) throw new LinhaJaRestauradaErro();
         return "concluida";
@@ -1397,6 +1411,23 @@ export class VendasService {
   }
 
   /**
+   * Fase 60.4.3.4.18.3 — confere, no snapshot da transação, que existe ONDE devolver a quantidade (produto ativo →
+   * variante → tamanho), e devolve o `tamanhoId`. Nunca recria um tamanho removido (antes, `exigirExistente: false`
+   * recriava silenciosamente). Cada ausência lança `ReferenciaDeEstoqueAusenteErro` com o código específico.
+   */
+  private async resolverDestinoDaDevolucao(item: ItemVenda, sessao: ClientSession): Promise<string> {
+    if (!item.varianteId) throw new ReferenciaDeEstoqueAusenteErro("ITEM_SEM_VARIANTE");
+    const produto = await this.produtosRepository.encontrarPorId(item.produtoId, sessao); // ignora excluídos (`excluidoEm`)
+    if (!produto) throw new ReferenciaDeEstoqueAusenteErro("PRODUTO_EXCLUIDO_OU_INEXISTENTE");
+    const variante = produto.variantes.find((registro) => String(registro._id) === item.varianteId);
+    if (!variante) throw new ReferenciaDeEstoqueAusenteErro("VARIANTE_INEXISTENTE");
+    const nomeTamanho = item.tamanho ? normalizarTamanho(item.tamanho) : null;
+    const tamanho = nomeTamanho === null ? undefined : variante.tamanhos.find((registro) => normalizarTamanho(registro.tamanho) === nomeTamanho);
+    if (!tamanho) throw new ReferenciaDeEstoqueAusenteErro("TAMANHO_INEXISTENTE");
+    return String(tamanho._id);
+  }
+
+  /**
    * Fase 60.4.3.4.18 — persiste a falha de UMA linha (fora de transação — a da restauração já abortou): incrementa
    * `tentativas`, agenda `proximaTentativaEm` com backoff exponencial ou, ao atingir `maxTentativas`, marca
    * `requer_intervencao` (o worker para de tentar; só a rota ADMIN de reconciliação a retoma). Nunca lança: uma falha
@@ -1407,14 +1438,16 @@ export class VendasService {
     vendaCodigo: string,
     eventoId: string,
     linha: ItemDevolvido,
-    estadoAnterior: EstadoRestauracao,
+    estadoAnterior: ClassificacaoRestauracao,
     tentativasLidas: number,
     modo: ModoRestauracao,
     erro: unknown,
   ): Promise<void> {
     const agora = new Date();
     const tentativa = tentativasLidas + 1;
-    const estadoNovo = tentativa >= this.configReconciliacao.maxTentativas ? "requer_intervencao" : "falha_recuperavel";
+    // Fase 60.4.3.4.18.3 — referência ausente não se resolve com nova tentativa: vai direto para intervenção.
+    const estadoNovo =
+      erro instanceof ReferenciaDeEstoqueAusenteErro || tentativa >= this.configReconciliacao.maxTentativas ? "requer_intervencao" : "falha_recuperavel";
     const proximaTentativaEm =
       estadoNovo === "falha_recuperavel"
         ? new Date(agora.getTime() + calcularEsperaDeRestauracao(tentativa, this.configReconciliacao.esperaBaseMs, this.configReconciliacao.esperaMaximaMs))
@@ -1483,7 +1516,16 @@ export class VendasService {
    */
   async reconciliarAutomaticamente(): Promise<ResultadoCicloReconciliacao> {
     const { loteVendas, maxItensPorCiclo } = this.configReconciliacao;
-    const ciclo: ResultadoCicloReconciliacao = { vendas: 0, tentadas: 0, concluidas: 0, jaConcluidas: 0, falhas: 0, adiadas: 0, vendasComErro: 0 };
+    const ciclo: ResultadoCicloReconciliacao = {
+      vendas: 0,
+      tentadas: 0,
+      concluidas: 0,
+      jaConcluidas: 0,
+      falhas: 0,
+      adiadas: 0,
+      indeterminadas: 0,
+      vendasComErro: 0,
+    };
     const vendas = await this.vendasRepository.buscarVendasComRestauracaoElegivel(new Date(), loteVendas);
     for (const venda of vendas) {
       const restantes = maxItensPorCiclo - ciclo.tentadas;
@@ -1496,6 +1538,7 @@ export class VendasService {
         ciclo.jaConcluidas += resultado.jaConcluidas;
         ciclo.falhas += resultado.falhas;
         ciclo.adiadas += resultado.adiadas;
+        ciclo.indeterminadas += resultado.indeterminadas;
       } catch (erro) {
         // Ex.: falha de leitura da venda — nada foi alterado; o próximo ciclo a encontra de novo.
         ciclo.vendasComErro += 1;
@@ -1516,7 +1559,7 @@ export class VendasService {
     for (const venda of vendas) {
       for (const evento of venda.cancelamentos) {
         for (const linha of evento.itens) {
-          const estado = estadoEfetivoDaRestauracao(linha);
+          const estado = classificarRestauracao(linha);
           if (estado === "concluida") continue;
           itens.push({
             vendaId: venda.id,
@@ -1541,11 +1584,6 @@ export class VendasService {
       }
     }
     return { totalVendas: total, vendasListadas: vendas.length, itens };
-  }
-
-  /** `ApiException` com status 404 — único caso em que uma falha de restauração de estoque é aceita como "nada a fazer" (produto/variante genuinamente excluído). */
-  private erroDeProdutoOuVarianteExcluido(erro: unknown): boolean {
-    return erro instanceof ApiException && erro.getStatus() === HttpStatus.NOT_FOUND;
   }
 
   /**
@@ -1936,18 +1974,18 @@ export class VendasService {
   }
 
   /**
-   * Etapa 10.22 — CORREÇÃO: não engole mais erros (`.catch(() => undefined)`
-   * removido) — o chamador (`restaurarEstoquePendente`) é quem decide o que
-   * fazer com uma falha (produto/variante excluído → aceita como concluído;
-   * qualquer outro erro → registra e mantém pendente para retry).
+   * Etapa 10.22 — não engole erros: o chamador (`restaurarLinha`) decide o que fazer com uma falha.
+   * Fase 60.4.3.4.15 (F04) — sempre dentro da transação da restauração: devolução + entrada no ledger juntas.
+   * Fase 60.4.3.4.18.3 — recebe o destino JÁ verificado (`resolverDestinoDaDevolucao`) e exige que o tamanho exista
+   * (`exigirExistente: true`): nunca retorna sem devolver (o antigo `if (!varianteId) return` marcava a linha como
+   * concluída sem estoque) e nunca recria um tamanho removido.
    */
-  /** Fase 60.4.3.4.15 (F04) — sempre dentro da transação da restauração: devolução + entrada no ledger juntas. */
-  private async devolverAoEstoque(item: ItemVenda, quantidade: number, venda: VendaDocument, sessao: ClientSession): Promise<void> {
-    if (!item.varianteId) return;
+  private async devolverAoEstoque(item: ItemVenda, tamanhoIdDestino: string, quantidade: number, venda: VendaDocument, sessao: ClientSession): Promise<void> {
+    if (!item.varianteId) throw new ReferenciaDeEstoqueAusenteErro("ITEM_SEM_VARIANTE");
     const { tamanhoId, saldoResultante } = await this.produtosService.ajustarQuantidadeTamanho(
       item.produtoId,
       item.varianteId,
-      { tamanho: item.tamanho ?? undefined, delta: quantidade, exigirExistente: false },
+      { tamanhoId: tamanhoIdDestino, delta: quantidade, exigirExistente: true },
       sessao,
     );
     await this.movimentacaoEstoqueModel.create(

@@ -16,6 +16,7 @@ import {
   type OrdenarVendaPor,
 } from "./vendas.constants.js";
 import { combinarFiltros, condicaoFaceta, filtroSempreAtivo, type SelecaoFacetas } from "./vendas-filtros.util.js";
+import { ESTADOS_ELEGIVEIS_AUTOMATICO, ESTADOS_RESTAURAVEIS } from "./restauracao-estoque.util.js";
 import type { DadosPersistirVenda } from "./vendas.types.js";
 import { Venda, type VendaDocument } from "./schemas/venda.schema.js";
 
@@ -270,7 +271,12 @@ export class VendasRepository {
           $inc: { [`${caminho}.tentativas`]: 1 },
         },
         {
-          arrayFilters: [{ "evt._id": new Types.ObjectId(eventoId) }, { "item.itemId": itemId, "item.restaurado": { $ne: true } }],
+          // Fase 60.4.3.4.18.3 — só uma linha PROVADAMENTE pendente (estado explícito restaurável) pode ser concluída:
+          // uma linha indeterminada nunca casa, e a transação que tentasse marcá-la é abortada.
+          arrayFilters: [
+            { "evt._id": new Types.ObjectId(eventoId) },
+            { "item.itemId": itemId, "item.restaurado": { $ne: true }, "item.estadoRestauracao": { $in: [...ESTADOS_RESTAURAVEIS] } },
+          ],
           ...(sessao ? { session: sessao } : {}),
         },
       )
@@ -318,7 +324,13 @@ export class VendasRepository {
         {
           arrayFilters: [
             { "evt._id": new Types.ObjectId(eventoId) },
-            { "item.itemId": itemId, "item.restaurado": { $ne: true }, "item.tentativas": filtroTentativas },
+            // Fase 60.4.3.4.18.3 — nunca grava estado numa linha indeterminada (isso a "promoveria" a pendente).
+            {
+              "item.itemId": itemId,
+              "item.restaurado": { $ne: true },
+              "item.estadoRestauracao": { $in: [...ESTADOS_RESTAURAVEIS] },
+              "item.tentativas": filtroTentativas,
+            },
           ],
         },
       )
@@ -569,7 +581,8 @@ export interface VendaResumoFinanceiro {
 function filtroLinhaElegivel(agora: Date): Record<string, unknown> {
   return {
     restaurado: { $ne: true },
-    estadoRestauracao: { $ne: "requer_intervencao" },
+    // Fase 60.4.3.4.18.3 — só estado EXPLÍCITO elegível: ausente/inválido (indeterminado) e `requer_intervencao` ficam fora.
+    estadoRestauracao: { $in: [...ESTADOS_ELEGIVEIS_AUTOMATICO] },
     $or: [{ proximaTentativaEm: null }, { proximaTentativaEm: { $lte: agora } }],
   };
 }

@@ -74,16 +74,26 @@ describe("configuration — storage.transporte (Fase 60.4.1)", () => {
 describe("configuration — reconciliacaoEstoque (Fase 60.4.3.4.18)", () => {
   const PADRAO = { intervaloMs: 60_000, loteVendas: 20, maxItensPorCiclo: 50, maxTentativas: 8, esperaBaseMs: 30_000, esperaMaximaMs: 3_600_000 };
 
-  it("sem variáveis, fora de teste: worker LIGADO com os padrões", () => {
+  it("Fase 60.4.3.4.18.3 — sem variáveis, EM PRODUÇÃO: worker DESLIGADO (ativação só explícita), com os padrões", () => {
     process.env["NODE_ENV"] = "production";
     for (const nome of VARIAVEIS_ISOLADAS) if (nome.startsWith("RECONCILIACAO_")) delete process.env[nome];
-    expect(configuration().reconciliacaoEstoque).toEqual({ habilitada: true, ...PADRAO });
+    expect(configuration().reconciliacaoEstoque).toEqual({ habilitada: false, ...PADRAO });
   });
 
-  it("NODE_ENV=test sem a variável: worker DESLIGADO (testes o acionam explicitamente)", () => {
-    process.env["NODE_ENV"] = "test";
-    process.env["RECONCILIACAO_ESTOQUE_HABILITADA"] = "";
-    expect(configuration().reconciliacaoEstoque.habilitada).toBe(false);
+  it("vazia ou qualquer valor diferente de \"true\": desligado, em qualquer ambiente", () => {
+    for (const ambiente of ["production", "development", "test"]) {
+      process.env["NODE_ENV"] = ambiente;
+      for (const valor of ["", "false", " "]) {
+        process.env["RECONCILIACAO_ESTOQUE_HABILITADA"] = valor;
+        expect(configuration().reconciliacaoEstoque.habilitada).toBe(false);
+      }
+    }
+  });
+
+  it("só `RECONCILIACAO_ESTOQUE_HABILITADA=true` liga o worker", () => {
+    process.env["NODE_ENV"] = "production";
+    process.env["RECONCILIACAO_ESTOQUE_HABILITADA"] = "true";
+    expect(configuration().reconciliacaoEstoque.habilitada).toBe(true);
   });
 
   it("a variável explícita prevalece sobre o ambiente; números sobrescrevem os padrões", () => {

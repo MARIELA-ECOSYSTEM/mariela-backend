@@ -224,8 +224,9 @@ class EnvironmentVariables {
 
   /**
    * Fase 60.4.3.4.18 — reconciliação automática de estoque em cancelamentos (`ReconciliacaoEstoqueWorker`). Todas
-   * opcionais (vazias = padrão de `RECONCILIACAO_ESTOQUE_PADRAO`). `RECONCILIACAO_ESTOQUE_HABILITADA` ausente liga o
-   * worker fora de `NODE_ENV=test` (testes o acionam explicitamente). Faixas impedem um laço agressivo (intervalo
+   * opcionais (vazias = padrão de `RECONCILIACAO_ESTOQUE_PADRAO`). O worker só liga com
+   * `RECONCILIACAO_ESTOQUE_HABILITADA=true` explícito (Fase 60.4.3.4.18.3 — desligado por padrão, inclusive em
+   * produção). Faixas impedem um laço agressivo (intervalo
    * mínimo de 5 s, espera mínima de 1 s) ou um ciclo que carregue a coleção inteira.
    */
   @IsOptional()

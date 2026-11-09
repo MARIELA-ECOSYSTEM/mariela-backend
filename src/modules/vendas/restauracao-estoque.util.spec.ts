@@ -3,46 +3,71 @@ import { mongo } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import {
   calcularEsperaDeRestauracao,
+  classificarRestauracao,
+  CODIGOS_REFERENCIA_AUSENTE,
   descreverFalhaDeRestauracao,
-  estadoEfetivoDaRestauracao,
   linhaElegivelParaReconciliacaoAutomatica,
+  linhaRestauravel,
+  ReferenciaDeEstoqueAusenteErro,
   resumoRestauracao,
 } from "./restauracao-estoque.util.js";
 
 /** Fase 60.4.3.4.18 — regras puras da reconciliação de estoque (sem MongoDB). */
 describe("restauracao-estoque.util", () => {
-  describe("estadoEfetivoDaRestauracao — compatibilidade com eventos legados", () => {
+  describe("classificarRestauracao — classificação conservadora (Fase 60.4.3.4.18.3)", () => {
     it("legado `restaurado: true` (sem estado explícito) é concluída", () => {
-      expect(estadoEfetivoDaRestauracao({ restaurado: true })).toBe("concluida");
+      expect(classificarRestauracao({ restaurado: true })).toBe("concluida");
     });
 
-    it("legado `restaurado: false` (sem estado explícito) é pendente", () => {
-      expect(estadoEfetivoDaRestauracao({ restaurado: false })).toBe("pendente");
+    it("legado `restaurado: false` SEM estado explícito é INDETERMINADO — nunca inferido como pendente", () => {
+      expect(classificarRestauracao({ restaurado: false })).toBe("indeterminado");
     });
 
-    it("campo `restaurado` AUSENTE nunca é lido como concluída", () => {
-      expect(estadoEfetivoDaRestauracao({})).toBe("pendente");
-      expect(estadoEfetivoDaRestauracao({ restaurado: null })).toBe("pendente");
+    it("legado sem `restaurado` e sem estado explícito é INDETERMINADO — ausência nunca é concluída nem pendente", () => {
+      expect(classificarRestauracao({})).toBe("indeterminado");
+      expect(classificarRestauracao({ restaurado: null, estadoRestauracao: null })).toBe("indeterminado");
     });
 
-    it("`estadoRestauracao: concluida` sem `restaurado: true` (inconsistente) continua pendente — o booleano é a fonte de verdade", () => {
-      expect(estadoEfetivoDaRestauracao({ restaurado: false, estadoRestauracao: "concluida" })).toBe("pendente");
+    it("estado explícito válido aplica a própria semântica", () => {
+      expect(classificarRestauracao({ restaurado: false, estadoRestauracao: "pendente" })).toBe("pendente");
+      expect(classificarRestauracao({ restaurado: false, estadoRestauracao: "falha_recuperavel" })).toBe("falha_recuperavel");
+      expect(classificarRestauracao({ restaurado: false, estadoRestauracao: "requer_intervencao" })).toBe("requer_intervencao");
+      expect(classificarRestauracao({ estadoRestauracao: "pendente" })).toBe("pendente");
     });
 
-    it("estados de falha persistidos são preservados enquanto a linha não for restaurada", () => {
-      expect(estadoEfetivoDaRestauracao({ restaurado: false, estadoRestauracao: "falha_recuperavel" })).toBe("falha_recuperavel");
-      expect(estadoEfetivoDaRestauracao({ restaurado: false, estadoRestauracao: "requer_intervencao" })).toBe("requer_intervencao");
-      expect(estadoEfetivoDaRestauracao({ restaurado: true, estadoRestauracao: "requer_intervencao" })).toBe("concluida");
+    it("estado explícito INVÁLIDO ou desconhecido é indeterminado", () => {
+      expect(classificarRestauracao({ restaurado: false, estadoRestauracao: "qualquer" })).toBe("indeterminado");
+      expect(classificarRestauracao({ restaurado: false, estadoRestauracao: "" })).toBe("indeterminado");
+      expect(classificarRestauracao({ restaurado: false, estadoRestauracao: "PENDENTE" })).toBe("indeterminado");
+    });
+
+    it("`estadoRestauracao: concluida` sem `restaurado: true` (contraditório) é indeterminado", () => {
+      expect(classificarRestauracao({ restaurado: false, estadoRestauracao: "concluida" })).toBe("indeterminado");
+    });
+
+    it("`restaurado: true` prevalece sobre qualquer estado", () => {
+      expect(classificarRestauracao({ restaurado: true, estadoRestauracao: "requer_intervencao" })).toBe("concluida");
+      expect(classificarRestauracao({ restaurado: true, estadoRestauracao: "invalido" })).toBe("concluida");
+    });
+
+    it("só estados explícitos pendentes são restauráveis", () => {
+      expect(linhaRestauravel("pendente")).toBe(true);
+      expect(linhaRestauravel("falha_recuperavel")).toBe(true);
+      expect(linhaRestauravel("requer_intervencao")).toBe(true);
+      expect(linhaRestauravel("indeterminado")).toBe(false);
+      expect(linhaRestauravel("concluida")).toBe(false);
     });
   });
 
   describe("linhaElegivelParaReconciliacaoAutomatica", () => {
     const agora = new Date("2026-11-07T12:00:00.000Z");
 
-    it("pendente sem agenda é elegível; com agenda futura não; com agenda vencida sim", () => {
-      expect(linhaElegivelParaReconciliacaoAutomatica({ restaurado: false }, agora)).toBe(true);
-      expect(linhaElegivelParaReconciliacaoAutomatica({ restaurado: false, proximaTentativaEm: new Date(agora.getTime() + 1) }, agora)).toBe(false);
-      expect(linhaElegivelParaReconciliacaoAutomatica({ restaurado: false, proximaTentativaEm: agora }, agora)).toBe(true);
+    it("pendente explícito sem agenda é elegível; com agenda futura não; com agenda vencida sim", () => {
+      expect(linhaElegivelParaReconciliacaoAutomatica({ restaurado: false, estadoRestauracao: "pendente" }, agora)).toBe(true);
+      expect(
+        linhaElegivelParaReconciliacaoAutomatica({ restaurado: false, estadoRestauracao: "falha_recuperavel", proximaTentativaEm: new Date(agora.getTime() + 1) }, agora),
+      ).toBe(false);
+      expect(linhaElegivelParaReconciliacaoAutomatica({ restaurado: false, estadoRestauracao: "falha_recuperavel", proximaTentativaEm: agora }, agora)).toBe(true);
     });
 
     it("concluída e `requer_intervencao` nunca são elegíveis para o worker", () => {
@@ -50,8 +75,20 @@ describe("restauracao-estoque.util", () => {
       expect(linhaElegivelParaReconciliacaoAutomatica({ restaurado: false, estadoRestauracao: "requer_intervencao", proximaTentativaEm: null }, agora)).toBe(false);
     });
 
-    it("linha legada sem nenhum campo é elegível (ausência = pendente)", () => {
-      expect(linhaElegivelParaReconciliacaoAutomatica({}, agora)).toBe(true);
+    it("linhas indeterminadas (legado sem estado, `restaurado:false`, estado inválido) NUNCA são elegíveis", () => {
+      expect(linhaElegivelParaReconciliacaoAutomatica({}, agora)).toBe(false);
+      expect(linhaElegivelParaReconciliacaoAutomatica({ restaurado: false }, agora)).toBe(false);
+      expect(linhaElegivelParaReconciliacaoAutomatica({ restaurado: false, estadoRestauracao: "qualquer" }, agora)).toBe(false);
+    });
+  });
+
+  describe("ReferenciaDeEstoqueAusenteErro", () => {
+    it("carrega um código específico por caso, exposto como `codigo` na descrição segura", () => {
+      for (const codigo of CODIGOS_REFERENCIA_AUSENTE) {
+        const descricao = descreverFalhaDeRestauracao(new ReferenciaDeEstoqueAusenteErro(codigo));
+        expect(descricao).toMatchObject({ classe: "ReferenciaDeEstoqueAusenteErro", codigo });
+        expect(descricao.mensagem.length).toBeGreaterThan(0);
+      }
     });
   });
 
@@ -71,7 +108,7 @@ describe("restauracao-estoque.util", () => {
       const tarde = new Date("2026-11-07T13:00:00.000Z");
       const resumo = resumoRestauracao([
         { itens: [{ restaurado: true }, { restaurado: false, estadoRestauracao: "falha_recuperavel", proximaTentativaEm: tarde }] },
-        { itens: [{ restaurado: false, proximaTentativaEm: cedo }, {}] },
+        { itens: [{ restaurado: false, estadoRestauracao: "pendente", proximaTentativaEm: cedo }, { estadoRestauracao: "pendente" }] },
       ]);
       expect(resumo).toEqual({
         status: "pendente",
@@ -80,14 +117,21 @@ describe("restauracao-estoque.util", () => {
         pendentes: 2,
         emFalhaRecuperavel: 1,
         requerIntervencao: 0,
+        indeterminados: 0,
         proximaTentativaEm: cedo,
       });
     });
 
-    it("qualquer linha `requer_intervencao` torna o status da venda `requer_intervencao`", () => {
+    it("qualquer linha `requer_intervencao` torna o status da venda `requer_intervencao` (precede `indeterminado`)", () => {
       const resumo = resumoRestauracao([{ itens: [{ restaurado: false }, { restaurado: false, estadoRestauracao: "requer_intervencao" }] }]);
       expect(resumo.status).toBe("requer_intervencao");
       expect(resumo.requerIntervencao).toBe(1);
+      expect(resumo.indeterminados).toBe(1);
+    });
+
+    it("linha histórica indeterminada torna o status `indeterminado` (nunca `pendente` nem `concluida`)", () => {
+      const resumo = resumoRestauracao([{ itens: [{ restaurado: true }, { restaurado: false }, {}] }]);
+      expect(resumo).toMatchObject({ status: "indeterminado", concluidos: 1, indeterminados: 2, pendentes: 0 });
     });
   });
 

@@ -14,7 +14,9 @@ import { VendasService, type ResultadoCicloReconciliacao } from "./vendas.servic
  * - Sem dependência nova (`@nestjs/schedule` não é usado no projeto): `setInterval` com `unref()` — nunca segura o
  *   processo vivo — e trava de reentrância — um ciclo lento nunca se sobrepõe ao seguinte NA MESMA instância.
  * - Iniciado em `onApplicationBootstrap` (só quando a aplicação sobe por completo; `Test.compile()` não dispara) e
- *   parado em `onModuleDestroy`. Desligável por `RECONCILIACAO_ESTOQUE_HABILITADA=false`.
+ *   parado em `onModuleDestroy`. Fase 60.4.3.4.18.3 — DESLIGADO por padrão: só `RECONCILIACAO_ESTOQUE_HABILITADA=true`
+ *   liga. Desligado, não cria timer, não roda ciclo imediato nem posterior — só registra que está desabilitado.
+ * - O primeiro ciclo roda depois de `intervaloMs` (nunca no boot).
  */
 @Injectable()
 export class ReconciliacaoEstoqueWorker implements OnApplicationBootstrap, OnModuleDestroy {

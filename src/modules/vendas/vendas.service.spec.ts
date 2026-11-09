@@ -5226,11 +5226,20 @@ describe("VendasService (integração — MongoDB real)", () => {
           .updateOne({ _id: new Types.ObjectId(produto.produtoId) }, { $inc: { "variantes.0.tamanhos.0.quantidade": -2 } });
         const movimentosAntes = await movimentosDaVenda(venda.id);
         await connection.collection("movimentos_caixa").deleteMany({ vendaId: venda.id, tipo: "cancelamento" });
+        // Fase 60.4.3.4.18.3 — o estado simulado inclui `estadoRestauracao: "pendente"`: é o que o código atual grava
+        // numa linha cuja devolução não foi confirmada. `restaurado:false` sem estado explícito agora é histórico
+        // indeterminado e, de propósito, nunca é devolvido automaticamente (ver `classificarRestauracao`).
         await connection
           .collection("vendas")
           .updateOne(
             { _id: new Types.ObjectId(venda.id) },
-            { $set: { "cancelamentos.$[].itens.$[].restaurado": false, "cancelamentos.$[].itens.$[].restaurando": false } },
+            {
+              $set: {
+                "cancelamentos.$[].itens.$[].restaurado": false,
+                "cancelamentos.$[].itens.$[].restaurando": false,
+                "cancelamentos.$[].itens.$[].estadoRestauracao": "pendente",
+              },
+            },
           );
 
         const meioDoCrash = await produtosService.obterPorId(produto.produtoId);
@@ -5791,11 +5800,19 @@ describe("VendasService (integração — MongoDB real)", () => {
       // a reivindicação (como se nunca tivesse sido confirmada) e força o
       // produto a um estado que faz `ajustarQuantidadeTamanho` rejeitar
       // (`resultado < 0`) — sem usar mocks, só estado real do MongoDB.
+      // Fase 60.4.3.4.18.3 — inclui `estadoRestauracao: "pendente"` (estado gravado pelo código atual numa linha não
+      // confirmada); sem ele, a linha seria histórico indeterminado e nenhum caminho a devolveria.
       await connection
         .collection("vendas")
         .updateOne(
           { _id: new Types.ObjectId(venda.id) },
-          { $set: { "cancelamentos.$[].itens.$[].restaurado": false, "cancelamentos.$[].itens.$[].restaurando": false } },
+          {
+            $set: {
+              "cancelamentos.$[].itens.$[].restaurado": false,
+              "cancelamentos.$[].itens.$[].restaurando": false,
+              "cancelamentos.$[].itens.$[].estadoRestauracao": "pendente",
+            },
+          },
         );
       await connection.collection("produtos").updateOne({ _id: new Types.ObjectId(produto.produtoId) }, { $set: { "variantes.0.tamanhos.0.quantidade": -100 } });
 
