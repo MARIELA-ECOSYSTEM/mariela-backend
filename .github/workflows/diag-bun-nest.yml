@@ -1,7 +1,9 @@
 # Fase 21.2.11-CI.3.1 — DIAGNÓSTICO TEMPORÁRIO (branch diag/ci-bun-nest-esm; NUNCA em main).
 # Fase 21.2.11-CI.3.3 — tratamento de erros compatível com o `bash -eo pipefail` do Actions (ver biblioteca).
-# Compara o commit que falhou (5b8ff3d) com o controle que passou (f174059) nos MESMOS experimentos,
-# cada tentativa em processo novo, classificada (APROVADO / ESM_CJS / FALHA_TESTE / OPERACIONAL / TIMEOUT).
+# Fase 21.2.11-CI.4   — validação comparativa do preload SÓ no commit 5b8ff3d, condições ALTERNADAS:
+#   E4 (import do AppModule) 30 sem × 30 com preload; E6 (spec isolado) 30 × 30; E7 (suíte completa) 3 × 3.
+#   O preload é temporário (criado no runner, nunca versionado) e importa SOMENTE @nestjs/common e @nestjs/core.
+#   A versão CI.3.3 deste arquivo (matriz 5b8ff3d × f174059, E1–E7) está preservada no commit b9e9f92.
 # Sem segredos reais; MongoDB descartável dentro do runner; nada de Atlas/Render/27118.
 name: diag-bun-nest
 
@@ -19,17 +21,15 @@ concurrency:
 
 jobs:
   diag:
-    name: diag ${{ matrix.rotulo }}
+    name: diag-ci4 preload-${{ matrix.rotulo }}
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - rotulo: falhou-5b8ff3d
+          - rotulo: 5b8ff3d
             ref: 5b8ff3d0c9568f6071861d6136e61862cd96c53e
-          - rotulo: controle-f174059
-            ref: f1740593549259a8cb63d7c84b40cd615e470cba
 
     # Idêntico ao ci.yml (valores FICTÍCIOS, só para o validateEnv).
     env:
@@ -101,7 +101,7 @@ jobs:
             echo "node=$(node --version 2>/dev/null || echo ausente)"
             echo "uname=$(uname -a)"
             . /etc/os-release && echo "os=$PRETTY_NAME"
-            echo "imagem=${ImageVersion:-?} runner=${RUNNER_OS:-?}/${RUNNER_ARCH:-?}"
+            echo "imagem=${ImageOS:-?}/${ImageVersion:-?} runner=${RUNNER_OS:-?}/${RUNNER_ARCH:-?}"
             for p in @nestjs/common @nestjs/core @nestjs/throttler @nestjs/testing @nestjs/config @nestjs/jwt @nestjs/mongoose reflect-metadata rxjs file-type load-esm; do
               v=$(bun -e "try{console.log(require('./node_modules/$p/package.json').version)}catch{console.log('ausente')}")
               echo "$p=$v"
@@ -113,12 +113,10 @@ jobs:
           if bun pm ls --all > "$SAIDA/bun-pm-ls-all.txt" 2>&1; then rc=0; else rc=$?; fi
           echo "bun_pm_ls_exit=$rc linhas_bun_pm_ls_all=$(wc -l < "$SAIDA/bun-pm-ls-all.txt")" | tee -a "$SAIDA/ambiente.txt"
 
-      # Fase 21.2.11-CI.3.3 — o shell `bash` do Actions é `bash --noprofile --norc -eo pipefail`: o `set -uo
-      # pipefail` da 1ª versão NÃO desligava o errexit e a 1ª tentativa abortava o passo (grep sem resultado).
-      # A biblioteca abaixo é SEGURA sob errexit: todo retorno não zero esperado é capturado com `if …; then …;
-      # else cod=$?; fi`; nenhum pipeline depende de grep encontrar algo (extrações com awk); falhas do PRÓPRIO
-      # harness (pasta, registro, preload, limpeza) são contadas em ERROS_HARNESS e reprovam o passo NO FIM, depois
-      # de todos os experimentos — nunca no meio. Um único arquivo, usado pelos dois passos de experimentos.
+      # Biblioteca SEGURA sob o `bash --noprofile --norc -eo pipefail` do Actions (CI.3.3): todo retorno não zero
+      # esperado é capturado com `if …; then …; else cod=$?; fi`; extrações com awk; falhas do PRÓPRIO harness são
+      # contadas em ERROS_HARNESS e reprovam o passo só NO FIM. CI.4: coluna `condicao` (sem/com preload) e
+      # extração do resumo e do primeiro erro completo da suíte.
       - name: Biblioteca de execução e classificação
         shell: bash
         run: |
@@ -126,6 +124,10 @@ jobs:
           cat > "$RUNNER_TEMP/diag-lib.sh" <<'LIB'
           ERROS_HARNESS=0
           ULTIMO_BASE=""
+          ULTIMA_CLASSE=""
+          ULTIMO_EXIT=""
+          ULTIMO_MS=""
+          ULTIMO_MODULO=""
 
           # Acrescenta uma linha a um arquivo de registro; falha de escrita = erro do harness (não aborta).
           registrar_em() { # $1 arquivo, $2 linha
@@ -135,7 +137,7 @@ jobs:
           registrar() { registrar_em "$SAIDA/tentativas.tsv" "$1"; }
           garantir_tsv() {
             if [ ! -f "$SAIDA/tentativas.tsv" ]; then
-              printf 'experimento\ttentativa\tclasse\texit\tms\tmodulo_async\tnota\n' > "$SAIDA/tentativas.tsv"; fi
+              printf 'experimento\ttentativa\tcondicao\tclasse\texit\tms\tmodulo_async\tnota\n' > "$SAIDA/tentativas.tsv"; fi
           }
 
           # Classe de UMA tentativa (sempre retorna 0). Ordem: TIMEOUT; saída não gravada ⇒ OPERACIONAL;
@@ -155,29 +157,48 @@ jobs:
 
           # Extrações com awk (retorna 0 sem correspondência; ≠0 só se o arquivo não puder ser lido).
           modulo_async() { awk 'match($0, /require\(\) async module "[^"]*/) { s = substr($0, RSTART, RLENGTH); sub(/.*node_modules\//, "", s); print s; exit }' "$@"; }
-          resumo_suite() { awk '/^ *[0-9]+ (pass|fail|skip|errors?)$|^Ran / { g = $0; gsub(/^ +| +$/, "", g); gsub(/ +/, " ", g); printf "%s; ", g }' "$@"; }
-          primeiro_arquivo_esm() { awk '/[A-Za-z0-9_.\/-]+\.(spec|test)\.ts:$/ { a = $0; sub(/^.*group\]/, "", a); sub(/:$/, "", a) } /require\(\) async module/ { print a; exit }' "$@"; }
+          # Resumo do `bun test`: pass, fail, skip, errors, total ("Ran N tests") e arquivos ("across M files").
+          # "-" = linha ausente na saída (não é zero).
+          resumo_suite() { awk 'BEGIN { p = f = s = e = t = a = "-" }
+            { l = $0; sub(/^.*##\[[a-z]+\]/, "", l) }
+            l ~ /^ *[0-9]+ pass$/ { split(l, x, " "); p = x[1] }
+            l ~ /^ *[0-9]+ fail$/ { split(l, x, " "); f = x[1] }
+            l ~ /^ *[0-9]+ skip$/ { split(l, x, " "); s = x[1] }
+            l ~ /^ *[0-9]+ errors?$/ { split(l, x, " "); e = x[1] }
+            l ~ /^Ran [0-9]+ tests? across [0-9]+ files?/ { split(l, x, " "); t = x[2]; a = x[5] }
+            END { printf "%s\t%s\t%s\t%s\t%s\t%s", p, f, s, e, t, a }' "$@"; }
+          # Último arquivo de teste anunciado antes do 1º erro (o bun no Actions prefixa com ##[group]).
+          primeiro_arquivo_erro() { awk '/[A-Za-z0-9_.\/-]+\.(spec|test)\.ts:$/ { a = $0; sub(/^.*group\]/, "", a); sub(/:$/, "", a) }
+            /require\(\) async module|^\(fail\)|^error:|^# Unhandled error/ { print a; exit }' "$@"; }
+          # Primeiro erro COMPLETO (linha do erro + até 80 linhas de stack/contexto), com o arquivo anunciado antes.
+          primeiro_erro() { awk 'n && FNR == 1 { exit }
+            /[A-Za-z0-9_.\/-]+\.(spec|test)\.ts:$/ { a = $0 }
+            !n && /require\(\) async module|^\(fail\)|^error:|^# Unhandled error/ { n = 1; print "arquivo anunciado antes: " a; print "fonte: " FILENAME ":" FNR }
+            n && c < 81 { print; c++ }
+            c >= 81 { exit }' "$@"; }
 
           # Uma tentativa em processo novo: exit code, duração, stdout e stderr SEPARADOS, classe e módulo.
-          executar() { # $1 experimento, $2 i, $3 timeout(s), resto = comando
-            local exp=$1 i=$2 lim=$3; shift 3
-            local dir="$SAIDA/$exp" base cod ini fim classe modulo="-" nota="-"
+          executar() { # $1 experimento, $2 condicao, $3 i, $4 timeout(s), resto = comando
+            local exp=$1 cond=$2 i=$3 lim=$4; shift 4
+            local dir="$SAIDA/$exp/$cond" base cod ini fim classe modulo="-" nota="-"
+            ULTIMO_BASE=""; ULTIMA_CLASSE=OPERACIONAL; ULTIMO_EXIT=-1; ULTIMO_MS=0; ULTIMO_MODULO="-"
             if ! mkdir -p "$dir"; then
               ERROS_HARNESS=$((ERROS_HARNESS + 1))
-              registrar "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$exp" "$i" OPERACIONAL -1 0 - sem_pasta_de_saida)"; return 0
+              registrar "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$exp" "$i" "$cond" OPERACIONAL -1 0 - sem_pasta_de_saida)"; return 0
             fi
             base="$dir/$i"; ULTIMO_BASE=$base
+            if ! printf '%s\n' "$*" > "$base.cmd"; then nota=cmd_nao_gravado; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
             ini=$(date +%s%N)
             if timeout --kill-after=10 "$lim" "$@" >"$base.stdout" 2>"$base.stderr"; then cod=0; else cod=$?; fi
             fim=$(date +%s%N)
             classe=$(classificar "$cod" "$base.stdout" "$base.stderr")
             if [ ! -f "$base.stdout" ] || [ ! -f "$base.stderr" ]; then nota=saida_nao_gravada; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
             if [ "$classe" = ESM_CJS ]; then
-              if modulo=$(modulo_async "$base.stdout" "$base.stderr"); then :; else modulo=ERRO_EXTRACAO; fi
+              if modulo=$(modulo_async "$base.stderr" "$base.stdout"); then :; else modulo=ERRO_EXTRACAO; fi
             fi
-            registrar "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$exp" "$i" "$classe" "$cod" "$(( (fim - ini) / 1000000 ))" "${modulo:--}" "$nota")"
+            ULTIMA_CLASSE=$classe; ULTIMO_EXIT=$cod; ULTIMO_MS=$(( (fim - ini) / 1000000 )); ULTIMO_MODULO=${modulo:--}
+            registrar "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$exp" "$i" "$cond" "$classe" "$cod" "$ULTIMO_MS" "$ULTIMO_MODULO" "$nota")"
           }
-          experimento() { local exp=$1 lim=$2 i; shift 2; for i in $(seq 1 10); do executar "$exp" "$i" "$lim" "$@"; done; }
 
           # Reprova o passo SÓ por erro do próprio harness, e só depois de rodar tudo.
           finalizar() {
@@ -188,73 +209,122 @@ jobs:
           bash -n "$RUNNER_TEMP/diag-lib.sh"
           cp "$RUNNER_TEMP/diag-lib.sh" "$SAIDA/diag-lib.sh.txt"
 
-      - name: Experimentos E1–E6b (10× cada, processo novo, classificados)
+      # O mecanismo de preload é PROVADO no próprio runner antes de qualquer experimento, com controle negativo:
+      # um marcador temporário define uma global; o código só a enxerga se o preload rodou ANTES dele.
+      # Depois, cria o preload REAL (só os dois imports) — o mesmo conteúdo do diagnóstico #2.
+      - name: Verifica o mecanismo de preload (bun -e e bun test) e cria o preload temporário
+        id: verifica
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="$SAIDA/verificacao-preload.txt"
+          printf 'globalThis.__DIAG_PRELOAD = 1;\n' > diag-preload-marcador.ts
+          printf 'import { test, expect } from "bun:test";\ntest("preload aplicado antes do spec", () => { expect((globalThis as any).__DIAG_PRELOAD).toBe(1); });\n' > diag-preload-verifica.spec.ts
+          sonda() { # $1 rótulo, $2 exit esperado, resto = comando
+            local rot=$1 esp=$2 cod; shift 2
+            if "$@" >> "$V" 2>&1; then cod=0; else cod=$?; fi
+            echo "$rot: exit=$cod esperado=$esp" | tee -a "$V"
+            [ "$cod" -eq "$esp" ]
+          }
+          ok=1
+          sonda "bun -e COM --preload"   0 bun --preload ./diag-preload-marcador.ts -e 'process.exit(globalThis.__DIAG_PRELOAD === 1 ? 0 : 3)' || ok=0
+          sonda "bun -e SEM preload"     3 bun -e 'process.exit(globalThis.__DIAG_PRELOAD === 1 ? 0 : 3)' || ok=0
+          sonda "bun test COM --preload" 0 bun test --preload ./diag-preload-marcador.ts ./diag-preload-verifica.spec.ts || ok=0
+          sonda "bun test SEM preload"   1 bun test ./diag-preload-verifica.spec.ts || ok=0
+          rm -f diag-preload-marcador.ts diag-preload-verifica.spec.ts
+          test ! -e diag-preload-marcador.ts && test ! -e diag-preload-verifica.spec.ts
+          if [ "$ok" -ne 1 ]; then echo "::error::mecanismo de preload NÃO comprovado no runner — experimentos com preload seriam inválidos"; exit 1; fi
+          printf 'import "@nestjs/common";\nimport "@nestjs/core";\n' > diag-preload.ts
+          cp diag-preload.ts "$SAIDA/diag-preload.ts.txt"
+          sha256sum diag-preload.ts | tee -a "$V"
+          # Registro (não bloqueia): o esperado é só "?? diag-preload.ts"; a integridade é EXIGIDA no passo de remoção.
+          git status --porcelain | tee "$SAIDA/git-status-com-preload.txt"
+
+      # E4 e E6: 30 pares ALTERNADOS (sem, com, sem, com…) em processo novo, para que a variação do runner ao longo
+      # do tempo afete as duas condições igualmente.
+      - name: E4 — import do AppModule, 30 sem × 30 com preload (alternado)
+        if: ${{ !cancelled() && steps.verifica.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           source "$RUNNER_TEMP/diag-lib.sh"
           garantir_tsv
-          experimento E1-import-common   120 bun -e 'await import("@nestjs/common"); console.log("ok")'
-          experimento E2-import-core     120 bun -e 'await import("@nestjs/core"); console.log("ok")'
-          experimento E3-require-thr     120 bun -e 'require("@nestjs/throttler"); console.log("ok")'
-          experimento E3b-import-thr     120 bun -e 'await import("@nestjs/throttler"); console.log("ok")'
-          experimento E4-appmodule       120 bun -e 'await import("./src/app.module.ts"); console.log("ok")'
-          experimento E5a-thr-antes      120 bun -e 'await import("@nestjs/throttler"); await import("@nestjs/common"); await import("@nestjs/core"); console.log("ok")'
-          experimento E5b-thr-depois     120 bun -e 'await import("@nestjs/common"); await import("@nestjs/core"); await import("@nestjs/throttler"); console.log("ok")'
+          for i in $(seq 1 30); do
+            executar E4-appmodule sem "$i" 120 bun -e 'await import("./src/app.module.ts"); console.log("ok")'
+            executar E4-appmodule com "$i" 120 bun --preload ./diag-preload.ts -e 'await import("./src/app.module.ts"); console.log("ok")'
+          done
+          finalizar
 
-          # E6 × E6b: MESMO arquivo, MESMO comando, só difere o --preload (sintaxe confirmada no Bun 1.4.2:
-          # `bun test --preload <arquivo>`). Tentativas ALTERNADAS (E6, E6b, E6, E6b…) para que variação do runner
-          # ao longo do tempo afete os dois igualmente. O preload é criado AQUI (não versionado) e removido no fim;
-          # o git status final prova que nada do repositório mudou.
-          PRELOAD_OK=0
-          if printf 'import "@nestjs/common";\nimport "@nestjs/core";\n' > diag-preload.ts && cp diag-preload.ts "$SAIDA/diag-preload.ts.txt"; then
-            PRELOAD_OK=1
-          else
-            echo "::error::diag-preload.ts não pôde ser criado"; ERROS_HARNESS=$((ERROS_HARNESS + 1))
+      - name: E6 — spec isolado, 30 sem × 30 com preload (alternado)
+        if: ${{ !cancelled() && steps.verifica.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/diag-lib.sh"
+          garantir_tsv
+          for i in $(seq 1 30); do
+            executar E6-spec sem "$i" 300 bun test src/app.module.spec.ts
+            executar E6-spec com "$i" 300 bun test --preload ./diag-preload.ts src/app.module.spec.ts
+          done
+          finalizar
+
+      # E7: sem, com, sem, com, sem, com — mesmo comando do ci.yml (`bun test`), com/sem o --preload.
+      - name: E7 — suíte completa, 3 sem × 3 com preload (alternado)
+        if: ${{ !cancelled() && steps.verifica.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/diag-lib.sh"
+          garantir_tsv
+          R="$SAIDA/E7-suite/resumo.tsv"
+          # Falha ao preparar o resumo = erro do harness; as execuções rodam mesmo assim (saídas ficam no tentativas.tsv).
+          if ! { mkdir -p "$SAIDA/E7-suite" && printf 'execucao\tcondicao\ttentativa\tclasse\texit\tms\tpass\tfail\tskip\terrors\ttotal\tarquivos\tmodulo_async\tarquivo_1o_erro\n' > "$R"; }; then
+            echo "::error::não foi possível preparar $R"; ERROS_HARNESS=$((ERROS_HARNESS + 1))
           fi
-          for i in $(seq 1 10); do
-            executar E6-spec-isolado "$i" 300 bun test src/app.module.spec.ts
-            if [ "$PRELOAD_OK" -eq 1 ]; then
-              executar E6b-spec-preload "$i" 300 bun test --preload ./diag-preload.ts src/app.module.spec.ts
-            else
-              registrar "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' E6b-spec-preload "$i" OPERACIONAL -1 0 - preload_nao_criado)"
-            fi
+          n=0
+          for i in 1 2 3; do
+            for cond in sem com; do
+              n=$((n + 1))
+              if [ "$cond" = sem ]; then
+                executar E7-suite sem "$i" 900 bun test
+              else
+                executar E7-suite com "$i" 900 bun test --preload ./diag-preload.ts
+              fi
+              r=$(printf -- '-\t-\t-\t-\t-\t-'); p="-"
+              if [ -n "$ULTIMO_BASE" ]; then
+                if r=$(resumo_suite "$ULTIMO_BASE.stdout" "$ULTIMO_BASE.stderr"); then :; else r=ERRO_EXTRACAO; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
+                if p=$(primeiro_arquivo_erro "$ULTIMO_BASE.stderr" "$ULTIMO_BASE.stdout"); then :; else p=ERRO_EXTRACAO; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
+                if primeiro_erro "$ULTIMO_BASE.stderr" "$ULTIMO_BASE.stdout" > "$ULTIMO_BASE.primeiro-erro.txt"; then :; else ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
+              fi
+              registrar_em "$R" "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$n" "$cond" "$i" "$ULTIMA_CLASSE" "$ULTIMO_EXIT" "$ULTIMO_MS" "$r" "$ULTIMO_MODULO" "${p:--}")"
+            done
           done
-          if ! rm -f diag-preload.ts; then echo "::error::falha ao remover diag-preload.ts"; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
           finalizar
 
-      # Roda mesmo se o passo anterior reprovar por erro do harness (só não roda se o job for cancelado).
-      - name: E7 — suíte completa 3× (mesmo comando do ci.yml)
-        if: ${{ !cancelled() }}
+      - name: Remove o preload temporário e confirma o repositório intacto
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
-          source "$RUNNER_TEMP/diag-lib.sh"
-          garantir_tsv
-          for i in 1 2 3; do
-            executar E7-suite "$i" 900 bun test
-            # resumo (pass/fail/skip/errors/Ran) e último arquivo antes do 1º erro ESM/CJS (o bun no Actions prefixa
-            # o cabeçalho com ##[group]); falha de LEITURA é registrada como ERRO_EXTRACAO, nunca escondida.
-            if r=$(resumo_suite "$ULTIMO_BASE.stdout" "$ULTIMO_BASE.stderr"); then :; else r=ERRO_EXTRACAO; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
-            if p=$(primeiro_arquivo_esm "$ULTIMO_BASE.stdout" "$ULTIMO_BASE.stderr"); then :; else p=ERRO_EXTRACAO; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
-            registrar_em "$SAIDA/E7-suite/resumo.tsv" "$(printf '%s\t%s\t%s' "$i" "${r:--}" "${p:--}")"
-          done
-          finalizar
+          rm -f diag-preload.ts diag-preload-marcador.ts diag-preload-verifica.spec.ts
+          git status --porcelain | tee "$SAIDA/git-status-final.txt"
+          sha256sum bun.lock | tee "$SAIDA/lock-final.sha256"
+          test -z "$(git status --porcelain)"
+          diff <(cut -d' ' -f1 "$SAIDA/lock-antes.sha256") <(cut -d' ' -f1 "$SAIDA/lock-final.sha256")
 
-      - name: Resumo por experimento
+      - name: Resumo por experimento e condição
         if: always()
         shell: bash
         run: |
           set -euo pipefail
           SAIDA="${SAIDA:-$RUNNER_TEMP/diag-out}"
           if [ ! -f "$SAIDA/tentativas.tsv" ]; then echo "sem tentativas registradas"; exit 0; fi
-          awk -F'\t' 'NR > 1 { k = $1 " " $3; n[k]++ } END { for (k in n) print k, n[k] }' "$SAIDA/tentativas.tsv" | sort | tee "$SAIDA/RESUMO.txt"
-          git status --porcelain | tee "$SAIDA/git-status-final.txt"
+          awk -F'\t' 'NR > 1 { k = $1 " " $3 " " $4; n[k]++ } END { for (k in n) print k, n[k] }' "$SAIDA/tentativas.tsv" | sort | tee "$SAIDA/RESUMO.txt"
           {
-            echo "## diag ${{ matrix.rotulo }}"
+            echo "## diag-ci4 preload ${{ matrix.rotulo }}"
             echo '```'
-            for f in "$SAIDA/ambiente.txt" "$SAIDA/RESUMO.txt" "$SAIDA/E7-suite/resumo.tsv"; do
-              if [ -f "$f" ]; then cat "$f"; else echo "(ausente: $(basename "$f"))"; fi
+            for f in "$SAIDA/ambiente.txt" "$SAIDA/verificacao-preload.txt" "$SAIDA/RESUMO.txt" "$SAIDA/E7-suite/resumo.tsv" "$SAIDA/git-status-final.txt"; do
+              if [ -f "$f" ]; then echo "### $(basename "$f")"; cat "$f"; else echo "(ausente: $(basename "$f"))"; fi
             done
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -263,7 +333,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diag-${{ matrix.rotulo }}
+          name: diag-ci4-preload-${{ matrix.rotulo }}
           path: ${{ runner.temp }}/diag-out/
           retention-days: 7
           if-no-files-found: warn
