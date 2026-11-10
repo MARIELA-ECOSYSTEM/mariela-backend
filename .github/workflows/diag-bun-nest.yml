@@ -1,4 +1,5 @@
 # Fase 21.2.11-CI.3.1 — DIAGNÓSTICO TEMPORÁRIO (branch diag/ci-bun-nest-esm; NUNCA em main).
+# Fase 21.2.11-CI.3.3 — tratamento de erros compatível com o `bash -eo pipefail` do Actions (ver biblioteca).
 # Compara o commit que falhou (5b8ff3d) com o controle que passou (f174059) nos MESMOS experimentos,
 # cada tentativa em processo novo, classificada (APROVADO / ESM_CJS / FALHA_TESTE / OPERACIONAL / TIMEOUT).
 # Sem segredos reais; MongoDB descartável dentro do runner; nada de Atlas/Render/27118.
@@ -105,35 +106,94 @@ jobs:
               v=$(bun -e "try{console.log(require('./node_modules/$p/package.json').version)}catch{console.log('ausente')}")
               echo "$p=$v"
             done
-            echo "pacotes_instalados=$(grep -Eo '[0-9]+ packages installed' "$SAIDA/install.txt" || echo '?')"
+            # awk (não grep||echo): ausência do texto ⇒ "?"; arquivo ilegível ⇒ erro real (aborta o passo).
+            echo "pacotes_instalados=$(awk 'match($0, /[0-9]+ packages installed/) { print substr($0, RSTART, RLENGTH); f = 1; exit } END { if (!f) print "?" }' "$SAIDA/install.txt")"
           } | tee "$SAIDA/ambiente.txt"
-          bun pm ls --all > "$SAIDA/bun-pm-ls-all.txt" 2>&1 || true
-          echo "linhas_bun_pm_ls_all=$(wc -l < "$SAIDA/bun-pm-ls-all.txt")" | tee -a "$SAIDA/ambiente.txt"
+          # Sem `|| true`: o código de saída do `bun pm ls` é REGISTRADO (informativo; não interrompe).
+          if bun pm ls --all > "$SAIDA/bun-pm-ls-all.txt" 2>&1; then rc=0; else rc=$?; fi
+          echo "bun_pm_ls_exit=$rc linhas_bun_pm_ls_all=$(wc -l < "$SAIDA/bun-pm-ls-all.txt")" | tee -a "$SAIDA/ambiente.txt"
+
+      # Fase 21.2.11-CI.3.3 — o shell `bash` do Actions é `bash --noprofile --norc -eo pipefail`: o `set -uo
+      # pipefail` da 1ª versão NÃO desligava o errexit e a 1ª tentativa abortava o passo (grep sem resultado).
+      # A biblioteca abaixo é SEGURA sob errexit: todo retorno não zero esperado é capturado com `if …; then …;
+      # else cod=$?; fi`; nenhum pipeline depende de grep encontrar algo (extrações com awk); falhas do PRÓPRIO
+      # harness (pasta, registro, preload, limpeza) são contadas em ERROS_HARNESS e reprovam o passo NO FIM, depois
+      # de todos os experimentos — nunca no meio. Um único arquivo, usado pelos dois passos de experimentos.
+      - name: Biblioteca de execução e classificação
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/diag-lib.sh" <<'LIB'
+          ERROS_HARNESS=0
+          ULTIMO_BASE=""
+
+          # Acrescenta uma linha a um arquivo de registro; falha de escrita = erro do harness (não aborta).
+          registrar_em() { # $1 arquivo, $2 linha
+            if printf '%s\n' "$2" >> "$1"; then printf '%s\n' "$2"; else
+              echo "::error::falha ao registrar em $1: $2"; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
+          }
+          registrar() { registrar_em "$SAIDA/tentativas.tsv" "$1"; }
+          garantir_tsv() {
+            if [ ! -f "$SAIDA/tentativas.tsv" ]; then
+              printf 'experimento\ttentativa\tclasse\texit\tms\tmodulo_async\tnota\n' > "$SAIDA/tentativas.tsv"; fi
+          }
+
+          # Classe de UMA tentativa (sempre retorna 0). Ordem: TIMEOUT; saída não gravada ⇒ OPERACIONAL;
+          # "require() async module" ⇒ ESM_CJS (mesmo com exit 0); grep ilegível (2) ⇒ OPERACIONAL; exit 0 ⇒
+          # APROVADO; "(fail)" ou "N fail" (N>0) ⇒ FALHA_TESTE; senão OPERACIONAL.
+          classificar() { # $1 exit, $2 stdout, $3 stderr
+            local cod=$1 out=$2 err=$3 r
+            if [ "$cod" -eq 124 ] || [ "$cod" -eq 137 ]; then echo TIMEOUT; return 0; fi
+            if [ ! -f "$out" ] || [ ! -f "$err" ]; then echo OPERACIONAL; return 0; fi
+            if grep -q 'require() async module' "$out" "$err"; then r=0; else r=$?; fi
+            if [ "$r" -eq 0 ]; then echo ESM_CJS; return 0; fi
+            if [ "$r" -ge 2 ]; then echo OPERACIONAL; return 0; fi
+            if [ "$cod" -eq 0 ]; then echo APROVADO; return 0; fi
+            if grep -Eq '^\(fail\)|^ *[1-9][0-9]* fail$' "$out" "$err"; then r=0; else r=$?; fi
+            if [ "$r" -eq 0 ]; then echo FALHA_TESTE; else echo OPERACIONAL; fi
+          }
+
+          # Extrações com awk (retorna 0 sem correspondência; ≠0 só se o arquivo não puder ser lido).
+          modulo_async() { awk 'match($0, /require\(\) async module "[^"]*/) { s = substr($0, RSTART, RLENGTH); sub(/.*node_modules\//, "", s); print s; exit }' "$@"; }
+          resumo_suite() { awk '/^ *[0-9]+ (pass|fail|skip|errors?)$|^Ran / { g = $0; gsub(/^ +| +$/, "", g); gsub(/ +/, " ", g); printf "%s; ", g }' "$@"; }
+          primeiro_arquivo_esm() { awk '/[A-Za-z0-9_.\/-]+\.(spec|test)\.ts:$/ { a = $0; sub(/^.*group\]/, "", a); sub(/:$/, "", a) } /require\(\) async module/ { print a; exit }' "$@"; }
+
+          # Uma tentativa em processo novo: exit code, duração, stdout e stderr SEPARADOS, classe e módulo.
+          executar() { # $1 experimento, $2 i, $3 timeout(s), resto = comando
+            local exp=$1 i=$2 lim=$3; shift 3
+            local dir="$SAIDA/$exp" base cod ini fim classe modulo="-" nota="-"
+            if ! mkdir -p "$dir"; then
+              ERROS_HARNESS=$((ERROS_HARNESS + 1))
+              registrar "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$exp" "$i" OPERACIONAL -1 0 - sem_pasta_de_saida)"; return 0
+            fi
+            base="$dir/$i"; ULTIMO_BASE=$base
+            ini=$(date +%s%N)
+            if timeout --kill-after=10 "$lim" "$@" >"$base.stdout" 2>"$base.stderr"; then cod=0; else cod=$?; fi
+            fim=$(date +%s%N)
+            classe=$(classificar "$cod" "$base.stdout" "$base.stderr")
+            if [ ! -f "$base.stdout" ] || [ ! -f "$base.stderr" ]; then nota=saida_nao_gravada; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
+            if [ "$classe" = ESM_CJS ]; then
+              if modulo=$(modulo_async "$base.stdout" "$base.stderr"); then :; else modulo=ERRO_EXTRACAO; fi
+            fi
+            registrar "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$exp" "$i" "$classe" "$cod" "$(( (fim - ini) / 1000000 ))" "${modulo:--}" "$nota")"
+          }
+          experimento() { local exp=$1 lim=$2 i; shift 2; for i in $(seq 1 10); do executar "$exp" "$i" "$lim" "$@"; done; }
+
+          # Reprova o passo SÓ por erro do próprio harness, e só depois de rodar tudo.
+          finalizar() {
+            if [ "$ERROS_HARNESS" -gt 0 ]; then echo "::error::$ERROS_HARNESS erro(s) do próprio harness (ver tentativas.tsv)"; return 1; fi
+            echo "harness sem erros"
+          }
+          LIB
+          bash -n "$RUNNER_TEMP/diag-lib.sh"
+          cp "$RUNNER_TEMP/diag-lib.sh" "$SAIDA/diag-lib.sh.txt"
 
       - name: Experimentos E1–E6b (10× cada, processo novo, classificados)
         shell: bash
         run: |
-          set -uo pipefail
-          # Uma tentativa: exit code, duração, stdout e stderr SEPARADOS; classificação explícita.
-          tentativa() { # $1 experimento, $2 i, $3 timeout(s), resto = comando
-            local exp=$1 i=$2 lim=$3; shift 3
-            local base="$SAIDA/$exp/$i"; mkdir -p "$SAIDA/$exp"
-            local ini fim cod classe
-            ini=$(date +%s%N)
-            timeout --kill-after=10 "$lim" "$@" >"$base.stdout" 2>"$base.stderr"; cod=$?
-            fim=$(date +%s%N)
-            if [ "$cod" -eq 124 ] || [ "$cod" -eq 137 ]; then classe=TIMEOUT
-            elif grep -q 'require() async module' "$base.stdout" "$base.stderr"; then classe=ESM_CJS
-            elif [ "$cod" -eq 0 ]; then classe=APROVADO
-            elif grep -Eq '^\(fail\)|^ *[1-9][0-9]* fail$' "$base.stdout" "$base.stderr"; then classe=FALHA_TESTE
-            else classe=OPERACIONAL; fi
-            local modulo
-            modulo=$(grep -ho 'require() async module "[^"]*' "$base.stdout" "$base.stderr" | head -1 | sed 's#.*node_modules/##')
-            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$exp" "$i" "$classe" "$cod" "$(( (fim-ini)/1000000 ))" "${modulo:--}" | tee -a "$SAIDA/tentativas.tsv"
-          }
-          experimento() { local exp=$1 lim=$2; shift 2; for i in $(seq 1 10); do tentativa "$exp" "$i" "$lim" "$@"; done; }
-
-          printf 'experimento\ttentativa\tclasse\texit\tms\tmodulo_async\n' > "$SAIDA/tentativas.tsv"
+          set -euo pipefail
+          source "$RUNNER_TEMP/diag-lib.sh"
+          garantir_tsv
           experimento E1-import-common   120 bun -e 'await import("@nestjs/common"); console.log("ok")'
           experimento E2-import-core     120 bun -e 'await import("@nestjs/core"); console.log("ok")'
           experimento E3-require-thr     120 bun -e 'require("@nestjs/throttler"); console.log("ok")'
@@ -146,46 +206,58 @@ jobs:
           # `bun test --preload <arquivo>`). Tentativas ALTERNADAS (E6, E6b, E6, E6b…) para que variação do runner
           # ao longo do tempo afete os dois igualmente. O preload é criado AQUI (não versionado) e removido no fim;
           # o git status final prova que nada do repositório mudou.
-          printf 'import "@nestjs/common";\nimport "@nestjs/core";\n' > diag-preload.ts
-          cp diag-preload.ts "$SAIDA/diag-preload.ts.txt"
+          PRELOAD_OK=0
+          if printf 'import "@nestjs/common";\nimport "@nestjs/core";\n' > diag-preload.ts && cp diag-preload.ts "$SAIDA/diag-preload.ts.txt"; then
+            PRELOAD_OK=1
+          else
+            echo "::error::diag-preload.ts não pôde ser criado"; ERROS_HARNESS=$((ERROS_HARNESS + 1))
+          fi
           for i in $(seq 1 10); do
-            tentativa E6-spec-isolado  "$i" 300 bun test src/app.module.spec.ts
-            tentativa E6b-spec-preload "$i" 300 bun test --preload ./diag-preload.ts src/app.module.spec.ts
+            executar E6-spec-isolado "$i" 300 bun test src/app.module.spec.ts
+            if [ "$PRELOAD_OK" -eq 1 ]; then
+              executar E6b-spec-preload "$i" 300 bun test --preload ./diag-preload.ts src/app.module.spec.ts
+            else
+              registrar "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' E6b-spec-preload "$i" OPERACIONAL -1 0 - preload_nao_criado)"
+            fi
           done
-          rm -f diag-preload.ts
-          exit 0
+          if ! rm -f diag-preload.ts; then echo "::error::falha ao remover diag-preload.ts"; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
+          finalizar
 
+      # Roda mesmo se o passo anterior reprovar por erro do harness (só não roda se o job for cancelado).
       - name: E7 — suíte completa 3× (mesmo comando do ci.yml)
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          source "$RUNNER_TEMP/diag-lib.sh"
+          garantir_tsv
           for i in 1 2 3; do
-            d="$SAIDA/E7-suite"; mkdir -p "$d"
-            ini=$(date +%s%N)
-            timeout --kill-after=10 900 bun test >"$d/$i.stdout" 2>"$d/$i.stderr"; cod=$?
-            fim=$(date +%s%N)
-            if [ "$cod" -eq 124 ] || [ "$cod" -eq 137 ]; then classe=TIMEOUT
-            elif grep -q 'require() async module' "$d/$i.stdout" "$d/$i.stderr"; then classe=ESM_CJS
-            elif [ "$cod" -eq 0 ]; then classe=APROVADO
-            elif grep -Eq '^\(fail\)|^ *[1-9][0-9]* fail$' "$d/$i.stdout" "$d/$i.stderr"; then classe=FALHA_TESTE
-            else classe=OPERACIONAL; fi
-            resumo=$(grep -hE '^ *[0-9]+ (pass|fail|skip|errors?)$|^Ran ' "$d/$i.stdout" "$d/$i.stderr" | tr -s ' ' | tr '\n' ';')
-            # último cabeçalho de arquivo antes do 1º erro ESM/CJS (o bun no Actions prefixa com ##[group])
-            primeiro=$(cat "$d/$i.stdout" "$d/$i.stderr" | awk '/[A-Za-z0-9_.\/-]+\.(spec|test)\.ts:$/ { a=$0; sub(/^.*group\]/, "", a); sub(/:$/, "", a) } /require\(\) async module/ { print a; exit }')
-            printf 'E7-suite\t%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$classe" "$cod" "$(( (fim-ini)/1000000 ))" "$resumo" "${primeiro:--}" | tee -a "$SAIDA/tentativas.tsv"
+            executar E7-suite "$i" 900 bun test
+            # resumo (pass/fail/skip/errors/Ran) e último arquivo antes do 1º erro ESM/CJS (o bun no Actions prefixa
+            # o cabeçalho com ##[group]); falha de LEITURA é registrada como ERRO_EXTRACAO, nunca escondida.
+            if r=$(resumo_suite "$ULTIMO_BASE.stdout" "$ULTIMO_BASE.stderr"); then :; else r=ERRO_EXTRACAO; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
+            if p=$(primeiro_arquivo_esm "$ULTIMO_BASE.stdout" "$ULTIMO_BASE.stderr"); then :; else p=ERRO_EXTRACAO; ERROS_HARNESS=$((ERROS_HARNESS + 1)); fi
+            registrar_em "$SAIDA/E7-suite/resumo.tsv" "$(printf '%s\t%s\t%s' "$i" "${r:--}" "${p:--}")"
           done
-          exit 0
+          finalizar
 
       - name: Resumo por experimento
         if: always()
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           SAIDA="${SAIDA:-$RUNNER_TEMP/diag-out}"
-          test -f "$SAIDA/tentativas.tsv" || { echo "sem tentativas"; exit 0; }
-          awk -F'\t' 'NR>1 { k=$1" "$3; n[k]++ } END { for (k in n) print k, n[k] }' "$SAIDA/tentativas.tsv" | sort | tee "$SAIDA/RESUMO.txt"
+          if [ ! -f "$SAIDA/tentativas.tsv" ]; then echo "sem tentativas registradas"; exit 0; fi
+          awk -F'\t' 'NR > 1 { k = $1 " " $3; n[k]++ } END { for (k in n) print k, n[k] }' "$SAIDA/tentativas.tsv" | sort | tee "$SAIDA/RESUMO.txt"
           git status --porcelain | tee "$SAIDA/git-status-final.txt"
-          { echo "## diag ${{ matrix.rotulo }}"; echo '```'; cat "$SAIDA/ambiente.txt" "$SAIDA/RESUMO.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## diag ${{ matrix.rotulo }}"
+            echo '```'
+            for f in "$SAIDA/ambiente.txt" "$SAIDA/RESUMO.txt" "$SAIDA/E7-suite/resumo.tsv"; do
+              if [ -f "$f" ]; then cat "$f"; else echo "(ausente: $(basename "$f"))"; fi
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Artefatos (sempre; sem segredos — só valores fictícios do próprio workflow)
         if: always()
@@ -199,4 +271,13 @@ jobs:
       - name: Limpeza do MongoDB descartável
         if: always()
         shell: bash
-        run: docker rm -f mongodb || true
+        run: |
+          set -euo pipefail
+          # Sem `|| true`: remove só se o contêiner existir; falha real da remoção reprova este passo.
+          # Falha do próprio `docker ps` é erro real (não vira "inexistente").
+          if ! nomes=$(docker ps -a --format '{{.Names}}'); then echo "::error::docker ps falhou"; exit 1; fi
+          if printf '%s\n' "$nomes" | awk '$0 == "mongodb" { f = 1 } END { exit !f }'; then
+            docker rm -f mongodb
+          else
+            echo "contêiner mongodb inexistente (nada a remover)"
+          fi
