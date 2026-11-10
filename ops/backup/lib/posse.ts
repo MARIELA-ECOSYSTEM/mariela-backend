@@ -1,91 +1,112 @@
 import { BSON, MongoServerError, type Db, type Document } from "mongodb";
-import { normalizarIndice, type IndiceNormalizado } from "./archive.js";
-import { COLECOES_BACKUP, RESTORE } from "./politica.js";
+import type { IndiceNormalizado, Verificacao } from "./archive.js";
+import { compararConteudoDoDestino, compararIndices, resumoComparacao, type ComparacaoColecao, type ConteudoColecao } from "./integridade.js";
+import { COLECOES_BACKUP, RESTORE, transicaoPermitida, type EstadoDestino } from "./politica.js";
 
 /**
- * Fase 60.4.3.4.21.2.4 (R21-2.3-01) — POSSE EXCLUSIVA do destino de restore.
+ * POSSE EXCLUSIVA E PERSISTENTE do destino de restore.
  *
- * Causa raiz do defeito: a "posse" era um booleano calculado UMA vez (destino inexistente antes da escrita) e a limpeza
- * usava `dropDatabase`, que apaga tudo — inclusive o que outra operação gravou depois da verificação.
+ * Fase 60.4.3.4.21.2.4 (R21-2.3-01): a "posse" era um booleano calculado uma vez e a limpeza usava `dropDatabase`.
+ * Fase 60.4.3.4.21.2.6 (auditoria 21.2.5):
+ *   A-01  o destino só é VERIFICADO depois de CONGELADO e comparado BYTE A BYTE com o archive; a posse NÃO é removida no
+ *         sucesso — fica `VERIFICADO` (com as evidências) até o operador liberar ou remover.
+ *   A-04  a limpeza compara o CONTEÚDO de cada documento (não só o `_id`).
+ *   A-05  toda remoção usa `drop` com `collectionUUID` (o servidor recusa atomicamente se a coleção não for a mesma) e
+ *         reconfere posse, estado e congelamento imediatamente antes de cada coleção.
+ *   A-07  o congelamento aplicado POR uma limpeza recusada é desfeito em `finally` — mas nunca o de um destino que já
+ *         estava protegido (VALIDANDO/VERIFICADO/...).
  *
- * Modelo:
- *   1. AQUISIÇÃO ATÔMICA: inserção do documento de posse `_id: "posse"` (único) com o `execucaoId` na coleção de
- *      controle — exatamente um processo vence (os demais: E11000). O banco precisa conter SÓ essa coleção — senão só a
- *      própria coleção de controle é removida (e só se a posse nela for desta execução).
- *   2. LIMPEZA (nunca `dropDatabase`): posse ATUAL comprovada → recusa se houver coleção fora do archive → CONGELA as
- *      coleções do archive (validador que rejeita qualquer escrita) → confere que todo `_id` existe no archive e todo
- *      índice existe no manifesto → só então remove coleção por coleção, a de controle por último. Qualquer divergência:
- *      descongela, não remove nada, `FALHOU_DESTINO_PARCIAL`. Coleção alheia criada durante a limpeza nunca é removida.
+ * Atomicidade: o documento `_id: "posse"` é único — exatamente um processo vence a inserção (os demais: E11000).
+ * Mudança de estado: compare-and-set (`updateOne` filtrando por `execucaoId` E estado atual).
  */
 
 export const COLECAO_POSSE = RESTORE.colecaoPosse;
 const ID_POSSE = "posse";
-/** Validador que rejeita QUALQUER inserção/atualização (congelamento durante a verificação e a remoção). */
-const VALIDADOR_CONGELADO = { $expr: { $eq: [1, 0] } };
+/** Validador que rejeita QUALQUER inserção/atualização. Com autenticação, só quem tem `collMod` o remove. */
+export const VALIDADOR_CONGELADO = { $expr: { $eq: [1, 0] } };
+
+export interface EvidenciasIntegridade {
+  verificadoEm: string;
+  documentos: number;
+  hashesPorColecao: Record<string, string>;
+  uuidsPorColecao: Record<string, string>;
+  indicesTotal: number;
+  verificacoes: Verificacao[];
+}
 
 export interface DocumentoPosse {
   _id: typeof ID_POSSE;
   execucaoId: string;
+  estado: EstadoDestino;
   pid: number;
   processoInicio: string;
+  processoInicioTicks: string;
+  executavel: string;
   banco: string;
   archive: string;
   archiveSha256: string;
   manifesto: string;
+  manifestoSha256: string;
   criadoEm: Date;
+  atualizadoEm: Date;
+  historico: { estado: EstadoDestino; em: Date; detalhe: string }[];
+  evidencias?: EvidenciasIntegridade;
+  liberacao?: { autorizadaEm: Date; operador: string; operacaoId: string };
+  intervencao?: { em: Date; motivo: string };
 }
 
-/** Chave canônica de um `_id` vindo do banco (mesma forma de `idsDoArchive`): bytes BSON do elemento `_id`. */
 export function chaveDoId(id: unknown): string {
   const b = Buffer.from(BSON.serialize({ _id: id }));
   return b.subarray(4, b.length - 1).toString("hex");
 }
 
-interface InfoColecao {
+export interface InfoColecao {
   nome: string;
   tipo: string;
   opcoes: Document;
-  /** UUID da coleção (muda se ela for apagada e recriada com o mesmo nome). */
-  uuid: string | null;
+  uuid: BSON.UUID | null;
 }
 
-async function nomesColecoes(db: Db): Promise<InfoColecao[]> {
+export async function infoColecoes(db: Db): Promise<InfoColecao[]> {
   return (await db.listCollections({}, { nameOnly: false }).toArray())
     .filter((c) => !c.name.startsWith("system."))
     .map((c) => {
-      const uuid = (c as { info?: { uuid?: { toString(enc: string): string } } }).info?.uuid;
-      return { nome: c.name, tipo: (c as { type?: string }).type ?? "collection", opcoes: (c as { options?: Document }).options ?? {}, uuid: uuid ? uuid.toString("hex") : null };
+      const uuid = (c as { info?: { uuid?: BSON.UUID } }).info?.uuid ?? null;
+      return { nome: c.name, tipo: (c as { type?: string }).type ?? "collection", opcoes: (c as { options?: Document }).options ?? {}, uuid };
     });
 }
 
-const congelada = (c: InfoColecao) => JSON.stringify(c.opcoes["validator"] ?? null) === JSON.stringify(VALIDADOR_CONGELADO);
+const hexUuid = (u: BSON.UUID | null) => (u ? Buffer.from(u.buffer).toString("hex") : null);
+export const estaCongelada = (c: InfoColecao) => JSON.stringify(c.opcoes["validator"] ?? null) === JSON.stringify(VALIDADOR_CONGELADO);
 
 async function documentosDePosse(db: Db): Promise<Document[]> {
   return db.collection(COLECAO_POSSE).find({}).limit(10).toArray();
 }
 
 /** A posse é desta execução AGORA? (exatamente um documento de posse, com o mesmo `execucaoId`). */
-export async function posseAtual(db: Db, execucaoId: string): Promise<{ ok: boolean; detalhe: string; documento: Document | null }> {
-  const existe = (await nomesColecoes(db)).some((c) => c.nome === COLECAO_POSSE);
+export async function posseAtual(db: Db, execucaoId: string): Promise<{ ok: boolean; detalhe: string; documento: DocumentoPosse | null }> {
+  const existe = (await infoColecoes(db)).some((c) => c.nome === COLECAO_POSSE);
   if (!existe) return { ok: false, detalhe: "coleção de posse ausente", documento: null };
   const docs = await documentosDePosse(db);
-  if (docs.length !== 1 || docs[0]!["_id"] !== ID_POSSE) return { ok: false, detalhe: `coleção de posse com ${docs.length} documento(s) inesperado(s)`, documento: docs[0] ?? null };
-  if (docs[0]!["execucaoId"] !== execucaoId) return { ok: false, detalhe: "posse pertence a OUTRA execução", documento: docs[0]! };
-  return { ok: true, detalhe: "posse desta execução", documento: docs[0]! };
+  const doc = (docs[0] ?? null) as DocumentoPosse | null;
+  if (docs.length !== 1 || doc?._id !== ID_POSSE) return { ok: false, detalhe: `coleção de posse com ${docs.length} documento(s) inesperado(s)`, documento: doc };
+  if (doc.execucaoId !== execucaoId) return { ok: false, detalhe: "posse pertence a OUTRA execução", documento: doc };
+  return { ok: true, detalhe: `posse desta execução (estado ${doc.estado})`, documento: doc };
 }
 
 export type ResultadoAquisicao = { adquirida: true } | { adquirida: false; motivo: "POSSE_JA_EXISTE" | "DESTINO_COM_DADOS"; colecoesAlheias: string[]; controleRemovido: boolean };
 
+export type DadosPosse = Omit<DocumentoPosse, "_id" | "criadoEm" | "atualizadoEm" | "estado" | "historico" | "evidencias" | "liberacao" | "intervencao">;
+
 /**
- * A ATOMICIDADE vem do `_id` ÚNICO do documento de posse (`_id: "posse"`): entre N processos simultâneos, exatamente um
- * `insertOne` vence; os demais recebem E11000. (`create` NÃO serve de primitiva: no MongoDB 8.0 criar uma coleção que já
- * existe com as mesmas opções é idempotente e não falha — comprovado no teste T01c.)
+ * Aquisição ATÔMICA (estado inicial PREPARANDO). A atomicidade vem do `_id` ÚNICO (`insertOne`): `create` não serve de
+ * primitiva — no MongoDB 8.0 criar uma coleção existente com as mesmas opções é idempotente (Fase 21.2.4, T01c).
  */
-export async function adquirirPosse(db: Db, posse: Omit<DocumentoPosse, "_id" | "criadoEm">): Promise<ResultadoAquisicao> {
+export async function adquirirPosse(db: Db, posse: DadosPosse): Promise<ResultadoAquisicao> {
   const jaExiste = async (): Promise<ResultadoAquisicao> => ({
     adquirida: false,
     motivo: "POSSE_JA_EXISTE",
-    colecoesAlheias: (await nomesColecoes(db)).map((c) => c.nome).filter((n) => n !== COLECAO_POSSE),
+    colecoesAlheias: (await infoColecoes(db)).map((c) => c.nome).filter((n) => n !== COLECAO_POSSE),
     controleRemovido: false,
   });
   try {
@@ -93,18 +114,25 @@ export async function adquirirPosse(db: Db, posse: Omit<DocumentoPosse, "_id" | 
   } catch (erro) {
     if (!(erro instanceof MongoServerError && (erro.code === 48 || erro.codeName === "NamespaceExists"))) throw erro;
   }
+  const agora = new Date();
   try {
-    await db.collection<DocumentoPosse>(COLECAO_POSSE).insertOne({ _id: ID_POSSE, ...posse, criadoEm: new Date() });
+    await db.collection<DocumentoPosse>(COLECAO_POSSE).insertOne({
+      _id: ID_POSSE,
+      ...posse,
+      estado: "PREPARANDO",
+      criadoEm: agora,
+      atualizadoEm: agora,
+      historico: [{ estado: "PREPARANDO", em: agora, detalhe: "posse adquirida" }],
+    });
   } catch (erro) {
     if (erro instanceof MongoServerError && erro.code === 11000) return jaExiste();
     throw erro;
   }
-  // A coleção de controle pode ter sido criada por outro agente; documento extra nela ⇒ não é posse exclusiva.
   if ((await db.collection(COLECAO_POSSE).countDocuments({})) !== 1) {
     await db.collection(COLECAO_POSSE).deleteOne({ _id: ID_POSSE as never, execucaoId: posse.execucaoId });
     return jaExiste();
   }
-  const outras = (await nomesColecoes(db)).map((c) => c.nome).filter((n) => n !== COLECAO_POSSE);
+  const outras = (await infoColecoes(db)).map((c) => c.nome).filter((n) => n !== COLECAO_POSSE);
   if (outras.length === 0) return { adquirida: true };
   // O banco já tinha dados de alguém: remove SÓ a própria coleção de controle (se continuar só com a nossa posse).
   const atual = await posseAtual(db, posse.execucaoId);
@@ -116,111 +144,188 @@ export async function adquirirPosse(db: Db, posse: Omit<DocumentoPosse, "_id" | 
   return { adquirida: false, motivo: "DESTINO_COM_DADOS", colecoesAlheias: outras, controleRemovido };
 }
 
-/** Restore concluído: remove SÓ a coleção de controle, e só se a posse ainda for desta execução. */
-export async function finalizarPosse(db: Db, execucaoId: string): Promise<{ finalizada: boolean; detalhe: string }> {
+/**
+ * Transição de estado por COMPARE-AND-SET: só aplica se a posse ainda for desta execução, o estado ainda for o lido e a
+ * transição for permitida pela máquina de estados. Devolve o estado anterior.
+ */
+export async function transicionar(db: Db, execucaoId: string, para: EstadoDestino, detalhe: string, extra: Partial<DocumentoPosse> = {}, permitidosDe?: readonly EstadoDestino[]): Promise<{ ok: boolean; de: EstadoDestino | null; detalhe: string }> {
   const atual = await posseAtual(db, execucaoId);
-  if (!atual.ok) return { finalizada: false, detalhe: atual.detalhe };
-  await db.collection(COLECAO_POSSE).drop();
-  return { finalizada: true, detalhe: "coleção de controle removida" };
+  if (!atual.ok || !atual.documento) return { ok: false, de: null, detalhe: atual.detalhe };
+  const de = atual.documento.estado;
+  if (permitidosDe && !permitidosDe.includes(de)) return { ok: false, de, detalhe: `estado ${de} não admite esta operação` };
+  if (!transicaoPermitida(de, para)) return { ok: false, de, detalhe: `transição ${de} → ${para} não permitida` };
+  const agora = new Date();
+  const r = await db.collection<DocumentoPosse>(COLECAO_POSSE).updateOne(
+    { _id: ID_POSSE, execucaoId, estado: de },
+    { $set: { ...extra, estado: para, atualizadoEm: agora }, $push: { historico: { estado: para, em: agora, detalhe } } },
+  );
+  return r.modifiedCount === 1 ? { ok: true, de, detalhe: `${de} → ${para}` } : { ok: false, de, detalhe: "a posse mudou durante a transição" };
+}
+
+async function congelar(db: Db, c: InfoColecao): Promise<void> {
+  await db.command({ collMod: c.nome, ...(c.uuid ? { collectionUUID: c.uuid } : {}), validator: VALIDADOR_CONGELADO, validationLevel: "strict", validationAction: "error" });
+}
+
+async function descongelar(db: Db, c: InfoColecao): Promise<void> {
+  await db.command({
+    collMod: c.nome,
+    ...(c.uuid ? { collectionUUID: c.uuid } : {}),
+    validator: c.opcoes["validator"] ?? {},
+    validationLevel: c.opcoes["validationLevel"] ?? "strict",
+    validationAction: c.opcoes["validationAction"] ?? "error",
+  });
 }
 
 export interface ReferenciaArchive {
-  /** `_id` (chave canônica) de cada coleção do archive. */
-  idsPorColecao: Map<string, Set<string>>;
+  /** Conteúdo esperado (chave do `_id` → SHA-256 dos bytes) por coleção. */
+  conteudoPorColecao: Map<string, ConteudoColecao>;
   /** Índices normalizados de cada coleção, segundo o manifesto. */
   indicesPorColecao: Record<string, IndiceNormalizado[]>;
+}
+
+/** Congela TODAS as coleções do archive presentes no destino (antes da validação). Recusa coleção fora da política. */
+export async function congelarDestino(db: Db): Promise<{ ok: boolean; detalhe: string; congeladas: string[] }> {
+  const cs = await infoColecoes(db);
+  const permitidas = new Set<string>([...COLECOES_BACKUP, COLECAO_POSSE]);
+  const alheias = cs.filter((c) => !permitidas.has(c.nome) || c.tipo !== "collection").map((c) => c.nome);
+  if (alheias.length) return { ok: false, detalhe: `coleções fora do archive: ${alheias.join(", ")}`, congeladas: [] };
+  const alvo = cs.filter((c) => c.nome !== COLECAO_POSSE);
+  for (const c of alvo) await congelar(db, c);
+  return { ok: true, detalhe: `${alvo.length} coleções congeladas`, congeladas: alvo.map((c) => c.nome) };
+}
+
+/**
+ * Verificação INTEGRAL do destino (A-01): posse desta execução; coleções EXATAMENTE as 27 + controle; todas congeladas;
+ * conteúdo byte a byte igual ao archive; índices iguais ao manifesto. Devolve evidências reproduzíveis.
+ */
+export async function verificarDestino(db: Db, execucaoId: string, ref: ReferenciaArchive): Promise<{ ok: boolean; verificacoes: Verificacao[]; evidencias: EvidenciasIntegridade; comparacoes: ComparacaoColecao[] }> {
+  const v: Verificacao[] = [];
+  const posse = await posseAtual(db, execucaoId);
+  v.push({ id: "posse.desta_execucao", ok: posse.ok, detalhe: posse.detalhe });
+  const cs = await infoColecoes(db);
+  const nomes = cs.map((c) => c.nome).sort();
+  const esperadas = [...COLECOES_BACKUP, COLECAO_POSSE].sort();
+  v.push({ id: "destino.colecoes_exatas", ok: JSON.stringify(nomes) === JSON.stringify(esperadas) && cs.every((c) => c.tipo === "collection"), detalhe: `${nomes.length} coleções; esperadas ${esperadas.length} (27 + controle)` });
+  const dados = cs.filter((c) => c.nome !== COLECAO_POSSE);
+  const naoCongeladas = dados.filter((c) => !estaCongelada(c)).map((c) => c.nome);
+  v.push({ id: "destino.protegido", ok: naoCongeladas.length === 0 && dados.length > 0, detalhe: naoCongeladas.length ? `sem proteção: ${naoCongeladas.join(", ")}` : `${dados.length} coleções congeladas` });
+  const comparacoes = await compararConteudoDoDestino(db, ref.conteudoPorColecao, COLECOES_BACKUP, "igual");
+  v.push(resumoComparacao(comparacoes));
+  const idxRuins: string[] = [];
+  let indicesTotal = 0;
+  for (const c of COLECOES_BACKUP) {
+    if (!nomes.includes(c)) continue;
+    const r = await compararIndices(db, c, ref.indicesPorColecao[c] ?? [], "igual");
+    indicesTotal += (ref.indicesPorColecao[c] ?? []).length;
+    if (!r.ok) idxRuins.push(`${c}(alheios=${r.alheios.join("|") || "-"}, faltando=${r.faltando.join("|") || "-"})`);
+  }
+  v.push({ id: "destino.indices_exatos", ok: idxRuins.length === 0, detalhe: idxRuins.length ? idxRuins.join("; ") : `${indicesTotal} índices idênticos ao manifesto` });
+  const evidencias: EvidenciasIntegridade = {
+    verificadoEm: new Date().toISOString(),
+    documentos: comparacoes.reduce((s, c) => s + c.encontrados, 0),
+    hashesPorColecao: Object.fromEntries(comparacoes.map((c) => [c.colecao, c.hashEncontrado])),
+    uuidsPorColecao: Object.fromEntries(dados.map((c) => [c.nome, hexUuid(c.uuid) ?? "?"])),
+    indicesTotal,
+    verificacoes: v,
+  };
+  return { ok: v.every((x) => x.ok), verificacoes: v, evidencias, comparacoes };
+}
+
+/** As evidências de agora são as MESMAS registradas (mesmo conteúdo, mesmas coleções/UUID)? */
+export function mesmasEvidencias(a: EvidenciasIntegridade, b: EvidenciasIntegridade): boolean {
+  return JSON.stringify(a.hashesPorColecao) === JSON.stringify(b.hashesPorColecao) && JSON.stringify(a.uuidsPorColecao) === JSON.stringify(b.uuidsPorColecao) && a.documentos === b.documentos;
 }
 
 export interface GanchosLimpeza {
   /** SOMENTE TESTES: chamados nos pontos sensíveis da limpeza (prova de concorrência). */
   aposCongelar?: () => Promise<void>;
   aposVerificar?: () => Promise<void>;
+  antesDeRemover?: (colecao: string) => Promise<void>;
 }
+
+export type MotivoRecusaLimpeza = "POSSE_NAO_COMPROVADA" | "ESTADO_INCOMPATIVEL" | "COLECOES_ALHEIAS" | "DADOS_ALHEIOS" | "ALHEIO_CRIADO_DURANTE_LIMPEZA" | "REMOCAO_INCOMPLETA";
 
 export type ResultadoLimpeza =
-  | { limpo: true; removidas: string[] }
-  | {
-      limpo: false;
-      motivo: "POSSE_NAO_COMPROVADA" | "COLECOES_ALHEIAS" | "DADOS_ALHEIOS" | "ALHEIO_CRIADO_DURANTE_LIMPEZA";
-      detalhe: string;
-      removidas: string[];
-      preservadas: string[];
-    };
-
-async function congelar(db: Db, nome: string): Promise<void> {
-  await db.command({ collMod: nome, validator: VALIDADOR_CONGELADO, validationLevel: "strict", validationAction: "error" });
-}
-
-async function descongelar(db: Db, nome: string, opcoes: Document): Promise<void> {
-  await db.command({
-    collMod: nome,
-    validator: opcoes["validator"] ?? {},
-    validationLevel: opcoes["validationLevel"] ?? "strict",
-    validationAction: opcoes["validationAction"] ?? "error",
-  });
-}
+  | { limpo: true; removidas: string[]; estadoFinal: "CANCELADO_COM_LIMPEZA_COMPROVADA" }
+  | { limpo: false; motivo: MotivoRecusaLimpeza; detalhe: string; removidas: string[]; preservadas: string[]; estadoFinal: EstadoDestino | null };
 
 /**
- * Limpeza SEGURA de um destino desta execução. Nunca `dropDatabase`; nunca remove coleção, documento ou índice que não
- * pertença ao archive ou à execução. Falha fechada em qualquer dúvida.
+ * Limpeza COMPROVADA de um destino desta execução (nunca `dropDatabase`). Remove SÓ o que é provadamente do archive:
+ * coleções da política, conteúdo de cada documento IDÊNTICO a um documento do archive (subconjunto) e índices do
+ * manifesto. Qualquer dúvida ⇒ nada (mais) é removido e a posse vai para INTERVENCAO_NECESSARIA.
  */
-export async function limparDestinoComPosse(db: Db, execucaoId: string, ref: ReferenciaArchive, ganchos: GanchosLimpeza = {}): Promise<ResultadoLimpeza> {
-  const posse = await posseAtual(db, execucaoId);
-  const nomesAntes = (await nomesColecoes(db)).map((c) => c.nome);
-  if (!posse.ok) return { limpo: false, motivo: "POSSE_NAO_COMPROVADA", detalhe: posse.detalhe, removidas: [], preservadas: nomesAntes };
-
-  const colecoes = await nomesColecoes(db);
-  const permitidas = new Set<string>([...COLECOES_BACKUP, COLECAO_POSSE]);
-  const alheias = colecoes.filter((c) => !permitidas.has(c.nome) || c.tipo !== "collection").map((c) => c.nome);
-  if (alheias.length) return { limpo: false, motivo: "COLECOES_ALHEIAS", detalhe: `coleções fora do archive: ${alheias.join(", ")}`, removidas: [], preservadas: colecoes.map((c) => c.nome) };
-
-  const alvo = colecoes.filter((c) => c.nome !== COLECAO_POSSE);
-  const congeladas: typeof alvo = [];
-  const falhar = async (motivo: "DADOS_ALHEIOS" | "POSSE_NAO_COMPROVADA", detalhe: string): Promise<ResultadoLimpeza> => {
-    for (const c of congeladas) await descongelar(db, c.nome, c.opcoes).catch(() => undefined);
-    return { limpo: false, motivo, detalhe, removidas: [], preservadas: (await nomesColecoes(db)).map((x) => x.nome) };
+export async function limparDestinoComPosse(db: Db, execucaoId: string, ref: ReferenciaArchive, estadosPermitidos: readonly EstadoDestino[], ganchos: GanchosLimpeza = {}): Promise<ResultadoLimpeza> {
+  const nomesAgora = async () => (await infoColecoes(db)).map((x) => x.nome);
+  const intervir = async (motivo: MotivoRecusaLimpeza, detalhe: string, removidas: string[] = []): Promise<ResultadoLimpeza> => {
+    const t = await transicionar(db, execucaoId, "INTERVENCAO_NECESSARIA", `${motivo}: ${detalhe}`, { intervencao: { em: new Date(), motivo: `${motivo}: ${detalhe}` } }).catch(() => ({ ok: false }));
+    return { limpo: false, motivo, detalhe, removidas, preservadas: await nomesAgora(), estadoFinal: t.ok ? "INTERVENCAO_NECESSARIA" : null };
   };
 
-  // Congela ANTES de verificar: a partir daqui nenhuma inserção/atualização (sem bypass) entra nas coleções verificadas.
-  for (const c of alvo) {
-    await congelar(db, c.nome);
-    congeladas.push(c);
+  const posse = await posseAtual(db, execucaoId);
+  if (!posse.ok || !posse.documento) return { limpo: false, motivo: "POSSE_NAO_COMPROVADA", detalhe: posse.detalhe, removidas: [], preservadas: await nomesAgora(), estadoFinal: null };
+  if (!estadosPermitidos.includes(posse.documento.estado)) {
+    return { limpo: false, motivo: "ESTADO_INCOMPATIVEL", detalhe: `estado ${posse.documento.estado} não admite esta limpeza`, removidas: [], preservadas: await nomesAgora(), estadoFinal: posse.documento.estado };
   }
-  await ganchos.aposCongelar?.();
 
-  for (const c of alvo) {
-    const esperados = ref.idsPorColecao.get(c.nome) ?? new Set<string>();
-    let alheios = 0;
-    for await (const d of db.collection(c.nome).find({}, { projection: { _id: 1 }, promoteValues: false, promoteLongs: false })) {
-      if (!esperados.has(chaveDoId(d["_id"]))) alheios += 1;
+  const cs = await infoColecoes(db);
+  const permitidas = new Set<string>([...COLECOES_BACKUP, COLECAO_POSSE]);
+  const alheias = cs.filter((c) => !permitidas.has(c.nome) || c.tipo !== "collection").map((c) => c.nome);
+  if (alheias.length) return intervir("COLECOES_ALHEIAS", `coleções fora do archive: ${alheias.join(", ")}`);
+
+  const alvo = cs.filter((c) => c.nome !== COLECAO_POSSE);
+  // A-07: só o congelamento aplicado POR ESTA limpeza é desfeito numa recusa (proteção prévia nunca é removida).
+  const congeladasAqui: InfoColecao[] = [];
+  let concluiu = false;
+  try {
+    for (const c of alvo) {
+      if (estaCongelada(c)) continue;
+      await congelar(db, c);
+      congeladasAqui.push(c);
     }
-    if (alheios) return falhar("DADOS_ALHEIOS", `${alheios} documento(s) fora do archive em ${c.nome}`);
-    const permitidos = new Set((ref.indicesPorColecao[c.nome] ?? []).map((i) => JSON.stringify(i)));
-    const indicesAlheios = (await db.collection(c.nome).indexes()).map((i) => normalizarIndice(i as Document)).filter((i) => !permitidos.has(JSON.stringify(i)));
-    if (indicesAlheios.length) return falhar("DADOS_ALHEIOS", `índice(s) fora do manifesto em ${c.nome}: ${indicesAlheios.map((i) => i.nome).join(", ")}`);
+    await ganchos.aposCongelar?.();
+
+    const comp = await compararConteudoDoDestino(db, ref.conteudoPorColecao, alvo.map((c) => c.nome), "subconjunto");
+    const ruins = comp.filter((c) => !c.ok);
+    if (ruins.length) return await intervir("DADOS_ALHEIOS", resumoComparacao(comp).detalhe);
+    for (const c of alvo) {
+      const r = await compararIndices(db, c.nome, ref.indicesPorColecao[c.nome] ?? [], "subconjunto");
+      if (!r.ok) return await intervir("DADOS_ALHEIOS", `índice(s) fora do manifesto em ${c.nome}: ${r.alheios.join(", ")}`);
+    }
+    const posseDepois = await posseAtual(db, execucaoId);
+    if (!posseDepois.ok || !posseDepois.documento || !estadosPermitidos.includes(posseDepois.documento.estado)) {
+      return { limpo: false, motivo: "POSSE_NAO_COMPROVADA", detalhe: `posse mudou durante a verificação: ${posseDepois.detalhe}`, removidas: [], preservadas: await nomesAgora(), estadoFinal: null };
+    }
+    await ganchos.aposVerificar?.();
+    concluiu = true;
+  } finally {
+    if (!concluiu) for (const c of congeladasAqui) await descongelar(db, c).catch(() => undefined);
   }
-  const posseDepois = await posseAtual(db, execucaoId);
-  if (!posseDepois.ok) return falhar("POSSE_NAO_COMPROVADA", `posse mudou durante a verificação: ${posseDepois.detalhe}`);
-  await ganchos.aposVerificar?.();
 
   const removidas: string[] = [];
   for (const c of alvo) {
-    // Defesa adicional: a coleção a remover é a MESMA que foi congelada e verificada (UUID) e continua congelada.
-    // Se alguém a apagou e recriou (ou descongelou) no meio do caminho, ela não é removida.
-    const agora = (await nomesColecoes(db)).find((x) => x.nome === c.nome);
-    if (!agora || !c.uuid || agora.uuid !== c.uuid || !congelada(agora)) continue;
-    await db.collection(c.nome).drop();
-    removidas.push(c.nome);
+    await ganchos.antesDeRemover?.(c.nome);
+    // Imediatamente antes de CADA remoção: posse e estado ainda desta execução; coleção ainda congelada e a MESMA.
+    const p = await posseAtual(db, execucaoId);
+    if (!p.ok || !p.documento || !estadosPermitidos.includes(p.documento.estado)) break;
+    const agora = (await infoColecoes(db)).find((x) => x.nome === c.nome);
+    if (!agora || !c.uuid || hexUuid(agora.uuid) !== hexUuid(c.uuid) || !estaCongelada(agora)) continue;
+    try {
+      // `collectionUUID`: o servidor recusa (CollectionUUIDMismatch, 361) se o nome não aponta mais para ESTA coleção.
+      await db.command({ drop: c.nome, collectionUUID: c.uuid });
+      removidas.push(c.nome);
+    } catch (erro) {
+      if (erro instanceof MongoServerError && (erro.code === 361 || erro.code === 26)) continue;
+      throw erro;
+    }
   }
-  // Controle por último, só se TODAS as coleções do alvo saíram e a posse continuar desta execução (senão a posse fica
-  // como evidência para a intervenção manual).
-  if (removidas.length === alvo.length && (await posseAtual(db, execucaoId)).ok) {
-    await db.collection(COLECAO_POSSE).drop();
-    removidas.push(COLECAO_POSSE);
-  }
-  const restantes = (await nomesColecoes(db)).map((c) => c.nome);
-  if (restantes.length) {
-    return { limpo: false, motivo: "ALHEIO_CRIADO_DURANTE_LIMPEZA", detalhe: `preservado(s): ${restantes.join(", ")}`, removidas, preservadas: restantes };
-  }
-  return { limpo: true, removidas };
+  if (removidas.length !== alvo.length) return intervir("REMOCAO_INCOMPLETA", `removidas ${removidas.length} de ${alvo.length}; o restante foi preservado`, removidas);
+
+  const t = await transicionar(db, execucaoId, "CANCELADO_COM_LIMPEZA_COMPROVADA", "todas as coleções do archive removidas com prova de conteúdo");
+  if (!t.ok) return { limpo: false, motivo: "POSSE_NAO_COMPROVADA", detalhe: `posse mudou antes do encerramento: ${t.detalhe}`, removidas, preservadas: await nomesAgora(), estadoFinal: null };
+  const controle = (await infoColecoes(db)).find((x) => x.nome === COLECAO_POSSE);
+  if (controle?.uuid) await db.command({ drop: COLECAO_POSSE, collectionUUID: controle.uuid });
+  removidas.push(COLECAO_POSSE);
+  const restantes = await nomesAgora();
+  if (restantes.length) return { limpo: false, motivo: "ALHEIO_CRIADO_DURANTE_LIMPEZA", detalhe: `preservado(s): ${restantes.join(", ")}`, removidas, preservadas: restantes, estadoFinal: "CANCELADO_COM_LIMPEZA_COMPROVADA" };
+  return { limpo: true, removidas, estadoFinal: "CANCELADO_COM_LIMPEZA_COMPROVADA" };
 }

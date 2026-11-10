@@ -7,7 +7,7 @@ import { ArchiveInvalidoErro, idsDoArchive } from "./archive.js";
 import { chaveDoId, COLECAO_POSSE } from "./posse.js";
 import { RESTORE } from "./politica.js";
 import { montarArchive } from "./teste-archive.util.js";
-import { caminhoTrava, verificarTrava } from "./trava.js";
+import { caminhoTrava, inicioDoProcesso, verificarTrava } from "./trava.js";
 
 /**
  * Fase 60.4.3.4.21.2.4 (R21-2.3-01) — testes unitários (sem MongoDB) da prova de conteúdo e da verificação da trava.
@@ -75,6 +75,30 @@ describe("verificarTrava (sem processo segurando a trava)", () => {
     expect(verificarTrava(arq, "e1", 42).find((x) => x.id === "trava.dono")!.ok).toBe(false);
     writeFileSync(arq, JSON.stringify({ livre: true, execucaoId: "e1", pid: 42 }));
     expect(verificarTrava(arq, "e1", 42).find((x) => x.id === "trava.execucao")!.ok).toBe(false);
+  });
+
+  it("A-09: horário de criação do dono — igual ⇒ ok; diferente (PID reutilizado), ausente ou ilegível ⇒ recusado", () => {
+    writeFileSync(arq, JSON.stringify({ execucaoId: "e1", pid: 42, processoInicioTicks: "134387417609834328" }));
+    const inicio = (v: ReturnType<typeof verificarTrava>) => v.find((x) => x.id === "trava.dono_inicio")!.ok;
+    expect(inicio(verificarTrava(arq, "e1", 42, 134387417609834328n))).toBe(true);
+    expect(inicio(verificarTrava(arq, "e1", 42, 134387417609834329n))).toBe(false);
+    expect(inicio(verificarTrava(arq, "e1", 42, null))).toBe(false);
+    writeFileSync(arq, JSON.stringify({ execucaoId: "e1", pid: 42 }));
+    expect(inicio(verificarTrava(arq, "e1", 42, 134387417609834328n))).toBe(false);
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("inicioDoProcesso (GetProcessTimes)", () => {
+  it.skipIf(process.platform !== "win32")("lê o horário de criação do próprio processo e devolve null para PID inexistente", () => {
+    const meu = inicioDoProcesso(process.pid);
+    expect(typeof meu).toBe("bigint");
+    expect(meu! > 0n).toBe(true);
+    expect(inicioDoProcesso(process.pid)).toBe(meu);
+    expect(inicioDoProcesso(0)).toBeNull();
+    expect(inicioDoProcesso(4_294_967_000)).toBeNull();
+  });
+  it("fora do Windows (CI): sempre null — a verificação da trava falha fechada", () => {
+    if (process.platform !== "win32") expect(inicioDoProcesso(process.pid)).toBeNull();
   });
 });

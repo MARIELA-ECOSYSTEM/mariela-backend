@@ -8,6 +8,7 @@ import { COLECOES_BACKUP, COLECOES_EXCLUIDAS } from "../lib/politica.js";
  * Uso: bun --no-env-file ops/backup/testes/origem-sintetica.ts <cenario>
  *   base | escrita-recente | caixa-aberto | colecao-desconhecida | reconciliacao-pendente | outro-banco | contagens
  *   | volume [n]  (Fase 21.2.4: acrescenta n documentos sintéticos a um eventos_*, para alongar o mongorestore)
+ *   | tipos       (Fase 21.2.6: documentos com todos os tipos BSON e `_id` de vários tipos em eventos_auth)
  */
 
 const URI = "mongodb://127.0.0.1:27119/?directConnection=true";
@@ -108,6 +109,38 @@ async function principal(): Promise<void> {
         for (let i = 0; i < n; i += 10_000) {
           await db.collection(ev).insertMany(Array.from({ length: Math.min(10_000, n - i) }, (_, k) => ({ tipo: "volume-sintetico", seq: i + k, carga: "x".repeat(64), criadoEm: antigo })), { ordered: false });
         }
+        break;
+      }
+      case "tipos": {
+        // Fase 21.2.6: documentos com TODOS os tipos BSON exigidos pela comparação canônica (e `_id` de vários tipos).
+        const { Binary, Decimal128, Double, Int32, Long, Timestamp, UUID } = await import("mongodb");
+        const ev = "eventos_auth";
+        await db.collection(ev).insertMany([
+          {
+            _id: new ObjectId(),
+            tipoTeste: "completo",
+            s: "texto",
+            i: new Int32(1),
+            l: Long.fromNumber(2),
+            d: new Double(1.0),
+            dz: new Double(-0),
+            dec: Decimal128.fromString("1.10"),
+            dt: new Date(1700000000123),
+            b: new Binary(Buffer.from([1, 2, 3]), 0),
+            u: new UUID("0f8fad5b-d9cb-469f-a165-70867728950e"),
+            ts: new Timestamp({ t: 5, i: 7 }),
+            emb: { a: [1, { b: null }], c: "z" },
+            arr: [1, 2, 3],
+            n: null,
+            criadoEm: antigo,
+          },
+          { _id: new ObjectId(), tipoTeste: "simples", v: 1, criadoEm: antigo },
+          { _id: "id-texto" as unknown as ObjectId, tipoTeste: "id", criadoEm: antigo },
+          { _id: new Int32(7) as unknown as ObjectId, tipoTeste: "id", criadoEm: antigo },
+          { _id: new UUID("1b4e28ba-2fa1-11d2-883f-0016d3cca427") as unknown as ObjectId, tipoTeste: "id", criadoEm: antigo },
+          { _id: Decimal128.fromString("9.99") as unknown as ObjectId, tipoTeste: "id", criadoEm: antigo },
+          { _id: { composto: 1, parte: "a" } as unknown as ObjectId, tipoTeste: "id", criadoEm: antigo },
+        ]);
         break;
       }
       case "contagens": {

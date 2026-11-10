@@ -11,7 +11,8 @@ import { RESTORE } from "./politica.js";
  * Aqui a CLI só VERIFICA, antes de cada operação de posse/limpeza:
  *   - a trava está SEGURA agora (abrir para escrita falha com EBUSY/EPERM);
  *   - o conteúdo nomeia ESTA execução (`execucaoId`);
- *   - o dono gravado é o processo PAI desta CLI (o restore que a chamou), não um processo qualquer.
+ *   - o dono gravado é o processo PAI desta CLI (o restore que a chamou) — Fase 21.2.6 (A-09): PID **e** horário de
+ *     criação do processo (FILETIME do Windows, lido pelo `GetProcessTimes`), para que PID reutilizado não engane.
  * Garantia LOCAL (mesma máquina). Não há exclusão distribuída.
  */
 
@@ -19,6 +20,8 @@ export interface ConteudoTrava {
   execucaoId?: string;
   pid?: number;
   processoInicio?: string;
+  /** FILETIME (UTC, 100 ns) da criação do processo dono, em texto decimal. */
+  processoInicioTicks?: string;
   banco?: string;
   livre?: boolean;
 }
@@ -47,12 +50,51 @@ export function travaSegura(caminho: string): boolean {
   }
 }
 
-export function verificarTrava(caminho: string, execucaoId: string, pidDono: number): Verificacao[] {
+/**
+ * Horário de criação (FILETIME UTC, 100 ns) de um processo pelo PID, via `GetProcessTimes` — o MESMO valor que o .NET
+ * expõe em `Process.StartTime.ToFileTimeUtc()`. `null` se não for possível ler (processo inexistente, sem acesso, ou
+ * plataforma sem kernel32): quem chama trata `null` como NÃO comprovado (falha fechada).
+ */
+export function inicioDoProcesso(pid: number): bigint | null {
+  if (process.platform !== "win32" || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { dlopen, FFIType, ptr } = require("bun:ffi") as typeof import("bun:ffi");
+    const k = dlopen("kernel32.dll", {
+      OpenProcess: { args: [FFIType.u32, FFIType.bool, FFIType.u32], returns: FFIType.ptr },
+      GetProcessTimes: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.bool },
+      CloseHandle: { args: [FFIType.ptr], returns: FFIType.bool },
+    });
+    try {
+      const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+      const h = k.symbols.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+      if (!h) return null;
+      const criacao = new BigUint64Array(1);
+      const resto = [new BigUint64Array(1), new BigUint64Array(1), new BigUint64Array(1)] as const;
+      const ok = k.symbols.GetProcessTimes(h, ptr(criacao), ptr(resto[0]), ptr(resto[1]), ptr(resto[2]));
+      k.symbols.CloseHandle(h);
+      return ok && criacao[0]! > 0n ? criacao[0]! : null;
+    } finally {
+      k.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+export function verificarTrava(caminho: string, execucaoId: string, pidDono: number, inicioDono: bigint | null = inicioDoProcesso(pidDono)): Verificacao[] {
   const segura = travaSegura(caminho);
   const conteudo = lerTrava(caminho);
+  const inicioGravado = conteudo?.processoInicioTicks;
+  const inicioOk = !!conteudo && inicioDono !== null && typeof inicioGravado === "string" && /^\d+$/.test(inicioGravado) && BigInt(inicioGravado) === inicioDono;
   return [
     { id: "trava.segura", ok: segura, detalhe: segura ? "trava de restore mantida por um processo" : "trava NÃO está segura (ninguém a mantém)" },
     { id: "trava.execucao", ok: !!conteudo && conteudo.execucaoId === execucaoId && conteudo.livre !== true, detalhe: conteudo ? `trava nomeia a execução ${conteudo.execucaoId ?? "(nenhuma)"}` : "conteúdo da trava ilegível" },
     { id: "trava.dono", ok: !!conteudo && conteudo.pid === pidDono, detalhe: `pid na trava=${conteudo?.pid ?? "?"}; processo chamador=${pidDono}` },
+    {
+      id: "trava.dono_inicio",
+      ok: inicioOk,
+      detalhe: inicioOk ? "horário de criação do processo dono confere (PID não reutilizado)" : `horário de criação não confere ou ilegível (gravado=${inicioGravado ?? "?"}; atual=${inicioDono ?? "?"})`,
+    },
   ];
 }

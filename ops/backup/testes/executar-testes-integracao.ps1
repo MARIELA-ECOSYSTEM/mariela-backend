@@ -55,13 +55,19 @@ function Restore([string]$Archive, [string[]]$Extra = @(), [string]$Shell = "pow
   $r = Invoke-Nativo -Programa $Shell -Argumentos (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script, "-ArquivoBackup", $Archive, "-DiretorioRelatorio", (Join-Path $raiz "relatorios")) + $Extra)
   return [pscustomobject]@{ Codigo = $r.Codigo; Saida = $r.Saida; Erro = $r.Erro }
 }
-function BancosNoRestore { $r =Invoke-Nativo -Programa $bun -Argumentos @("--no-env-file", "-e", "import { MongoClient } from 'mongodb'; const c = new MongoClient('mongodb://127.0.0.1:27118/?directConnection=true'); await c.connect(); console.log(JSON.stringify((await c.db('admin').admin().listDatabases({ nameOnly: true })).databases.map(d => d.name))); await c.close();") -DiretorioTrabalho (Split-Path -Parent $ops | Split-Path -Parent); return ($r.Saida.Trim() | ConvertFrom-Json) }
+# Fase 21.2.6: a instância isolada exige credencial (DPAPI; só pelo stdin).
+$credRestore = Get-CredencialIsolada (Join-Path $env:USERPROFILE "mariela-restore-isolado") 'restore'
+function BancosNoRestore { $r = Invoke-CliBackup -Argumentos @("listar-bancos", "--porta", "27118") -Credencial $credRestore; if (-not $r.ok) { throw "listar-bancos: $($r.mensagem)" }; return @($r.resultado.bancos) }
+function RemoverRestore([string]$Banco, [string]$ExecucaoId, [string]$Shell = "powershell.exe") {
+  $r = Invoke-Nativo -Programa $Shell -Argumentos @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ops "gerir-restore.ps1"), "-Acao", "Remover", "-BancoDestino", $Banco, "-ExecucaoId", $ExecucaoId, "-DiretorioRelatorio", (Join-Path $raiz "relatorios"))
+  return $r.Codigo
+}
 function SemArchiveValido([string]$Dir) { return @(Get-ChildItem -LiteralPath $Dir -File | Where-Object { $_.Name -match '^mariela_(prod|extra)_.*\.archive\.gz$' }).Count -eq 0 }
 
 try {
   # --- Pré-requisitos -------------------------------------------------------------------------------------------
-  $estado27118 = Invoke-CliBackup -Argumentos @("local-estado", "--porta", "27118")
-  Exigir ($estado27118.ok -and $estado27118.resultado.versao -eq "8.0.37" -and $estado27118.resultado.bindIp -eq "127.0.0.1" -and $estado27118.resultado.primario) "instância isolada 27118 indisponível"
+  $estado27118 = Invoke-CliBackup -Argumentos @("local-estado", "--porta", "27118") -Credencial $credRestore
+  Exigir ($estado27118.ok -and $estado27118.resultado.versao -eq "8.0.37" -and $estado27118.resultado.bindIp -eq "127.0.0.1" -and $estado27118.resultado.primario -and $estado27118.resultado.autenticacao) "instância isolada 27118 indisponível ou sem autenticação"
   $estado27119 = Invoke-CliBackup -Argumentos @("local-estado", "--porta", "27119")
   Exigir ($estado27119.ok -and $estado27119.resultado.bindIp -eq "127.0.0.1") "origem sintética 27119 indisponível"
   Semear "base" | Out-Null
@@ -301,11 +307,12 @@ try {
     Exigir ($rel.resultado -eq "PASSOU") "relatório: $($rel.resultado)"
     $mr = $rel.etapas | Where-Object { $_.etapa -eq "mongorestore" }
     Exigir ($mr.documentosComFalha -eq 0 -and -not $mr.avisoCrossVersion) "mongorestore com falhas/cross-version"
-    $vr = $rel.etapas | Where-Object { $_.etapa -eq "validar-restaurado" }
-    Exigir (@($vr.verificacoes | Where-Object { -not $_.ok }).Count -eq 0) "validação pós-restore"
+    $vr = $rel.etapas | Where-Object { $_.etapa -eq "congelar-e-verificar" }
+    Exigir ($vr.ok -and @($vr.verificacoes | Where-Object { -not $_.ok }).Count -eq 0) "verificação integral pós-restore"
+    Exigir ($rel.estadoDestino -eq "VERIFICADO") "estado do destino: $($rel.estadoDestino)"
     Exigir ((BancosNoRestore) -contains "mariela_restore_20260101_000002" -and (BancosNoRestore) -notcontains "marielaDB") "banco de destino"
-    $null = Invoke-CliBackup -Argumentos @("derrubar-restore", "--porta", "27118", "--banco", "mariela_restore_20260101_000002")
-    "PASSOU em $($rel.duracaoSegundos)s; $($mr.documentosRestaurados) documentos; " + (($vr.verificacoes | ForEach-Object { $_.detalhe }) -join " | ")
+    Exigir ((RemoverRestore "mariela_restore_20260101_000002" $rel.execucaoId) -eq 0 -and (BancosNoRestore) -notcontains "mariela_restore_20260101_000002") "remoção comprovada"
+    "PASSOU (VERIFICADO) em $($rel.duracaoSegundos)s; $($mr.documentosRestaurados) documentos; " + (($vr.verificacoes | ForEach-Object { $_.detalhe }) -join " | ")
   }
 
   Caso "T20" "restore recusa destino marielaDB, nome fora do padrão e porta ≠ 27118" {
@@ -337,9 +344,10 @@ try {
     $r = Backup $dir7 $cfg @("-Extraordinario") "pwsh"
     Exigir ($r.Codigo -eq 0 -and $r.Log.resultado -eq "VALIDO_LOCAL") "backup pwsh: $($r.Log.resultado) $($r.Log.motivo)"
     $arq = Join-Path $dir7 $r.Log.arquivo
-    $rr = Restore $arq @("-BancoDestino", "mariela_restore_20260101_000004", "-RemoverAoFinal") "pwsh"
+    $rr = Restore $arq @("-BancoDestino", "mariela_restore_20260101_000004") "pwsh"
     Exigir ($rr.Codigo -eq 0) "restore pwsh falhou"
-    Exigir ((BancosNoRestore) -notcontains "mariela_restore_20260101_000004") "-RemoverAoFinal não removeu"
+    $rel4 = Get-Content -LiteralPath (Join-Path $raiz "relatorios\restore_mariela_restore_20260101_000004.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+    Exigir ((RemoverRestore "mariela_restore_20260101_000004" $rel4.execucaoId "pwsh") -eq 0 -and (BancosNoRestore) -notcontains "mariela_restore_20260101_000004") "remoção comprovada (pwsh) não removeu"
     "backup e restore no PowerShell $(pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'); 5.1 coberto nos demais casos"
   }
 

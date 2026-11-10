@@ -226,15 +226,38 @@ function tamanhoDoValorBson(tipo: number, dados: Buffer, p: number): number | nu
 }
 
 /**
- * Fase 60.4.3.4.21.2.4 (R21-2.3-01) — conjunto de `_id` de cada namespace do archive, como CHAVE CANÔNICA = bytes BSON
- * do elemento `_id` (tipo + nome + valor) em hex. Lê SÓ o primeiro elemento de cada documento (o `_id`, que o MongoDB
- * sempre grava primeiro); nenhum outro campo é lido. Documento cujo primeiro campo não é `_id` ⇒ ArchiveInvalidoErro
- * (falha fechada: sem a lista exata de `_id`, nenhuma limpeza é autorizada).
+ * CHAVE CANÔNICA do `_id` de um documento BSON BRUTO = bytes do elemento `_id` (tipo + nome + valor) em hex. Preserva o
+ * tipo (Int32 7 ≠ Int64 7 ≠ Double 7 ≠ "7"). Exige que o PRIMEIRO elemento seja `_id` (o MongoDB sempre o grava
+ * primeiro; o mongodump o exporta assim). Fora disso ⇒ ArchiveInvalidoErro (falha fechada). Usada no archive E no banco.
  */
-export function idsDoArchive(dados: Buffer): Map<string, Set<string>> {
+export function chaveDoIdBruto(doc: Uint8Array): string {
+  const dados = Buffer.from(doc.buffer, doc.byteOffset, doc.byteLength);
+  if (dados.length < 5) throw new ArchiveInvalidoErro("ESTRUTURA_INVALIDA", "documento BSON curto demais");
+  const t = dados.readInt32LE(0);
+  if (t !== dados.length || dados[t - 1] !== 0) throw new ArchiveInvalidoErro("ESTRUTURA_INVALIDA", "documento BSON com tamanho inconsistente");
+  const fimDoc = t - 1;
+  const tipo = dados[4]!;
+  const fimNome = dados.indexOf(0, 5);
+  if (fimNome < 0 || fimNome >= fimDoc || dados.toString("latin1", 5, fimNome) !== "_id") {
+    throw new ArchiveInvalidoErro("ESTRUTURA_INVALIDA", "documento cujo primeiro campo não é _id");
+  }
+  const tamanhoValor = tamanhoDoValorBson(tipo, dados, fimNome + 1);
+  if (tamanhoValor === null || fimNome + 1 + tamanhoValor > fimDoc) throw new ArchiveInvalidoErro("ESTRUTURA_INVALIDA", `_id de tipo BSON 0x${tipo.toString(16)} não suportado`);
+  return dados.toString("hex", 4, fimNome + 1 + tamanhoValor);
+}
+
+/** SHA-256 (hex) dos BYTES do documento BSON — representação canônica de CONTEÚDO (tipos, ordem e valores exatos). */
+export function hashDoDocumentoBruto(doc: Uint8Array): string {
+  return createHash("sha256").update(doc).digest("hex");
+}
+
+/**
+ * Percorre os documentos de DADOS do archive (nunca os de controle), entregando o namespace e os BYTES BSON brutos de
+ * cada documento, exatamente como o mongodump os gravou (e como o mongorestore os insere).
+ */
+export function percorrerDocumentosDoArchive(dados: Buffer, visitar: (ns: string, doc: Buffer) => void): void {
   if (dados.length < 4 || dados.readUInt32LE(0) !== MAGIC_ARCHIVE) throw new ArchiveInvalidoErro("MAGIC_INVALIDO", "assinatura de archive do mongodump ausente");
   let pos = 4;
-  const ids = new Map<string, Set<string>>();
   const tamanhoDoc = (): number => {
     if (pos + 4 > dados.length) throw new ArchiveInvalidoErro("TRUNCADO", "fim inesperado do archive");
     const t = dados.readInt32LE(pos);
@@ -261,24 +284,46 @@ export function idsDoArchive(dados: Buffer): Map<string, Set<string>> {
       pos += 4;
       continue;
     }
-    const conjunto = ids.get(ns) ?? new Set<string>();
-    ids.set(ns, conjunto);
+    visitar(ns, dados.subarray(pos, pos)); // garante o namespace mesmo sem documentos
     while (!ehTerminador()) {
       if (pos >= dados.length) throw new ArchiveInvalidoErro("TRUNCADO", "bloco de dados sem terminador");
       const t = tamanhoDoc();
-      const fimDoc = pos + t - 1;
-      const tipo = dados[pos + 4]!;
-      const fimNome = dados.indexOf(0, pos + 5);
-      if (fimNome < 0 || fimNome >= fimDoc || dados.toString("latin1", pos + 5, fimNome) !== "_id") {
-        throw new ArchiveInvalidoErro("ESTRUTURA_INVALIDA", "documento cujo primeiro campo não é _id");
-      }
-      const tamanhoValor = tamanhoDoValorBson(tipo, dados, fimNome + 1);
-      if (tamanhoValor === null || fimNome + 1 + tamanhoValor > fimDoc) throw new ArchiveInvalidoErro("ESTRUTURA_INVALIDA", `_id de tipo BSON 0x${tipo.toString(16)} não suportado`);
-      conjunto.add(dados.toString("hex", pos + 4, fimNome + 1 + tamanhoValor));
+      visitar(ns, dados.subarray(pos, pos + t));
       pos += t;
     }
     pos += 4;
   }
+}
+
+/**
+ * Fase 60.4.3.4.21.2.6 (A-01/A-04) — CONTEÚDO de cada namespace do archive: chave canônica do `_id` → SHA-256 dos bytes
+ * do documento. `_id` repetido no mesmo namespace ⇒ ArchiveInvalidoErro.
+ */
+export function conteudoDoArchive(dados: Buffer): Map<string, Map<string, string>> {
+  const r = new Map<string, Map<string, string>>();
+  percorrerDocumentosDoArchive(dados, (ns, doc) => {
+    const m = r.get(ns) ?? new Map<string, string>();
+    r.set(ns, m);
+    if (doc.length === 0) return;
+    const chave = chaveDoIdBruto(doc);
+    if (m.has(chave)) throw new ArchiveInvalidoErro("ESTRUTURA_INVALIDA", `_id repetido em ${ns}`);
+    m.set(chave, hashDoDocumentoBruto(doc));
+  });
+  return r;
+}
+
+export function conteudoDoArchiveGzipDoArquivo(caminho: string): Map<string, Map<string, string>> {
+  return conteudoDoArchive(descompactar(readFileSync(caminho)));
+}
+
+/** Conjunto de `_id` (chaves canônicas) de cada namespace — derivado do conteúdo. */
+export function idsDoArchive(dados: Buffer): Map<string, Set<string>> {
+  const ids = new Map<string, Set<string>>();
+  percorrerDocumentosDoArchive(dados, (ns, doc) => {
+    const s = ids.get(ns) ?? new Set<string>();
+    ids.set(ns, s);
+    if (doc.length) s.add(chaveDoIdBruto(doc));
+  });
   return ids;
 }
 

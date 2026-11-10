@@ -86,9 +86,19 @@ function Get-CaminhoBun {
   segredos de produção). Devolve o objeto JSON da resposta ({ ok, comando, resultado } ou { ok:false, codigo, mensagem }).
 #>
 function Invoke-CliBackup {
-  param([Parameter(Mandatory = $true)][string[]]$Argumentos)
+  param(
+    [Parameter(Mandatory = $true)][string[]]$Argumentos,
+    # Fase 21.2.6 (A-03): credencial da instância isolada — vai SÓ pelo stdin (nunca argumento/ambiente/log).
+    $Credencial = $null
+  )
   $cli = Join-Path $PSScriptRoot 'lib\cli.ts'
-  $r = Invoke-Nativo -Programa (Get-CaminhoBun) -Argumentos (@('--no-env-file', $cli) + $Argumentos)
+  $entrada = $null
+  if ($null -ne $Credencial) {
+    $Argumentos = @($Argumentos) + '--credencial-stdin'
+    $entrada = ConvertTo-EntradaCredencial $Credencial
+  }
+  $r = Invoke-Nativo -Programa (Get-CaminhoBun) -Argumentos (@('--no-env-file', $cli) + $Argumentos) -Entrada $entrada
+  $entrada = $null
   $linha = @($r.Saida -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') }) | Select-Object -Last 1
   if (-not $linha) { throw "A CLI de backup não devolveu JSON (código $($r.Codigo))." }
   return ($linha | ConvertFrom-Json)
@@ -185,8 +195,11 @@ function Enter-TravaRestore([string]$Caminho, [string]$ExecucaoId, [string]$Banc
     $lidos = if ($buffer.Length) { $fluxo.Read($buffer, 0, $buffer.Length) } else { 0 }
     $anterior = $null
     if ($lidos -gt 0) { try { $anterior = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $lidos) | ConvertFrom-Json } catch { $anterior = [pscustomobject]@{ ilegivel = $true } } }
-    $inicio = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o")
-    $conteudo = [System.Text.Encoding]::UTF8.GetBytes((@{ execucaoId = $ExecucaoId; pid = $PID; processoInicio = $inicio; banco = $Banco; adquiridaEm = (Get-Date).ToString("o") } | ConvertTo-Json -Compress))
+    $eu = Get-Process -Id $PID
+    $inicio = $eu.StartTime.ToUniversalTime().ToString("o")
+    # Fase 21.2.6 (A-09): horário de criação EXATO (FILETIME UTC) — a CLI confere com o GetProcessTimes do processo pai.
+    $ticks = [string]$eu.StartTime.ToUniversalTime().ToFileTimeUtc()
+    $conteudo = [System.Text.Encoding]::UTF8.GetBytes((@{ execucaoId = $ExecucaoId; pid = $PID; processoInicio = $inicio; processoInicioTicks = $ticks; executavel = $eu.Path; banco = $Banco; adquiridaEm = (Get-Date).ToString("o") } | ConvertTo-Json -Compress))
     $fluxo.SetLength(0)
     $fluxo.Position = 0
     $fluxo.Write($conteudo, 0, $conteudo.Length)
@@ -195,7 +208,7 @@ function Enter-TravaRestore([string]$Caminho, [string]$ExecucaoId, [string]$Banc
     $fluxo.Close()
     throw
   }
-  return [pscustomobject]@{ Fluxo = $fluxo; Caminho = $Caminho; ExecucaoId = $ExecucaoId; ProcessoInicio = $inicio; Anterior = $anterior }
+  return [pscustomobject]@{ Fluxo = $fluxo; Caminho = $Caminho; ExecucaoId = $ExecucaoId; ProcessoInicio = $inicio; ProcessoInicioTicks = $ticks; Executavel = $eu.Path; Anterior = $anterior }
 }
 
 function Exit-TravaRestore($Trava) {
@@ -227,4 +240,167 @@ function Get-Sha256([string]$Caminho) {
 function ConvertFrom-SenhaSegura([System.Security.SecureString]$Senha) {
   $ponteiro = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Senha)
   try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ponteiro) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ponteiro) }
+}
+
+# ===============================================================================================================
+# Fase 60.4.3.4.21.2.6 (A-03) — CREDENCIAIS da instância isolada (sintéticas, geradas localmente).
+#   Guardadas com DPAPI (ConvertFrom-SecureString sem chave = escopo da conta Windows atual): só esta conta, nesta
+#   máquina, as decifra. Arquivo: "<usuario>`n<blob DPAPI>", pasta <Raiz>\seguranca com ACL restrita. Nunca impressas,
+#   nunca em argumento: chegam aos processos SÓ pelo stdin (Invoke-CliBackup -Credencial; mongorestore -Entrada).
+# ===============================================================================================================
+$script:UsuariosIsolados = @{ admin = 'mariela_bootstrap'; restore = 'mariela_restore'; leitor = 'mariela_leitor' }
+
+function Get-CaminhoCredencial([string]$Raiz, [ValidateSet('admin', 'restore', 'leitor')][string]$Papel) {
+  return (Join-Path $Raiz "seguranca\$Papel.cred")
+}
+
+<# Senha aleatória ASCII alfanumérica (gerador criptográfico), 32 caracteres. #>
+function New-SenhaAleatoria {
+  $alfabeto = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
+  $bytes = New-Object byte[] 64
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+  $s = New-Object System.Security.SecureString
+  foreach ($b in $bytes[0..31]) { $s.AppendChar($alfabeto[$b % $alfabeto.Length]) }
+  $s.MakeReadOnly()
+  return $s
+}
+
+<# Cria a credencial (se não existir). Devolve $true se criou. Nunca sobrescreve. #>
+function New-CredencialIsolada([string]$Raiz, [ValidateSet('admin', 'restore', 'leitor')][string]$Papel) {
+  $arq = Get-CaminhoCredencial $Raiz $Papel
+  if (Test-Path -LiteralPath $arq) { return $false }
+  $pasta = Split-Path -Parent $arq
+  if (-not (Test-Path -LiteralPath $pasta)) { New-Item -ItemType Directory -Path $pasta | Out-Null; Set-AclRestrita $pasta }
+  $blob = ConvertFrom-SecureString -SecureString (New-SenhaAleatoria)
+  [System.IO.File]::WriteAllText($arq, "$($script:UsuariosIsolados[$Papel])`n$blob`n", (New-Object System.Text.UTF8Encoding($false)))
+  Set-AclRestrita $arq
+  return $true
+}
+
+function Get-CredencialIsolada([string]$Raiz, [ValidateSet('admin', 'restore', 'leitor')][string]$Papel) {
+  $arq = Get-CaminhoCredencial $Raiz $Papel
+  if (-not (Test-Path -LiteralPath $arq -PathType Leaf)) { throw "credencial '$Papel' da instância isolada ausente (execute mongod-isolado.ps1 -Acao ConfigurarAutenticacao)." }
+  $acl = Test-AclRestrita $arq
+  if (-not $acl.Ok) { throw "credencial '$Papel' com ACL aberta: $($acl.Detalhe)" }
+  $linhas = @([System.IO.File]::ReadAllLines($arq) | Where-Object { $_ })
+  if ($linhas.Count -ne 2) { throw "credencial '$Papel' ilegível." }
+  return [pscustomobject]@{ Papel = $Papel; Usuario = $linhas[0]; Senha = (ConvertTo-SecureString -String $linhas[1]) }
+}
+
+<# JSON do stdin da CLI: {"conexao":{usuario,senha}} — a senha existe em texto só dentro desta string, só para o stdin. #>
+function ConvertTo-EntradaCredencial($Credencial) {
+  return (@{ conexao = @{ usuario = $Credencial.Usuario; senha = (ConvertFrom-SenhaSegura $Credencial.Senha) } } | ConvertTo-Json -Compress)
+}
+
+# ===============================================================================================================
+# Fase 60.4.3.4.21.2.6 (A-06) — CONTROLE DOS PROCESSOS FILHOS: Job Object do Windows com
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. O próprio PowerShell coordenador entra no job; todo processo que ele criar
+# depois (bun/CLI, mongorestore, …) herda o job. Quando o coordenador morre por QUALQUER motivo (fim normal,
+# Stop-Process -Force, janela fechada), o último handle do job fecha e o Windows mata todos os processos do job.
+# Comprovado no PowerShell 5.1 e 7 (filho morto ao matar só o PowerShell).
+# ===============================================================================================================
+function Initialize-TipoJob {
+  if ('MarielaControleJob' -as [type]) { return }
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class MarielaControleJob {
+  [StructLayout(LayoutKind.Sequential)] struct BASIC { public long a; public long b; public uint LimitFlags; public UIntPtr c; public UIntPtr d; public uint e; public UIntPtr f; public uint g; public uint h; }
+  [StructLayout(LayoutKind.Sequential)] struct IOC { public ulong a, b, c, d, e, f; }
+  [StructLayout(LayoutKind.Sequential)] struct EXT { public BASIC Basic; public IOC Io; public UIntPtr p1, p2, p3, p4; }
+  [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateJobObject(IntPtr a, string n);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr j, int c, ref EXT i, uint l);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool QueryInformationJobObject(IntPtr j, int c, IntPtr i, uint l, IntPtr r);
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+  const uint KILL_ON_JOB_CLOSE = 0x2000;
+  public static IntPtr Criar() {
+    IntPtr j = CreateJobObject(IntPtr.Zero, null);
+    if (j == IntPtr.Zero) throw new Exception("CreateJobObject " + Marshal.GetLastWin32Error());
+    EXT x = new EXT(); x.Basic.LimitFlags = KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(j, 9, ref x, (uint)Marshal.SizeOf(typeof(EXT)))) throw new Exception("SetInformationJobObject " + Marshal.GetLastWin32Error());
+    if (!AssignProcessToJobObject(j, GetCurrentProcess())) throw new Exception("AssignProcessToJobObject " + Marshal.GetLastWin32Error());
+    return j;
+  }
+  /// PIDs de TODOS os processos ativos no job (JobObjectBasicProcessIdList).
+  public static long[] Processos(IntPtr j) {
+    int cap = 256; int tam = 8 + cap * IntPtr.Size;
+    IntPtr buf = Marshal.AllocHGlobal(tam);
+    try {
+      if (!QueryInformationJobObject(j, 3, buf, (uint)tam, IntPtr.Zero)) throw new Exception("QueryInformationJobObject " + Marshal.GetLastWin32Error());
+      int n = Marshal.ReadInt32(buf, 4);
+      long[] r = new long[n];
+      for (int i = 0; i < n; i++) r[i] = Marshal.ReadIntPtr(buf, 8 + i * IntPtr.Size).ToInt64();
+      return r;
+    } finally { Marshal.FreeHGlobal(buf); }
+  }
+}
+'@
+}
+
+<# Coloca o PowerShell atual num job kill-on-close. Falha ⇒ exceção (o chamador NÃO prossegue: falha fechada). #>
+function Enable-ControleDeProcessos {
+  if ($script:JobControle) { return $script:JobControle }
+  Initialize-TipoJob
+  $script:JobControle = [MarielaControleJob]::Criar()
+  return $script:JobControle
+}
+
+<# Processos do job além do próprio coordenador (conhost.exe do console é ignorado: não escreve no banco). #>
+function Get-ProcessosFilhosAtivos {
+  if (-not $script:JobControle) { throw "controle de processos não habilitado" }
+  $r = @()
+  foreach ($id in [MarielaControleJob]::Processos($script:JobControle)) {
+    if ($id -eq $PID) { continue }
+    $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+    if ($p -and $p.ProcessName -eq 'conhost') { continue }
+    $r += [pscustomobject]@{ Pid = $id; Nome = $(if ($p) { $p.ProcessName } else { '?' }) }
+  }
+  return , $r
+}
+
+<# Horário de criação (FILETIME UTC) de um processo; $null se não existir; 'SEM_ACESSO' se existir sem leitura. #>
+function Get-InicioProcesso([int]$Id) {
+  $p = Get-Process -Id $Id -ErrorAction SilentlyContinue
+  if (-not $p) { return $null }
+  try { return [string]$p.StartTime.ToUniversalTime().ToFileTimeUtc() } catch { return 'SEM_ACESSO' }
+}
+
+<#
+  Decisão PURA (testável com fixtures): o dono registrado ainda pode estar vivo?
+  - processo inexistente ⇒ encerrado;
+  - processo existe e o horário de criação é OUTRO ⇒ PID reutilizado ⇒ o dono está encerrado;
+  - mesmo horário ⇒ VIVO; horário ilegível ⇒ tratado como VIVO (falha fechada).
+#>
+function Test-DonoVivo([string]$TicksRegistrados, $TicksAtuais) {
+  if ($null -eq $TicksAtuais) { return $false }
+  if ($TicksAtuais -eq 'SEM_ACESSO' -or -not $TicksRegistrados) { return $true }
+  return ([string]$TicksAtuais -eq [string]$TicksRegistrados)
+}
+
+<#
+  Processos que PODEM pertencer a uma execução: qualquer processo (de qualquer nome/executável) cuja linha de comando
+  cite o banco de destino ou o execucaoId — exceto este processo e seus ancestrais (que o citam por terem chamado
+  este script). Falha fechada: em dúvida, conta como ativo.
+#>
+function Get-ProcessosDaExecucao([string[]]$Marcadores) {
+  $todos = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+  $porId = @{}; foreach ($t in $todos) { $porId[[int]$t.ProcessId] = $t }
+  $excluir = @{}; $atual = $PID
+  for ($i = 0; $i -lt 64 -and $atual -and -not $excluir.ContainsKey($atual); $i++) {
+    $excluir[$atual] = $true
+    $atual = if ($porId.ContainsKey($atual)) { [int]$porId[$atual].ParentProcessId } else { 0 }
+  }
+  $r = @()
+  foreach ($t in $todos) {
+    if ($excluir.ContainsKey([int]$t.ProcessId) -or -not $t.CommandLine) { continue }
+    foreach ($m in $Marcadores) {
+      if ($m -and $t.CommandLine.IndexOf($m, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        $r += [pscustomobject]@{ Pid = [int]$t.ProcessId; Nome = $t.Name; Executavel = $t.ExecutablePath }
+        break
+      }
+    }
+  }
+  return , $r
 }

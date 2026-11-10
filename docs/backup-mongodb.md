@@ -7,8 +7,9 @@ Fonte de verdade dos parâmetros: [`ops/backup/lib/politica.ts`](../ops/backup/l
 
 | Item | Situação |
 | --- | --- |
-| Scripts de backup, cifra, restore e instância isolada | **Implementados e validados localmente**, só com dados SINTÉTICOS (77 testes unitários + 31 testes de scripts + 21 casos de integração + 16 de concorrência da posse, Windows PowerShell 5.1 e PowerShell 7) |
-| Posse exclusiva do destino de restore (R21-2.3-01) | **Corrigida na Fase 21.2.4** — trava local + posse atômica + limpeza sem `dropDatabase` (ver "Posse exclusiva do destino") |
+| Scripts de backup, cifra, restore e instância isolada | **Implementados e validados localmente**, só com dados SINTÉTICOS (ver "Testes"; Windows PowerShell 5.1 e PowerShell 7) |
+| Posse exclusiva do destino de restore (R21-2.3-01) | **Corrigida na Fase 21.2.4** — trava local + posse atômica + limpeza sem `dropDatabase` |
+| Integridade final, posse persistente, autenticação e processos (A-01…A-10, auditoria 21.2.5) | **Implementados na Fase 21.2.6** — `PASSOU` = VERIFICADO com prova byte a byte; liberação/remoção só pelo operador; instância com `--auth`; Job Object (ver "Restore de teste") |
 | MongoDB 8.0.37 isolado (`127.0.0.1:27118`) | **Instalado e validado** (ver "Instância isolada") |
 | Backup real de produção (`marielaDB`) | **NÃO executado** — exige autorização da Fase 21.3 |
 | Restore de backup real | **NÃO executado** — Fase 21.4 |
@@ -43,11 +44,13 @@ Fonte de verdade dos parâmetros: [`ops/backup/lib/politica.ts`](../ops/backup/l
 | --- | --- |
 | `ops/backup/backup-mongo.ps1` | Backup (diário ou `-Extraordinario`) |
 | `ops/backup/restore-test.ps1` | Restore de TESTE isolado (só `127.0.0.1:27118`) |
+| `ops/backup/gerir-restore.ps1` | Decisões do operador sobre um restore VERIFICADO: Inspecionar / Verificar / Liberar / Remover (Fase 21.2.6) |
 | `ops/backup/recuperar-destino.ps1` | Recuperação MANUAL de destino deixado por restore interrompido (inspeção; remoção só com provas) |
-| `ops/backup/lib/trava.ts`, `lib/posse.ts` | Verificação da trava local e posse/limpeza segura do destino (Fase 21.2.4) |
+| `ops/backup/lib/trava.ts`, `lib/posse.ts` | Trava local (PID + horário de criação), posse persistente com máquina de estados, verificação e limpeza comprovada |
+| `ops/backup/lib/integridade.ts` | Comparação canônica (bytes BSON) archive × destino (Fase 21.2.6) |
 | `ops/backup/cifrar-backup.ps1` | Cifrar / Verificar / Decifrar com 7-Zip |
-| `ops/backup/mongod-isolado.ps1` | Iniciar / Parar / Estado da instância 8.0.37 isolada |
-| `ops/backup/comum.ps1` | Funções compartilhadas (processo sem segredo em argumento, ACL, log) |
+| `ops/backup/mongod-isolado.ps1` | ConfigurarAutenticacao / Iniciar / Parar / Estado da instância 8.0.37 isolada |
+| `ops/backup/comum.ps1` | Funções compartilhadas (processo sem segredo em argumento, ACL, log, credenciais DPAPI, Job Object) |
 | `ops/backup/lib/*.ts` | Lógica (Bun): leitura do archive, janela, manifesto, retenção, segunda cópia, CLI |
 | `ops/backup/lib/*.spec.ts` | Testes unitários (rodam no `bun test`/CI, sem dependências externas) |
 | `ops/backup/testes/` | Testes de integração locais (origem sintética + restore isolado) |
@@ -67,10 +70,12 @@ Instalada na Fase 21.2 (autorizada):
 | `mongod.exe` | SHA-256 `60CFE52905D211BF5BF64373637CA116AF08A23A07DB5C10C614D00F148F1249`; **sem assinatura Authenticode** (normal no zip; a garantia é o SHA-256 oficial via HTTPS) |
 | Versão | 8.0.37 — a mesma observada no Atlas (Fase 60.4.3.4.20) |
 | Diretórios | `%USERPROFILE%\mariela-restore-isolado\` → `mongodb-8.0.37\bin`, `data-27118\` (com marcador `.mariela-restore-isolado`), `logs\`, `relatorios\`, `downloads\` |
-| Rede | **só `127.0.0.1:27118`** (conferido por `getCmdLineOpts`); sem autenticação — nunca exponha em outra interface |
+| Rede | **só `127.0.0.1:27118`** (conferido por `getCmdLineOpts`) — nunca exponha em outra interface |
+| Autenticação | **`--auth --keyFile`** desde a Fase 21.2.6; usuários `mariela_bootstrap` (root), `mariela_restore` (papel mínimo `marielaRestore`), `mariela_leitor`; credenciais sintéticas DPAPI em `seguranca\` |
 | Replica set | 1 nó, `rs-restore` |
 
 ```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\mongod-isolado.ps1 -Acao ConfigurarAutenticacao   # 1ª vez (idempotente)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\mongod-isolado.ps1 -Acao Iniciar   # idempotente
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\mongod-isolado.ps1 -Acao Estado
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\mongod-isolado.ps1 -Acao Parar
@@ -251,89 +256,150 @@ download corrompido, erro de upload).
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\mongod-isolado.ps1 -Acao Iniciar
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\restore-test.ps1 -ArquivoBackup "<base>.archive.gz" [-RemoverAoFinal]
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\restore-test.ps1 -ArquivoBackup "<base>.archive.gz"
+# decisões do operador, cada uma por comando separado (execucaoId = o do relatório do restore):
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\gerir-restore.ps1 -Acao Inspecionar -BancoDestino <destino>
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\gerir-restore.ps1 -Acao Verificar  -BancoDestino <destino> -ExecucaoId <id>
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\gerir-restore.ps1 -Acao Liberar    -BancoDestino <destino> -ExecucaoId <id>
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\gerir-restore.ps1 -Acao Remover    -BancoDestino <destino> -ExecucaoId <id>
 ```
 
-0. **Identidade da instância (Fase 21.2.2, R21-2.1-11), antes de qualquer conexão de escrita:** o único processo que
-   escuta em 27118 é o `mongod.exe` de `<Raiz>\mongodb-8.0.37\bin`, e só em `127.0.0.1`; já conectado, a própria
-   instância informa `dbPath` = `<Raiz>\data-27118` com o marcador `.mariela-restore-isolado`, bind só `127.0.0.1` e
-   replica set `rs-restore`. Qualquer divergência (outro processo, outro `dbPath`, marcador ausente, bind aberto,
-   replica set diferente) ⇒ nada é feito; nenhuma outra porta é tentada. A mesma conferência é repetida antes de
-   validar e antes de remover qualquer banco.
-T. **Trava local (Fase 21.2.4), antes de qualquer conexão:** `<Raiz>\locks\restore.lock` é aberta com
-   compartilhamento só-leitura e **mantida aberta até o fim**; cada execução gera um `execucaoId` (GUID). Trava ocupada
-   (outro restore ou recuperação em andamento) ⇒ recusa imediata, sem nenhuma chamada.
-1. **Antes de qualquer escrita:** SHA-256 = manifesto = `.sha256`; manifesto `VALIDO_LOCAL`; archive com exatamente os 27
-   namespaces de `marielaDB` e as contagens do manifesto; mesma série de versão da origem (8.0; correção diferente é
-   registrada); banco `mariela_restore_yyyyMMdd_HHmmss` **inexistente** (nunca `marielaDB`, nunca sobrescreve).
-2. **Posse atômica (Fase 21.2.4):** documento `_id: "posse"` com o `execucaoId` na coleção de controle
-   `_mariela_restore_posse` do destino. O banco tem de conter **só** essa coleção; senão a posse é recusada e nada é
-   escrito. Sem posse, não há `mongorestore`.
-3. `mongorestore --nsInclude marielaDB.<cada uma das 27> --nsFrom "marielaDB.*" --nsTo "<destino>.*" --stopOnError`
-   (**sem `--drop`**). Aviso `Cross-version` ou documento com falha → FALHOU.
-4. **Depois:** coleções exatas (a de controle não conta), contagens, índices, referências (órfãos iguais aos da origem)
-   e sequências idênticos ao manifesto. Relatório: `%USERPROFILE%\mariela-restore-isolado\relatorios\restore_<destino>.json`
-   (com `execucaoId`, `posseAdquirida`, `escritaIniciada`, `execucaoAnteriorInterrompida`, duração).
-5. **PASSOU:** remove só a coleção de controle (posse conferida). Com `-RemoverAoFinal`: limpeza segura do destino
-   inteiro; se a limpeza for recusada, o resultado é `FALHOU_DESTINO_PARCIAL` (nunca `PASSOU`).
+Fluxo do `restore-test.ps1` (Fases 21.2.2, 21.2.4 e 21.2.6):
 
-**Falha depois de iniciar a escrita:** `mongorestore` com falha, validação pós-restore com falha ou exceção ⇒ o destino
-é **inválido** e passa pela **limpeza segura** (abaixo). Limpo ⇒ `FALHOU`; qualquer recusa ⇒ `FALHOU_DESTINO_PARCIAL`
-com `exigeIntervencao: true` e o motivo (`POSSE_NAO_COMPROVADA`, `COLECOES_ALHEIAS`, `DADOS_ALHEIOS`,
-`ALHEIO_CRIADO_DURANTE_LIMPEZA`, `ARCHIVE_DIVERGENTE`) — nada alheio é removido. Falha **antes** da escrita não remove
-nada. Um restore parcial nunca é `PASSOU`.
+- **T. Trava local**, antes de qualquer conexão: `<Raiz>\locks\restore.lock` aberta com compartilhamento só-leitura e
+  mantida até o fim; `execucaoId` (GUID) próprio. Ocupada ⇒ recusa imediata.
+- **J. Controle de processos (A-06):** o PowerShell entra num **Job Object** com `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+  Todo processo criado depois (bun/CLI, mongorestore) herda o job; se o PowerShell morrer por qualquer motivo (fim
+  normal, `Stop-Process -Force`, janela fechada), o Windows mata todos eles. Sem o job, o restore não prossegue.
+- **0. Identidade** (R21-2.1-11): processo da porta = `mongod.exe` da raiz, só `127.0.0.1`; já conectado: `dbPath`,
+  marcador, bind, replica set. Credencial do usuário de **restore** (DPAPI), passada só pelo stdin.
+- **1. Antes de qualquer escrita:** SHA-256 = manifesto = `.sha256`; manifesto `VALIDO_LOCAL`; 27 namespaces e
+  contagens; mesma série de versão; banco `mariela_restore_yyyyMMdd_HHmmss` **inexistente** (nunca `marielaDB`).
+- **2. PREPARANDO — posse atômica e persistente:** documento `_id:"posse"` em `_mariela_restore_posse` com
+  `execucaoId`, processo (PID + horário de criação FILETIME + executável), **SHA-256 do archive e do manifesto**.
+- **3. RESTAURANDO:** `mongorestore` (sem `--drop`, sem bypass), usuário de restore, senha pelo stdin.
+- **4. VALIDANDO:** o destino é **congelado primeiro** (validador que rejeita qualquer inserção/atualização) e só então
+  declarado VALIDANDO; verificação **integral** (abaixo).
+- **5. VERIFICADO:** evidências gravadas na posse; **segunda verificação** com o destino já VERIFICADO tem de dar as
+  mesmas evidências (senão `INTERVENCAO_NECESSARIA`).
 
-### Posse exclusiva do destino (Fase 21.2.4, R21-2.3-01)
+### Definição de PASSOU (A-01)
 
-**Causa raiz do defeito corrigido:** até a 21.2.3 a "posse" era um booleano (`destinoExclusivo`) calculado **uma vez**,
-antes da escrita, e a limpeza usava `dropDatabase`. Qualquer escrita alheia feita entre a verificação e o
-`mongorestore` (ou durante ele) era apagada junto. Reproduzido na 21.2.4 com o código do commit `b1624de`: um documento
-alheio gravado durante o `mongorestore` desapareceu com o banco.
+`PASSOU` ⇔ todas, conferidas no fim da execução e registradas em `condicoesPassou` no relatório:
 
-**Modelo atual (três camadas):**
+1. o restore terminou (`mongorestore` código 0, 0 documentos com falha, sem `Cross-version`);
+2. comparação **integral** archive × destino aprovada;
+3. nenhum documento ou coleção alheia;
+4. proteção contra escrita **ativa** (as 27 coleções congeladas);
+5. posse persistida como **VERIFICADO**, desta execução;
+6. archive e manifesto **vinculados** pelos SHA-256 gravados na posse;
+7. **nenhum processo filho ativo** no Job Object;
+8. trava e identidade da execução ainda válidas (PID + horário de criação).
 
-| Camada | Mecanismo | O que garante |
-| --- | --- | --- |
-| Trava local | `<Raiz>\locks\restore.lock` aberta pelo PowerShell (FileShare.Read) durante toda a execução | Um único restore/recuperação por vez **nesta máquina**; o SO libera a trava em queda/encerramento forçado |
-| Posse no destino | `insertOne({_id:"posse", execucaoId, pid, processoInicio, archive, archiveSha256, manifesto, criadoEm})` em `_mariela_restore_posse` | Exatamente um vencedor por destino (`_id` único; E11000 para os demais). `create` de coleção **não** serve: no 8.0 é idempotente |
-| Limpeza segura | CLI `limpar-destino` (nunca `dropDatabase`) | Só remove o que é comprovadamente do archive e da execução |
+`PASSOU` **não** é liberação: o destino fica **VERIFICADO, congelado e com posse**. "Restore liberado para uso" só existe
+depois de `gerir-restore.ps1 -Acao Liberar` (estado `LIBERACAO_AUTORIZADA`), que reverifica tudo antes.
 
-Antes de cada operação de posse/limpeza a CLI confere que a trava está **segura agora**, que o conteúdo dela nomeia a
-**mesma execução** e que o dono gravado é o **processo que chamou a CLI** — uma execução antiga, outro processo ou uma
-chamada manual sem trava são recusados.
+| Condição | Onde é provada |
+| --- | --- |
+| Restore executado sem erro | `mongorestore` código 0 e contagem de falhas = 0 |
+| Conteúdo restaurado integralmente | comparação byte a byte de todos os documentos com o archive |
+| Ausência de conteúdo alheio | nenhum `_id` fora do archive, nenhuma coleção extra, nenhum índice fora do manifesto |
+| Destino protegido contra novas escritas | validador congelado + autenticação (só quem tem `collMod` remove a proteção) |
+| Posse persistente e verificável | documento de posse com estado, histórico e evidências; sobrevive ao fim do processo |
+| Verificado, aguardando o operador | estado `VERIFICADO` |
+| Liberado para uso | estado `LIBERACAO_AUTORIZADA` (comando explícito) |
 
-**Limpeza segura, passo a passo:** posse atual = esta execução → nenhuma coleção fora das 27 + controle → **congela**
-as coleções do archive (validador que rejeita qualquer inserção/atualização) → confere que **todo `_id`** existe no
-archive (chave = bytes BSON do `_id`, sem colisão entre tipos) e **todo índice** existe no manifesto → confere de novo a
-posse → remove **coleção por coleção**, só se a coleção ainda tem o mesmo UUID e continua congelada → a de controle por
-último, só se todas saíram. Qualquer divergência: descongela, não remove nada. Coleção alheia criada durante a limpeza
-nunca é removida (`ALHEIO_CRIADO_DURANTE_LIMPEZA`).
+### Máquina de estados do destino
 
-**Execução interrompida** (queda de energia, processo morto): a trava fica com o conteúdo da execução (sem `livre`); a
-próxima execução registra `execucaoAnteriorInterrompida` no relatório e **não toca** o destino dela. Recuperação só
-manual:
+| De | Para | Quem | Pré-condição / efeito |
+| --- | --- | --- | --- |
+| — | PREPARANDO | restore-test | posse atômica; banco só com a coleção de controle |
+| PREPARANDO | RESTAURANDO | restore-test | trava + posse desta execução; então o mongorestore |
+| RESTAURANDO | VALIDANDO | restore-test (`congelar-e-verificar`) | **depois** de congelar as 27 coleções |
+| VALIDANDO | VERIFICADO | restore-test | verificação integral aprovada; evidências gravadas; 2ª verificação igual |
+| PREPARANDO/RESTAURANDO/VALIDANDO | FALHOU_DESTINO_PARCIAL | restore-test | falha depois de adquirir a posse |
+| FALHOU_DESTINO_PARCIAL | CANCELADO_COM_LIMPEZA_COMPROVADA | restore-test (limpeza `falha`) | conteúdo ⊆ archive; banco deixa de existir |
+| VERIFICADO | LIBERACAO_AUTORIZADA | operador (`gerir-restore -Acao Liberar`) | reverificação integral = evidências; não remove nem descongela |
+| VERIFICADO/LIBERACAO_AUTORIZADA | CANCELADO_COM_LIMPEZA_COMPROVADA | operador (`-Acao Remover`) | limpeza comprovada |
+| interrompidos (PREPARANDO…INTERVENCAO) | CANCELADO_COM_LIMPEZA_COMPROVADA | operador (`recuperar-destino -Remover`) | dono encerrado; nenhum processo citando o destino |
+| qualquer não final | INTERVENCAO_NECESSARIA | qualquer etapa | segurança de seguir/remover não provada (dado alheio, divergência, posse/coleção trocada) |
 
-```powershell
-# só inspeção (padrão): relata posse, coleções e as provas
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\recuperar-destino.ps1 -BancoDestino mariela_restore_<carimbo>
-# remoção: exige TODAS as provas
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\recuperar-destino.ps1 -BancoDestino mariela_restore_<carimbo> -Remover
-```
+Transições por compare-and-set (`updateOne` filtrando `execucaoId` **e** estado atual); atalhos (ex.: RESTAURANDO →
+VERIFICADO, VALIDANDO → LIBERACAO_AUTORIZADA) são recusados (`TRANSICOES_DESTINO`, `politica.ts`).
+`CANCELADO_COM_LIMPEZA_COMPROVADA` é final: registrado no relatório da operação (o banco não existe mais).
 
-Provas exigidas: trava adquirida pela recuperação; identidade da instância; exatamente um documento de posse; processo
-dono **encerrado** (PID **e** horário de início — PID reutilizado não engana); archive da posse presente com o mesmo
-SHA-256; limpeza segura sem nenhuma divergência. Senão `NADA_REMOVIDO` (relatório `recuperacao_<destino>.json`).
-`derrubar-restore` (remoção manual de restore concluído) recusa banco que ainda tenha coleção de posse.
+### Integridade BSON (A-01, A-04)
 
-**Limites (não é garantia distribuída):**
-- A trava é **local** (mesma máquina). Duas máquinas não são cobertas — e não precisam ser enquanto a instância só
-  escutar em `127.0.0.1` (o T11 da fase não é executável por desenho). Se um dia a instância for exposta, este modelo
-  **não** basta.
-- Um agente que escreva no destino **sem** respeitar a trava ainda é contido pela posse e pela limpeza, com três
-  ressalvas: escrita com `bypassDocumentValidation` ignora o congelamento; um índice criado depois da verificação é
-  removido junto com a coleção (metadado, não documento); `collMod` alheio que descongele a coleção faz a remoção dela
-  ser pulada (fica para intervenção).
-- Não há renovação/expiração (lease) da posse: a recuperação depende do processo dono estar comprovadamente encerrado.
+Representação canônica = **os bytes BSON** de cada documento: no archive (como o mongodump gravou) e no destino
+(`find` com `raw: true`, como o servidor devolve). Comprovado que o mongorestore + servidor preservam os bytes (ordem de
+campos, tipos e valores) com ObjectId, String, Int32, Int64, Double (inclusive −0), Decimal128, Date, Binary (e
+subtipo), UUID, Timestamp, documentos e arrays aninhados, null e campos ausentes. Nada passa por JSON.
+
+- chave do documento = bytes do elemento `_id` (tipo + valor: Int32 7 ≠ Int64 7 ≠ "7"); conteúdo = SHA-256 dos bytes;
+- por coleção: hash reproduzível = SHA-256 dos pares `chave:hash` ordenados;
+- detecta: campo alterado/adicionado/removido, troca de tipo, ordem de campos, delete+insert que preserva contagem,
+  documento alheio com `_id` esperado, documento adicional, documento faltante, índice extra/faltante, sequência
+  alterada (a coleção `sequencias` também é comparada byte a byte);
+- documento que não pode ser lido canonicamente (primeiro campo ≠ `_id`, tipo de `_id` não suportado) ⇒ falha fechada.
+
+### Autenticação e privilégios (A-03)
+
+A instância roda com `--auth --keyFile` (`mongod-isolado.ps1 -Acao ConfigurarAutenticacao`, idempotente; migra uma
+instância antiga sem `--auth`). Credenciais **sintéticas**, aleatórias, guardadas com **DPAPI** (só a conta Windows que
+as criou as decifra) em `<Raiz>\seguranca\*.cred` com ACL restrita; nunca em argumento, variável de ambiente, log ou
+relatório — chegam aos processos só pelo **stdin** (`--credencial-stdin` da CLI; `mongorestore --username` sem
+`--password`).
+
+| Usuário | Papel | Pode | Não pode |
+| --- | --- | --- | --- |
+| sem autenticação | — | nada | tudo (Unauthorized) |
+| `mariela_leitor` | `readAnyDatabase` | ler | qualquer escrita, `collMod`, `drop`, rename, bypass, posse |
+| `mariela_restore` | `marielaRestore` | insert, createCollection/Index, find, `collMod`, `dropCollection`, update/remove **só** na coleção de posse | **bypassDocumentValidation**, update/remove de dados, `dropDatabase`, shutdown, gestão de usuários |
+| `mariela_bootstrap` | `root` | tudo | — (usado só por `mongod-isolado.ps1`: configurar e desligar) |
+
+Comprovado (testes AU): sem autenticação e leitor não fazem nada além de ler; o restore recebe `121` ao inserir numa
+coleção congelada e `Unauthorized` em bypass/update/delete/`dropDatabase`. **Limite assumido:** o usuário de restore é o
+principal confiável do fluxo — ele precisa de `collMod` (congelar) e `dropCollection` (limpeza), e com isso também
+consegue descongelar e (por composição find+insert+createIndex+dropCollection) renomear coleções. Essas ações são
+**detectadas** (Verificar/Liberar/Remover reverificam proteção, coleções, UUIDs e conteúdo). O bootstrap (`root`) pode
+tudo, inclusive bypass; também é detectado pela reverificação. Quem tem a conta Windows do operador tem as credenciais.
+
+### Limpeza comprovada e remoção (A-02, A-04, A-05, A-07)
+
+`derrubar-restore` (que usava `dropDatabase`) **foi removido**. Toda remoção — falha do restore, recuperação de execução
+interrompida, decisão do operador — usa a mesma limpeza (`limpar-destino --modo falha|recuperacao|remocao`):
+
+1. posse desta execução **e** estado compatível com o modo; archive e manifesto com os SHA-256 da posse;
+2. nenhuma coleção fora das 27 + controle (senão `INTERVENCAO_NECESSARIA`, nada removido);
+3. congela (as que ainda não estavam); **conteúdo de cada documento ⊆ archive** (byte a byte) e índices ⊆ manifesto;
+4. imediatamente antes de **cada** coleção: trava ainda desta operação, posse e estado ainda válidos, coleção ainda
+   congelada e com o mesmo UUID — e o `drop` é feito com **`collectionUUID`** (o servidor recusa atomicamente, código
+   361, se o nome passou a apontar para outra coleção);
+5. só se todas saíram: estado `CANCELADO_COM_LIMPEZA_COMPROVADA` e remoção da coleção de controle (também por UUID);
+6. qualquer divergência ⇒ nada (mais) é removido, estado `INTERVENCAO_NECESSARIA`; o congelamento aplicado **por esta
+   limpeza** é desfeito em `finally` — a proteção de um destino que já estava congelado nunca é removida.
+
+Nunca `dropDatabase`. Coleção alheia criada durante a limpeza nunca é removida.
+
+### Execução interrompida e recuperação
+
+A trava fica sem `livre`; a próxima execução registra `execucaoAnteriorInterrompida` e **não toca** o destino dela.
+`recuperar-destino.ps1` (sem `-Remover`: só inspeção) exige: trava; Job Object; identidade; credencial; exatamente um
+documento de posse em estado **interrompível**; dono **encerrado** (PID **e** horário de criação FILETIME — PID
+reutilizado não engana; horário ilegível conta como vivo); **nenhum processo, de qualquer nome ou executável, cuja linha
+de comando cite o destino ou o execucaoId** (exceto ele mesmo e seus ancestrais); archive e manifesto com os mesmos
+SHA-256; limpeza comprovada sem divergência. Senão `NADA_REMOVIDO`. Destinos `VERIFICADO`/`LIBERACAO_AUTORIZADA` são do
+`gerir-restore.ps1`.
+
+### Limites (não é garantia distribuída)
+
+- A trava é **local** (mesma máquina) e a instância só escuta em `127.0.0.1`; duas máquinas não são cobertas (T11 não
+  executável por desenho). Redirecionamento de porta (`netsh portproxy`, túnel, WSL/Docker) não é detectado: se a
+  instância for exposta, este modelo **não** basta.
+- `PASSOU` vale no instante das verificações; uma escrita **posterior** só é possível com credencial de restore
+  (`collMod`) ou bootstrap (bypass) e é detectada por `Verificar`/`Liberar` (vira `INTERVENCAO_NECESSARIA`).
+- Sem renovação/expiração (lease) da posse: a recuperação depende do dono comprovadamente encerrado.
+- O Job Object cobre os processos criados **depois** de o PowerShell entrar no job (todo o fluxo).
 
 O smoke test do backend sobre uma cópia restaurada (e a recriação das 2 coleções de token) é de fase posterior, com
 autorização própria. **Recuperação real** (incidente): restaurar num banco/cluster NOVO, validar como acima, trocar a
@@ -351,19 +417,26 @@ Quando autorizado (Fase 21.6), no Task Scheduler, na conta Windows do operador:
 ## Testes
 
 ```powershell
-bun test ops/backup/lib                                                    # 77 unitários (também no CI)
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\testes\testes-scripts.ps1              # 31 (sem MongoDB; rodar também no pwsh)
+bun test ops/backup/lib                                                    # 109 unitários (também no CI)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\testes\testes-scripts.ps1              # 39 (sem MongoDB; rodar também no pwsh)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\testes\executar-testes-integracao.ps1   # 21 casos
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\testes\testes-posse.ps1                 # 16 casos de concorrência (rodar também no pwsh)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\testes\testes-posse.ps1                 # concorrência + integridade + autenticação + processos (rodar também no pwsh)
 ```
 
-`testes-posse.ps1` (Fase 21.2.4) usa processos **independentes** e MongoDB real: dois restores simultâneos (mesmo destino
-e destinos diferentes), 8 aquisições diretas de posse na mesma barreira, escrita alheia depois da posse / durante o
-`mongorestore` / durante a validação / durante a limpeza (ganchos após congelar e após verificar), queda no meio da
-escrita + recuperação (inspeção, recusa com dado alheio, remoção), execução antiga tentando limpar a nova, posse
-adulterada/removida, trava ocupada/diretório/ausente, fluxo normal e `-RemoverAoFinal`, e a conferência final de que
-todo documento alheio continua no banco. Só cria/remove bancos `mariela_restore_20260103_*`
-(`testes/posse-auxiliar.ts` recusa outro nome).
+`testes-posse.ps1` (Fases 21.2.4 e 21.2.6) usa processos **independentes**, MongoDB real com autenticação e as
+credenciais sintéticas (só stdin):
+- **T01–T12** concorrência: restores simultâneos, 8 aquisições na mesma barreira, escrita alheia antes do mongorestore /
+  durante / durante a validação (credencial de restore → 121; bootstrap com bypass → nunca PASSOU sem detecção) /
+  depois do PASSOU, limpeza com ganchos (após congelar, após verificar, coleção recriada com outro UUID, `_id` esperado
+  com outro conteúdo), queda + recuperação, execução antiga × nova, posse adulterada, trava/credencial ausentes, fluxo
+  normal Liberar → Remover, e a conferência de que todo dado alheio continua no banco;
+- **I00–I21** integridade: cada divergência (campo, tipo, Binary, Decimal128, Date, Timestamp, UUID, embutido, array,
+  null/ausente, delete+insert, `_id` esperado com outro conteúdo, documento adicional, índice, sequência) dá
+  `Verificar = DIVERGENTE` e a reversão exata volta a `INTEGRO`; Liberar com divergência → `INTERVENCAO_NECESSARIA`;
+- **AU01–AU06** autenticação: sem auth, leitor, restore, bootstrap; senha nunca em relatório/log/linha de comando;
+- **PR01–PR08** processos: fim normal, `Stop-Process -Force` só no PowerShell durante mongorestore / validação / limpeza,
+  recuperação com processo vivo citando o destino, PID reutilizado, mesmo PID+horário com executável diferente.
+Só cria/remove bancos `mariela_restore_20260103_*` (`testes/posse-auxiliar.ts` recusa outro nome).
 
 A integração exige a origem SINTÉTICA `127.0.0.1:27119` (MongoDB 8.0.37 com `dbPath` descartável; dados criados por
 `testes/origem-sintetica.ts`, que só aceita essa porta) e a instância isolada `27118`. Cobre: banco `marielaDB`/recusa
@@ -378,7 +451,7 @@ versão (archive forjado 8.2.1), ACL aberta, PowerShell 7.
 Backup real contra o Atlas · restore de archive real · upload para o Google Drive · criação de credencial/OAuth ·
 agendamento contra produção · mudanças no Atlas (usuários, roles, IP Access List, tier) · mudanças no Render ·
 homologação integrada. Nunca: restaurar no Atlas, em `marielaDB` ou em `test`; usar `--drop`; passar URI ou senha por
-argumento; gravar senha em arquivo.
+argumento; gravar senha em texto em arquivo (as credenciais sintéticas da instância isolada ficam só cifradas com DPAPI).
 
 ## Histórico
 
@@ -388,3 +461,7 @@ argumento; gravar senha em arquivo.
 - Fase 60.4.3.4.21.2 (09/11/2026): política 21.1 implementada; MongoDB 8.0.37 isolado; validação local completa.
 - Fase 60.4.3.4.21.2.4 (09/11/2026): R21-2.3-01 (TOCTOU na limpeza do restore) corrigido — trava local, posse atômica,
   limpeza segura sem `dropDatabase`, recuperação manual de execução interrompida; 16 testes de concorrência.
+- Fase 60.4.3.4.21.2.6 (09/11/2026): achados A-01…A-10 da auditoria 21.2.5 — PASSOU = VERIFICADO com comparação byte a
+  byte e 8 condições; posse persistente com máquina de estados; liberação/remoção só por comando do operador;
+  `derrubar-restore` removido; instância com `--auth` e papel mínimo; `drop` com `collectionUUID`; Job Object
+  kill-on-close; horário de criação do processo na trava e na recuperação.
