@@ -1,0 +1,202 @@
+# Fase 21.2.11-CI.3.1 — DIAGNÓSTICO TEMPORÁRIO (branch diag/ci-bun-nest-esm; NUNCA em main).
+# Compara o commit que falhou (5b8ff3d) com o controle que passou (f174059) nos MESMOS experimentos,
+# cada tentativa em processo novo, classificada (APROVADO / ESM_CJS / FALHA_TESTE / OPERACIONAL / TIMEOUT).
+# Sem segredos reais; MongoDB descartável dentro do runner; nada de Atlas/Render/27118.
+name: diag-bun-nest
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [diag/ci-bun-nest-esm]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diag-bun-nest
+  cancel-in-progress: false
+
+jobs:
+  diag:
+    name: diag ${{ matrix.rotulo }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rotulo: falhou-5b8ff3d
+            ref: 5b8ff3d0c9568f6071861d6136e61862cd96c53e
+          - rotulo: controle-f174059
+            ref: f1740593549259a8cb63d7c84b40cd615e470cba
+
+    # Idêntico ao ci.yml (valores FICTÍCIOS, só para o validateEnv).
+    env:
+      NODE_ENV: test
+      MONGODB_URI: mongodb://127.0.0.1:27017/mariela_test?replicaSet=rs0
+      MONGODB_URI_TESTE: mongodb://127.0.0.1:27017/mariela_test?replicaSet=rs0
+      MONGODB_URI_PROVA_TRANSACAO: mongodb://127.0.0.1:27017/mariela_ci_prova_transacao?replicaSet=rs0
+      MONGODB_URI_E2E_F04: mongodb://127.0.0.1:27017/mariela_e2e_f04?replicaSet=rs0
+      JWT_ACCESS_SECRET: ci-fake-jwt-access-secret-nunca-usar-fora-do-runner
+      JWT_REFRESH_SECRET: ci-fake-jwt-refresh-secret-nunca-usar-fora-do-runner
+      PDV_JWT_ACCESS_SECRET: ci-fake-pdv-access-secret-nunca-usar-fora-do-runner
+      PDV_JWT_REFRESH_SECRET: ci-fake-pdv-refresh-secret-nunca-usar-fora-do-runner
+      CORS_ORIGINS: ""
+      SWAGGER_ENABLED: "false"
+
+    steps:
+      - name: Checkout do commit da matriz (o workflow vem da branch diag; o código, do ref)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+
+      - name: Confirma o commit (e define a pasta de saída FORA do checkout)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SAIDA="$RUNNER_TEMP/diag-out"; echo "SAIDA=$SAIDA" >> "$GITHUB_ENV"
+          mkdir -p "$SAIDA"
+          test "$(git rev-parse HEAD)" = "${{ matrix.ref }}"
+          git rev-parse HEAD | tee "$SAIDA/commit.txt"
+          git status --porcelain | tee "$SAIDA/git-status-inicial.txt"
+
+      # Igual ao passo "MongoDB 7 — replica set de 1 nó" do ci.yml (mesma imagem, rs0, host 127.0.0.1:27017).
+      - name: MongoDB 7 — replica set de 1 nó (descartável)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name mongodb -p 127.0.0.1:27017:27017 mongo:7 --replSet rs0 --bind_ip_all
+          esperar() {
+            for tentativa in $(seq 1 60); do
+              if [ "$(docker exec mongodb mongosh --quiet --eval "$2" 2>/dev/null || true)" = "true" ]; then
+                echo "$1: pronto (tentativa $tentativa)"; return 0
+              fi
+              sleep 2
+            done
+            echo "::error::$1: não ficou pronto em 120 s"; docker logs --tail 50 mongodb; return 1
+          }
+          esperar "ping" 'db.adminCommand({ ping: 1 }).ok === 1'
+          docker exec mongodb mongosh --quiet --eval 'printjson(rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "127.0.0.1:27017" }] }))'
+          esperar "primário gravável" 'db.hello().isWritablePrimary === true'
+          docker exec mongodb mongosh --quiet --eval 'db.version()' | tee "$SAIDA/mongo-versao.txt"
+
+      - name: Bun 1.4.2 (igual ao ci.yml)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Dependências congeladas + inventário
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum bun.lock | tee "$SAIDA/lock-antes.sha256"
+          bun install --frozen-lockfile 2>&1 | tee "$SAIDA/install.txt"
+          sha256sum bun.lock | tee "$SAIDA/lock-depois.sha256"
+          diff <(cut -d' ' -f1 "$SAIDA/lock-antes.sha256") <(cut -d' ' -f1 "$SAIDA/lock-depois.sha256")
+          git diff --exit-code -- bun.lock package.json
+          {
+            echo "bun=$(bun --version) revision=$(bun --revision)"
+            echo "node=$(node --version 2>/dev/null || echo ausente)"
+            echo "uname=$(uname -a)"
+            . /etc/os-release && echo "os=$PRETTY_NAME"
+            echo "imagem=${ImageVersion:-?} runner=${RUNNER_OS:-?}/${RUNNER_ARCH:-?}"
+            for p in @nestjs/common @nestjs/core @nestjs/throttler @nestjs/testing @nestjs/config @nestjs/jwt @nestjs/mongoose reflect-metadata rxjs file-type load-esm; do
+              v=$(bun -e "try{console.log(require('./node_modules/$p/package.json').version)}catch{console.log('ausente')}")
+              echo "$p=$v"
+            done
+            echo "pacotes_instalados=$(grep -Eo '[0-9]+ packages installed' "$SAIDA/install.txt" || echo '?')"
+          } | tee "$SAIDA/ambiente.txt"
+          bun pm ls --all > "$SAIDA/bun-pm-ls-all.txt" 2>&1 || true
+          echo "linhas_bun_pm_ls_all=$(wc -l < "$SAIDA/bun-pm-ls-all.txt")" | tee -a "$SAIDA/ambiente.txt"
+
+      - name: Experimentos E1–E6b (10× cada, processo novo, classificados)
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Uma tentativa: exit code, duração, stdout e stderr SEPARADOS; classificação explícita.
+          tentativa() { # $1 experimento, $2 i, $3 timeout(s), resto = comando
+            local exp=$1 i=$2 lim=$3; shift 3
+            local base="$SAIDA/$exp/$i"; mkdir -p "$SAIDA/$exp"
+            local ini fim cod classe
+            ini=$(date +%s%N)
+            timeout --kill-after=10 "$lim" "$@" >"$base.stdout" 2>"$base.stderr"; cod=$?
+            fim=$(date +%s%N)
+            if [ "$cod" -eq 124 ] || [ "$cod" -eq 137 ]; then classe=TIMEOUT
+            elif grep -q 'require() async module' "$base.stdout" "$base.stderr"; then classe=ESM_CJS
+            elif [ "$cod" -eq 0 ]; then classe=APROVADO
+            elif grep -Eq '^\(fail\)|^ *[1-9][0-9]* fail$' "$base.stdout" "$base.stderr"; then classe=FALHA_TESTE
+            else classe=OPERACIONAL; fi
+            local modulo
+            modulo=$(grep -ho 'require() async module "[^"]*' "$base.stdout" "$base.stderr" | head -1 | sed 's#.*node_modules/##')
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$exp" "$i" "$classe" "$cod" "$(( (fim-ini)/1000000 ))" "${modulo:--}" | tee -a "$SAIDA/tentativas.tsv"
+          }
+          experimento() { local exp=$1 lim=$2; shift 2; for i in $(seq 1 10); do tentativa "$exp" "$i" "$lim" "$@"; done; }
+
+          printf 'experimento\ttentativa\tclasse\texit\tms\tmodulo_async\n' > "$SAIDA/tentativas.tsv"
+          experimento E1-import-common   120 bun -e 'await import("@nestjs/common"); console.log("ok")'
+          experimento E2-import-core     120 bun -e 'await import("@nestjs/core"); console.log("ok")'
+          experimento E3-require-thr     120 bun -e 'require("@nestjs/throttler"); console.log("ok")'
+          experimento E3b-import-thr     120 bun -e 'await import("@nestjs/throttler"); console.log("ok")'
+          experimento E4-appmodule       120 bun -e 'await import("./src/app.module.ts"); console.log("ok")'
+          experimento E5a-thr-antes      120 bun -e 'await import("@nestjs/throttler"); await import("@nestjs/common"); await import("@nestjs/core"); console.log("ok")'
+          experimento E5b-thr-depois     120 bun -e 'await import("@nestjs/common"); await import("@nestjs/core"); await import("@nestjs/throttler"); console.log("ok")'
+
+          # E6 × E6b: MESMO arquivo, MESMO comando, só difere o --preload (sintaxe confirmada no Bun 1.4.2:
+          # `bun test --preload <arquivo>`). Tentativas ALTERNADAS (E6, E6b, E6, E6b…) para que variação do runner
+          # ao longo do tempo afete os dois igualmente. O preload é criado AQUI (não versionado) e removido no fim;
+          # o git status final prova que nada do repositório mudou.
+          printf 'import "@nestjs/common";\nimport "@nestjs/core";\n' > diag-preload.ts
+          cp diag-preload.ts "$SAIDA/diag-preload.ts.txt"
+          for i in $(seq 1 10); do
+            tentativa E6-spec-isolado  "$i" 300 bun test src/app.module.spec.ts
+            tentativa E6b-spec-preload "$i" 300 bun test --preload ./diag-preload.ts src/app.module.spec.ts
+          done
+          rm -f diag-preload.ts
+          exit 0
+
+      - name: E7 — suíte completa 3× (mesmo comando do ci.yml)
+        shell: bash
+        run: |
+          set -uo pipefail
+          for i in 1 2 3; do
+            d="$SAIDA/E7-suite"; mkdir -p "$d"
+            ini=$(date +%s%N)
+            timeout --kill-after=10 900 bun test >"$d/$i.stdout" 2>"$d/$i.stderr"; cod=$?
+            fim=$(date +%s%N)
+            if [ "$cod" -eq 124 ] || [ "$cod" -eq 137 ]; then classe=TIMEOUT
+            elif grep -q 'require() async module' "$d/$i.stdout" "$d/$i.stderr"; then classe=ESM_CJS
+            elif [ "$cod" -eq 0 ]; then classe=APROVADO
+            elif grep -Eq '^\(fail\)|^ *[1-9][0-9]* fail$' "$d/$i.stdout" "$d/$i.stderr"; then classe=FALHA_TESTE
+            else classe=OPERACIONAL; fi
+            resumo=$(grep -hE '^ *[0-9]+ (pass|fail|skip|errors?)$|^Ran ' "$d/$i.stdout" "$d/$i.stderr" | tr -s ' ' | tr '\n' ';')
+            # último cabeçalho de arquivo antes do 1º erro ESM/CJS (o bun no Actions prefixa com ##[group])
+            primeiro=$(cat "$d/$i.stdout" "$d/$i.stderr" | awk '/[A-Za-z0-9_.\/-]+\.(spec|test)\.ts:$/ { a=$0; sub(/^.*group\]/, "", a); sub(/:$/, "", a) } /require\(\) async module/ { print a; exit }')
+            printf 'E7-suite\t%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$classe" "$cod" "$(( (fim-ini)/1000000 ))" "$resumo" "${primeiro:--}" | tee -a "$SAIDA/tentativas.tsv"
+          done
+          exit 0
+
+      - name: Resumo por experimento
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          SAIDA="${SAIDA:-$RUNNER_TEMP/diag-out}"
+          test -f "$SAIDA/tentativas.tsv" || { echo "sem tentativas"; exit 0; }
+          awk -F'\t' 'NR>1 { k=$1" "$3; n[k]++ } END { for (k in n) print k, n[k] }' "$SAIDA/tentativas.tsv" | sort | tee "$SAIDA/RESUMO.txt"
+          git status --porcelain | tee "$SAIDA/git-status-final.txt"
+          { echo "## diag ${{ matrix.rotulo }}"; echo '```'; cat "$SAIDA/ambiente.txt" "$SAIDA/RESUMO.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Artefatos (sempre; sem segredos — só valores fictícios do próprio workflow)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-${{ matrix.rotulo }}
+          path: ${{ runner.temp }}/diag-out/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Limpeza do MongoDB descartável
+        if: always()
+        shell: bash
+        run: docker rm -f mongodb || true
