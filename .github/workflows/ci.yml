@@ -114,7 +114,8 @@ jobs:
         run: bun run typecheck
 
       - name: Testes (suíte completa)
-        run: bun test
+        # Fase 21.2.11-CI.5 — preload de testes (ver src/test-utils/preload-nestjs.ts).
+        run: bun test --preload ./src/test-utils/preload-nestjs.ts
 
       - name: Build de produção
         run: bun run build
