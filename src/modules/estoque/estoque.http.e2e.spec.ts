@@ -151,6 +151,45 @@ describe("HTTP — Estoque (integração — servidor real)", () => {
     expect(saidaExcedente.status).toBe(400);
   });
 
+  // Fase 22.1 — contrato HTTP da idempotência opcional (campo aditivo; payloads antigos continuam válidos — ver teste acima).
+  it("Fase 22.1 — mesma idempotencyKey: replay devolve 201 com o MESMO saldo (sem lançar de novo); conteúdo diferente: 409", async () => {
+    const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(2);
+    const corpo = { produtoId, varianteId, tamanhoId, quantidade: 4, idempotencyKey: `http-22.1-${Date.now()}` };
+
+    const primeira = await fetch(`${baseUrl}/api/v1/estoque/entrada`, { method: "POST", headers: jsonHeaders(adminAccessToken), body: JSON.stringify(corpo) });
+    const repetida = await fetch(`${baseUrl}/api/v1/estoque/entrada`, { method: "POST", headers: jsonHeaders(adminAccessToken), body: JSON.stringify(corpo) });
+    expect(primeira.status).toBe(201);
+    expect(repetida.status).toBe(201);
+    expect(((await primeira.json()) as { data: { quantidadeTotal: number } }).data.quantidadeTotal).toBe(6);
+    expect(((await repetida.json()) as { data: { quantidadeTotal: number } }).data.quantidadeTotal).toBe(6);
+
+    const diferente = await fetch(`${baseUrl}/api/v1/estoque/entrada`, {
+      method: "POST",
+      headers: jsonHeaders(adminAccessToken),
+      body: JSON.stringify({ ...corpo, quantidade: 1 }),
+    });
+    expect(diferente.status).toBe(409);
+    const corpoConflito = (await diferente.json()) as { code?: string; error?: { code?: string } };
+    expect(JSON.stringify(corpoConflito)).toContain("CONFLICT");
+
+    const movimentacoes = await connection.collection("movimentacoes_estoque").countDocuments({ idempotencyKey: corpo.idempotencyKey });
+    expect(movimentacoes).toBe(1);
+  });
+
+  it("Fase 22.1 — idempotencyKey vazia ou com mais de 120 caracteres é rejeitada (400) antes de qualquer escrita", async () => {
+    const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(3);
+    for (const idempotencyKey of ["", "x".repeat(121)]) {
+      const resposta = await fetch(`${baseUrl}/api/v1/estoque/saida`, {
+        method: "POST",
+        headers: jsonHeaders(adminAccessToken),
+        body: JSON.stringify({ produtoId, varianteId, tamanhoId, quantidade: 1, motivo: "Teste", idempotencyKey }),
+      });
+      expect(resposta.status).toBe(400);
+    }
+    const produto = await app.get(ProdutosService).obterPorId(produtoId);
+    expect(produto.quantidadeTotal).toBe(3);
+  });
+
   it("resposta de erro nunca vaza stack trace/detalhe interno", async () => {
     const resposta = await fetch(`${baseUrl}/api/v1/estoque/entrada`, {
       method: "POST",

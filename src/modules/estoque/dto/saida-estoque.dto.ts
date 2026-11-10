@@ -1,6 +1,6 @@
-import { ApiProperty } from "@nestjs/swagger";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
 import { Type } from "class-transformer";
-import { IsInt, IsMongoId, IsNotEmpty, IsPositive, IsString, MaxLength } from "class-validator";
+import { IsInt, IsMongoId, IsNotEmpty, IsOptional, IsPositive, IsString, MaxLength } from "class-validator";
 
 /** Espelha `SaidaEstoqueRequest` (`src/types/estoque.ts`). */
 export class SaidaEstoqueDto {
@@ -27,4 +27,15 @@ export class SaidaEstoqueDto {
   @IsNotEmpty({ message: "Motivo é obrigatório." })
   @MaxLength(200, { message: "Máximo de 200 caracteres." })
   motivo!: string;
+
+  @ApiPropertyOptional({
+    description:
+      "Fase 22.1 — chave de idempotência opcional. Repetir a MESMA chave com o MESMO conteúdo não lança de novo; com conteúdo diferente responde 409.",
+    maxLength: 120,
+  })
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty({ message: "idempotencyKey não pode ser vazia quando informada." })
+  @MaxLength(120, { message: "Máximo de 120 caracteres." })
+  idempotencyKey?: string;
 }

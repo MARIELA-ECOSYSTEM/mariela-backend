@@ -1,8 +1,10 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { JwtModule } from "@nestjs/jwt";
-import { getConnectionToken } from "@nestjs/mongoose";
+import { getConnectionToken, getModelToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import { Types, type Connection } from "mongoose";
+import { Types, type ClientSession, type Connection, type Model } from "mongoose";
+import { MovimentacaoEstoque, type MovimentacaoEstoqueDocument } from "./schemas/movimentacao-estoque.schema.js";
+import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { inserirMidiaDiretamente } from "../../test-utils/media-storage-falso.util.js";
@@ -400,6 +402,234 @@ describe("EstoqueService (integração — MongoDB real)", () => {
 
       const movimentacoes = await movimentacoesDoProduto(produtoId);
       expect(movimentacoes).toHaveLength(2);
+    });
+  });
+
+  // Fase 22.1 — porta única (`movimentar`): saldo + ledger na MESMA transação, e idempotência opcional por chave.
+  describe("Fase 22.1 — porta única de movimentação (transação + idempotência)", () => {
+    const espioes: { mockRestore: () => void }[] = [];
+    afterEach(() => {
+      while (espioes.length) espioes.pop()!.mockRestore();
+    });
+
+    function modelDoLedger(): Model<MovimentacaoEstoqueDocument> {
+      return moduleRef.get<Model<MovimentacaoEstoqueDocument>>(getModelToken(MovimentacaoEstoque.name));
+    }
+
+    async function quantidadeDoTamanho(produtoId: string, tamanhoId: string): Promise<number> {
+      const produto = await produtosService.obterPorId(produtoId);
+      for (const variante of produto.variantes) {
+        const tamanho = variante.tamanhos.find((item) => String(item._id) === tamanhoId);
+        if (tamanho) return tamanho.quantidade;
+      }
+      throw new Error("tamanho não encontrado no teste");
+    }
+
+    function chave(): string {
+      return `teste-22.1-${Date.now()}-${sufixo()}`;
+    }
+
+    async function codigoDoErro(promessa: Promise<unknown>): Promise<string> {
+      try {
+        await promessa;
+      } catch (erro) {
+        return erro instanceof ApiException ? String((erro.getResponse() as { code?: string }).code) : `NAO_API:${String(erro)}`;
+      }
+      return "SEM_ERRO";
+    }
+
+    it("o índice único parcial de idempotencyKey existe no ledger", async () => {
+      const indices = await connection.collection("movimentacoes_estoque").indexes();
+      const indice = indices.find((item) => item.name === "idempotencyKey_unico_parcial");
+      expect(indice).toBeDefined();
+      expect(indice?.unique).toBe(true);
+      expect(indice?.partialFilterExpression).toEqual({ idempotencyKey: { $type: "string" } });
+    });
+
+    it("(1) entrada manual atualiza o saldo e cria EXATAMENTE um registro — sem chave, sem campos de idempotência", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(4);
+      await service.entrada({ produtoId, varianteId, tamanhoId, quantidade: 3 }, "usuario-22.1");
+
+      expect(await quantidadeDoTamanho(produtoId, tamanhoId)).toBe(7);
+      const movimentacoes = await movimentacoesDoProduto(produtoId);
+      expect(movimentacoes).toHaveLength(1);
+      expect(movimentacoes[0]?.["tipo"]).toBe("entrada");
+      expect(movimentacoes[0]?.["origem"]).toBe("manual");
+      expect(movimentacoes[0]?.["saldoResultante"]).toBe(7);
+      expect(movimentacoes[0]?.["usuarioId"]).toBe("usuario-22.1");
+      // (9) compatibilidade: sem chave, o documento não ganha campos novos.
+      expect("idempotencyKey" in movimentacoes[0]!).toBe(false);
+      expect("idempotencyAssinatura" in movimentacoes[0]!).toBe(false);
+    });
+
+    it("(2) saída manual atualiza o saldo e cria EXATAMENTE um registro", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(6);
+      await service.saida({ produtoId, varianteId, tamanhoId, quantidade: 2, motivo: "Avaria" }, null);
+
+      expect(await quantidadeDoTamanho(produtoId, tamanhoId)).toBe(4);
+      const movimentacoes = await movimentacoesDoProduto(produtoId);
+      expect(movimentacoes).toHaveLength(1);
+      expect(movimentacoes[0]?.["tipo"]).toBe("saida");
+      expect(movimentacoes[0]?.["motivo"]).toBe("Avaria");
+      expect(movimentacoes[0]?.["saldoResultante"]).toBe(4);
+    });
+
+    it("(3) falha na gravação do ledger DESFAZ a alteração de saldo (o saldo foi alterado dentro da transação e revertido)", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(5);
+      let saldoVistoDentroDaTransacao: number | null = null;
+
+      const espiao = spyOn(modelDoLedger(), "create").mockImplementationOnce((async (_docs: unknown, opcoes: { session: ClientSession }) => {
+        // Lê o produto NA SESSÃO da transação: prova que a baixa já foi escrita antes da falha do ledger.
+        const visto = await connection
+          .collection("produtos")
+          .findOne({ _id: new Types.ObjectId(produtoId) }, { session: opcoes.session });
+        const tamanho = (visto?.["variantes"] as { tamanhos: { _id: unknown; quantidade: number }[] }[])
+          .flatMap((variante) => variante.tamanhos)
+          .find((item) => String(item._id) === tamanhoId);
+        saldoVistoDentroDaTransacao = tamanho?.quantidade ?? null;
+        throw new Error("falha injetada na gravação do ledger");
+      }) as never);
+      espioes.push(espiao);
+
+      expect(await codigoDoErro(service.saida({ produtoId, varianteId, tamanhoId, quantidade: 2, motivo: "Teste rollback" }, null))).toBe(
+        "NAO_API:Error: falha injetada na gravação do ledger",
+      );
+      expect(espiao).toHaveBeenCalledTimes(1);
+      expect(saldoVistoDentroDaTransacao as number | null).toBe(3); // dentro da transação a baixa existia…
+      expect(await quantidadeDoTamanho(produtoId, tamanhoId)).toBe(5); // …e foi desfeita no abort.
+      expect(await movimentacoesDoProduto(produtoId)).toHaveLength(0);
+    });
+
+    it("(4) falha na atualização do saldo não deixa registro de movimentação (ledger nunca é chamado)", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(5);
+      const repositorio = moduleRef.get(ProdutosRepository);
+      const espiaoSalvar = spyOn(repositorio, "salvarComRetentativa").mockImplementationOnce((async () => {
+        throw new Error("falha injetada ao salvar o saldo");
+      }) as never);
+      const espiaoLedger = spyOn(modelDoLedger(), "create");
+      espioes.push(espiaoSalvar, espiaoLedger);
+
+      expect(await codigoDoErro(service.entrada({ produtoId, varianteId, tamanhoId, quantidade: 2 }, null))).toBe(
+        "NAO_API:Error: falha injetada ao salvar o saldo",
+      );
+      expect(espiaoLedger).toHaveBeenCalledTimes(0);
+      expect(await quantidadeDoTamanho(produtoId, tamanhoId)).toBe(5);
+      expect(await movimentacoesDoProduto(produtoId)).toHaveLength(0);
+    });
+
+    it("(5) a MESMA chave com o MESMO conteúdo não duplica a operação (entrada e saída) e devolve o produto", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(10);
+      const chaveEntrada = chave();
+      const primeira = await service.entrada({ produtoId, varianteId, tamanhoId, quantidade: 3, idempotencyKey: chaveEntrada }, "u1");
+      const repetida = await service.entrada({ produtoId, varianteId, tamanhoId, quantidade: 3, idempotencyKey: chaveEntrada }, "u2");
+      expect(primeira.quantidadeTotal).toBe(13);
+      expect(repetida.quantidadeTotal).toBe(13);
+      expect(repetida.id).toBe(produtoId);
+
+      const chaveSaida = chave();
+      await service.saida({ produtoId, varianteId, tamanhoId, quantidade: 4, motivo: " Ajuste ", idempotencyKey: chaveSaida }, null);
+      // motivo com espaços diferentes nas pontas é a MESMA operação (assinatura usa o motivo aparado)
+      await service.saida({ produtoId, varianteId, tamanhoId, quantidade: 4, motivo: "Ajuste", idempotencyKey: chaveSaida }, null);
+
+      expect(await quantidadeDoTamanho(produtoId, tamanhoId)).toBe(9);
+      const movimentacoes = await movimentacoesDoProduto(produtoId);
+      expect(movimentacoes).toHaveLength(2);
+      expect(movimentacoes.map((item) => item["idempotencyKey"]).sort()).toEqual([chaveEntrada, chaveSaida].sort());
+    });
+
+    it("(6) a mesma chave com conteúdo DIFERENTE responde 409 e não altera nada", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(10);
+      const k = chave();
+      await service.entrada({ produtoId, varianteId, tamanhoId, quantidade: 2, idempotencyKey: k }, null);
+
+      // quantidade diferente
+      expect(await codigoDoErro(service.entrada({ produtoId, varianteId, tamanhoId, quantidade: 5, idempotencyKey: k }, null))).toBe("CONFLICT");
+      // operação diferente (mesma chave usada numa saída)
+      expect(await codigoDoErro(service.saida({ produtoId, varianteId, tamanhoId, quantidade: 2, motivo: "x", idempotencyKey: k }, null))).toBe(
+        "CONFLICT",
+      );
+      // outro produto
+      const outro = await criarProdutoComTamanho(1);
+      expect(
+        await codigoDoErro(
+          service.entrada({ produtoId: outro.produtoId, varianteId: outro.varianteId, tamanhoId: outro.tamanhoId, quantidade: 2, idempotencyKey: k }, null),
+        ),
+      ).toBe("CONFLICT");
+
+      expect(await quantidadeDoTamanho(produtoId, tamanhoId)).toBe(12);
+      expect(await quantidadeDoTamanho(outro.produtoId, outro.tamanhoId)).toBe(1);
+      expect(await movimentacoesDoProduto(produtoId)).toHaveLength(1);
+      expect(await movimentacoesDoProduto(outro.produtoId)).toHaveLength(0);
+    });
+
+    it("(7) saldo insuficiente bloqueia a saída (com chave) e NÃO consome a chave — depois de repor, a mesma chave aplica", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(1);
+      const k = chave();
+      expect(await codigoDoErro(service.saida({ produtoId, varianteId, tamanhoId, quantidade: 3, motivo: "Perda", idempotencyKey: k }, null))).toBe(
+        "VALIDATION_ERROR",
+      );
+      expect(await quantidadeDoTamanho(produtoId, tamanhoId)).toBe(1);
+      expect(await movimentacoesDoProduto(produtoId)).toHaveLength(0);
+
+      await service.entrada({ produtoId, varianteId, tamanhoId, quantidade: 5 }, null);
+      await service.saida({ produtoId, varianteId, tamanhoId, quantidade: 3, motivo: "Perda", idempotencyKey: k }, null);
+      expect(await quantidadeDoTamanho(produtoId, tamanhoId)).toBe(3);
+      expect(await movimentacoesDoProduto(produtoId)).toHaveLength(2);
+    });
+
+    it("(8a) saídas concorrentes: saldo nunca negativo e saldo final = inicial − soma do ledger (sucessos = registros)", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(3);
+      const resultados = await Promise.allSettled(
+        Array.from({ length: 6 }, (_, i) => service.saida({ produtoId, varianteId, tamanhoId, quantidade: 1, motivo: `Concorrente ${i}` }, null)),
+      );
+      const sucessos = resultados.filter((r) => r.status === "fulfilled").length;
+      for (const r of resultados) {
+        if (r.status === "rejected") {
+          // só recusas de regra (saldo) ou de conflito esgotado — nunca erro cru
+          expect(r.reason instanceof ApiException).toBe(true);
+          expect(["VALIDATION_ERROR", "CONFLICT"]).toContain(String((r.reason.getResponse() as { code?: string }).code));
+        }
+      }
+      const saldo = await quantidadeDoTamanho(produtoId, tamanhoId);
+      const movimentacoes = await movimentacoesDoProduto(produtoId);
+      expect(saldo).toBeGreaterThanOrEqual(0);
+      expect(movimentacoes).toHaveLength(sucessos);
+      expect(saldo).toBe(3 - movimentacoes.reduce((total, item) => total + Number(item["quantidade"]), 0));
+      expect(sucessos).toBeLessThanOrEqual(3);
+    });
+
+    it("(8b) a MESMA chave enviada 5× ao mesmo tempo aplica UMA vez só; as demais recebem o replay", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(0);
+      const k = chave();
+      const resultados = await Promise.allSettled(
+        Array.from({ length: 5 }, () => service.entrada({ produtoId, varianteId, tamanhoId, quantidade: 2, idempotencyKey: k }, null)),
+      );
+      expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);
+      expect(await quantidadeDoTamanho(produtoId, tamanhoId)).toBe(2);
+      expect(await movimentacoesDoProduto(produtoId)).toHaveLength(1);
+    });
+
+    it("(9) sem chave, duas requisições iguais continuam lançando duas vezes (comportamento anterior preservado)", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(0);
+      await service.entrada({ produtoId, varianteId, tamanhoId, quantidade: 1 }, null);
+      await service.entrada({ produtoId, varianteId, tamanhoId, quantidade: 1 }, null);
+      expect(await quantidadeDoTamanho(produtoId, tamanhoId)).toBe(2);
+      expect(await movimentacoesDoProduto(produtoId)).toHaveLength(2);
+    });
+
+    it("movimentar() rejeita quantidade não inteira/≤0 e tipo inválido antes de qualquer escrita", async () => {
+      const { produtoId, varianteId, tamanhoId } = await criarProdutoComTamanho(2);
+      const base = { produtoId, varianteId, tamanhoId, motivo: null, usuarioId: null, origem: "manual" as const };
+      const sessao = await connection.startSession();
+      try {
+        expect(await codigoDoErro(service.movimentar({ ...base, tipo: "entrada", quantidade: 0 }, sessao))).toBe("VALIDATION_ERROR");
+        expect(await codigoDoErro(service.movimentar({ ...base, tipo: "entrada", quantidade: 1.5 }, sessao))).toBe("VALIDATION_ERROR");
+        expect(await codigoDoErro(service.movimentar({ ...base, tipo: "ajuste" as never, quantidade: 1 }, sessao))).toBe("VALIDATION_ERROR");
+      } finally {
+        await sessao.endSession();
+      }
+      expect(await quantidadeDoTamanho(produtoId, tamanhoId)).toBe(2);
+      expect(await movimentacoesDoProduto(produtoId)).toHaveLength(0);
     });
   });
 });

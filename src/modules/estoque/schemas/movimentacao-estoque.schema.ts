@@ -52,8 +52,30 @@ export class MovimentacaoEstoque {
   /** Venda que originou a movimentação (`origem` = `venda` ou `cancelamento`); `null` nas manuais. */
   @Prop({ type: String, default: null, index: true })
   vendaId!: string | null;
+
+  /**
+   * Fase 22.1 — chave de idempotência OPCIONAL das movimentações MANUAIS (`POST /estoque/entrada|saida`). Sem
+   * `default`: movimentações sem chave (inclusive as de venda/cancelamento) continuam gravadas sem o campo, como antes.
+   * Unicidade garantida pelo índice parcial abaixo — persiste entre reinicializações e entre instâncias.
+   */
+  @Prop({ type: String, required: false })
+  idempotencyKey?: string;
+
+  /**
+   * Fase 22.1 — "assinatura" da operação manual que usou `idempotencyKey` (operação, produto, variante, tamanho,
+   * quantidade e motivo, em JSON canônico). Uma repetição da chave só é aceita como replay se a assinatura for igual;
+   * diferente → 409. Nunca contém dado sensível.
+   */
+  @Prop({ type: String, required: false })
+  idempotencyAssinatura?: string;
 }
 
 export type MovimentacaoEstoqueDocument = HydratedDocument<MovimentacaoEstoque>;
 export const MovimentacaoEstoqueSchema = SchemaFactory.createForClass(MovimentacaoEstoque);
 aplicarSerializacaoPadrao(MovimentacaoEstoqueSchema);
+// Fase 22.1 — mesmo padrão de `movimentos_caixa` (Etapa 10.13): único só entre os documentos que TÊM chave (string);
+// os demais (sem o campo) ficam fora do índice. Nenhum documento existente tem o campo, então a criação é segura.
+MovimentacaoEstoqueSchema.index(
+  { idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: "string" } }, name: "idempotencyKey_unico_parcial" },
+);
