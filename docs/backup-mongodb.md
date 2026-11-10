@@ -321,8 +321,35 @@ Fluxo do `restore-test.ps1` (Fases 21.2.2, 21.2.4, 21.2.6 e 21.2.8):
 | `CANCELADO_COM_LIMPEZA_COMPROVADA` / `DESCARTADO` | — | — | — | finais; o banco removido (ou só a coleção de controle órfã, que a recuperação conclui) |
 | `INTERVENCAO_NECESSARIA` | não | não garantido | não | algo não pôde ser provado; nada mais é removido automaticamente |
 
-Os comandos de reverificação (`Verificar`, `Liberar`, `IniciarUso`, `Remover`) refazem **toda** a comparação; qualquer
-divergência num destino que se dizia íntegro o leva a `INTERVENCAO_NECESSARIA`.
+Os comandos de reverificação (`Verificar`, `Liberar`, `IniciarUso`, `Remover`) refazem **toda** a comparação.
+
+**Classificação das falhas (Fase 21.2.11, X1 — `lib/classificacao.ts`).** Cada verificação reprovada tem categoria
+explícita; só o que prova problema **no destino ou na evidência dele** registra `INTERVENCAO_NECESSARIA`:
+
+| Categoria | Exemplos | Efeito em Liberar/IniciarUso |
+| --- | --- | --- |
+| `ENTRADA_OPERADOR` | archive/manifesto inexistente; SHA do arquivo **informado** ≠ registrado (com registro/posse coerentes) | recusa, **estado inalterado**; o operador corrige e repete |
+| `POSSE_INVALIDA` | posse ausente, de outra execução, de outro banco ou instância | recusa, **nada tocado** (a posse não é desta operação) |
+| `EVIDENCIA_INCONSISTENTE` / `registro_posse` | posse ≠ registro local (SHA, caminhos, estado, evidências, banco, instância, execução) | `INTERVENCAO_NECESSARIA` registrada |
+| `EVIDENCIA_INCONSISTENTE` / `registro` | registro local ausente ou com cadeia inválida | recusa sem transição (a âncora não aceita o registro); **intervenção manual** |
+| `EVIDENCIA_INCONSISTENTE` / `artefatos_backup` | `.sha256` ou manifesto do diretório de backup não descrevem o archive registrado | recusa sem transição (o destino não foi afetado); intervenção manual no backup |
+| `EVIDENCIA_INCONSISTENTE` / `desconhecido` | verificação sem categoria conhecida | recusa sem transição; intervenção manual (falha fechada) |
+| `DESTINO_ADULTERADO` | conteúdo, índices, opções, proteção, coleções ou evidências do destino divergentes | `INTERVENCAO_NECESSARIA` registrada |
+| `FALHA_OPERACIONAL` | exceção (conexão, leitura, permissão) | recusa, **estado inalterado** — nunca vira "adulteração" |
+
+Prioridade quando há várias: `POSSE_INVALIDA` > registro > registro×posse > destino > desconhecido > artefatos >
+entrada — uma entrada errada **nunca** esconde uma divergência real. Se a intervenção não puder ser registrada (âncora
+ou CAS recusam), o resultado diz `divergenciaNaoRegistravel` e o estado fica como estava. O relatório do
+`gerir-restore.ps1` traz `categoria`, `escopo`, `intervencaoManual`, `intervencaoPersistida` e o resultado
+`RECUSADO` / `FALHA_OPERACIONAL` / `INTERVENCAO_NECESSARIA`.
+
+**Garantias efetivas (Fase 21.2.11, D14/N4 — `lib/garantias.ts`).** A tabela acima é o que cada estado **declara**.
+`Inspecionar` e `Verificar` devolvem também o que foi **efetivamente comprovado** na consulta (`garantias` =
+efetivas; `garantiasDeclaradas` = do estado; `garantiasEfetivas.situacao` por garantia: `COMPROVADA`,
+`DECLARADA_NAO_REVERIFICADA`, `INDISPONIVEL`, `NAO_SE_APLICA`). Âncora ausente/ilegível/inválida, estado não admitido
+pelo registro, identidade da instância ou da posse não comprovada, posse não única, estado desconhecido ou reverificação
+reprovada ⇒ **nenhuma** garantia efetiva. `Inspecionar` nunca compara com o archive: "igual ao archive" aparece como
+`DECLARADA_NAO_REVERIFICADA` (valor efetivo falso); só `Verificar` com sucesso a comprova.
 
 ### Máquina de estados do destino
 
@@ -371,12 +398,31 @@ qualquer → estado final sem REMOVENDO, EM_USO → VERIFICADO) são recusados (
 | `mariela_leitor` | `readAnyDatabase` | ler | qualquer escrita, `collMod`, `drop`, rename, bypass, posse |
 | `mariela_restore` | `marielaRestore` | insert, createCollection, createIndex, find, listagens | **collMod**, **dropCollection** (logo, rename), update, remove, bypass, `dropDatabase`, escrita na posse |
 | `mariela_guardiao` | `marielaGuardiao` | find, listagens, **collMod**, **dropCollection** (sempre com `collectionUUID`), create/insert/update/remove **só** na coleção de controle | insert/update/remove/createIndex em dados, bypass, `dropDatabase` |
-| `mariela_bootstrap` | `root` | tudo | — (só `mongod-isolado.ps1`: configurar, identidade, desligar) |
+| `mariela_bootstrap` | `root` | tudo | — (só `mongod-isolado.ps1`, com a trava: configurar, identidade, desligar) |
 
 Nenhum usuário do fluxo consegue, **sozinho**, descongelar **e** escrever dados. O restore ainda consegue criar
 coleções/índices e inserir em coleção não congelada; o guardião consegue descongelar (`collMod`). Essas ações não são
 impedidas — são **detectadas** pela reverificação completa (proteção com os três campos, coleções, índices, opções,
 conteúdo). Quem tem a conta Windows tem todas as credenciais: contra esse adversário a defesa é detecção, não prevenção.
+
+**Identidade da instância protegida (Fase 21.2.11, N3 — `lib/identidade.ts`).** O `configurar-autenticacao`
+(bootstrap) **congela** `mariela_isolada_meta.identidade` com o mesmo trio de validação do destino: o restore não insere
+nem altera (sem bypass), nenhum papel operacional tem update/remove nela. Toda operação exige **exatamente um**
+documento, bem formado, igual a `instancia.json`, **e** a coleção congelada — senão recusa. Limite: o guardião continua
+com `collMod`/`dropCollection` em qualquer banco e pode descongelar ou remover a coleção; isso é **detectado** (falha
+fechada), não impedido; forjar uma identidade exigiria os dois papéis. Recuperação: identidade íntegra sem proteção ⇒ o
+`ConfigurarAutenticacao` congela; cópia local ausente ⇒ recriada a partir da instância; documento removido com cópia
+local presente ⇒ **recusa**, salvo `mongod-isolado.ps1 -Acao ConfigurarAutenticacao -RestaurarIdentidadeLocal`
+(decisão explícita do operador); divergência ou documento extra ⇒ recusa sempre.
+
+**Risco aceito (Fase 21.2.11, X2).** O papel `marielaGuardiao` tem `createCollection/insert/update/remove` em
+`{db: "", collection: "_mariela_restore_posse"}` — isto é, na coleção de controle de **qualquer** banco não-sistema,
+não só nos `mariela_restore_*`. O MongoDB não aceita padrão de nome de banco em privilégio; restringir exigiria um papel
+por banco (criado/removido a cada restore pelo bootstrap — ampliaria o uso do root) ou mover a posse para um banco único
+(mudança arquitetural). **Aceito tecnicamente**, com: (1) a CLI só opera bancos `mariela_restore_yyyyMMdd_HHmmss` (nunca
+`marielaDB`); (2) a instância isolada não tem dados de produção; (3) uma coleção `_mariela_restore_posse` criada em outro
+banco não dá acesso a dados (o guardião não escreve em dados) e, num destino, aparece como posse inválida/alheia (recusa).
+Não foi ampliado nenhum privilégio. Revisar se a instância isolada passar a hospedar outros bancos.
 
 ### Âncora externa (A21-7-02)
 
@@ -388,6 +434,15 @@ conteúdo). Quem tem a conta Windows tem todas as credenciais: contra esse adver
   manifesto = registro = posse; caminhos da posse = registrados; banco, execução e instância iguais; cadeia íntegra;
   estado da posse admitido pelo registro (o confirmado, ou `de`/`para` de uma intenção pendente); evidências da posse =
   registradas. Qualquer divergência ⇒ recusa.
+  (21.2.11) As conferências são **granulares** (`ancora.archive` = informado × registro; `ancora.archive_registro` =
+  registro × posse; `ancora.archive_sha256`/`ancora.archive_manifesto` = artefatos do backup × informado;
+  `ancora.posse_banco`/`ancora.posse_instancia` = posse × contexto…) para a classificação acima.
+- **Durabilidade (21.2.11, N2):** cada linha é gravada com abrir → escrever → `fsync` do arquivo → fechar (e `fsync` do
+  diretório fora do Windows; no Windows o Node/Bun não o suporta e o NTFS registra metadados no journal). Qualquer erro
+  aborta a transição **antes** do CAS. O formato é UTF-8 sem BOM, LF, cada linha terminada: última linha sem LF
+  (escrita interrompida), CR/CRLF ou BOM ⇒ registro **inválido** (falha fechada; nenhum acréscimo). Limite: `fsync` pede
+  ao SO a descarga para o dispositivo; não protege contra cache volátil do disco/controladora que ignore o pedido. Queda
+  de energia real **não** foi testada (só falhas injetadas em cada etapa).
 - **Limite:** tamper-*evident*, não tamper-*proof*. Não há chave secreta (exigiria aprovação do operador). Um processo da
   **mesma conta** que reescreva de forma coerente o registro inteiro, a posse e os arquivos do backup não é detectado.
 
@@ -421,6 +476,24 @@ final com **só** a coleção de controle órfã (que é concluída); dono encer
 processo citando o destino ou a execução; âncora externa; limpeza comprovada sem divergência. Destinos
 `VERIFICADO`/`LIBERACAO_AUTORIZADA`/`EM_USO` são do `gerir-restore.ps1`.
 
+### Operações administrativas e a trava (Fase 21.2.11, N1)
+
+`mongod-isolado.ps1 -Acao Iniciar|Parar|ConfigurarAutenticacao` adquire a **mesma** trava do restore
+(`<Raiz>\locks\restore.lock`, `Enter-TravaRestore`, banco `ADMIN:<ação>`) **antes** de qualquer efeito (inclusive criar
+chave/credenciais) e a libera no fim (`finally`). Não há segundo mecanismo de trava.
+
+- **Ocupada** (restore, gestão, recuperação ou outra ação administrativa em andamento) ⇒ recusa, nada feito. A exclusão é
+  do SO (handle aberto); ninguém "rouba" nem libera a trava de outra operação.
+- Conteúdo anterior **ilegível** ou **desconhecido** ⇒ recusa e o conteúdo é **preservado** (lido com o handle exclusivo
+  já em mãos: sem TOCTOU).
+- Conteúdo de execução **interrompida** (não liberou, mas o SO concedeu o handle ⇒ o dono morreu) ⇒ prossegue com aviso
+  nomeando a execução (necessário para a recuperação). O PID gravado **não** é usado como prova, nem a idade da trava.
+- A CLI exige `--trava-execucao` (+ trava segura, desta execução, do processo chamador com PID e horário de criação)
+  em `local-desligar`, `local-rs-iniciar` e `configurar-autenticacao` na 27118. A 27119 (origem sintética dos testes)
+  não usa trava. `Estado` é só leitura e não usa a trava.
+- Falha na liberação: o SO solta o handle com o fim do processo; o conteúdo fica como "interrompida" e a próxima operação
+  prossegue com aviso.
+
 ### Limites (o que NÃO é garantido)
 
 - **Distribuição:** a trava é local e a instância só escuta em `127.0.0.1`; duas máquinas e redirecionamento de porta
@@ -450,8 +523,8 @@ Quando autorizado (Fase 21.6), no Task Scheduler, na conta Windows do operador:
 ## Testes
 
 ```powershell
-bun test ops/backup/lib                                                    # 156 unitários (também no CI)
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\testes\testes-scripts.ps1              # 41 (sem MongoDB; rodar também no pwsh)
+bun test ops/backup/lib                                                    # unitários (também no CI; contagem no histórico)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\testes\testes-scripts.ps1              # 55 (sem MongoDB; rodar também no pwsh)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\testes\executar-testes-integracao.ps1   # 21 casos
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\testes\testes-posse.ps1                 # concorrência + integridade + autenticação + processos (rodar também no pwsh)
 ```
@@ -470,6 +543,18 @@ credenciais sintéticas (só stdin):
 - **PR01–PR08** processos: fim normal, `Stop-Process -Force` só no PowerShell durante mongorestore / validação / limpeza,
   recuperação com processo vivo citando o destino, PID reutilizado, mesmo PID+horário com executável diferente.
 Só cria/remove bancos `mariela_restore_20260103_*` (`testes/posse-auxiliar.ts` recusa outro nome).
+
+**Pacote de evidências (Fase 21.2.11, N5 — `lib/evidencias.ts`, comandos `pacote-evidencias`/`conferir-pacote`).** Ao
+terminar, **antes** da limpeza, o `testes-posse.ps1` cria `<-DiretorioPacote>\pacote_<data>_<id>` (padrão
+`%USERPROFILE%\mariela-evidencias-testes`; vazio = não gera): `indice.json` (id único, resumo por resultado, arquivos,
+exclusões), `resultados.json` (por caso), `arquivos\` (relatórios do runner e âncoras **só** dos destinos de teste,
+sanitizados: URIs, senhas/tokens, `Bearer`, chaves privadas e as senhas sintéticas — recebidas pelo stdin) e
+`MANIFESTO.sha256`. Recusa destino dentro do repositório, da raiz isolada ou das pastas de origem (a limpeza não o
+alcança); nunca inclui `*.cred`, `*.key`, `seguranca\`, `.env*` nem binários; nunca sobrescreve; sem upload. Conferir:
+`bun --no-env-file ops/backup/lib/cli.ts conferir-pacote --pasta <pacote>`.
+
+**T06c (Fase 21.2.11):** o runner lembra o archive da **primeira** tentativa em cada destino
+(`testes/apoio-posse.ps1`); a tentativa recusada do T06b não troca mais o archive do destino 20.
 
 A integração exige a origem SINTÉTICA `127.0.0.1:27119` (MongoDB 8.0.37 com `dbPath` descartável; dados criados por
 `testes/origem-sintetica.ts`, que só aceita essa porta) e a instância isolada `27118`. Cobre: banco `marielaDB`/recusa
@@ -509,6 +594,19 @@ A Fase 21.2.8 não iniciou MongoDB. Antes de qualquer decisão sobre restore rea
    conclui; `system.js` criado pelo root → destino recusado, nunca "banco removido".
 10. **Regressão:** `executar-testes-integracao.ps1` (21) e `testes-posse.ps1` completos nos dois PowerShell.
 
+Itens 1–10 executados na 21.2.9 (resultados na auditoria 21.2.10). **Pendentes da Fase 21.2.11** (implementada e
+testada **sem** MongoDB; exigem a instância descartável e autorização):
+
+11. **X1 integrado:** Liberar/IniciarUso com archive errado, `.sha256`/manifesto adulterados, posse adulterada, cadeia
+    adulterada, destino adulterado e MongoDB parado → categoria e estado antes/depois conforme a tabela de classificação.
+12. **N1 integrado:** `mongod-isolado.ps1 -Acao Parar/Iniciar/ConfigurarAutenticacao` durante um restore real → recusa;
+    CLI `local-desligar` na 27118 sem `--trava-execucao` → recusa; fluxo normal com a trava.
+13. **N3 integrado / migração:** `ConfigurarAutenticacao` sobre a instância atual → coleção de identidade congelada
+    (`identidadeProtegida`), idempotência; restore tentando inserir na identidade → recusado pelo validador; guardião
+    descongelando/removendo → toda operação recusa; `-RestaurarIdentidadeLocal` reinsere.
+14. **N4 integrado:** `Inspecionar` com âncora corrompida/removida e identidade divergente → garantias efetivas falsas.
+15. **N5 e T06c:** `testes-posse.ps1` completo (T06c deve passar) gerando o pacote de evidências; conferir o pacote.
+
 ## Operações que exigem autorização posterior (proibidas por padrão)
 
 Backup real contra o Atlas · restore de archive real · upload para o Google Drive · criação de credencial/OAuth ·
@@ -534,3 +632,10 @@ argumento; gravar senha em texto em arquivo (as credenciais sintéticas da inst�
   estados REMOVENDO, EM_USO e DESCARTADO; identidade da instância e banco na posse; conclusão da coleção de controle
   órfã; `system.*` como alheio; comparação em fluxo; Job Object no backup e sem limite de PIDs; trava só com `EBUSY`.
   **Validado sem MongoDB; validação integrada pendente.**
+- Fase 60.4.3.4.21.2.9/21.2.10 (10/11/2026): validação integrada com MongoDB descartável e auditoria independente
+  (achados X1, D14, X2, T06c, N1–N5).
+- Fase 60.4.3.4.21.2.11 (10/11/2026): classificação explícita das falhas (X1); trava nas operações administrativas
+  (N1); garantias efetivas × declaradas (D14/N4); escrita durável da âncora e detecção de registro incompleto (N2);
+  identidade da instância congelada com plano de recuperação (N3); risco X2 aceito e documentado; correção do runner
+  T06c; pacote de evidências (N5). **Validado sem MongoDB; itens 11–15 de "Testes pendentes" exigem a instância
+  descartável.**

@@ -4,7 +4,9 @@
   INICIAR USO, REMOVER ou DESCARTAR — cada uma por comando explícito e separado.
 
 .DESCRIPTION
-  -Acao Inspecionar  só leitura: estado, garantias do estado, histórico, evidências, âncora.
+  -Acao Inspecionar  só leitura: estado, garantias EFETIVAS (Fase 21.2.11: declaradas pelo estado × efetivamente
+                     comprovadas nesta consulta — âncora, identidade, posse, proteção; "igual ao archive" nunca é
+                     reconferido aqui), histórico, evidências, âncora.
   -Acao Verificar    só leitura: compara AGORA o destino com o archive, as evidências e a âncora externa.
   -Acao Liberar      VERIFICADO → LIBERACAO_AUTORIZADA, depois de reverificar tudo. NÃO descongela (o destino continua
                      protegido e igual ao archive); NÃO remove nada; NÃO apaga evidências.
@@ -65,6 +67,22 @@ function Fim([string]$Resultado, [int]$Codigo) {
   } catch { [Console]::Error.WriteLine("[RELATORIO] " + (ConvertTo-MensagemSegura $_)); if ($Codigo -eq 0) { $Codigo = 1 } }
   exit $Codigo
 }
+# Fase 21.2.11 (X1): a CLI classifica a falha; o relatório a expõe e o resultado distingue intervenção, falha operacional
+# e recusa simples (entrada do operador, posse alheia, evidência de backup).
+function Set-Classificacao($Resultado) {
+  if (-not $Resultado) { return }
+  $c = $Resultado.classificacao
+  $rel.categoria = $Resultado.categoria
+  $rel.escopo = $(if ($c) { $c.escopo } else { $null })
+  $rel.intervencaoManual = [bool]($c -and $c.intervencaoManual)
+  $rel.intervencaoPersistida = [bool]$Resultado.intervencaoPersistida
+  $rel.divergenciaNaoRegistravel = [bool]$Resultado.divergenciaNaoRegistravel
+}
+function Get-ResultadoRecusa($Resultado) {
+  if ($Resultado -and $Resultado.estado -eq "INTERVENCAO_NECESSARIA") { return "INTERVENCAO_NECESSARIA" }
+  if ($Resultado -and $Resultado.categoria -eq "FALHA_OPERACIONAL") { return "FALHA_OPERACIONAL" }
+  return "RECUSADO"
+}
 
 try {
   try { $null = Enable-ControleDeProcessos } catch { $rel.detalhe = "controle de processos indisponível: " + (ConvertTo-MensagemSegura $_); Fim "RECUSADO" 1 }
@@ -85,6 +103,9 @@ try {
     $rel.identidade = $insp.resultado.identidade
     $rel.estadoDepois = $p.estado
     $rel.garantiasDepois = $p.garantias
+    $rel.garantiasDeclaradas = $p.garantiasDeclaradas
+    $rel.garantiasEfetivas = $insp.resultado.garantiasEfetivas
+    $rel.identidadeInstancia = $insp.resultado.identidadeInstancia
     Fim "INSPECIONADO" 0
   }
   if (-not $p -or $p.execucaoId -ne $ExecucaoId.ToLowerInvariant()) { $rel.detalhe = "a posse do destino não é da execução informada"; Fim "RECUSADO" 1 }
@@ -95,17 +116,20 @@ try {
     "Verificar" {
       $v = Invoke-CliBackup -Argumentos (@("verificar-integridade") + $comuns + $vinculo + @("--posse-execucao", $ExecucaoId)) -Credencial $cred
       $rel.verificacoes = @($v.resultado.verificacoes); $rel.divergencias = @($v.resultado.divergencias); $rel.estadoDepois = $p.estado; $rel.garantiasDepois = $v.resultado.garantias
-      if ($v.ok -and $v.resultado.ok) { Fim "INTEGRO" 0 } else { $rel.detalhe = "$($v.resultado.motivo)$($v.mensagem)"; Fim "DIVERGENTE" 1 }
+      Set-Classificacao $v.resultado
+      if ($v.ok -and $v.resultado.ok) { Fim "INTEGRO" 0 } else { $rel.detalhe = "$($v.resultado.classificacao.motivo)$($v.mensagem)"; Fim $(if ($v.resultado.categoria -eq "FALHA_OPERACIONAL") { "FALHA_OPERACIONAL" } else { "DIVERGENTE" }) 1 }
     }
     "Liberar" {
       $l = Invoke-CliBackup -Argumentos (@("liberar-restore") + $comuns + $vinculo + @("--trava-execucao", $operacaoId, "--posse-execucao", $ExecucaoId, "--operador", $rel.operador)) -Credencial $guard
       $rel.estadoDepois = $l.resultado.estado; $rel.detalhe = "$($l.resultado.motivo)$($l.mensagem)"; $rel.verificacoes = @($l.resultado.verificacoes)
-      if ($l.ok -and $l.resultado.ok) { Fim "LIBERACAO_AUTORIZADA" 0 } else { Fim "RECUSADO" 1 }
+      Set-Classificacao $l.resultado
+      if ($l.ok -and $l.resultado.ok) { Fim "LIBERACAO_AUTORIZADA" 0 } else { Fim (Get-ResultadoRecusa $l.resultado) 1 }
     }
     "IniciarUso" {
       $u = Invoke-CliBackup -Argumentos (@("iniciar-uso") + $comuns + $vinculo + @("--trava-execucao", $operacaoId, "--posse-execucao", $ExecucaoId, "--operador", $rel.operador, "--confirmar-banco", $ConfirmarBanco)) -Credencial $guard
       $rel.estadoDepois = $u.resultado.estado; $rel.detalhe = "$($u.resultado.detalhe)$($u.resultado.motivo)$($u.mensagem)"; $rel.descongeladas = @($u.resultado.descongeladas)
-      if ($u.ok -and $u.resultado.ok) { Fim "EM_USO" 0 } else { Fim $(if ($u.resultado.estado -eq "INTERVENCAO_NECESSARIA") { "INTERVENCAO_NECESSARIA" } else { "RECUSADO" }) 1 }
+      Set-Classificacao $u.resultado
+      if ($u.ok -and $u.resultado.ok) { Fim "EM_USO" 0 } else { Fim (Get-ResultadoRecusa $u.resultado) 1 }
     }
     default {
       # Remover (remoção comprovada) ou Descartar (destino usado)

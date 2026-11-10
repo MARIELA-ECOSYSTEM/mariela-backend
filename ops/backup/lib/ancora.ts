@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { Verificacao } from "./archive.js";
 import { raizIsolada } from "./instancia.js";
 import { RESTORE, type EstadoDestino } from "./politica.js";
@@ -74,6 +74,11 @@ export function proximaLinha(textoAtual: string, evento: EventoAncora, agora: Da
 export function lerCadeia(texto: string): { ok: boolean; entradas: EntradaAncora[]; motivo: string } {
   const linhas = texto.split("\n").filter((l) => l.trim());
   if (!linhas.length) return { ok: false, entradas: [], motivo: "registro de evidências vazio" };
+  // Fase 21.2.11 (N2): o formato é UTF-8 + LF, cada linha terminada. CR ou BOM ⇒ o arquivo foi regravado por outra
+  // ferramenta; última linha sem LF ⇒ escrita interrompida (registro incompleto). Ambos falham fechado.
+  if (texto.charCodeAt(0) === 0xfeff) return { ok: false, entradas: [], motivo: "registro com BOM (regravado fora do formato UTF-8 sem BOM)" };
+  if (texto.includes("\r")) return { ok: false, entradas: [], motivo: "registro com terminador CR/CRLF (regravado fora do formato LF)" };
+  if (!texto.endsWith("\n")) return { ok: false, entradas: [], motivo: "registro INCOMPLETO: última linha sem terminador (escrita interrompida)" };
   const entradas: EntradaAncora[] = [];
   let anterior = GENESIS;
   for (let i = 0; i < linhas.length; i += 1) {
@@ -131,7 +136,16 @@ export interface FatosAtuais {
   shaDoManifesto: string | null;
 }
 
-/** Confere a âncora externa contra a posse e os arquivos informados pelo operador (PURA). */
+/**
+ * Confere a âncora externa contra a posse e os arquivos informados pelo operador (PURA).
+ *
+ * Fase 21.2.11 (X1): verificações GRANULARES, para que a classificação (classificacao.ts) distinga:
+ *   - registro × posse (evidência persistida):  ancora.execucao, .banco, .instancia, .archive_registro,
+ *     .manifesto_registro, .caminhos, .estado, .evidencias, .cadeia, .presente;
+ *   - posse × contexto atual (posse válida):     ancora.posse_presente, .posse_banco, .posse_instancia;
+ *   - arquivo INFORMADO pelo operador × registro: ancora.archive, .manifesto;
+ *   - artefatos do diretório de backup × arquivo informado: ancora.archive_sha256, .archive_manifesto.
+ */
 export function conferirAncora(texto: string | null, f: FatosAtuais): Verificacao[] {
   const v: Verificacao[] = [];
   const add = (id: string, ok: boolean, detalhe: string) => v.push({ id, ok, detalhe });
@@ -146,19 +160,25 @@ export function conferirAncora(texto: string | null, f: FatosAtuais): Verificaca
   const p = f.posse;
   add("ancora.posse_presente", !!p, p ? "posse lida do banco" : "sem posse no banco");
   if (!p) return v;
+  // registro × posse × contexto
   add("ancora.execucao", posseReg.execucaoId === p.execucaoId, `registro=${posseReg.execucaoId} posse=${p.execucaoId}`);
-  add("ancora.banco", posseReg.banco === f.banco && p.banco === f.banco, `registro=${posseReg.banco} posse=${p.banco ?? "?"} destino=${f.banco}`);
-  add("ancora.instancia", posseReg.instanciaId === f.instanciaId && p.instanciaId === f.instanciaId, `registro=${posseReg.instanciaId} posse=${p.instanciaId ?? "?"} instância=${f.instanciaId}`);
+  add("ancora.banco", posseReg.banco === f.banco, `registro=${posseReg.banco} destino=${f.banco}`);
+  add("ancora.instancia", posseReg.instanciaId === f.instanciaId, `registro=${posseReg.instanciaId} instância=${f.instanciaId}`);
+  add("ancora.posse_banco", p.banco === f.banco, `posse=${p.banco ?? "?"} destino=${f.banco}`);
+  add("ancora.posse_instancia", p.instanciaId === f.instanciaId, `posse=${p.instanciaId ?? "?"} instância=${f.instanciaId}`);
   const a = posseReg.archive;
   const m = posseReg.manifesto;
-  const shaArch = f.archiveInformado.sha256.toUpperCase();
-  const shaMan = f.manifestoInformado.sha256.toUpperCase();
-  add(
-    "ancora.archive",
-    !!a && a.sha256.toUpperCase() === shaArch && (p.archiveSha256 ?? "").toUpperCase() === shaArch && (f.shaDoArquivoSha256 ?? "").toUpperCase() === shaArch && (f.shaDoManifesto ?? "").toUpperCase() === shaArch,
-    "SHA-256 do archive informado = registro = posse = .sha256 = manifesto",
-  );
-  add("ancora.manifesto", !!m && m.sha256.toUpperCase() === shaMan && (p.manifestoSha256 ?? "").toUpperCase() === shaMan, "SHA-256 do manifesto informado = registro = posse");
+  const up = (x: string | null | undefined) => (x ?? "").toUpperCase();
+  add("ancora.archive_registro", !!a && up(a.sha256) === up(p.archiveSha256), "SHA-256 do archive: registro = posse");
+  add("ancora.manifesto_registro", !!m && up(m.sha256) === up(p.manifestoSha256), "SHA-256 do manifesto: registro = posse");
+  // arquivos INFORMADOS pelo operador × registro
+  const shaArch = up(f.archiveInformado.sha256);
+  const shaMan = up(f.manifestoInformado.sha256);
+  add("ancora.archive", !!a && up(a.sha256) === shaArch, "SHA-256 do archive INFORMADO = registrado na aquisição");
+  add("ancora.manifesto", !!m && up(m.sha256) === shaMan, "SHA-256 do manifesto INFORMADO = registrado na aquisição");
+  // artefatos do diretório de backup (ao lado do archive informado) × archive informado
+  add("ancora.archive_sha256", up(f.shaDoArquivoSha256) === shaArch, ".sha256 do diretório de backup = archive informado");
+  add("ancora.archive_manifesto", up(f.shaDoManifesto) === shaArch, "archive.sha256 do manifesto informado = archive informado");
   add("ancora.caminhos", !!a && !!m && (p.archive ?? "") === a.caminho && (p.manifesto ?? "") === m.caminho, "caminhos da posse = caminhos registrados na aquisição");
   const admitidos = estadosAdmitidos(cadeia.entradas);
   add("ancora.estado", admitidos.includes(p.estado), `posse=${p.estado}; registro admite ${admitidos.join(" ou ") || "(nenhum)"}`);
@@ -178,17 +198,71 @@ export function lerAncora(raiz: string | undefined, banco: string, execucaoId: s
   return existsSync(c) ? readFileSync(c, "utf8") : null;
 }
 
-/** Cria o registro (falha se já existir) com o evento POSSE. A pasta deve ter sido criada com ACL restrita pelo PowerShell. */
-export function criarAncora(raiz: string | undefined, evento: EventoAncora): void {
-  const c = caminhoAncora(raiz, evento.banco, evento.execucaoId);
-  mkdirSync(join(raizIsolada(raiz), RESTORE.pastaEvidencias), { recursive: true });
-  writeFileSync(c, `${proximaLinha("", evento)}\n`, { flag: "wx" }); // nunca reaproveita um registro existente
+/**
+ * Fase 21.2.11 (N2) — ESCRITA DURÁVEL. Operações de arquivo injetáveis (testes simulam falha em cada etapa).
+ * Sequência: abrir → escrever → fsync do ARQUIVO → fechar → (fora do Windows) fsync do DIRETÓRIO.
+ * Qualquer erro é PROPAGADO: a transição é abortada ANTES do compare-and-set no banco (a intenção vem antes do CAS).
+ * Limite: `fsync` pede ao SO que descarregue para o dispositivo; não garante contra cache de escrita volátil do disco,
+ * controladora ou filesystem que ignore o pedido. No Windows o fsync de diretório não é suportado pelo Node/Bun (o
+ * NTFS registra metadados no journal); é pulado e documentado.
+ */
+export interface OperacoesArquivo {
+  abrir(caminho: string, flag: "wx" | "a"): number;
+  escrever(fd: number, dados: Buffer): void;
+  sincronizar(fd: number): void;
+  fechar(fd: number): void;
+  sincronizarDiretorio(diretorio: string): void;
 }
 
-export function acrescentarAncora(raiz: string | undefined, evento: EventoAncora): void {
+export const ARQUIVO_REAL: OperacoesArquivo = {
+  abrir: (c, flag) => openSync(c, flag),
+  escrever: (fd, dados) => {
+    let escrito = 0;
+    while (escrito < dados.length) escrito += writeSync(fd, dados, escrito, dados.length - escrito);
+  },
+  sincronizar: (fd) => fsyncSync(fd),
+  fechar: (fd) => closeSync(fd),
+  sincronizarDiretorio: (d) => {
+    if (process.platform === "win32") return;
+    const fd = openSync(d, "r");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  },
+};
+
+/** Grava `texto` (UTF-8, sem BOM) de forma durável; propaga qualquer erro (o fd é fechado mesmo em falha). */
+export function gravarDuravel(caminho: string, texto: string, flag: "wx" | "a", fs: OperacoesArquivo = ARQUIVO_REAL): void {
+  const fd = fs.abrir(caminho, flag);
+  let erro: unknown = null;
+  try {
+    fs.escrever(fd, Buffer.from(texto, "utf8"));
+    fs.sincronizar(fd);
+  } catch (e) {
+    erro = e;
+  }
+  try {
+    fs.fechar(fd);
+  } catch (e) {
+    erro ??= e;
+  }
+  if (erro) throw erro;
+  fs.sincronizarDiretorio(dirname(caminho));
+}
+
+/** Cria o registro (falha se já existir) com o evento POSSE. A pasta deve ter sido criada com ACL restrita pelo PowerShell. */
+export function criarAncora(raiz: string | undefined, evento: EventoAncora, fs: OperacoesArquivo = ARQUIVO_REAL): void {
+  const c = caminhoAncora(raiz, evento.banco, evento.execucaoId);
+  mkdirSync(join(raizIsolada(raiz), RESTORE.pastaEvidencias), { recursive: true });
+  gravarDuravel(c, `${proximaLinha("", evento)}\n`, "wx", fs); // nunca reaproveita um registro existente
+}
+
+export function acrescentarAncora(raiz: string | undefined, evento: EventoAncora, fs: OperacoesArquivo = ARQUIVO_REAL): void {
   const atual = lerAncora(raiz, evento.banco, evento.execucaoId);
   if (atual === null) throw new Error("registro local de evidências ausente — nada é transicionado sem âncora");
   const cadeia = lerCadeia(atual);
   if (!cadeia.ok) throw new Error(`registro local de evidências inválido (${cadeia.motivo}) — nada é transicionado`);
-  appendFileSync(caminhoAncora(raiz, evento.banco, evento.execucaoId), `${proximaLinha(atual, evento)}\n`);
+  gravarDuravel(caminhoAncora(raiz, evento.banco, evento.execucaoId), `${proximaLinha(atual, evento)}\n`, "a", fs);
 }

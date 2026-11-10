@@ -186,7 +186,25 @@ function Test-EvidenciaInstancia($Evidencia, [string]$MongodEsperado) {
   de posse/limpeza. Se a execução anterior não deixou "livre", ela foi interrompida: isso é devolvido em .Anterior.
   Lança se a trava estiver ocupada (outro restore em andamento) ou não puder ser criada.
 #>
-function Enter-TravaRestore([string]$Caminho, [string]$ExecucaoId, [string]$Banco) {
+<#
+  Fase 21.2.11 (N1) — situação do conteúdo ANTERIOR da trava (PURA). A exclusão mútua é do SO (handle aberto com
+  FileShare.Read); o conteúdo só descreve quem a teve por último:
+    NOVA          arquivo vazio/recém-criado;
+    LIVRE         liberada por Exit-TravaRestore;
+    INTERROMPIDA  nomeia uma execução que NÃO liberou — o SO já soltou o handle, logo o dono morreu (o PID gravado não é
+                  usado como prova; a prova é o SO ter concedido o handle exclusivo);
+    ILEGIVEL      conteúdo corrompido;
+    DESCONHECIDA  JSON legível mas sem a forma esperada.
+#>
+function Get-SituacaoTrava($Anterior) {
+  if ($null -eq $Anterior) { return "NOVA" }
+  if ($Anterior.ilegivel -eq $true) { return "ILEGIVEL" }
+  if ($Anterior.livre -eq $true) { return "LIVRE" }
+  if ("$($Anterior.execucaoId)" -match '^[0-9a-fA-F-]{36}$') { return "INTERROMPIDA" }
+  return "DESCONHECIDA"
+}
+
+function Enter-TravaRestore([string]$Caminho, [string]$ExecucaoId, [string]$Banco, [switch]$RecusarAnteriorInvalida) {
   $pasta = Split-Path -Parent $Caminho
   if (-not (Test-Path -LiteralPath $pasta -PathType Container)) { New-Item -ItemType Directory -Path $pasta | Out-Null }
   $fluxo = [System.IO.File]::Open($Caminho, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
@@ -195,6 +213,10 @@ function Enter-TravaRestore([string]$Caminho, [string]$ExecucaoId, [string]$Banc
     $lidos = if ($buffer.Length) { $fluxo.Read($buffer, 0, $buffer.Length) } else { 0 }
     $anterior = $null
     if ($lidos -gt 0) { try { $anterior = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $lidos) | ConvertFrom-Json } catch { $anterior = [pscustomobject]@{ ilegivel = $true } } }
+    # 21.2.11 (N1): falha FECHADA — com o handle exclusivo já em mãos (sem TOCTOU), um conteúdo ilegível ou desconhecido
+    # é preservado (nada é escrito) e a aquisição é recusada.
+    $situacao = Get-SituacaoTrava $anterior
+    if ($RecusarAnteriorInvalida -and ($situacao -eq "ILEGIVEL" -or $situacao -eq "DESCONHECIDA")) { throw "trava em estado $situacao — conteúdo preservado; intervenção manual (nada foi feito)" }
     $eu = Get-Process -Id $PID
     $inicio = $eu.StartTime.ToUniversalTime().ToString("o")
     # Fase 21.2.6 (A-09): horário de criação EXATO (FILETIME UTC) — a CLI confere com o GetProcessTimes do processo pai.
@@ -208,7 +230,7 @@ function Enter-TravaRestore([string]$Caminho, [string]$ExecucaoId, [string]$Banc
     $fluxo.Close()
     throw
   }
-  return [pscustomobject]@{ Fluxo = $fluxo; Caminho = $Caminho; ExecucaoId = $ExecucaoId; ProcessoInicio = $inicio; ProcessoInicioTicks = $ticks; Executavel = $eu.Path; Anterior = $anterior }
+  return [pscustomobject]@{ Fluxo = $fluxo; Caminho = $Caminho; ExecucaoId = $ExecucaoId; ProcessoInicio = $inicio; ProcessoInicioTicks = $ticks; Executavel = $eu.Path; Anterior = $anterior; Situacao = $situacao }
 }
 
 function Exit-TravaRestore($Trava) {

@@ -212,21 +212,26 @@ describe("A21-7-02 — âncora externa (registro local encadeado)", () => {
     linhas[2] = linhas[2]!.replace("RESTAURANDO", "VERIFICADO");
     expect(falhas(conferirAncora(linhas.join("\n"), fatos()))).toEqual(["ancora.cadeia"]);
   });
-  it("posse com SHA do archive adulterado ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({}, { archiveSha256: "C".repeat(64) })))).toContain("ancora.archive"));
-  it("posse com SHA do manifesto adulterado ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({}, { manifestoSha256: "C".repeat(64) })))).toContain("ancora.manifesto"));
+  // Fase 21.2.11 (X1): ids granulares — registro×posse (…_registro) separado de informado×registro e de artefatos do backup.
+  it("posse com SHA do archive adulterado ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({}, { archiveSha256: "C".repeat(64) })))).toEqual(["ancora.archive_registro"]));
+  it("posse com SHA do manifesto adulterado ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({}, { manifestoSha256: "C".repeat(64) })))).toEqual(["ancora.manifesto_registro"]));
   it("posse com CAMINHOS trocados ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({}, { archive: "C:\\outro\\y.archive.gz" })))).toContain("ancora.caminhos"));
   it("archive INFORMADO diferente (outro backup) ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({ archiveInformado: { caminho: "x", sha256: "D".repeat(64) } })))).toContain("ancora.archive"));
-  it(".sha256 do diretório de backup divergente ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({ shaDoArquivoSha256: "E".repeat(64) })))).toContain("ancora.archive"));
-  it("manifesto que descreve OUTRO archive ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({ shaDoManifesto: "E".repeat(64) })))).toContain("ancora.archive"));
+  it(".sha256 do diretório de backup divergente ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({ shaDoArquivoSha256: "E".repeat(64) })))).toEqual(["ancora.archive_sha256"]));
+  it("manifesto que descreve OUTRO archive ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({ shaDoManifesto: "E".repeat(64) })))).toEqual(["ancora.archive_manifesto"]));
   it("posse com ESTADO adulterado (LIBERACAO sem registro) ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({}, { estado: "LIBERACAO_AUTORIZADA" })))).toContain("ancora.estado"));
   it("posse com EVIDÊNCIAS adulteradas ⇒ recusa", () => expect(falhas(conferirAncora(normal(), fatos({}, { evidencias: { ...ev, hashesPorColecao: { vendas: "x" } } })))).toContain("ancora.evidencias"));
   it("posse de OUTRO banco / OUTRA instância / OUTRA execução ⇒ recusa", () => {
-    expect(falhas(conferirAncora(normal(), fatos({}, { banco: "mariela_restore_20260101_000009" })))).toContain("ancora.banco");
+    expect(falhas(conferirAncora(normal(), fatos({}, { banco: "mariela_restore_20260101_000009" })))).toContain("ancora.posse_banco");
+    expect(falhas(conferirAncora(normal(), fatos({ banco: "mariela_restore_20260101_000009" })))).toContain("ancora.banco");
     expect(falhas(conferirAncora(normal(), fatos({ instanciaId: "i9" })))).toContain("ancora.instancia");
+    expect(falhas(conferirAncora(normal(), fatos({ instanciaId: "i9" })))).toContain("ancora.posse_instancia");
     expect(falhas(conferirAncora(normal(), fatos({}, { execucaoId: "e9" })))).toContain("ancora.execucao");
   });
   it("queda entre INTENÇÃO e CONFIRMAÇÃO: banco no 'de' OU no 'para' é admitido; outro estado não", () => {
-    const t = normal() + `${proximaLinha(normal(), { ...base, evento: "INTENCAO", de: "VERIFICADO", para: "REMOVENDO" })}\n`;
+    // 21.2.11: o registro é montado UMA vez (normal() chamado duas vezes dava carimbos de tempo diferentes ⇒ teste instável).
+    const n = normal();
+    const t = n + `${proximaLinha(n, { ...base, evento: "INTENCAO", de: "VERIFICADO", para: "REMOVENDO" })}\n`;
     expect(estadosAdmitidos(lerCadeia(t).entradas)).toEqual(["VERIFICADO", "REMOVENDO"]);
     expect(falhas(conferirAncora(t, fatos({}, { estado: "REMOVENDO" })))).toEqual([]);
     expect(falhas(conferirAncora(t, fatos({}, { estado: "VERIFICADO" })))).toEqual([]);
@@ -234,7 +239,8 @@ describe("A21-7-02 — âncora externa (registro local encadeado)", () => {
   });
   it("registro que não começa pela posse, ou mistura execuções ⇒ inválido", () => {
     expect(lerCadeia(montar([{ evento: "INTENCAO", de: "PREPARANDO", para: "RESTAURANDO" }])).ok).toBe(false);
-    const misturado = normal() + `${proximaLinha(normal(), { ...base, execucaoId: "e2", evento: "INTENCAO", de: "VERIFICADO", para: "REMOVENDO" })}\n`;
+    const n = normal();
+    const misturado = n + `${proximaLinha(n, { ...base, execucaoId: "e2", evento: "INTENCAO", de: "VERIFICADO", para: "REMOVENDO" })}\n`;
     expect(lerCadeia(misturado).ok).toBe(false);
   });
 });

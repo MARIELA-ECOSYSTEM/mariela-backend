@@ -42,7 +42,7 @@ function Escrever([string]$Caminho, [string]$Texto) { [System.IO.File]::WriteAll
 # ---------------------------------------------------------------------------------------------------------------
 $copia = Join-Path $raiz "ops"
 New-Item -ItemType Directory -Path $copia | Out-Null
-foreach ($f in "backup-mongo.ps1", "restore-test.ps1", "comum.ps1", "gerir-restore.ps1", "recuperar-destino.ps1") { Copy-Item -LiteralPath (Join-Path $ops $f) -Destination $copia }
+foreach ($f in "backup-mongo.ps1", "restore-test.ps1", "comum.ps1", "gerir-restore.ps1", "recuperar-destino.ps1", "mongod-isolado.ps1") { Copy-Item -LiteralPath (Join-Path $ops $f) -Destination $copia }
 $stubs = @'
 
 # ===================== STUBS DE TESTE (somente nesta cópia temporária) =====================
@@ -56,6 +56,8 @@ function Get-CredencialIsolada([string]$Raiz, [string]$Papel) {
 }
 # Pasta de evidências: no stub, só cria a pasta (sem icacls).
 function Initialize-PastaEvidencias([string]$Raiz) { $d = Join-Path $Raiz "evidencias"; if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d | Out-Null }; return $d }
+# 21.2.11 (N1): porta da instância "em uso" até o stub de local-desligar ser chamado (mongod-isolado.ps1).
+function Get-NetTCPConnection { param($LocalPort, $State, $ErrorAction) if ((Get-CenarioTeste).portaEmUso -and -not (UltimaChamada "local-desligar")) { return [pscustomobject]@{ OwningProcess = 1; LocalAddress = "127.0.0.1" } } return $null }
 function UltimaChamada([string]$Cmd) { return @(Get-Content -LiteralPath $env:MARIELA_TESTE_CHAMADAS -Encoding UTF8 | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.cmd -eq $Cmd }) | Select-Object -Last 1 }
 function Invoke-CliBackup {
   param([string[]]$Argumentos, $Credencial = $null)
@@ -117,7 +119,10 @@ function Invoke-CliBackup {
     }
     "conferir-trava" { if ($c.travaOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"verificacoes":[{"id":"trava.dono_inicio","ok":false}]}}' } else { '{"ok":true,"resultado":{"ok":true,"verificacoes":[]}}' } }
     "iniciar-uso" { if ($c.usoOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"estado":"INTERVENCAO_NECESSARIA","detalhe":"o destino não confere com o VERIFICADO"}}' } else { '{"ok":true,"resultado":{"ok":true,"estado":"EM_USO","detalhe":"EM_USO: 27 coleções descongeladas","descongeladas":["c1"]}}' } }
-    "liberar-restore" { if ($c.liberarOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"estado":"INTERVENCAO_NECESSARIA","motivo":"o destino não é mais idêntico ao VERIFICADO"}}' } else { '{"ok":true,"resultado":{"ok":true,"estado":"LIBERACAO_AUTORIZADA","motivo":"VERIFICADO → LIBERACAO_AUTORIZADA"}}' } }
+    "local-estado" { '{"ok":true,"resultado":' + (@{ dbPath = $c.dbPath; autenticacao = $true; porta = 27118 } | ConvertTo-Json -Compress) + '}' }
+    "local-desligar" { if ($c.dormirDesligar) { Start-Sleep -Seconds ([int]$c.dormirDesligar) }; if ($c.desligarRecusado) { '{"ok":false,"codigo":"UsoInvalidoErro","mensagem":"trava de restore não comprovada"}' } else { '{"ok":true,"resultado":{"desligado":true}}' } }
+    "local-rs-iniciar" { '{"ok":true,"resultado":{"replicaSet":"rs-restore","primario":true}}' }
+    "liberar-restore" { if ($c.liberarResposta) { '{"ok":true,"resultado":' + ($c.liberarResposta | ConvertTo-Json -Compress -Depth 6) + '}' } elseif ($c.liberarOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"estado":"INTERVENCAO_NECESSARIA","motivo":"o destino não é mais idêntico ao VERIFICADO"}}' } else { '{"ok":true,"resultado":{"ok":true,"estado":"LIBERACAO_AUTORIZADA","motivo":"VERIFICADO → LIBERACAO_AUTORIZADA"}}' } }
     "limpar-destino" {
       if ($c.limparOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"limpo":false,"motivo":"DADOS_ALHEIOS","detalhe":"produtos: 1 documento fora do archive","removidas":[],"preservadas":["produtos"],"estadoFinal":"INTERVENCAO_NECESSARIA"}}' }
       elseif ($c.lancarEmLimpeza) { '{"ok":false,"codigo":"UsoInvalidoErro","mensagem":"trava de restore não comprovada"}' }
@@ -610,6 +615,163 @@ Write-Output "redirecionado=$redir bytes=[$hex]"
       Exigir ($rr.Codigo -eq 0 -and $li.Count -eq 1 -and $li[0].o.modo -eq "recuperacao" -and $li[0].credencial -eq "guardiao" -and $li[0].o.arquivo -eq $arq) "estado $e não retomado pela recuperação"
     }
     "VERIFICADO → recusado; dono vivo → recusado; PID reutilizado → limpeza; órfão citando o destino → recusado; sem archive do operador → recusado; REMOVENDO e CANCELADO órfão → retomados (guardião, archive do operador)"
+  }
+
+  # ============================== Fase 21.2.11 — X1 / N4 no gerir-restore ==================================
+  Caso "X1-ps" "gerir-restore expõe a CATEGORIA: entrada do operador → RECUSADO sem mudar estado; falha operacional → FALHA_OPERACIONAL; divergência → INTERVENCAO" {
+    $entrada = Gerir "Liberar" @{ posseGestao = $posseG; liberarResposta = @{ ok = $false; estado = "VERIFICADO"; motivo = "archive informado diferente"; categoria = "ENTRADA_OPERADOR"; classificacao = @{ categoria = "ENTRADA_OPERADOR"; intervencaoManual = $false }; intervencaoPersistida = $false; divergenciaNaoRegistravel = $false; verificacoes = @() } } @("-ExecucaoId", $posseG.execucaoId)
+    Exigir ($entrada.Codigo -eq 1 -and $entrada.Rel.resultado -eq "RECUSADO" -and $entrada.Rel.categoria -eq "ENTRADA_OPERADOR" -and $entrada.Rel.estadoDepois -eq "VERIFICADO" -and -not $entrada.Rel.intervencaoManual) "entrada: $($entrada.Rel.resultado)/$($entrada.Rel.categoria)/$($entrada.Rel.estadoDepois)"
+    $oper = Gerir "Liberar" @{ posseGestao = $posseG; liberarResposta = @{ ok = $false; estado = $null; motivo = "falha operacional"; categoria = "FALHA_OPERACIONAL"; classificacao = @{ categoria = "FALHA_OPERACIONAL"; intervencaoManual = $false } } } @("-ExecucaoId", $posseG.execucaoId)
+    Exigir ($oper.Codigo -eq 1 -and $oper.Rel.resultado -eq "FALHA_OPERACIONAL") "falha operacional: $($oper.Rel.resultado)"
+    $evid = Gerir "Liberar" @{ posseGestao = $posseG; liberarResposta = @{ ok = $false; estado = "VERIFICADO"; motivo = "x"; categoria = "EVIDENCIA_INCONSISTENTE"; classificacao = @{ categoria = "EVIDENCIA_INCONSISTENTE"; escopo = "artefatos_backup"; intervencaoManual = $true } } } @("-ExecucaoId", $posseG.execucaoId)
+    Exigir ($evid.Codigo -eq 1 -and $evid.Rel.resultado -eq "RECUSADO" -and $evid.Rel.escopo -eq "artefatos_backup" -and $evid.Rel.intervencaoManual) "evidência de backup: $($evid.Rel.resultado)/$($evid.Rel.escopo)"
+    $div = Gerir "Liberar" @{ posseGestao = $posseG; liberarResposta = @{ ok = $false; estado = "INTERVENCAO_NECESSARIA"; motivo = "x"; categoria = "DESTINO_ADULTERADO"; classificacao = @{ categoria = "DESTINO_ADULTERADO"; intervencaoManual = $true }; intervencaoPersistida = $true } } @("-ExecucaoId", $posseG.execucaoId)
+    Exigir ($div.Codigo -eq 1 -and $div.Rel.resultado -eq "INTERVENCAO_NECESSARIA" -and $div.Rel.intervencaoPersistida) "destino: $($div.Rel.resultado)"
+    "ENTRADA → RECUSADO (VERIFICADO mantido); FALHA_OPERACIONAL → FALHA_OPERACIONAL; EVIDENCIA/artefatos → RECUSADO + intervenção manual; DESTINO → INTERVENCAO_NECESSARIA persistida"
+  }
+  Caso "N4-ps" "Inspecionar: o relatório traz as garantias da CLI (efetivas) sem reinterpretá-las, mais as declaradas" {
+    $pg = $posseG.Clone(); $pg.garantias = @{ igualAoArchive = $false; protegido = $false; utilizavel = $false }; $pg.garantiasDeclaradas = @{ igualAoArchive = $true; protegido = $true; utilizavel = $false }
+    $i = Gerir "Inspecionar" @{ posseGestao = $pg }
+    Exigir ($i.Codigo -eq 0 -and $i.Rel.garantiasDepois.igualAoArchive -eq $false -and $i.Rel.garantiasDepois.protegido -eq $false -and $i.Rel.garantiasDeclaradas.igualAoArchive -eq $true) "garantias: $($i.Rel.garantiasDepois | ConvertTo-Json -Compress)"
+    "efetivas (todas falsas) preservadas; declaradas (VERIFICADO) à parte"
+  }
+
+  # ============================== Fase 21.2.11 — T06c (runner) =============================================
+  Caso "T06c-r" "regressão do runner: tentativa RECUSADA num destino não troca o archive lembrado dele (apoio-posse.ps1)" {
+    . (Join-Path $PSScriptRoot "apoio-posse.ps1")
+    $mapa = @{}
+    $b20 = "mariela_restore_20260103_000020"; $b21 = "mariela_restore_20260103_000021"
+    $null = Register-ArchiveDoDestino $mapa $b20 "C:\x\vol.archive.gz"      # T06a: execução interrompida (archVol)
+    $null = Register-ArchiveDoDestino $mapa $b21 "C:\x\base.archive.gz"     # T06b: outro destino (archBase)
+    $ret = Register-ArchiveDoDestino $mapa $b20 "C:\x\base.archive.gz"      # T06b: restore RECUSADO no destino 20
+    Exigir ($ret -eq "C:\x\vol.archive.gz" -and (Get-ArchiveDoDestino $mapa $b20) -eq "C:\x\vol.archive.gz") "o archive do destino 20 foi trocado (defeito T06c)"
+    Exigir ((Get-ArchiveDoDestino $mapa $b21) -eq "C:\x\base.archive.gz" -and $null -eq (Get-ArchiveDoDestino $mapa "mariela_restore_20260103_000099")) "mapa incorreto"
+    $t = Get-Content -LiteralPath (Join-Path $PSScriptRoot "testes-posse.ps1") -Raw -Encoding UTF8
+    Exigir ($t -match 'Register-ArchiveDoDestino \$script:archivePorBanco' -and $t -notmatch '\$script:archivePorBanco\[\$B\] = \$Archive') "testes-posse.ps1 não usa o apoio"
+    "destino 20 continua com o archive da execução interrompida; testes-posse usa Register-ArchiveDoDestino"
+  }
+
+  # ============================== Fase 21.2.11 — N1: trava nas operações administrativas =====================
+  $rzAdm = Join-Path $raiz "isolado-adm"
+  $travaAdm = Join-Path $rzAdm "locks\restore.lock"
+  $evAdm = @{ Enderecos = @("127.0.0.1"); Processos = @(@{ Pid = 1; Caminho = (Join-Path $rzAdm "mongodb-8.0.37\bin\mongod.exe") }) }
+  function Adm([string]$Acao, [hashtable]$Extra = @{}) {
+    $c = @{ evidencia = $evAdm; portaEmUso = $true; dbPath = (Join-Path $rzAdm "data-27118") }
+    foreach ($k in $Extra.Keys) { $c[$k] = $Extra[$k] }
+    $r = Rodar "mongod-isolado.ps1" $c @("-Acao", $Acao, "-Raiz", $rzAdm)
+    return [pscustomobject]@{ Codigo = $r.Codigo; Erro = "$($r.Erro)"; Saida = "$($r.Saida)"; Chamadas = $r.Chamadas; Cmds = @($r.Chamadas | ForEach-Object { $_.cmd }) }
+  }
+  function ConteudoTrava { $fs = [System.IO.File]::Open($travaAdm, "Open", "Read", "ReadWrite"); try { return (New-Object System.IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Close() } }
+  function GravarTrava([string]$Texto) { New-Item -ItemType Directory -Force -Path (Split-Path -Parent $travaAdm) | Out-Null; [System.IO.File]::WriteAllText($travaAdm, $Texto, $utf8) }
+  function SegurarTrava([string]$Texto) { GravarTrava $Texto; return [System.IO.File]::Open($travaAdm, "Open", "ReadWrite", "Read") }
+  $restoreVivo = '{"execucaoId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","pid":1234,"banco":"mariela_restore_20260101_000001","processoInicioTicks":"1"}'
+
+  Caso "N1-a" "Get-SituacaoTrava (pura): NOVA, LIVRE, INTERROMPIDA, ILEGIVEL, DESCONHECIDA" {
+    $t = @(
+      @{ a = $null; e = "NOVA" }, @{ a = [pscustomobject]@{ livre = $true }; e = "LIVRE" },
+      @{ a = ($restoreVivo | ConvertFrom-Json); e = "INTERROMPIDA" }, @{ a = [pscustomobject]@{ ilegivel = $true }; e = "ILEGIVEL" },
+      @{ a = [pscustomobject]@{ foo = 1 }; e = "DESCONHECIDA" }, @{ a = [pscustomobject]@{ execucaoId = "nao-guid" }; e = "DESCONHECIDA" }
+    )
+    foreach ($x in $t) { $s = Get-SituacaoTrava $x.a; Exigir ($s -eq $x.e) "esperado $($x.e), obtido $s" }
+    "6 situações classificadas"
+  }
+  Caso "N1-b" "Parar com trava LIVRE: adquire, passa --trava-execucao/--raiz à CLI com a trava SEGURA, libera ao final" {
+    GravarTrava '{"livre":true}'
+    $r = Adm "Parar"
+    $d = @($r.Chamadas | Where-Object { $_.cmd -eq "local-desligar" })
+    Exigir ($r.Codigo -eq 0 -and $d.Count -eq 1) "Parar: código $($r.Codigo) $($r.Erro)"
+    Exigir ($d[0].o.'trava-execucao' -match '^[0-9a-f-]{36}$' -and $d[0].o.raiz -eq $rzAdm -and $d[0].travaSegura -eq $true -and $d[0].credencial -eq "admin") "local-desligar sem trava comprovada: $($d[0] | ConvertTo-Json -Compress)"
+    $depois = ConteudoTrava | ConvertFrom-Json
+    Exigir ($depois.livre -eq $true -and $depois.ultimaExecucao -eq $d[0].o.'trava-execucao') "trava não liberada: $(ConteudoTrava)"
+    "local-desligar com trava segura (execução $($d[0].o.'trava-execucao')); trava livre ao final"
+  }
+  Caso "N1-c" "trava OCUPADA por um restore → Parar, Iniciar e ConfigurarAutenticacao recusados sem efeito; posse do outro intacta" {
+    $fs = SegurarTrava $restoreVivo
+    try {
+      $out = @()
+      foreach ($ac in "Parar", "Iniciar", "ConfigurarAutenticacao") {
+        $r = Adm $ac
+        Exigir ($r.Codigo -eq 1 -and $r.Cmds.Count -eq 0 -and $r.Erro -match "Trava") "$ac aceito com a trava ocupada: $($r.Codigo) cmds=$($r.Cmds -join ',')"
+        $out += $ac
+      }
+      Exigir (-not (Test-Path -LiteralPath (Join-Path $rzAdm "seguranca"))) "ConfigurarAutenticacao criou chave/credenciais antes da trava"
+    } finally { $fs.Close() }
+    Exigir ((ConteudoTrava) -eq $restoreVivo) "o conteúdo da trava do restore foi alterado"
+    "$($out -join ', ') → recusados, 0 chamadas; seguranca\ não criada; conteúdo do dono intacto"
+  }
+  Caso "N1-d" "trava OCUPADA por outra operação ADMINISTRATIVA → recusada (uma não rouba a outra)" {
+    $fs = SegurarTrava '{"execucaoId":"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee","pid":1,"banco":"ADMIN:Iniciar"}'
+    try { $r = Adm "Parar" } finally { $fs.Close() }
+    Exigir ($r.Codigo -eq 1 -and $r.Cmds.Count -eq 0) "Parar concorrente aceito"
+    Exigir ((ConteudoTrava | ConvertFrom-Json).banco -eq "ADMIN:Iniciar") "conteúdo da outra operação alterado"
+    "recusado; conteúdo ADMIN:Iniciar intacto"
+  }
+  Caso "N1-e" "trava ILEGÍVEL ou DESCONHECIDA (não segura) → falha fechada, conteúdo PRESERVADO byte a byte" {
+    foreach ($lixo in '{{corrompido', '{"foo":1}') {
+      GravarTrava $lixo
+      $r = Adm "Parar"
+      Exigir ($r.Codigo -eq 1 -and $r.Cmds.Count -eq 0 -and $r.Erro -match "ILEGIVEL|DESCONHECIDA") "aceito com trava '$lixo': $($r.Codigo) $($r.Erro)"
+      Exigir ((ConteudoTrava) -eq $lixo) "conteúdo '$lixo' não preservado: $(ConteudoTrava)"
+    }
+    "ilegível e desconhecida → recusadas; conteúdo preservado"
+  }
+  Caso "N1-f" "CONCORRÊNCIA real: Parar em andamento (trava mantida) × segundo Parar → o segundo é recusado; o primeiro conclui" {
+    GravarTrava '{"livre":true}'
+    $script:n++
+    $cen1 = Join-Path $raiz "cenario-$($script:n).json"; $ch1 = Join-Path $raiz "chamadas-$($script:n).jsonl"
+    Escrever $cen1 (@{ evidencia = $evAdm; portaEmUso = $true; dbPath = (Join-Path $rzAdm "data-27118"); dormirDesligar = 6 } | ConvertTo-Json -Depth 6); Escrever $ch1 ""
+    $env:MARIELA_TESTE_CENARIO = $cen1; $env:MARIELA_TESTE_CHAMADAS = $ch1
+    $p1 = Start-Process -FilePath $shell -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$(Join-Path $copia 'mongod-isolado.ps1')`"", "-Acao", "Parar", "-Raiz", "`"$rzAdm`"") -WindowStyle Hidden -PassThru
+    try {
+      $segura = $false
+      for ($i = 0; $i -lt 100 -and -not $segura; $i++) { Start-Sleep -Milliseconds 200; if ((Get-Content -LiteralPath $ch1 -Raw -ErrorAction SilentlyContinue) -match "local-desligar") { $segura = $true } }
+      Exigir $segura "o primeiro Parar não chegou ao desligamento"
+      $r2 = Adm "Parar"
+      Exigir ($r2.Codigo -eq 1 -and $r2.Cmds.Count -eq 0) "segundo Parar aceito durante o primeiro"
+      Exigir ($p1.WaitForExit(60000)) "primeiro Parar não terminou"
+      $p1.WaitForExit()
+      Exigir ($p1.ExitCode -eq 0) "primeiro Parar falhou: $($p1.ExitCode)"
+    } finally { if (-not $p1.HasExited) { Stop-Process -Id $p1.Id -Force -ErrorAction SilentlyContinue } }
+    Exigir ((ConteudoTrava | ConvertFrom-Json).livre -eq $true) "trava não liberada após o primeiro"
+    "primeiro conclui (0); segundo recusado durante a execução (1, 0 chamadas); trava livre ao final"
+  }
+  Caso "N1-g" "trava-DIRETÓRIO (caminho da trava é uma pasta) → recusa sem efeito" {
+    $rzD = Join-Path $raiz "isolado-adm-dir"; New-Item -ItemType Directory -Force -Path (Join-Path $rzD "locks\restore.lock") | Out-Null
+    $r = Rodar "mongod-isolado.ps1" @{ evidencia = $evAdm; portaEmUso = $true } @("-Acao", "Parar", "-Raiz", $rzD)
+    Exigir ($r.Codigo -eq 1 -and @($r.Chamadas).Count -eq 0) "aceito com trava-diretório"
+    "recusado, 0 chamadas"
+  }
+  Caso "N1-h" "execução INTERROMPIDA (dono morto; o SO soltou o handle) → prossegue com AVISO; PID gravado não é usado como prova" {
+    GravarTrava $restoreVivo   # NÃO segurada: o dono morreu
+    $r = Adm "Parar"
+    Exigir ($r.Codigo -eq 0 -and $r.Erro -match "AVISO" -and $r.Erro -match "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") "interrompida: $($r.Codigo) $($r.Erro)"
+    Exigir ((ConteudoTrava | ConvertFrom-Json).livre -eq $true) "não liberou"
+    "prosseguiu com aviso nomeando a execução interrompida; trava livre ao final"
+  }
+  Caso "N1-i" "RECUPERAÇÃO: depois da operação administrativa, a recuperação/restore adquire a trava normalmente" {
+    $t = Enter-TravaRestore -Caminho $travaAdm -ExecucaoId ([guid]::NewGuid().ToString()) -Banco "mariela_restore_20260101_000001" -RecusarAnteriorInvalida
+    try { Exigir ($t.Situacao -eq "LIVRE") "situação $($t.Situacao)" } finally { Exit-TravaRestore $t }
+    "adquirida (LIVRE) e liberada"
+  }
+  Caso "N1-j" "FALHA NA LIBERAÇÃO (fluxo já fechado): o SO solta o handle; o conteúdo indica interrupção e a próxima operação prossegue com aviso" {
+    $t = Enter-TravaRestore -Caminho $travaAdm -ExecucaoId "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee" -Banco "ADMIN:Parar" -RecusarAnteriorInvalida
+    $t.Fluxo.Close()
+    $lancou = $false; try { Exit-TravaRestore $t } catch { $lancou = $true }
+    Exigir $lancou "Exit-TravaRestore com fluxo fechado não lançou"
+    $fs = [System.IO.File]::Open($travaAdm, "Open", "ReadWrite", "None"); $fs.Close()   # handle solto
+    $r = Adm "Parar"
+    Exigir ($r.Codigo -eq 0 -and $r.Erro -match "cccccccc") "após falha de liberação: $($r.Codigo) $($r.Erro)"
+    "liberação falhou → handle solto pelo SO; conteúdo 'interrompida' → próxima operação prossegue com aviso"
+  }
+  Caso "N1-k" "CLI recusa o desligamento (trava não comprovada) → Parar falha (1) e ainda libera a trava; Estado não usa a trava" {
+    GravarTrava '{"livre":true}'
+    $r = Adm "Parar" @{ desligarRecusado = $true }
+    Exigir ($r.Codigo -eq 1 -and $r.Erro -match "desligamento recusado") "Parar: $($r.Codigo) $($r.Erro)"
+    Exigir ((ConteudoTrava | ConvertFrom-Json).livre -eq $true) "trava presa após falha"
+    $fs = SegurarTrava $restoreVivo
+    try { $e = Adm "Estado" @{ portaEmUso = $false } } finally { $fs.Close() }
+    Exigir ($e.Codigo -eq 0) "Estado (só leitura) recusado com a trava ocupada"
+    "desligamento recusado → 1, trava livre; Estado → 0 mesmo com trava ocupada"
   }
 } finally {
   Remove-Item Env:MARIELA_TESTE_CENARIO, Env:MARIELA_TESTE_CHAMADAS -ErrorAction SilentlyContinue

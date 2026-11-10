@@ -1,5 +1,5 @@
 import { existsSync, linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { MongoClient, type Document } from "mongodb";
 import {
   ArchiveInvalidoErro,
@@ -14,6 +14,9 @@ import {
   type Verificacao,
 } from "./archive.js";
 import { acrescentarAncora, conferirAncora, criarAncora, estadosAdmitidos, lerAncora, lerCadeia, ultimasEvidencias } from "./ancora.js";
+import { classificarExcecao, classificarFalhas, operarComReverificacao, type PortasReverificacao } from "./classificacao.js";
+import { garantiasEfetivas } from "./garantias.js";
+import { conferirPacote, criarPacoteEvidencias, type ResultadoCaso } from "./evidencias.js";
 import { conteudoPorColecao, type ComparacaoColecao } from "./integridade.js";
 import {
   adquirirPosse,
@@ -33,9 +36,11 @@ import {
   type DocumentoPosse,
   type ModoLimpeza,
   type ReferenciaArchive,
+  VALIDADOR_CONGELADO,
 } from "./posse.js";
+import { conferirIdentidade, planoIdentidade, type FatosIdentidade } from "./identidade.js";
 import { raizIsolada } from "./instancia.js";
-import { caminhoTrava, inicioDoProcesso, verificarTrava } from "./trava.js";
+import { caminhoTrava, exigeTravaAdministrativa, inicioDoProcesso, verificarTrava } from "./trava.js";
 import { ConfigMongoErro, lerConfigMongo, sanitizarMensagem } from "./config-mongo.js";
 import {
   avaliarDevido,
@@ -52,7 +57,6 @@ import {
   BANCO_ORIGEM,
   COLECOES_BACKUP,
   COLECOES_EXCLUIDAS,
-  garantiasDoEstado,
   JANELA,
   MARGEM_RECONCILIACAO_MINUTOS,
   PRIVILEGIOS_GUARDIAO,
@@ -399,6 +403,18 @@ function exigirTrava(o: Record<string, string>, execucao: string): void {
   if (falhas.length) throw new UsoInvalidoErro(`trava de restore não comprovada para a execução: ${falhas.map((f) => `${f.id} (${f.detalhe})`).join("; ")}`);
 }
 
+/**
+ * 21.2.11 (N1) — operações ADMINISTRATIVAS da instância isolada (desligar, iniciar replica set, configurar autenticação)
+ * exigem a MESMA trava do restore, mantida por quem chamou (mongod-isolado.ps1). A conferência é a mesma de exigirTrava
+ * (EBUSY + execução + PID + início do processo chamador). Decisão por porta em trava.ts (exigeTravaAdministrativa).
+ */
+function exigirTravaAdministrativa(o: Record<string, string>): void {
+  if (!exigeTravaAdministrativa(o["porta"] ?? "")) return;
+  const execucao = o["trava-execucao"];
+  if (!execucao) throw new UsoInvalidoErro("operação administrativa na instância isolada exige --trava-execucao (trava de restore mantida pelo chamador)");
+  exigirTrava(o, exigirExecucao(execucao));
+}
+
 function exigirExecucao(valor: string): string {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(valor)) throw new UsoInvalidoErro("identificador de execução inválido (GUID exigido)");
   return valor.toLowerCase();
@@ -409,14 +425,24 @@ function exigirExecucao(valor: string): string {
  * (`<raiz>/seguranca/instancia.json`). Os dois têm de existir e coincidir; senão nada é feito.
  */
 async function identidadeInstancia(c: MongoClient, raiz: string | undefined): Promise<string> {
-  const doc = await c.db(RESTORE.identidade.banco).collection(RESTORE.identidade.colecao).findOne({ _id: RESTORE.identidade.id as never });
+  const r = conferirIdentidade(await fatosIdentidade(c, raiz));
+  if (!r.ok) throw new UsoInvalidoErro(`identidade da instância não comprovada (${r.detalhe}) — execute mongod-isolado.ps1 -Acao ConfigurarAutenticacao`);
+  return r.instanciaId;
+}
+
+/** 21.2.11 (N3): documentos da coleção de identidade, se ela está congelada, e a cópia local (ilegível ⇒ erro). */
+async function fatosIdentidade(c: MongoClient, raiz: string | undefined): Promise<FatosIdentidade> {
+  const meta = c.db(RESTORE.identidade.banco);
+  const info = (await meta.listCollections({ name: RESTORE.identidade.colecao }).toArray())[0] as { options?: Record<string, unknown> } | undefined;
+  const documentos = info ? ((await meta.collection(RESTORE.identidade.colecao).find({}).limit(5).toArray()) as FatosIdentidade["documentos"]) : null;
   const arq = join(raizIsolada(raiz), ...RESTORE.identidade.arquivoLocal.split("/"));
-  const local = existsSync(arq) ? (JSON.parse(readFileSync(arq, "utf8").replace(/^﻿/, "")) as { instanciaId?: string }) : null;
-  const naInstancia = typeof doc?.["instanciaId"] === "string" ? (doc["instanciaId"] as string) : null;
-  if (!naInstancia || !local?.instanciaId || naInstancia !== local.instanciaId) {
-    throw new UsoInvalidoErro(`identidade da instância não comprovada (na instância: ${naInstancia ? "presente" : "AUSENTE"}; local: ${local?.instanciaId ? "presente" : "AUSENTE"}; ${naInstancia && local?.instanciaId ? "DIFERENTES" : "-"}) — execute mongod-isolado.ps1 -Acao ConfigurarAutenticacao`);
+  let local: string | null = null;
+  if (existsSync(arq)) {
+    const j = JSON.parse(readFileSync(arq, "utf8").replace(/^﻿/, "")) as { instanciaId?: unknown };
+    if (typeof j.instanciaId !== "string") throw new UsoInvalidoErro("cópia local da identidade ilegível — intervenção manual");
+    local = j.instanciaId;
   }
-  return naInstancia;
+  return { documentos, congelada: !!info && estaCongelada({ opcoes: info.options ?? {} }), local };
 }
 
 /** Identidade isolada (processo/bind/dbPath/marcador/rs) + identidade da instância. */
@@ -584,6 +610,9 @@ async function congelarEVerificarCmd(o: Record<string, string>) {
 async function reverificar(c: MongoClient, o: Record<string, string>, banco: string, execucaoId: string, instanciaId: string) {
   const db = c.db(banco);
   const posse = await posseAtual(db, execucaoId, instanciaId);
+  // 21.2.11 (X1): posse de outra execução/banco/instância é classificada como POSSE_INVALIDA antes de qualquer outra
+  // conferência (o registro lido seria o da OUTRA execução).
+  if (!posse.ok) return { ok: false, posse, verificacoes: [{ id: "posse.desta_execucao", ok: false, detalhe: posse.detalhe }] as Verificacao[], divergencias: [] as ComparacaoColecao[], evidencias: null };
   const anc = await conferirAncoraCmd(o, banco, instanciaId, posse.documento);
   if (falhasDe(anc).length) return { ok: false, posse, verificacoes: anc, divergencias: [] as ComparacaoColecao[], evidencias: null };
   const v = await verificarDestino(db, execucaoId, instanciaId, referenciaDoArchive(exigir(o, "arquivo")));
@@ -600,15 +629,50 @@ async function verificarIntegridadeCmd(o: Record<string, string>) {
   const execucaoId = exigirExecucao(exigir(o, "posse-execucao"));
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
     const { instanciaId } = await contextoIsolado(c, o);
-    const r = await reverificar(c, o, banco, execucaoId, instanciaId);
+    let r: Awaited<ReturnType<typeof reverificar>>;
+    try {
+      r = await reverificar(c, o, banco, execucaoId, instanciaId);
+    } catch (erro) {
+      const cl = classificarExcecao(erro);
+      return { ok: false, estado: null, garantias: null, categoria: cl.categoria, classificacao: cl, verificacoes: [], divergencias: [] };
+    }
     const estado = r.posse.documento?.estado ?? null;
-    return { ok: r.ok, estado, garantias: estado ? garantiasDoEstado(estado) : null, verificacoes: r.verificacoes, divergencias: r.divergencias };
+    const cl = classificarFalhas(r.verificacoes);
+    // 21.2.11 (N4): garantias EFETIVAS — só verdadeiras se a reverificação completa passou. Reprovada ⇒ todas falsas.
+    const ancoraOk = !r.verificacoes.some((v) => !v.ok && (v.id === "ancora.presente" || v.id === "ancora.cadeia"));
+    const g = garantiasEfetivas({
+      estado,
+      documentosDePosse: r.posse.documento ? 1 : 0,
+      identidadePosseOk: r.posse.ok,
+      identidadeInstanciaOk: true,
+      ancora: { presente: !r.verificacoes.some((v) => v.id === "ancora.presente" && !v.ok), cadeiaOk: ancoraOk, estadoAdmitido: !r.verificacoes.some((v) => v.id === "ancora.estado" && !v.ok) },
+      congeladas: r.ok ? 1 : 0,
+      colecoesDeDados: 1,
+      reverificacaoOk: r.ok,
+    });
+    return { ok: r.ok, estado, garantias: g.efetivas, garantiasDeclaradas: g.declaradas, garantiasEfetivas: g, categoria: cl?.categoria ?? null, classificacao: cl, verificacoes: r.verificacoes, divergencias: r.divergencias };
   });
 }
 
-/** Reverificação divergente num destino que se dizia íntegro ⇒ INTERVENCAO_NECESSARIA (com âncora). */
+/** Divergência PROVADA num destino que se dizia íntegro ⇒ INTERVENCAO_NECESSARIA (com âncora). Erros propagam ao fluxo. */
 async function intervirPorDivergencia(c: MongoClient, o: Record<string, string>, banco: string, execucaoId: string, instanciaId: string, motivo: string) {
-  return transicionar(c.db(banco), execucaoId, instanciaId, "INTERVENCAO_NECESSARIA", motivo, ancoradorPara(o["raiz"], banco, execucaoId, instanciaId), { intervencao: { em: new Date(), motivo } }).catch(() => ({ ok: false }));
+  return transicionar(c.db(banco), execucaoId, instanciaId, "INTERVENCAO_NECESSARIA", motivo, ancoradorPara(o["raiz"], banco, execucaoId, instanciaId), { intervencao: { em: new Date(), motivo } });
+}
+
+/** Portas reais (MongoDB + âncora) do fluxo classificado de Liberar/IniciarUso (21.2.11, X1). */
+function portasReais(c: MongoClient, o: Record<string, string>, banco: string, execucaoId: string, instanciaId: string, operacao: string, executar: PortasReverificacao["executar"]): PortasReverificacao & { divergencias: () => ComparacaoColecao[] } {
+  let divergencias: ComparacaoColecao[] = [];
+  return {
+    reverificar: async () => {
+      const r = await reverificar(c, o, banco, execucaoId, instanciaId);
+      divergencias = r.divergencias;
+      return { estado: r.posse.documento?.estado ?? null, verificacoes: r.verificacoes };
+    },
+    intervir: (motivo) => intervirPorDivergencia(c, o, banco, execucaoId, instanciaId, motivo),
+    executar,
+    exigirTrava: () => exigirTrava(o, operacao),
+    divergencias: () => divergencias,
+  };
 }
 
 /** VERIFICADO → LIBERACAO_AUTORIZADA, por comando EXPLÍCITO do operador, depois de reverificar tudo. Não descongela. */
@@ -621,15 +685,12 @@ async function liberarRestoreCmd(o: Record<string, string>) {
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
     const { instanciaId } = await contextoIsolado(c, o);
     exigirTrava(o, operacao);
-    const r = await reverificar(c, o, banco, execucaoId, instanciaId);
-    if (r.posse.documento?.estado !== "VERIFICADO") return { ok: false, estado: r.posse.documento?.estado ?? null, motivo: `liberação exige posse VERIFICADO desta execução (${r.posse.detalhe})`, verificacoes: r.verificacoes };
-    if (!r.ok) {
-      const ti = await intervirPorDivergencia(c, o, banco, execucaoId, instanciaId, "reverificação da liberação divergente");
-      return { ok: false, estado: ti.ok ? "INTERVENCAO_NECESSARIA" : "VERIFICADO", motivo: "o destino (ou a âncora) não confere com o VERIFICADO", verificacoes: r.verificacoes, divergencias: r.divergencias };
-    }
-    exigirTrava(o, operacao);
-    const t = await transicionar(c.db(banco), execucaoId, instanciaId, "LIBERACAO_AUTORIZADA", `liberado por ${operador} (destino continua congelado)`, ancoradorPara(o["raiz"], banco, execucaoId, instanciaId), { liberacao: { autorizadaEm: new Date(), operador, operacaoId: operacao } }, ["VERIFICADO"]);
-    return { ok: t.ok, estado: t.ok ? "LIBERACAO_AUTORIZADA" : t.de, motivo: t.detalhe };
+    const portas = portasReais(c, o, banco, execucaoId, instanciaId, operacao, async () => {
+      const t = await transicionar(c.db(banco), execucaoId, instanciaId, "LIBERACAO_AUTORIZADA", `liberado por ${operador} (destino continua congelado)`, ancoradorPara(o["raiz"], banco, execucaoId, instanciaId), { liberacao: { autorizadaEm: new Date(), operador, operacaoId: operacao } }, ["VERIFICADO"]);
+      return { ok: t.ok, estado: t.ok ? "LIBERACAO_AUTORIZADA" : t.de, detalhe: t.detalhe };
+    });
+    const r = await operarComReverificacao(portas, "VERIFICADO");
+    return { ...r, divergencias: portas.divergencias() };
   });
 }
 
@@ -645,19 +706,28 @@ async function iniciarUsoCmd(o: Record<string, string>) {
     const { instanciaId } = await contextoIsolado(c, o);
     exigirTrava(o, operacao);
     const db = c.db(banco);
+    const usar = async () => {
+      const u = await iniciarUso(db, execucaoId, instanciaId, referenciaDoArchive(exigir(o, "arquivo")), operador, operacao, ancoradorPara(o["raiz"], banco, execucaoId, instanciaId));
+      return { ok: u.ok, estado: u.estado, detalhe: u.detalhe, descongeladas: u.descongeladas };
+    };
     const p = await posseAtual(db, execucaoId, instanciaId);
-    if (p.documento?.estado === "LIBERACAO_AUTORIZADA") {
-      const r = await reverificar(c, o, banco, execucaoId, instanciaId);
-      if (!r.ok) {
-        const ti = await intervirPorDivergencia(c, o, banco, execucaoId, instanciaId, "reverificação do início de uso divergente");
-        return { ok: false, estado: ti.ok ? "INTERVENCAO_NECESSARIA" : "LIBERACAO_AUTORIZADA", motivo: "o destino não confere com o VERIFICADO", verificacoes: r.verificacoes };
-      }
-    } else {
+    if (p.documento?.estado === "EM_USO" && p.ok) {
+      // Retomada idempotente (queda entre a transição e o descongelamento): só a âncora é conferida — o destino já não
+      // é declarado igual ao archive. Falha ⇒ recusa classificada, sem transição.
       const anc = await conferirAncoraCmd(o, banco, instanciaId, p.documento);
-      if (falhasDe(anc).length) return { ok: false, estado: p.documento?.estado ?? null, motivo: "âncora externa não confere", verificacoes: anc };
+      const cl = classificarFalhas(anc);
+      if (cl) return { ok: false, estado: p.documento.estado, motivo: cl.motivo, categoria: cl.categoria, classificacao: cl, intervencaoPersistida: false, divergenciaNaoRegistravel: false, verificacoes: anc };
+      exigirTrava(o, operacao);
+      return { ...(await usar()), categoria: null, classificacao: null };
     }
-    exigirTrava(o, operacao);
-    return iniciarUso(db, execucaoId, instanciaId, referenciaDoArchive(exigir(o, "arquivo")), operador, operacao, ancoradorPara(o["raiz"], banco, execucaoId, instanciaId));
+    let descongeladas: string[] = [];
+    const portas = portasReais(c, o, banco, execucaoId, instanciaId, operacao, async () => {
+      const u = await usar();
+      descongeladas = u.descongeladas;
+      return { ok: u.ok, estado: u.estado, detalhe: u.detalhe };
+    });
+    const r = await operarComReverificacao(portas, "LIBERACAO_AUTORIZADA");
+    return { ...r, descongeladas, divergencias: portas.divergencias() };
   });
 }
 
@@ -693,27 +763,61 @@ async function inspecionarDestinoCmd(o: Record<string, string>) {
   const banco = exigir(o, "banco");
   exigirBancoRestore(banco);
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
-    const { instanciaId } = await contextoIsolado(c, o);
+    await exigirInstanciaIsolada(c, o["raiz"]);
+    // 21.2.11 (N4): Inspecionar é só leitura — identidade da instância não comprovada não impede a consulta, mas torna
+    // TODAS as garantias indisponíveis (e é exposta no resultado).
+    let instanciaId: string | null = null;
+    let identidadeInstancia_: { ok: boolean; detalhe: string };
+    try {
+      instanciaId = await identidadeInstancia(c, o["raiz"]);
+      identidadeInstancia_ = { ok: true, detalhe: "documento na instância = cópia local" };
+    } catch (erro) {
+      identidadeInstancia_ = { ok: false, detalhe: erro instanceof Error ? erro.message : String(erro) };
+    }
     const db = c.db(banco);
     const existe = (await c.db("admin").admin().listDatabases({ nameOnly: true })).databases.some((d) => d.name === banco);
     const info = existe ? await infoColecoes(db) : [];
     const colecoes = info.map((x) => x.nome).sort();
     const docs = colecoes.includes(COLECAO_POSSE) ? await db.collection(COLECAO_POSSE).find({}).limit(10).toArray() : [];
     const p = docs.length === 1 ? (docs[0] as unknown as DocumentoPosse) : null;
-    const ancoraTexto = p ? lerAncora(o["raiz"], banco, p.execucaoId) : null;
-    const cadeia = ancoraTexto ? lerCadeia(ancoraTexto) : null;
+    let ancoraTexto: string | null = null;
+    let erroAncora: string | null = null;
+    try {
+      ancoraTexto = p && typeof p.execucaoId === "string" ? lerAncora(o["raiz"], banco, p.execucaoId) : null;
+    } catch (erro) {
+      erroAncora = erro instanceof Error ? erro.message : String(erro);
+    }
+    const cadeia = ancoraTexto !== null ? lerCadeia(ancoraTexto) : null;
+    const admitidos = cadeia?.ok ? estadosAdmitidos(cadeia.entradas) : [];
+    const identidade = p ? (instanciaId ? conferirIdentidadePosse(p, { execucaoId: p.execucaoId, banco, instanciaId }) : { ok: false, detalhe: "identidade da instância não comprovada" }) : null;
+    const dadosCol = info.filter((x) => x.nome !== COLECAO_POSSE);
+    const congeladas = dadosCol.filter((x) => estaCongelada(x)).length;
+    const efetivas = garantiasEfetivas({
+      estado: p ? ((p.estado as string | undefined) ?? "?") : null,
+      documentosDePosse: docs.length,
+      identidadePosseOk: !!identidade?.ok,
+      identidadeInstanciaOk: identidadeInstancia_.ok,
+      ancora: { presente: ancoraTexto !== null, cadeiaOk: !!cadeia?.ok, estadoAdmitido: !!p && admitidos.includes(p.estado), erro: erroAncora },
+      congeladas,
+      colecoesDeDados: dadosCol.length,
+    });
     return {
       ok: true,
       existe,
       colecoes,
-      congeladas: info.filter((x) => x.nome !== COLECAO_POSSE && estaCongelada(x)).length,
-      identidade: p ? conferirIdentidadePosse(p, { execucaoId: p.execucaoId, banco, instanciaId }) : null,
-      ancora: cadeia ? { ok: cadeia.ok, motivo: cadeia.motivo, entradas: cadeia.entradas.length, estadosAdmitidos: estadosAdmitidos(cadeia.entradas) } : { ok: false, motivo: "registro local ausente" },
+      congeladas,
+      identidadeInstancia: identidadeInstancia_,
+      identidade,
+      ancora: erroAncora ? { ok: false, motivo: `registro local ilegível: ${erroAncora}` } : cadeia ? { ok: cadeia.ok, motivo: cadeia.motivo, entradas: cadeia.entradas.length, estadosAdmitidos: admitidos } : { ok: false, motivo: "registro local ausente" },
+      garantiasEfetivas: efetivas,
       posse: p
         ? {
             execucaoId: p.execucaoId,
             estado: p.estado,
-            garantias: garantiasDoEstado(p.estado),
+            // 21.2.11 (N4): `garantias` = garantias EFETIVAS (mesma forma de antes, valores conservadores);
+            // a declaração do estado fica em `garantiasDeclaradas`.
+            garantias: efetivas.efetivas,
+            garantiasDeclaradas: efetivas.declaradas,
             banco: p.banco,
             instanciaId: p.instanciaId,
             pid: p.pid,
@@ -751,7 +855,7 @@ async function listarBancosCmd(o: Record<string, string>) {
  * Sem usuários ainda: cria o bootstrap pela exceção de localhost. Depois: papéis `marielaRestore` e `marielaGuardiao`
  * (privilégios mínimos e SEPARADOS), usuários, e a IDENTIDADE da instância (documento na instância + cópia local).
  */
-async function configurarAutenticacaoCmd(o: Record<string, string>) {
+async function configurarAutenticacaoCmd(o: Record<string, string>, flags: Set<string>) {
   const e = await lerEntradaStdin();
   const admin = credencialDe(e["admin"], "admin");
   const restore = credencialDe(e["restore"], "restore");
@@ -760,7 +864,8 @@ async function configurarAutenticacaoCmd(o: Record<string, string>) {
   const a0 = RESTORE.autenticacao;
   if (admin.usuario !== a0.usuarioAdmin || restore.usuario !== a0.usuarioRestore || guardiao.usuario !== a0.usuarioGuardiao || leitor.usuario !== a0.usuarioLeitor) throw new UsoInvalidoErro("nomes de usuário diferentes da política");
   const uri = uriLocal(exigir(o, "porta"), [RESTORE.porta]);
-  const opcoesAdmin = { auth: { username: admin.usuario, password: admin.senha }, authSource: a0.authSource, serverSelectionTimeoutMS: 15_000 };
+  exigirTravaAdministrativa(o);
+  const opcoesAdmin ={ auth: { username: admin.usuario, password: admin.senha }, authSource: a0.authSource, serverSelectionTimeoutMS: 15_000 };
   let bootstrapCriado = false;
   const tentarAdmin = async () => {
     const c = new MongoClient(uri, opcoesAdmin);
@@ -789,6 +894,8 @@ async function configurarAutenticacaoCmd(o: Record<string, string>) {
   }
   let instanciaId: string;
   let identidadeCriada = false;
+  let identidadeRestaurada = false;
+  let identidadeProtegida = false;
   try {
     const a = c.db("admin");
     await exigirInstanciaIsolada(c, o["raiz"]);
@@ -809,23 +916,31 @@ async function configurarAutenticacaoCmd(o: Record<string, string>) {
     await garantirUsuario(guardiao, [{ role: a0.papelGuardiao, db: "admin" }]);
     await garantirUsuario(leitor, [{ role: "readAnyDatabase", db: "admin" }]);
     // Identidade da instância (A21-7-06): documento NA instância + cópia local; nunca troca uma existente.
-    const col = c.db(RESTORE.identidade.banco).collection(RESTORE.identidade.colecao);
-    const doc = await col.findOne({ _id: RESTORE.identidade.id as never });
+    // 21.2.11 (N3): plano PURO (identidade.ts) + coleção CONGELADA pelo bootstrap; reinserção a partir da cópia local
+    // só com --restaurar-identidade-local (pedido explícito do operador).
+    const meta = c.db(RESTORE.identidade.banco);
+    const col = meta.collection(RESTORE.identidade.colecao);
     const arq = join(raizIsolada(o["raiz"]), ...RESTORE.identidade.arquivoLocal.split("/"));
-    const local = existsSync(arq) ? (JSON.parse(readFileSync(arq, "utf8").replace(/^﻿/, "")) as { instanciaId?: string }) : null;
-    if (doc?.["instanciaId"]) {
-      instanciaId = doc["instanciaId"] as string;
-      if (local?.instanciaId && local.instanciaId !== instanciaId) throw new Error("identidade local DIFERENTE da gravada na instância — nada alterado (intervenção manual)");
-    } else {
-      if (local?.instanciaId) throw new Error("identidade local existe mas a instância não tem a sua — outra instância? nada alterado (intervenção manual)");
-      instanciaId = crypto.randomUUID();
-      await col.insertOne({ _id: RESTORE.identidade.id as never, instanciaId, criadaEm: new Date() });
-      identidadeCriada = true;
+    const plano = planoIdentidade(await fatosIdentidade(c, o["raiz"]), { restaurarDaCopiaLocal: flags.has("restaurar-identidade-local") });
+    if (plano.acao === "RECUSAR") throw new Error(plano.detalhe);
+    if (plano.acao === "CRIAR" || plano.acao === "RESTAURAR_DA_COPIA_LOCAL") {
+      instanciaId = plano.acao === "CRIAR" ? crypto.randomUUID() : plano.instanciaId;
+      // root tem bypassDocumentValidation: insere mesmo numa coleção já congelada (e vazia).
+      await col.insertOne({ _id: RESTORE.identidade.id as never, instanciaId, criadaEm: new Date(), ...(plano.acao === "RESTAURAR_DA_COPIA_LOCAL" ? { restauradaDaCopiaLocalEm: new Date() } : {}) }, { bypassDocumentValidation: true });
+      identidadeCriada = plano.acao === "CRIAR";
+      identidadeRestaurada = plano.acao === "RESTAURAR_DA_COPIA_LOCAL";
+    } else instanciaId = plano.instanciaId;
+    const infoCol = (await meta.listCollections({ name: RESTORE.identidade.colecao }).toArray())[0] as { options?: Record<string, unknown> } | undefined;
+    if (!infoCol || !estaCongelada({ opcoes: infoCol.options ?? {} })) {
+      await meta.command({ collMod: RESTORE.identidade.colecao, validator: VALIDADOR_CONGELADO, validationLevel: "strict", validationAction: "error" });
     }
-    if (!local?.instanciaId) {
+    if (plano.acao === "CRIAR" || plano.acao === "CRIAR_COPIA_LOCAL") {
       mkdirSync(dirname(arq), { recursive: true });
       writeFileSync(arq, JSON.stringify({ instanciaId }, null, 2), { flag: "wx" });
     }
+    const conf = conferirIdentidade(await fatosIdentidade(c, o["raiz"]));
+    if (!conf.ok) throw new Error(`identidade não confirmada após a configuração: ${conf.detalhe}`);
+    identidadeProtegida = true;
   } finally {
     await c.close().catch(() => undefined);
   }
@@ -840,7 +955,7 @@ async function configurarAutenticacaoCmd(o: Record<string, string>) {
     await sem.close().catch(() => undefined);
   }
   if (!semAuthRecusado) throw new Error("a instância aceitou listDatabases SEM autenticação — --auth não está ativo");
-  return { bootstrapCriado, identidadeCriada, papeis: [a0.papelRestore, a0.papelGuardiao], usuarios: [admin.usuario, restore.usuario, guardiao.usuario, leitor.usuario], semAuthRecusado };
+  return { bootstrapCriado, identidadeCriada, identidadeRestaurada, identidadeProtegida, papeis: [a0.papelRestore, a0.papelGuardiao], usuarios: [admin.usuario, restore.usuario, guardiao.usuario, leitor.usuario], semAuthRecusado };
 }
 
 async function localEstado(o: Record<string, string>) {
@@ -864,6 +979,8 @@ async function localEstado(o: Record<string, string>) {
 async function localRsIniciar(o: Record<string, string>, flags: Set<string>) {
   const porta = exigir(o, "porta");
   const nome = exigir(o, "rs");
+  uriLocal(porta, [RESTORE.porta]);
+  exigirTravaAdministrativa(o);
   // `--localhost`: usa a exceção de localhost (instância nova, ainda SEM usuários) — único caso sem credencial.
   return comCliente(
     uriLocal(porta, [RESTORE.porta]),
@@ -890,6 +1007,7 @@ async function localDesligar(o: Record<string, string>, flags: Set<string>) {
   const isolada = Number(o["porta"]) === RESTORE.porta;
   // 27118: só o bootstrap (root) tem `shutdown`. `--sem-autenticacao`: migração de uma instância antiga ainda sem --auth.
   if (isolada && !CREDENCIAL && !flags.has("sem-autenticacao")) throw new UsoInvalidoErro("desligar a instância isolada exige a credencial bootstrap");
+  exigirTravaAdministrativa(o);
   const auth = isolada && CREDENCIAL ? { auth: { username: CREDENCIAL.usuario, password: CREDENCIAL.senha }, authSource: RESTORE.autenticacao.authSource } : {};
   const c = new MongoClient(uri, { serverSelectionTimeoutMS: 5_000, ...auth });
   try {
@@ -969,7 +1087,7 @@ async function principal(): Promise<number> {
         resultado = await localDesligar(o, flags);
         break;
       case "configurar-autenticacao":
-        resultado = await configurarAutenticacaoCmd(o);
+        resultado = await configurarAutenticacaoCmd(o, flags);
         break;
       case "marcar-estado":
         resultado = await marcarEstadoCmd(o);
@@ -997,6 +1115,26 @@ async function principal(): Promise<number> {
       }
       case "registrar-cifrado":
         resultado = await registrarCifradoCmd(o);
+        break;
+      case "pacote-evidencias": {
+        // 21.2.11 (N5): pacote local de evidências (fora do repositório, da raiz isolada e das origens). Segredos
+        // literais a remover chegam SÓ pelo stdin (`--segredos-stdin`: {"segredos":[…]}), nunca por argumento.
+        const segredos = flags.has("segredos-stdin") ? (((await lerEntradaStdin())["segredos"] as unknown[]) ?? []).filter((s): s is string => typeof s === "string") : [];
+        const resultados = lerJson<ResultadoCaso[]>(exigir(o, "resultados"));
+        const r = criarPacoteEvidencias({
+          destino: exigir(o, "destino"),
+          origens: exigir(o, "origens").split("|").filter(Boolean),
+          resultados: Array.isArray(resultados) ? resultados : [],
+          repositorio: resolve(import.meta.dir, "..", "..", ".."),
+          raizIsolada: raizIsolada(o["raiz"]),
+          segredos,
+          descricao: o["descricao"],
+        });
+        resultado = { id: r.id, pasta: r.pasta, arquivos: r.arquivos.length, excluidos: r.excluidos, conferencia: conferirPacote(r.pasta) };
+        break;
+      }
+      case "conferir-pacote":
+        resultado = conferirPacote(exigir(o, "pasta"));
         break;
       case "adquirir-posse":
         resultado = await adquirirPosseCmd(o);

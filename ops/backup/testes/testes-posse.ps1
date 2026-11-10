@@ -14,7 +14,12 @@
     AU01–AU06 autenticação e privilégios (sem auth, leitor, restore, bootstrap)
     PR01–PR08 processos filhos (Job Object) e recuperação
 #>
-param([switch]$ManterArtefatos, [int]$Volume = 300000, [string]$Somente = "")
+param(
+  [switch]$ManterArtefatos, [int]$Volume = 300000, [string]$Somente = "",
+  # Fase 21.2.11 (N5): pacote de evidências criado ANTES da limpeza, FORA do repositório, da raiz isolada e da pasta
+  # temporária do runner (a limpeza não o alcança). Vazio = não gerar.
+  [string]$DiretorioPacote = (Join-Path $env:USERPROFILE "mariela-evidencias-testes")
+)
 
 $ErrorActionPreference = "Stop"
 $ops = Split-Path -Parent $PSScriptRoot
@@ -87,9 +92,11 @@ function Esperar($Proc, [int]$Segundos = 300) {
   return [pscustomobject]@{ Codigo = $Proc.P.ExitCode; Saida = (Get-Content -LiteralPath $Proc.Out -Raw -ErrorAction SilentlyContinue); Erro = (Get-Content -LiteralPath $Proc.Err -Raw -ErrorAction SilentlyContinue) }
 }
 # Fase 21.2.8 (A21-7-02): o archive de cada destino é lembrado para ser INFORMADO nos comandos do operador.
+# Fase 21.2.11 (T06c): só o da PRIMEIRA tentativa no destino (apoio-posse.ps1) — uma tentativa recusada não o troca.
+. (Join-Path $PSScriptRoot "apoio-posse.ps1")
 $script:archivePorBanco = @{}
 function RestoreAsync([string]$Archive, [string]$B, [string[]]$Extra = @()) {
-  $script:archivePorBanco[$B] = $Archive
+  $null = Register-ArchiveDoDestino $script:archivePorBanco $B $Archive
   return Disparar $shell (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ops "restore-test.ps1"), "-ArquivoBackup", $Archive, "-BancoDestino", $B, "-DiretorioRelatorio", $relDir) + $Extra)
 }
 function Restore([string]$Archive, [string]$B) { $r = Esperar (RestoreAsync $Archive $B); return [pscustomobject]@{ Codigo = $r.Codigo; Erro = $r.Erro; Rel = (Relatorio $B) } }
@@ -658,6 +665,23 @@ try {
   $resultados | Format-Table -AutoSize -Wrap | Out-String -Width 240 | Write-Host
   $falhas = @($resultados | Where-Object { $_.Resultado -ne "PASSOU" }).Count
   Write-Host ("TOTAL: {0} casos, {1} PASSOU, {2} FALHOU (PowerShell {3})" -f $resultados.Count, ($resultados.Count - $falhas), $falhas, $PSVersionTable.PSVersion)
+  if ($DiretorioPacote) {
+    # N5: relatórios do runner + âncoras SÓ dos destinos de teste deste runner; senhas sintéticas removidas (stdin).
+    try {
+      $anc = Join-Path $raiz "ancoras-teste"; New-Item -ItemType Directory -Force -Path $anc | Out-Null
+      $bancosTeste = @($script:bancosCriados | Select-Object -Unique)
+      Get-ChildItem -LiteralPath (Join-Path $raizIsolada "evidencias") -Filter "mariela_restore_20260103_*.jsonl" -ErrorAction SilentlyContinue | Where-Object { $bancosTeste -contains ($_.Name -split '__')[0] } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $anc }
+      $arqRes = Join-Path $raiz "resultados.json"
+      [System.IO.File]::WriteAllText($arqRes, (ConvertTo-Json -InputObject @($resultados | ForEach-Object { @{ id = $_.Id; caso = $_.Caso; resultado = $_.Resultado; detalhe = "$($_.Detalhe)" } }) -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+      $segredos = @{ segredos = @(foreach ($p in $creds.Keys) { ConvertFrom-SenhaSegura $creds[$p].Senha }) } | ConvertTo-Json -Compress
+      $pk = Invoke-Nativo -Programa $bun -Argumentos @("--no-env-file", (Join-Path $ops "lib\cli.ts"), "pacote-evidencias", "--destino", $DiretorioPacote, "--origens", "$relDir|$anc", "--resultados", $arqRes, "--raiz", $raizIsolada, "--descricao", "testes-posse PowerShell $($PSVersionTable.PSVersion)", "--segredos-stdin") -DiretorioTrabalho $repo -Entrada $segredos
+      $segredos = $null
+      $jp = @($pk.Saida -split "`r?`n" | Where-Object { $_.Trim().StartsWith("{") }) | Select-Object -Last 1
+      $jp = if ($jp) { $jp | ConvertFrom-Json } else { $null }
+      if ($jp -and $jp.ok) { Write-Host "pacote de evidências: $($jp.resultado.pasta) ($($jp.resultado.arquivos) arquivos; conferência ok=$($jp.resultado.conferencia.ok))" }
+      else { Write-Host "pacote de evidências NÃO criado: $(if ($jp) { $jp.mensagem } else { ConvertTo-MensagemSegura $pk.Erro })" }
+    } catch { Write-Host ("pacote de evidências NÃO criado: " + (ConvertTo-MensagemSegura $_)) }
+  }
   if (-not $ManterArtefatos) {
     foreach ($b in @($script:bancosCriados | Select-Object -Unique)) { try { $null = Aux @("remover-banco-de-teste", $b) } catch { Write-Host "não removido: $b" } }
     Remove-Item -LiteralPath $raiz -Recurse -Force -ErrorAction SilentlyContinue

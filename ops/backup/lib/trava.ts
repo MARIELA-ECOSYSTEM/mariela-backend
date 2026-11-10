@@ -26,6 +26,14 @@ export interface ConteudoTrava {
   livre?: boolean;
 }
 
+/**
+ * Fase 21.2.11 (N1) — operações ADMINISTRATIVAS (desligar, iniciar replica set, configurar autenticação) na instância
+ * isolada (27118) exigem a trava; a origem sintética dos testes (27119) não tem trava. PURA.
+ */
+export function exigeTravaAdministrativa(porta: string | number): boolean {
+  return Number(porta) === RESTORE.porta;
+}
+
 export function caminhoTrava(raiz?: string): string {
   return join(raizIsolada(raiz), ...RESTORE.arquivoTrava.split("/"));
 }
