@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Int32, Long, ObjectId } from "bson";
@@ -7,7 +7,7 @@ import { ArchiveInvalidoErro, idsDoArchive } from "./archive.js";
 import { chaveDoId, COLECAO_POSSE } from "./posse.js";
 import { RESTORE } from "./politica.js";
 import { montarArchive } from "./teste-archive.util.js";
-import { caminhoTrava, inicioDoProcesso, verificarTrava } from "./trava.js";
+import { caminhoTrava, codigoAberturaTrava, inicioDoProcesso, travaSegura, verificarTrava } from "./trava.js";
 
 /**
  * Fase 60.4.3.4.21.2.4 (R21-2.3-01) — testes unitários (sem MongoDB) da prova de conteúdo e da verificação da trava.
@@ -75,6 +75,19 @@ describe("verificarTrava (sem processo segurando a trava)", () => {
     expect(verificarTrava(arq, "e1", 42).find((x) => x.id === "trava.dono")!.ok).toBe(false);
     writeFileSync(arq, JSON.stringify({ livre: true, execucaoId: "e1", pid: 42 }));
     expect(verificarTrava(arq, "e1", 42).find((x) => x.id === "trava.execucao")!.ok).toBe(false);
+  });
+
+  it("A21-7-08: erro de PERMISSÃO (arquivo somente-leitura) NÃO conta como trava segura — só EBUSY (compartilhamento)", () => {
+    const ro = join(dir, "locks", "somente-leitura.lock");
+    writeFileSync(ro, JSON.stringify({ execucaoId: "e1", pid: 42 }));
+    chmodSync(ro, 0o444);
+    try {
+      // No Windows/Linux sem privilégio: EPERM/EACCES. Como root a abertura pode até funcionar — em nenhum caso é EBUSY.
+      expect(codigoAberturaTrava(ro)).not.toBe("EBUSY");
+      expect(travaSegura(ro)).toBe(false);
+    } finally {
+      chmodSync(ro, 0o666);
+    }
   });
 
   it("A-09: horário de criação do dono — igual ⇒ ok; diferente (PID reutilizado), ausente ou ilegível ⇒ recusado", () => {

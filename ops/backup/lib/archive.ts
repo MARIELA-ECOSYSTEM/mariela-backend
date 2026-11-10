@@ -40,12 +40,31 @@ export interface IndiceNormalizado {
   ttl: number | null;
 }
 
+/**
+ * Fase 60.4.3.4.21.2.8 (A21-7-03) — especificação COMPLETA de um índice: todas as opções (collation, hidden, text/geo,
+ * unique, partial, sparse, TTL, wildcardProjection…), em forma canônica. Só são ignorados campos sem efeito semântico:
+ *   `v`  — versão interna do formato do índice, escolhida pelo servidor;
+ *   `ns` — namespace (redundante; ausente desde o 4.4);
+ *   `background` — opção de CONSTRUÇÃO, ignorada pelo servidor desde o 4.2 (não altera o índice construído).
+ * A ordem das chaves de `key` é PRESERVADA (é significativa); nas demais opções as chaves são ordenadas. Números BSON são
+ * comparados por valor (1, 1.0 e Int32(1) são o mesmo sentido de índice).
+ */
+export interface EspecificacaoIndice {
+  nome: string;
+  especificacao: string;
+}
+
+/** Opções de COLEÇÃO comparáveis (canônicas), SEM o trio de validação (validator/nível/ação), conferido à parte. */
+export const CAMPOS_VALIDACAO = ["validator", "validationLevel", "validationAction"] as const;
+
 export interface ColecaoDoArchive {
   db: string;
   colecao: string;
   tipo: string;
   opcoes: Record<string, unknown>;
   indices: IndiceNormalizado[];
+  /** Fase 21.2.8: índices completos (para a validação do restore). */
+  especificacoes: EspecificacaoIndice[];
 }
 
 export interface ArchiveLido {
@@ -88,6 +107,41 @@ export function normalizarIndice(indice: Document): IndiceNormalizado {
 
 export function ordenarIndices(indices: IndiceNormalizado[]): IndiceNormalizado[] {
   return [...indices].sort((a, b) => a.nome.localeCompare(b.nome));
+}
+
+/** Canônico com chaves ORDENADAS (para opções cuja ordem não tem significado). */
+function canonicoOrdenado(valor: unknown): unknown {
+  const c = canonico(valor);
+  const ordenar = (v: unknown): unknown => {
+    if (v === null || typeof v !== "object") return v;
+    if (Array.isArray(v)) return v.map(ordenar);
+    return Object.fromEntries(Object.keys(v as Record<string, unknown>).sort().map((k) => [k, ordenar((v as Record<string, unknown>)[k])]));
+  };
+  return ordenar(c);
+}
+
+const IGNORADOS_NO_INDICE = new Set(["v", "ns", "background"]);
+
+/** Especificação completa e canônica de um índice (Fase 21.2.8, A21-7-03). */
+export function especificacaoIndice(indice: Document): EspecificacaoIndice {
+  const campos = Object.keys(indice).filter((k) => !IGNORADOS_NO_INDICE.has(k)).sort();
+  const partes = campos.map((k) => {
+    // `key`: a ORDEM dos campos é significativa (índice composto) — não ordenar.
+    const v = k === "key" ? canonico(indice[k]) : canonicoOrdenado(indice[k]);
+    return [k, v] as const;
+  });
+  return { nome: String(indice["name"]), especificacao: JSON.stringify(partes) };
+}
+
+export function ordenarEspecificacoes(e: EspecificacaoIndice[]): EspecificacaoIndice[] {
+  return [...e].sort((a, b) => (a.nome < b.nome ? -1 : a.nome > b.nome ? 1 : 0));
+}
+
+/** Opções de coleção canônicas SEM o trio de validação (Fase 21.2.8, A21-7-03). */
+export function opcoesComparaveis(opcoes: Record<string, unknown> | null | undefined): string {
+  const o = { ...(opcoes ?? {}) };
+  for (const c of CAMPOS_VALIDACAO) delete o[c];
+  return JSON.stringify(canonicoOrdenado(o));
 }
 
 export function descompactar(gz: Buffer): Buffer {
@@ -149,6 +203,7 @@ export function lerArchive(dados: Buffer): ArchiveLido {
       tipo: typeof meta["type"] === "string" ? meta["type"] : "collection",
       opcoes: (metadados["options"] as Record<string, unknown>) ?? {},
       indices: ordenarIndices(((metadados["indexes"] as Document[]) ?? []).map(normalizarIndice)),
+      especificacoes: ordenarEspecificacoes(((metadados["indexes"] as Document[]) ?? []).map(especificacaoIndice)),
     });
   }
   pos += 4;

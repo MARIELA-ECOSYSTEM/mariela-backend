@@ -12,13 +12,17 @@
     5. o processo dono NÃO existe mais: PID **e** horário de criação (FILETIME) — PID reutilizado não engana;
     6. NENHUM outro processo (de qualquer nome ou executável) cita o banco ou o execucaoId na linha de comando
        (um mongorestore/CLI órfão de versões sem Job Object seria encontrado aqui);
-    7. archive e manifesto da posse presentes, com os MESMOS SHA-256 gravados (conferidos pela CLI);
+    7. (Fase 21.2.8, A21-7-02) archive e manifesto INFORMADOS PELO OPERADOR (-ArquivoBackup/-Manifesto), conferidos pela
+       CLI contra o .sha256, o manifesto, o registro local de evidências e a posse (âncora externa);
     8. a limpeza comprovada (conteúdo ⊆ archive, collectionUUID, nunca dropDatabase) não encontra nada alheio.
   Qualquer falha ⇒ nada é removido; o relatório indica o motivo (intervenção manual).
 #>
 param(
   [Parameter(Mandatory = $true)][string]$BancoDestino,
   [switch]$Remover,
+  # Fase 21.2.8 (A21-7-02): para -Remover, archive e manifesto do backup escolhido pelo OPERADOR (nunca os da posse).
+  [string]$ArquivoBackup = "",
+  [string]$Manifesto = "",
   [int]$Porta = 27118,
   [string]$Raiz = (Join-Path $env:USERPROFILE "mariela-restore-isolado"),
   [string]$DiretorioRelatorio = (Join-Path $env:USERPROFILE "mariela-restore-isolado\relatorios")
@@ -30,6 +34,11 @@ $ErrorActionPreference = "Stop"
 function Recusar([string]$Mensagem) { [Console]::Error.WriteLine($Mensagem); exit 1 }
 if ($Porta -ne 27118) { Recusar "Porta $Porta recusada." }
 if ($BancoDestino -eq "marielaDB" -or $BancoDestino -notmatch '^mariela_restore_\d{8}_\d{6}$') { Recusar "Banco '$BancoDestino' recusado." }
+if ($Remover) {
+  if (-not $ArquivoBackup -or -not $Manifesto -or -not (Test-Path -LiteralPath $ArquivoBackup -PathType Leaf) -or -not (Test-Path -LiteralPath $Manifesto -PathType Leaf)) { Recusar "-Remover exige -ArquivoBackup e -Manifesto existentes (os do backup escolhido pelo operador)." }
+  $ArquivoBackup = (Resolve-Path -LiteralPath $ArquivoBackup).Path
+  $Manifesto = (Resolve-Path -LiteralPath $Manifesto).Path
+}
 
 $execucaoId = [guid]::NewGuid().ToString()
 try { $trava = Enter-TravaRestore -Caminho (Join-Path $Raiz "locks\restore.lock") -ExecucaoId $execucaoId -Banco $BancoDestino }
@@ -53,6 +62,7 @@ try {
   $jobOk = $true
   try { $null = Enable-ControleDeProcessos } catch { $jobOk = $false }
   if (-not (Prova "controle.processos" $jobOk "Job Object kill-on-close")) { Fim "NADA_REMOVIDO" 1 }
+  $null = Initialize-PastaEvidencias $Raiz
   $ident = Test-EvidenciaInstancia (Get-EvidenciaPorta $Porta) (Join-Path $Raiz "mongodb-8.0.37\bin\mongod.exe")
   if (-not (Prova "instancia.processo" $ident.Ok $ident.Detalhe)) { Fim "NADA_REMOVIDO" 1 }
   $cred = Get-CredencialIsolada $Raiz 'restore'
@@ -65,7 +75,8 @@ try {
   $p = $insp.resultado.posse
   if (-not (Prova "posse.unica" ([bool]$p -and $insp.resultado.documentosDePosse -eq 1) "documentos de posse: $($insp.resultado.documentosDePosse)")) { Fim "NADA_REMOVIDO" 1 }
   $rel.posse = @{ execucaoId = $p.execucaoId; estado = $p.estado; pid = $p.pid; processoInicio = $p.processoInicio; executavel = $p.executavel; criadoEm = $p.criadoEm }
-  $interrompiveis = @("PREPARANDO", "RESTAURANDO", "VALIDANDO", "FALHOU_DESTINO_PARCIAL", "INTERVENCAO_NECESSARIA")
+  # 21.2.8: REMOVENDO (remoção interrompida, A21-7-04) e estado final com a coleção de controle órfã (A21-7-07) também.
+  $interrompiveis = @("PREPARANDO", "RESTAURANDO", "VALIDANDO", "FALHOU_DESTINO_PARCIAL", "INTERVENCAO_NECESSARIA", "REMOVENDO", "CANCELADO_COM_LIMPEZA_COMPROVADA", "DESCARTADO")
   if (-not (Prova "posse.estado_interrompivel" ($interrompiveis -contains $p.estado) "estado $($p.estado)")) { Fim "NADA_REMOVIDO" 1 }
 
   # Dono ainda vivo? PID + horário de criação (FILETIME). PID reutilizado por outro processo não conta como o dono.
@@ -76,12 +87,12 @@ try {
   $ativos = Get-ProcessosDaExecucao @($BancoDestino, [string]$p.execucaoId)
   if (-not (Prova "processos.nenhum_ativo" (@($ativos).Count -eq 0) $(if (@($ativos).Count) { "ativos: " + ((@($ativos) | ForEach-Object { "$($_.Nome)#$($_.Pid)" }) -join ", ") } else { "nenhum processo cita o destino ou a execução" }))) { Fim "NADA_REMOVIDO" 1 }
 
-  $arquivosOk = (Test-Path -LiteralPath $p.archive -PathType Leaf) -and (Test-Path -LiteralPath $p.manifesto -PathType Leaf) -and ((Get-Sha256 $p.archive) -eq $p.archiveSha256) -and ((Get-Sha256 $p.manifesto) -eq $p.manifestoSha256)
-  if (-not (Prova "archive_manifesto.mesmos" $arquivosOk "archive e manifesto da posse presentes com os mesmos SHA-256: $arquivosOk")) { Fim "NADA_REMOVIDO" 1 }
-
+  $rel.ancora = $insp.resultado.ancora
   if (-not $Remover) { Fim "SO_INSPECAO" 0 }
 
-  $l = Invoke-CliBackup -Argumentos (@("limpar-destino") + $comuns + @("--modo", "recuperacao", "--trava-execucao", $execucaoId, "--posse-execucao", $p.execucaoId, "--arquivo", $p.archive, "--manifesto", $p.manifesto)) -Credencial $cred
+  # Âncora externa: a CLI confere os arquivos INFORMADOS contra .sha256, manifesto, registro local e posse.
+  $guard = Get-CredencialIsolada $Raiz 'guardiao'
+  $l = Invoke-CliBackup -Argumentos (@("limpar-destino") + $comuns + @("--modo", "recuperacao", "--trava-execucao", $execucaoId, "--posse-execucao", $p.execucaoId, "--arquivo", $ArquivoBackup, "--manifesto", $Manifesto)) -Credencial $guard
   $okL = [bool]($l.ok -and $l.resultado.limpo)
   $null = Prova "limpeza.comprovada" $okL $(if ($l.ok) { "$($l.resultado.motivo) $($l.resultado.detalhe)" } else { $l.mensagem })
   $rel.removidas = @($l.resultado.removidas)

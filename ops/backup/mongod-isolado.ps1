@@ -10,12 +10,14 @@
 
   Fase 21.2.6: sempre `--auth --keyFile`. Usuários (credenciais SINTÉTICAS, DPAPI, em <Raiz>\seguranca):
     mariela_bootstrap (root)        — só configuração e desligamento;
-    mariela_restore (marielaRestore) — fluxo de restore, privilégios mínimos (sem bypass, sem update/remove de dados,
-                                       sem dropDatabase);
+    mariela_restore (marielaRestore) — mongorestore e leitura: insert/createIndex/find; SEM collMod, drop, rename,
+                                       bypass, update/remove, dropDatabase ou escrita na posse;
+    mariela_guardiao (marielaGuardiao) — posse, transições, congelamento e limpeza: collMod, dropCollection (sempre
+                                       com collectionUUID), escrita SÓ na coleção de controle; SEM escrita em dados;
     mariela_leitor (readAnyDatabase) — inspeção.
   ConfigurarAutenticacao (idempotente): gera chave e credenciais que faltarem, migra uma instância antiga sem --auth
-  (desliga e religa com --auth), cria o bootstrap pela exceção de localhost, o papel e os usuários, e prova que conexão
-  sem credencial é recusada.
+  (desliga e religa com --auth), cria o bootstrap pela exceção de localhost, os papéis e os usuários, a IDENTIDADE da instância (documento
+  na instância + cópia local seguranca\instancia.json — Fase 21.2.8, A21-7-06) e prova que conexão sem credencial é recusada.
 #>
 param(
   [Parameter(Mandatory = $true)][ValidateSet("Iniciar", "Parar", "Estado", "ConfigurarAutenticacao")][string]$Acao,
@@ -105,7 +107,7 @@ switch ($Acao) {
       [System.IO.File]::WriteAllText($chave, [Convert]::ToBase64String($bytes), (New-Object System.Text.ASCIIEncoding))
       Set-AclRestrita $chave
     }
-    $criadas = @(foreach ($p in 'admin', 'restore', 'leitor') { if (New-CredencialIsolada $Raiz $p) { $p } })
+    $criadas = @(foreach ($p in 'admin', 'restore', 'guardiao', 'leitor') { if (New-CredencialIsolada $Raiz $p) { $p } })
     # 2. Migração: instância antiga rodando SEM --auth (só se for comprovadamente a isolada).
     if (PortaEmUso) {
       if (-not (ProcessoDaPortaOk)) { Falhar "Porta $porta ocupada por OUTRO processo — nada foi feito." }
@@ -120,7 +122,7 @@ switch ($Acao) {
     IniciarProcesso
     GarantirReplicaSet
     $creds = @{}
-    foreach ($p in 'admin', 'restore', 'leitor') { $c = Get-CredencialIsolada $Raiz $p; $creds[$p] = @{ usuario = $c.Usuario; senha = (ConvertFrom-SenhaSegura $c.Senha) } }
+    foreach ($p in 'admin', 'restore', 'guardiao', 'leitor') { $c = Get-CredencialIsolada $Raiz $p; $creds[$p] = @{ usuario = $c.Usuario; senha = (ConvertFrom-SenhaSegura $c.Senha) } }
     $entrada = $creds | ConvertTo-Json -Compress
     $creds = $null
     $r = Invoke-Nativo -Programa (Get-CaminhoBun) -Argumentos @("--no-env-file", (Join-Path $PSScriptRoot "lib\cli.ts"), "configurar-autenticacao", "--porta", "$porta", "--raiz", $Raiz) -Entrada $entrada
@@ -128,9 +130,11 @@ switch ($Acao) {
     $linha = @($r.Saida -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') }) | Select-Object -Last 1
     $j = if ($linha) { $linha | ConvertFrom-Json } else { $null }
     if (-not ($j -and $j.ok)) { Falhar "configuração de autenticação falhou: $(if ($j) { $j.mensagem } else { 'sem resposta' })" }
+    $idLocal = Join-Path $Raiz "seguranca\instancia.json"
+    if (Test-Path -LiteralPath $idLocal) { Set-AclRestrita $idLocal }
     $e = Invoke-CliBackup -Argumentos @("local-estado", "--porta", "$porta") -Credencial (Get-CredencialIsolada $Raiz 'restore')
     if (-not ($e.ok -and $e.resultado.autenticacao)) { Falhar "autenticação não confirmada: $($e.mensagem)" }
-    [pscustomobject]@{ credenciaisCriadas = $criadas; bootstrapCriado = $j.resultado.bootstrapCriado; usuarios = $j.resultado.usuarios; semAuthRecusado = $j.resultado.semAuthRecusado; instancia = $e.resultado } | ConvertTo-Json -Compress -Depth 4
+    [pscustomobject]@{ credenciaisCriadas = $criadas; bootstrapCriado = $j.resultado.bootstrapCriado; identidadeCriada = $j.resultado.identidadeCriada; papeis = $j.resultado.papeis; usuarios = $j.resultado.usuarios; semAuthRecusado = $j.resultado.semAuthRecusado; instancia = $e.resultado } | ConvertTo-Json -Compress -Depth 4
     exit 0
   }
 }

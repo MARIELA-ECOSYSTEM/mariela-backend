@@ -54,6 +54,8 @@ function Get-CredencialIsolada([string]$Raiz, [string]$Papel) {
   if ((Get-CenarioTeste).semCredencial) { throw "credencial '$Papel' da instância isolada ausente" }
   return [pscustomobject]@{ Papel = $Papel; Usuario = "usuario_$Papel"; Senha = (ConvertTo-SecureString "senha-ficticia-de-teste-$Papel" -AsPlainText -Force) }
 }
+# Pasta de evidências: no stub, só cria a pasta (sem icacls).
+function Initialize-PastaEvidencias([string]$Raiz) { $d = Join-Path $Raiz "evidencias"; if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d | Out-Null }; return $d }
 function UltimaChamada([string]$Cmd) { return @(Get-Content -LiteralPath $env:MARIELA_TESTE_CHAMADAS -Encoding UTF8 | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.cmd -eq $Cmd }) | Select-Object -Last 1 }
 function Invoke-CliBackup {
   param([string[]]$Argumentos, $Credencial = $null)
@@ -109,14 +111,17 @@ function Invoke-CliBackup {
     "verificar-integridade" {
       $prot = $c.protecaoOk -ne $false
       $okI = $c.integridadeOk -ne $false
-      '{"ok":true,"resultado":' + (@{ ok = ($okI -and $prot); estado = "VERIFICADO"; verificacoes = @(@{ id = "destino.protegido"; ok = $prot; detalhe = "x" }, @{ id = "integridade.conteudo"; ok = $okI; detalhe = "x" }); divergencias = @($(if (-not $okI) { @{ colecao = "c1"; divergentes = 1 } })) } | ConvertTo-Json -Compress -Depth 6) + '}'
+      $okA = $c.ancoraOk -ne $false
+      $anc = @("ancora.cadeia", "ancora.execucao", "ancora.banco", "ancora.instancia", "ancora.archive", "ancora.manifesto", "ancora.caminhos", "ancora.estado") | ForEach-Object { @{ id = $_; ok = $(if ($_ -eq "ancora.archive") { $okA } else { $true }); detalhe = "x" } }
+      '{"ok":true,"resultado":' + (@{ ok = ($okI -and $prot -and $okA); estado = "VERIFICADO"; verificacoes = @($anc) + @(@{ id = "destino.protegido"; ok = $prot; detalhe = "x" }, @{ id = "integridade.conteudo"; ok = $okI; detalhe = "x" }); divergencias = @($(if (-not $okI) { @{ colecao = "c1"; divergentes = 1 } })) } | ConvertTo-Json -Compress -Depth 6) + '}'
     }
     "conferir-trava" { if ($c.travaOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"verificacoes":[{"id":"trava.dono_inicio","ok":false}]}}' } else { '{"ok":true,"resultado":{"ok":true,"verificacoes":[]}}' } }
+    "iniciar-uso" { if ($c.usoOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"estado":"INTERVENCAO_NECESSARIA","detalhe":"o destino não confere com o VERIFICADO"}}' } else { '{"ok":true,"resultado":{"ok":true,"estado":"EM_USO","detalhe":"EM_USO: 27 coleções descongeladas","descongeladas":["c1"]}}' } }
     "liberar-restore" { if ($c.liberarOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"estado":"INTERVENCAO_NECESSARIA","motivo":"o destino não é mais idêntico ao VERIFICADO"}}' } else { '{"ok":true,"resultado":{"ok":true,"estado":"LIBERACAO_AUTORIZADA","motivo":"VERIFICADO → LIBERACAO_AUTORIZADA"}}' } }
     "limpar-destino" {
       if ($c.limparOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"limpo":false,"motivo":"DADOS_ALHEIOS","detalhe":"produtos: 1 documento fora do archive","removidas":[],"preservadas":["produtos"],"estadoFinal":"INTERVENCAO_NECESSARIA"}}' }
       elseif ($c.lancarEmLimpeza) { '{"ok":false,"codigo":"UsoInvalidoErro","mensagem":"trava de restore não comprovada"}' }
-      else { '{"ok":true,"resultado":{"ok":true,"limpo":true,"removidas":["c1","_mariela_restore_posse"],"estadoFinal":"CANCELADO_COM_LIMPEZA_COMPROVADA"}}' }
+      else { '{"ok":true,"resultado":{"ok":true,"limpo":true,"removidas":["c1","_mariela_restore_posse"],"estadoFinal":"' + $(if ($o["modo"] -eq "descarte") { "DESCARTADO" } else { "CANCELADO_COM_LIMPEZA_COMPROVADA" }) + '","bancoRemovido":true,"restantes":[]}}' }
     }
     "derrubar-restore" { '{"ok":false,"codigo":"USO_INVALIDO","mensagem":"derrubar-restore foi removido"}' }
     default { throw "stub: comando inesperado $cmd" }
@@ -448,7 +453,7 @@ Write-Output "redirecionado=$redir bytes=[$hex]"
 
   # ======================= Fase 21.2.6: PASSOU estrito, credencial, processos e operador =======================
   Caso "A01-a" "qualquer condição de PASSOU falhando ⇒ nunca PASSOU (integridade, proteção, posse, vínculo SHA, trava)" {
-    $casos = @(@{ integridadeOk = $false; c = "conteudoIntegral" }, @{ protecaoOk = $false; c = "protecaoAtiva" }, @{ estadoInspecao = "VALIDANDO"; c = "posseVerificado" }, @{ shaDivergente = $true; c = "archiveEManifestoVinculados" }, @{ travaOk = $false; c = "travaEIdentidade" })
+    $casos = @(@{ integridadeOk = $false; c = "conteudoIntegral" }, @{ protecaoOk = $false; c = "protecaoAtiva" }, @{ estadoInspecao = "VALIDANDO"; c = "posseVerificado" }, @{ shaDivergente = $true; c = "archiveEManifestoVinculados" }, @{ ancoraOk = $false; c = "archiveEManifestoVinculados" }, @{ travaOk = $false; c = "travaEIdentidade" })
     $out = @()
     foreach ($k in $casos) {
       $cen = @{}; foreach ($ch in $k.Keys) { if ($ch -ne "c") { $cen[$ch] = $k[$ch] } }
@@ -457,12 +462,16 @@ Write-Output "redirecionado=$redir bytes=[$hex]"
       Exigir ($x.Rel.condicoesPassou.($k.c) -eq $false) "condição $($k.c) não registrada como falsa"
       $out += $k.c
     }
-    "5 condições forçadas a falhar → $($out.Count)× FALHOU_DESTINO_PARCIAL, nada removido"
+    "$($out.Count) cenários (5 condições + âncora externa divergente) → FALHOU_DESTINO_PARCIAL, nada removido"
   }
-  Caso "A03-a" "credencial: toda chamada à instância isolada leva a credencial de RESTORE; a senha nunca aparece em argumento/relatório" {
+  Caso "A03-a" "credenciais SEPARADAS (21.2.8): leituras com RESTORE, transições com GUARDIÃO; a senha nunca aparece em argumento/relatório" {
     $x = Restore @{}
-    $isoladas = @($x.Chamadas | Where-Object { $_.cmd -in @("preparar-restore", "adquirir-posse", "marcar-estado", "congelar-e-verificar", "inspecionar-destino", "verificar-integridade") })
-    Exigir ($isoladas.Count -ge 6 -and @($isoladas | Where-Object { $_.credencial -ne "restore" }).Count -eq 0) "chamada sem credencial de restore"
+    $leituras = @($x.Chamadas | Where-Object { $_.cmd -in @("preparar-restore", "inspecionar-destino", "verificar-integridade") })
+    $transicoes = @($x.Chamadas | Where-Object { $_.cmd -in @("adquirir-posse", "marcar-estado", "congelar-e-verificar") })
+    Exigir ($leituras.Count -ge 3 -and @($leituras | Where-Object { $_.credencial -ne "restore" }).Count -eq 0) "leitura sem credencial de restore"
+    Exigir ($transicoes.Count -ge 3 -and @($transicoes | Where-Object { $_.credencial -ne "guardiao" }).Count -eq 0) "transição sem credencial de guardião"
+    Exigir (@($transicoes | Where-Object { -not $_.o.arquivo -or -not $_.o.manifesto }).Count -eq 0) "transição sem archive/manifesto (âncora externa)"
+    $isoladas = $leituras + $transicoes
     $todas = ($x.Chamadas | ConvertTo-Json -Depth 6 -Compress)
     $mr = @($x.Chamadas | Where-Object { $_.cmd -eq "mongorestore" })[0]
     Exigir ($mr.stdin -eq "senha-ficticia-de-teste-restore") "mongorestore não recebeu a senha pelo stdin"
@@ -471,7 +480,7 @@ Write-Output "redirecionado=$redir bytes=[$hex]"
     Exigir (($x.Rel | ConvertTo-Json -Depth 10) -notmatch "senha-ficticia") "senha no relatório"
     $y = Restore @{ semCredencial = $true }
     Exigir ($y.Codigo -eq 1 -and $y.Cmds -notcontains "adquirir-posse" -and $y.Cmds -notcontains "mongorestore") "seguiu sem credencial"
-    "$($isoladas.Count) chamadas com credencial de restore; senha só no stdin do mongorestore; sem credencial → recusa antes de escrever"
+    "$($leituras.Count) leituras (restore) + $($transicoes.Count) transições (guardião, com archive/manifesto); senha só no stdin do mongorestore; sem credencial → recusa antes de escrever"
   }
   Caso "A06-a" "Job Object: matar SÓ o PowerShell do restore durante o mongorestore mata o mongorestore (PS $versaoPs)" {
     $script:n++
@@ -517,9 +526,11 @@ Write-Output "redirecionado=$redir bytes=[$hex]"
     "processo cmd.exe citando o destino encontrado; encerrado → não listado"
   }
   $posseG = @{ execucaoId = "11111111-2222-3333-4444-555555555555"; estado = "VERIFICADO"; archive = $arq; manifesto = ($arq -replace '\.archive\.gz$', '.manifest.json') }
+  function ComEstado([string]$E) { $h = $posseG.Clone(); $h.estado = $E; return $h }
   function Gerir([string]$Acao, [hashtable]$Cenario, [string[]]$Extra = @()) {
     if (-not $Cenario.ContainsKey("evidencia")) { $Cenario.evidencia = $evOk }
-    $r = Rodar "gerir-restore.ps1" $Cenario (@("-Acao", $Acao, "-BancoDestino", "mariela_restore_20260101_000001", "-Raiz", $raizIsolada, "-DiretorioRelatorio", (Join-Path $raiz "relatorios")) + $Extra)
+    $arqs = if ($Acao -ne "Inspecionar" -and -not $Cenario.semArquivos) { @("-ArquivoBackup", $arq, "-Manifesto", ($arq -replace '\.archive\.gz$', '.manifest.json')) } else { @() }
+    $r = Rodar "gerir-restore.ps1" $Cenario (@("-Acao", $Acao, "-BancoDestino", "mariela_restore_20260101_000001", "-Raiz", $raizIsolada, "-DiretorioRelatorio", (Join-Path $raiz "relatorios")) + $arqs + $Extra)
     $relArq = Join-Path $raiz ("relatorios\gestao_mariela_restore_20260101_000001_{0}.json" -f $Acao.ToLowerInvariant())
     $rel = if (Test-Path -LiteralPath $relArq) { Get-Content -LiteralPath $relArq -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
     if (Test-Path -LiteralPath $relArq) { Remove-Item -LiteralPath $relArq }
@@ -533,7 +544,7 @@ Write-Output "redirecionado=$redir bytes=[$hex]"
     $ok = Gerir "Liberar" @{ posseGestao = $posseG } @("-ExecucaoId", $posseG.execucaoId)
     Exigir ($ok.Codigo -eq 0 -and $ok.Rel.resultado -eq "LIBERACAO_AUTORIZADA" -and $ok.Cmds -notcontains "limpar-destino") "liberação: $($ok.Rel.resultado)"
     $l = @($ok.Chamadas | Where-Object { $_.cmd -eq "liberar-restore" })[0]
-    Exigir ($l.o.'posse-execucao' -eq $posseG.execucaoId -and $l.o.'trava-execucao' -ne $posseG.execucaoId -and $l.credencial -eq "restore") "liberar-restore com parâmetros errados"
+    Exigir ($l.o.'posse-execucao' -eq $posseG.execucaoId -and $l.o.'trava-execucao' -ne $posseG.execucaoId -and $l.credencial -eq "guardiao" -and $l.o.arquivo -eq $arq) "liberar-restore com parâmetros errados"
     $div = Gerir "Liberar" @{ posseGestao = $posseG; liberarOk = $false } @("-ExecucaoId", $posseG.execucaoId)
     Exigir ($div.Codigo -eq 1 -and $div.Rel.estadoDepois -eq "INTERVENCAO_NECESSARIA") "divergência não virou INTERVENCAO"
     "sem/errado -ExecucaoId → recusado; ok → LIBERACAO_AUTORIZADA sem remoção; divergente → INTERVENCAO_NECESSARIA"
@@ -548,9 +559,37 @@ Write-Output "redirecionado=$redir bytes=[$hex]"
     Exigir ($mdb.Codigo -eq 1 -and @($mdb.Chamadas).Count -eq 0) "aceitou marielaDB"
     "Remover → limpar-destino --modo remocao → CANCELADO_COM_LIMPEZA_COMPROVADA; recusa → INTERVENCAO_NECESSARIA; marielaDB recusado sem chamadas"
   }
+  Caso "A21-7-02" "âncora externa: Verificar/Liberar/IniciarUso/Remover/Descartar SEM archive+manifesto do operador → recusados sem nenhuma chamada" {
+    $out = @()
+    foreach ($ac in "Verificar", "Liberar", "IniciarUso", "Remover", "Descartar") {
+      $x = Gerir $ac @{ posseGestao = $posseG; semArquivos = $true } @("-ExecucaoId", $posseG.execucaoId, "-ConfirmarBanco", "mariela_restore_20260101_000001")
+      Exigir ($x.Codigo -eq 1 -and $x.Cmds.Count -eq 0) "$ac aceitou sem archive/manifesto"
+      $out += $ac
+    }
+    $insp = Gerir "Inspecionar" @{ posseGestao = $posseG }
+    Exigir ($insp.Codigo -eq 0) "Inspecionar (só leitura) deveria dispensar os arquivos"
+    "$($out -join ', ') → recusados; Inspecionar (só leitura) dispensa"
+  }
+  Caso "A21-7-05" "ciclo de vida: IniciarUso exige -ConfirmarBanco e o guardião; Descartar usa o modo 'descarte'; nenhum descongela sem comando explícito" {
+    $sem = Gerir "IniciarUso" @{ posseGestao = $posseG } @("-ExecucaoId", $posseG.execucaoId)
+    Exigir ($sem.Codigo -eq 1 -and $sem.Cmds.Count -eq 0) "IniciarUso sem -ConfirmarBanco aceito"
+    $errado = Gerir "IniciarUso" @{ posseGestao = $posseG } @("-ExecucaoId", $posseG.execucaoId, "-ConfirmarBanco", "mariela_restore_20260101_000002")
+    Exigir ($errado.Codigo -eq 1 -and $errado.Cmds.Count -eq 0) "IniciarUso com -ConfirmarBanco errado aceito"
+    $ok = Gerir "IniciarUso" @{ posseGestao = (ComEstado "LIBERACAO_AUTORIZADA") } @("-ExecucaoId", $posseG.execucaoId, "-ConfirmarBanco", "mariela_restore_20260101_000001")
+    $u = @($ok.Chamadas | Where-Object { $_.cmd -eq "iniciar-uso" })
+    Exigir ($ok.Codigo -eq 0 -and $ok.Rel.resultado -eq "EM_USO" -and $u.Count -eq 1 -and $u[0].credencial -eq "guardiao" -and $u[0].o.'confirmar-banco' -eq "mariela_restore_20260101_000001") "IniciarUso: $($ok.Rel.resultado)"
+    $lib = Gerir "Liberar" @{ posseGestao = $posseG } @("-ExecucaoId", $posseG.execucaoId)
+    Exigir ($lib.Cmds -notcontains "iniciar-uso") "Liberar disparou descongelamento"
+    $semD = Gerir "Descartar" @{ posseGestao = (ComEstado "EM_USO") } @("-ExecucaoId", $posseG.execucaoId)
+    Exigir ($semD.Codigo -eq 1 -and $semD.Cmds.Count -eq 0) "Descartar sem -ConfirmarBanco aceito"
+    $d = Gerir "Descartar" @{ posseGestao = (ComEstado "EM_USO") } @("-ExecucaoId", $posseG.execucaoId, "-ConfirmarBanco", "mariela_restore_20260101_000001")
+    $l = @($d.Chamadas | Where-Object { $_.cmd -eq "limpar-destino" })
+    Exigir ($d.Codigo -eq 0 -and $d.Rel.resultado -eq "DESCARTADO" -and $l.Count -eq 1 -and $l[0].o.modo -eq "descarte" -and $l[0].credencial -eq "guardiao") "Descartar: $($d.Rel.resultado)"
+    "IniciarUso: sem/errado -ConfirmarBanco → recusado; ok → EM_USO (guardião); Liberar não descongela; Descartar → modo 'descarte' → DESCARTADO"
+  }
   Caso "A06-d" "recuperar-destino: recusa VERIFICADO, dono vivo e processo que cita o destino; só então limpa (modo recuperacao)" {
     $base = @{ execucaoId = "11111111-2222-3333-4444-555555555555"; archive = $arq; manifesto = ($arq -replace '\.archive\.gz$', '.manifest.json'); archiveSha256 = (Get-Sha256 $arq); manifestoSha256 = (Get-Sha256 ($arq -replace '\.archive\.gz$', '.manifest.json')) }
-    $rodar = { param($posse, [switch]$Remover) $a = @("-BancoDestino", "mariela_restore_20260101_000001", "-Raiz", $raizIsolada, "-DiretorioRelatorio", (Join-Path $raiz "relatorios")); if ($Remover) { $a += "-Remover" }; Rodar "recuperar-destino.ps1" @{ evidencia = $evOk; posseGestao = $posse } $a }
+    $rodar = { param($posse, [switch]$Remover, [switch]$SemArquivos) $a = @("-BancoDestino", "mariela_restore_20260101_000001", "-Raiz", $raizIsolada, "-DiretorioRelatorio", (Join-Path $raiz "relatorios")); if ($Remover) { $a += "-Remover"; if (-not $SemArquivos) { $a += @("-ArquivoBackup", $arq, "-Manifesto", ($arq -replace '\.archive\.gz$', '.manifest.json')) } }; Rodar "recuperar-destino.ps1" @{ evidencia = $evOk; posseGestao = $posse } $a }
     $v = & $rodar ($base + @{ estado = "VERIFICADO"; pid = 999999; processoInicioTicks = "1" }) -Remover
     Exigir ($v.Codigo -eq 1 -and @($v.Chamadas | Where-Object { $_.cmd -eq "limpar-destino" }).Count -eq 0) "limpou VERIFICADO"
     $vivo = & $rodar ($base + @{ estado = "RESTAURANDO"; pid = $PID; processoInicioTicks = (Get-InicioProcesso $PID) }) -Remover
@@ -563,7 +602,14 @@ Write-Output "redirecionado=$redir bytes=[$hex]"
       $orfao = & $rodar ($base + @{ estado = "RESTAURANDO"; pid = 999999; processoInicioTicks = "1" }) -Remover
     } finally { Stop-Process -Id $dummy.Id -Force -ErrorAction SilentlyContinue }
     Exigir ($orfao.Codigo -eq 1 -and @($orfao.Chamadas | Where-Object { $_.cmd -eq "limpar-destino" }).Count -eq 0) "limpou com processo órfão citando o destino"
-    "VERIFICADO → recusado; dono vivo → recusado; PID reutilizado → limpeza (modo recuperacao); órfão citando o destino → recusado"
+    $semArq = & $rodar ($base + @{ estado = "RESTAURANDO"; pid = 999999; processoInicioTicks = "1" }) -Remover -SemArquivos
+    Exigir ($semArq.Codigo -eq 1 -and @($semArq.Chamadas).Count -eq 0) "-Remover sem archive/manifesto do operador foi aceito"
+    foreach ($e in "REMOVENDO", "CANCELADO_COM_LIMPEZA_COMPROVADA") {
+      $rr = & $rodar ($base + @{ estado = $e; pid = 999999; processoInicioTicks = "1" }) -Remover
+      $li = @($rr.Chamadas | Where-Object { $_.cmd -eq "limpar-destino" })
+      Exigir ($rr.Codigo -eq 0 -and $li.Count -eq 1 -and $li[0].o.modo -eq "recuperacao" -and $li[0].credencial -eq "guardiao" -and $li[0].o.arquivo -eq $arq) "estado $e não retomado pela recuperação"
+    }
+    "VERIFICADO → recusado; dono vivo → recusado; PID reutilizado → limpeza; órfão citando o destino → recusado; sem archive do operador → recusado; REMOVENDO e CANCELADO órfão → retomados (guardião, archive do operador)"
   }
 } finally {
   Remove-Item Env:MARIELA_TESTE_CENARIO, Env:MARIELA_TESTE_CHAMADAS -ErrorAction SilentlyContinue

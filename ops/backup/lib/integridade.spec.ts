@@ -138,7 +138,10 @@ describe("máquina de estados do destino", () => {
     expect(transicaoPermitida("RESTAURANDO", "VALIDANDO")).toBe(true);
     expect(transicaoPermitida("VALIDANDO", "VERIFICADO")).toBe(true);
     expect(transicaoPermitida("VERIFICADO", "LIBERACAO_AUTORIZADA")).toBe(true);
-    expect(transicaoPermitida("VERIFICADO", "CANCELADO_COM_LIMPEZA_COMPROVADA")).toBe(true);
+    // Fase 21.2.8 (A21-7-04): remoção sempre via REMOVENDO.
+    expect(transicaoPermitida("VERIFICADO", "REMOVENDO")).toBe(true);
+    expect(transicaoPermitida("REMOVENDO", "CANCELADO_COM_LIMPEZA_COMPROVADA")).toBe(true);
+    expect(transicaoPermitida("VERIFICADO", "CANCELADO_COM_LIMPEZA_COMPROVADA")).toBe(false);
   });
   it("atalhos proibidos", () => {
     expect(transicaoPermitida("RESTAURANDO", "VERIFICADO")).toBe(false); // sem validar

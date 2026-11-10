@@ -1,19 +1,40 @@
 import { existsSync, linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { MongoClient, type Document } from "mongodb";
-import { ArchiveInvalidoErro, conteudoDoArchiveGzipDoArquivo, lerArchiveGzipDoArquivo, sha256DoArquivo, type ArchiveLido } from "./archive.js";
-import { conteudoPorColecao } from "./integridade.js";
+import {
+  ArchiveInvalidoErro,
+  CAMPOS_VALIDACAO,
+  conteudoDoArchive,
+  descompactar,
+  lerArchive,
+  lerArchiveGzipDoArquivo,
+  sha256DoArquivo,
+  type ArchiveLido,
+  type EspecificacaoIndice,
+  type Verificacao,
+} from "./archive.js";
+import { acrescentarAncora, conferirAncora, criarAncora, estadosAdmitidos, lerAncora, lerCadeia, ultimasEvidencias } from "./ancora.js";
+import { conteudoPorColecao, type ComparacaoColecao } from "./integridade.js";
 import {
   adquirirPosse,
   COLECAO_POSSE,
+  conferirIdentidadePosse,
   congelarDestino,
+  ESTADOS_POR_MODO,
+  estaCongelada,
+  infoColecoes,
+  iniciarUso,
   limparDestinoComPosse,
   mesmasEvidencias,
   posseAtual,
   transicionar,
   verificarDestino,
+  type Ancorador,
+  type DocumentoPosse,
+  type ModoLimpeza,
   type ReferenciaArchive,
 } from "./posse.js";
+import { raizIsolada } from "./instancia.js";
 import { caminhoTrava, inicioDoProcesso, verificarTrava } from "./trava.js";
 import { ConfigMongoErro, lerConfigMongo, sanitizarMensagem } from "./config-mongo.js";
 import {
@@ -31,9 +52,10 @@ import {
   BANCO_ORIGEM,
   COLECOES_BACKUP,
   COLECOES_EXCLUIDAS,
-  ESTADOS_INTERROMPIVEIS,
+  garantiasDoEstado,
   JANELA,
   MARGEM_RECONCILIACAO_MINUTOS,
+  PRIVILEGIOS_GUARDIAO,
   PRIVILEGIOS_RESTORE,
   RESTORE,
   type EstadoDestino,
@@ -368,7 +390,7 @@ function derrubarRestoreRemovido(): never {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// POSSE persistente, integridade e limpeza comprovada (Fases 21.2.4 e 21.2.6)
+// POSSE persistente, âncora externa, integridade e limpeza comprovada (Fases 21.2.4, 21.2.6 e 21.2.8)
 // ---------------------------------------------------------------------------------------------------------------
 
 /** Trava segura por QUEM chamou esta CLI (PID + horário de criação), nomeando a execução informada. Senão: recusa. */
@@ -382,6 +404,87 @@ function exigirExecucao(valor: string): string {
   return valor.toLowerCase();
 }
 
+/**
+ * A21-7-06 — IDENTIDADE da instância: documento gravado NA instância pelo bootstrap + cópia local
+ * (`<raiz>/seguranca/instancia.json`). Os dois têm de existir e coincidir; senão nada é feito.
+ */
+async function identidadeInstancia(c: MongoClient, raiz: string | undefined): Promise<string> {
+  const doc = await c.db(RESTORE.identidade.banco).collection(RESTORE.identidade.colecao).findOne({ _id: RESTORE.identidade.id as never });
+  const arq = join(raizIsolada(raiz), ...RESTORE.identidade.arquivoLocal.split("/"));
+  const local = existsSync(arq) ? (JSON.parse(readFileSync(arq, "utf8").replace(/^﻿/, "")) as { instanciaId?: string }) : null;
+  const naInstancia = typeof doc?.["instanciaId"] === "string" ? (doc["instanciaId"] as string) : null;
+  if (!naInstancia || !local?.instanciaId || naInstancia !== local.instanciaId) {
+    throw new UsoInvalidoErro(`identidade da instância não comprovada (na instância: ${naInstancia ? "presente" : "AUSENTE"}; local: ${local?.instanciaId ? "presente" : "AUSENTE"}; ${naInstancia && local?.instanciaId ? "DIFERENTES" : "-"}) — execute mongod-isolado.ps1 -Acao ConfigurarAutenticacao`);
+  }
+  return naInstancia;
+}
+
+/** Identidade isolada (processo/bind/dbPath/marcador/rs) + identidade da instância. */
+async function contextoIsolado(c: MongoClient, o: Record<string, string>): Promise<{ instanciaId: string }> {
+  await exigirInstanciaIsolada(c, o["raiz"]);
+  return { instanciaId: await identidadeInstancia(c, o["raiz"]) };
+}
+
+/** A21-7-02 — registra cada transição na âncora EXTERNA (intenção antes do CAS, confirmação depois). */
+function ancoradorPara(raiz: string | undefined, banco: string, execucaoId: string, instanciaId: string): Ancorador {
+  const base = { banco, execucaoId, instanciaId };
+  return {
+    intencao: (de, para, detalhe) => acrescentarAncora(raiz, { ...base, evento: "INTENCAO", de, para, detalhe }),
+    confirmacao: (de, para, detalhe) => acrescentarAncora(raiz, { ...base, evento: "CONFIRMACAO", de, para, detalhe }),
+    evidencias: (e) => acrescentarAncora(raiz, { ...base, evento: "EVIDENCIAS", evidencias: { documentos: e.documentos, hashesPorColecao: e.hashesPorColecao, uuidsPorColecao: e.uuidsPorColecao } }),
+  };
+}
+
+/** Referência de integridade a partir do ARCHIVE informado pelo operador (conteúdo, índices completos, opções). */
+function referenciaDoArchive(arquivo: string): ReferenciaArchive {
+  const dados = descompactar(readFileSync(arquivo));
+  const lido = lerArchive(dados);
+  const especificacoesPorColecao: Record<string, EspecificacaoIndice[]> = {};
+  const opcoesPorColecao: Record<string, Record<string, unknown>> = {};
+  for (const c of lido.colecoes) {
+    if (c.db !== BANCO_ORIGEM) continue;
+    especificacoesPorColecao[c.colecao] = c.especificacoes;
+    opcoesPorColecao[c.colecao] = c.opcoes;
+    // Política (21.1): coleções SEM validador próprio. O congelamento usa o trio de validação — um validador do archive
+    // seria sobrescrito; isso é recusado em vez de ignorado.
+    for (const campo of CAMPOS_VALIDACAO) if (c.opcoes[campo] !== undefined) throw new UsoInvalidoErro(`o archive traz '${campo}' em ${c.colecao}: não suportado pelo congelamento (revisar a política)`);
+  }
+  return { conteudoPorColecao: conteudoPorColecao(conteudoDoArchive(dados)), especificacoesPorColecao, opcoesPorColecao };
+}
+
+/**
+ * A21-7-02 — confere a âncora externa: arquivos INFORMADOS PELO OPERADOR (`--arquivo`, `--manifesto`; nunca os caminhos
+ * da posse), o `<archive>.sha256` e o manifesto do diretório de backup, o registro local e a posse. Devolve as
+ * verificações; o chamador recusa se qualquer uma falhar.
+ */
+async function conferirAncoraCmd(o: Record<string, string>, banco: string, instanciaId: string, posse: DocumentoPosse | null): Promise<Verificacao[]> {
+  const arquivo = exigir(o, "arquivo");
+  const caminhoManifesto = exigir(o, "manifesto");
+  if (!existsSync(arquivo) || !existsSync(caminhoManifesto)) return [{ id: "ancora.arquivos", ok: false, detalhe: "archive ou manifesto informado não existe" }];
+  const shaArq = await sha256DoArquivo(arquivo);
+  const shaMan = await sha256DoArquivo(caminhoManifesto);
+  const arqSha = `${arquivo}.sha256`;
+  const shaDoArquivoSha256 = existsSync(arqSha) ? (readFileSync(arqSha, "utf8").trim().split(/\s+/)[0] ?? null) : null;
+  let shaDoManifesto: string | null = null;
+  try {
+    shaDoManifesto = lerJson<Manifesto>(caminhoManifesto).archive?.sha256 ?? null;
+  } catch {
+    shaDoManifesto = null;
+  }
+  const texto = posse ? lerAncora(o["raiz"], banco, posse.execucaoId) : null;
+  return conferirAncora(texto, {
+    banco,
+    instanciaId,
+    posse: posse ? { execucaoId: posse.execucaoId, estado: posse.estado, banco: posse.banco, instanciaId: posse.instanciaId, archiveSha256: posse.archiveSha256, manifestoSha256: posse.manifestoSha256, archive: posse.archive, manifesto: posse.manifesto, evidencias: posse.evidencias } : null,
+    archiveInformado: { caminho: arquivo, sha256: shaArq },
+    manifestoInformado: { caminho: caminhoManifesto, sha256: shaMan },
+    shaDoArquivoSha256,
+    shaDoManifesto,
+  });
+}
+
+const falhasDe = (v: Verificacao[]) => v.filter((x) => !x.ok);
+
 async function adquirirPosseCmd(o: Record<string, string>) {
   const banco = exigir(o, "banco");
   exigirBancoRestore(banco);
@@ -389,22 +492,26 @@ async function adquirirPosseCmd(o: Record<string, string>) {
   const arquivo = exigir(o, "arquivo");
   const manifesto = exigir(o, "manifesto");
   const ticks = exigir(o, "processo-inicio-ticks");
-  // O horário de criação informado tem de ser o do processo que chamou (comprovado pelo SO), não um valor qualquer.
   if (!/^\d+$/.test(ticks) || inicioDoProcesso(process.ppid) !== BigInt(ticks)) throw new UsoInvalidoErro("horário de criação do processo chamador não confere");
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
-    await exigirInstanciaIsolada(c, o["raiz"]);
+    const { instanciaId } = await contextoIsolado(c, o);
     exigirTrava(o, execucaoId);
+    const archiveSha256 = await sha256DoArquivo(arquivo);
+    const manifestoSha256 = await sha256DoArquivo(manifesto);
+    // Âncora externa ANTES da posse no banco (`wx`: nunca reaproveita um registro).
+    criarAncora(o["raiz"], { evento: "POSSE", banco, execucaoId, instanciaId, archive: { caminho: arquivo, sha256: archiveSha256 }, manifesto: { caminho: manifesto, sha256: manifestoSha256 } });
     const r = await adquirirPosse(c.db(banco), {
       execucaoId,
+      banco,
+      instanciaId,
       pid: process.ppid,
       processoInicio: exigir(o, "processo-inicio"),
       processoInicioTicks: ticks,
       executavel: exigir(o, "executavel"),
-      banco,
       archive: arquivo,
-      archiveSha256: await sha256DoArquivo(arquivo),
+      archiveSha256,
       manifesto,
-      manifestoSha256: await sha256DoArquivo(manifesto),
+      manifestoSha256,
     });
     return { ok: r.adquirida, ...r };
   });
@@ -418,87 +525,93 @@ async function marcarEstadoCmd(o: Record<string, string>) {
   const para = exigir(o, "para") as EstadoDestino;
   if (para !== "RESTAURANDO" && para !== "FALHOU_DESTINO_PARCIAL") throw new UsoInvalidoErro(`marcar-estado só aceita RESTAURANDO ou FALHOU_DESTINO_PARCIAL (recebido ${para})`);
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
-    await exigirInstanciaIsolada(c, o["raiz"]);
+    const { instanciaId } = await contextoIsolado(c, o);
     exigirTrava(o, execucaoId);
-    return transicionar(c.db(banco), execucaoId, para, o["detalhe"] ?? "");
+    const db = c.db(banco);
+    const posse = await posseAtual(db, execucaoId, instanciaId);
+    const anc = await conferirAncoraCmd(o, banco, instanciaId, posse.documento);
+    if (falhasDe(anc).length) return { ok: false, de: posse.documento?.estado ?? null, detalhe: `âncora externa não confere: ${falhasDe(anc).map((f) => f.id).join(", ")}`, verificacoes: anc };
+    return transicionar(db, execucaoId, instanciaId, para, o["detalhe"] ?? "", ancoradorPara(o["raiz"], banco, execucaoId, instanciaId));
   });
 }
 
-/** A posse vincula o archive E o manifesto por SHA-256 (A-08): os arquivos informados têm de ser exatamente esses. */
-async function referenciaVinculada(o: Record<string, string>, posse: { archiveSha256?: string; manifestoSha256?: string } | null): Promise<{ ref: ReferenciaArchive; manifesto: Manifesto } | { erro: string }> {
-  const arquivo = exigir(o, "arquivo");
-  const caminhoManifesto = exigir(o, "manifesto");
-  if (!posse) return { erro: "sem documento de posse" };
-  if (posse.archiveSha256 !== (await sha256DoArquivo(arquivo))) return { erro: "ARCHIVE_DIVERGENTE: o archive informado não é o vinculado à posse" };
-  if (posse.manifestoSha256 !== (await sha256DoArquivo(caminhoManifesto))) return { erro: "MANIFESTO_DIVERGENTE: o manifesto informado não é o vinculado à posse" };
-  const manifesto = lerJson<Manifesto>(caminhoManifesto);
-  if (manifesto.archive?.sha256 !== posse.archiveSha256) return { erro: "MANIFESTO_DIVERGENTE: o manifesto não descreve este archive" };
-  return { ref: { conteudoPorColecao: conteudoPorColecao(conteudoDoArchiveGzipDoArquivo(arquivo)), indicesPorColecao: manifesto.indices?.porColecao ?? {} }, manifesto };
-}
-
 /**
- * A-01 — RESTAURANDO → VALIDANDO → (congela) → verificação INTEGRAL → VERIFICADO (com evidências) → SEGUNDA verificação
- * com o destino já VERIFICADO e protegido: tem de dar as MESMAS evidências; senão INTERVENCAO_NECESSARIA.
+ * A-01 — (congela) → RESTAURANDO → VALIDANDO → verificação INTEGRAL → VERIFICADO (evidências na posse E na âncora) →
+ * SEGUNDA verificação com o destino já VERIFICADO: tem de dar as MESMAS evidências; senão INTERVENCAO_NECESSARIA.
  */
 async function congelarEVerificarCmd(o: Record<string, string>) {
   const banco = exigir(o, "banco");
   exigirBancoRestore(banco);
   const execucaoId = exigirExecucao(exigir(o, "execucao"));
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
-    await exigirInstanciaIsolada(c, o["raiz"]);
+    const { instanciaId } = await contextoIsolado(c, o);
     exigirTrava(o, execucaoId);
     const db = c.db(banco);
-    const posse = await posseAtual(db, execucaoId);
-    const vinculo = await referenciaVinculada(o, posse.documento);
-    if ("erro" in vinculo) return { ok: false, estado: posse.documento?.estado ?? null, motivo: vinculo.erro, verificacoes: [] };
+    const ancora = ancoradorPara(o["raiz"], banco, execucaoId, instanciaId);
+    const posse = await posseAtual(db, execucaoId, instanciaId);
+    const anc = await conferirAncoraCmd(o, banco, instanciaId, posse.documento);
+    if (falhasDe(anc).length) return { ok: false, estado: posse.documento?.estado ?? null, motivo: `âncora externa não confere: ${falhasDe(anc).map((f) => `${f.id} (${f.detalhe})`).join("; ")}`, verificacoes: anc };
     if (!posse.ok || posse.documento?.estado !== "RESTAURANDO") return { ok: false, estado: posse.documento?.estado ?? null, motivo: `validação exige posse RESTAURANDO desta execução (${posse.detalhe})`, verificacoes: [] };
+    const ref = referenciaDoArchive(exigir(o, "arquivo"));
+    const manifesto = lerJson<Manifesto>(exigir(o, "manifesto"));
     // CONGELA ANTES de declarar VALIDANDO: "VALIDANDO" significa sempre "destino já protegido".
     const cong = await congelarDestino(db);
     if (!cong.ok) return { ok: false, estado: "RESTAURANDO", motivo: `congelamento recusado: ${cong.detalhe}`, verificacoes: [] };
-    const t1 = await transicionar(db, execucaoId, "VALIDANDO", `destino congelado (${cong.detalhe}); validando`, {}, ["RESTAURANDO"]);
+    const t1 = await transicionar(db, execucaoId, instanciaId, "VALIDANDO", `destino congelado (${cong.detalhe}); validando`, ancora, {}, ["RESTAURANDO"]);
     if (!t1.ok) return { ok: false, estado: t1.de, motivo: `transição para VALIDANDO recusada: ${t1.detalhe}`, verificacoes: [] };
     exigirTrava(o, execucaoId);
-    const v1 = await verificarDestino(db, execucaoId, vinculo.ref);
-    // Cruzamento extra com o manifesto (contagens, referências e sequências registradas na origem).
-    const manif = await validarRestaurado(db, vinculo.manifesto);
+    const v1 = await verificarDestino(db, execucaoId, instanciaId, ref);
+    const manif = await validarRestaurado(db, manifesto);
     const verificacoes = [...v1.verificacoes, ...manif];
     if (!v1.ok || manif.some((x) => !x.ok)) return { ok: false, estado: "VALIDANDO", motivo: "verificação de integridade reprovada", verificacoes, comparacoes: v1.comparacoes.filter((x) => !x.ok) };
     exigirTrava(o, execucaoId);
-    const t2 = await transicionar(db, execucaoId, "VERIFICADO", "conteúdo idêntico ao archive; destino protegido", { evidencias: { ...v1.evidencias, verificacoes } }, ["VALIDANDO"]);
+    ancora.evidencias(v1.evidencias);
+    const t2 = await transicionar(db, execucaoId, instanciaId, "VERIFICADO", "conteúdo, índices e opções idênticos ao archive; destino protegido", ancora, { evidencias: { ...v1.evidencias, verificacoes } }, ["VALIDANDO"]);
     if (!t2.ok) return { ok: false, estado: t2.de, motivo: `transição para VERIFICADO recusada: ${t2.detalhe}`, verificacoes };
-    const v2 = await verificarDestino(db, execucaoId, vinculo.ref);
+    const v2 = await verificarDestino(db, execucaoId, instanciaId, ref);
     if (!v2.ok || !mesmasEvidencias(v1.evidencias, v2.evidencias)) {
-      const ti = await transicionar(db, execucaoId, "INTERVENCAO_NECESSARIA", "o destino mudou depois da verificação", { intervencao: { em: new Date(), motivo: "segunda verificação divergente" } });
+      const ti = await transicionar(db, execucaoId, instanciaId, "INTERVENCAO_NECESSARIA", "o destino mudou depois da verificação", ancora, { intervencao: { em: new Date(), motivo: "segunda verificação divergente" } });
       return { ok: false, estado: ti.ok ? "INTERVENCAO_NECESSARIA" : null, motivo: "o destino mudou entre a verificação e o registro de VERIFICADO", verificacoes: v2.verificacoes };
     }
     return { ok: true, estado: "VERIFICADO", verificacoes, evidencias: { ...v1.evidencias, verificacoes: undefined }, segundaVerificacao: v2.evidencias.verificadoEm };
   });
 }
 
-/** Somente leitura: o destino continua IDÊNTICO às evidências registradas no VERIFICADO (e ao archive)? */
+/**
+ * Reverificação COMPLETA (só leitura no banco): identidade, âncora externa (arquivos do operador), proteção completa,
+ * conteúdo/índices/opções iguais ao archive e às evidências registradas (na posse E na âncora).
+ */
+async function reverificar(c: MongoClient, o: Record<string, string>, banco: string, execucaoId: string, instanciaId: string) {
+  const db = c.db(banco);
+  const posse = await posseAtual(db, execucaoId, instanciaId);
+  const anc = await conferirAncoraCmd(o, banco, instanciaId, posse.documento);
+  if (falhasDe(anc).length) return { ok: false, posse, verificacoes: anc, divergencias: [] as ComparacaoColecao[], evidencias: null };
+  const v = await verificarDestino(db, execucaoId, instanciaId, referenciaDoArchive(exigir(o, "arquivo")));
+  const registradas = posse.documento?.evidencias;
+  const daAncora = ultimasEvidencias(lerCadeia(lerAncora(o["raiz"], banco, execucaoId) ?? "").entradas);
+  const iguais = !!registradas && !!daAncora && mesmasEvidencias(registradas, v.evidencias) && JSON.stringify(daAncora.hashesPorColecao) === JSON.stringify(v.evidencias.hashesPorColecao) && JSON.stringify(daAncora.uuidsPorColecao) === JSON.stringify(v.evidencias.uuidsPorColecao);
+  const verificacoes = [...anc, ...v.verificacoes, { id: "evidencias.iguais_ao_verificado", ok: iguais, detalhe: iguais ? "mesmos hashes, UUIDs, índices e opções do VERIFICADO (posse e âncora)" : "diferente das evidências registradas" }];
+  return { ok: v.ok && iguais, posse, verificacoes, divergencias: v.comparacoes.filter((x) => !x.ok), evidencias: v.evidencias };
+}
+
 async function verificarIntegridadeCmd(o: Record<string, string>) {
   const banco = exigir(o, "banco");
   exigirBancoRestore(banco);
   const execucaoId = exigirExecucao(exigir(o, "posse-execucao"));
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
-    await exigirInstanciaIsolada(c, o["raiz"]);
-    const db = c.db(banco);
-    const posse = await posseAtual(db, execucaoId);
-    const vinculo = await referenciaVinculada(o, posse.documento);
-    if ("erro" in vinculo) return { ok: false, estado: posse.documento?.estado ?? null, motivo: vinculo.erro, verificacoes: [] };
-    const v = await verificarDestino(db, execucaoId, vinculo.ref);
-    const registradas = posse.documento?.evidencias;
-    const iguais = !!registradas && mesmasEvidencias(registradas, v.evidencias);
-    return {
-      ok: v.ok && iguais,
-      estado: posse.documento?.estado ?? null,
-      verificacoes: [...v.verificacoes, { id: "evidencias.iguais_ao_verificado", ok: iguais, detalhe: registradas ? (iguais ? "mesmos hashes e UUIDs do VERIFICADO" : "hashes/UUIDs diferentes dos registrados") : "sem evidências registradas" }],
-      divergencias: v.comparacoes.filter((x) => !x.ok),
-    };
+    const { instanciaId } = await contextoIsolado(c, o);
+    const r = await reverificar(c, o, banco, execucaoId, instanciaId);
+    const estado = r.posse.documento?.estado ?? null;
+    return { ok: r.ok, estado, garantias: estado ? garantiasDoEstado(estado) : null, verificacoes: r.verificacoes, divergencias: r.divergencias };
   });
 }
 
-/** VERIFICADO → LIBERACAO_AUTORIZADA, por comando EXPLÍCITO do operador, depois de reverificar tudo. Não remove nada. */
+/** Reverificação divergente num destino que se dizia íntegro ⇒ INTERVENCAO_NECESSARIA (com âncora). */
+async function intervirPorDivergencia(c: MongoClient, o: Record<string, string>, banco: string, execucaoId: string, instanciaId: string, motivo: string) {
+  return transicionar(c.db(banco), execucaoId, instanciaId, "INTERVENCAO_NECESSARIA", motivo, ancoradorPara(o["raiz"], banco, execucaoId, instanciaId), { intervencao: { em: new Date(), motivo } }).catch(() => ({ ok: false }));
+}
+
+/** VERIFICADO → LIBERACAO_AUTORIZADA, por comando EXPLÍCITO do operador, depois de reverificar tudo. Não descongela. */
 async function liberarRestoreCmd(o: Record<string, string>) {
   const banco = exigir(o, "banco");
   exigirBancoRestore(banco);
@@ -506,92 +619,118 @@ async function liberarRestoreCmd(o: Record<string, string>) {
   const execucaoId = exigirExecucao(exigir(o, "posse-execucao"));
   const operador = exigir(o, "operador");
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
-    await exigirInstanciaIsolada(c, o["raiz"]);
+    const { instanciaId } = await contextoIsolado(c, o);
     exigirTrava(o, operacao);
-    const db = c.db(banco);
-    const posse = await posseAtual(db, execucaoId);
-    if (!posse.ok || posse.documento?.estado !== "VERIFICADO") return { ok: false, estado: posse.documento?.estado ?? null, motivo: `liberação exige posse VERIFICADO desta execução (${posse.detalhe})` };
-    const vinculo = await referenciaVinculada(o, posse.documento);
-    if ("erro" in vinculo) return { ok: false, estado: "VERIFICADO", motivo: vinculo.erro };
-    const v = await verificarDestino(db, execucaoId, vinculo.ref);
-    if (!v.ok || !posse.documento.evidencias || !mesmasEvidencias(posse.documento.evidencias, v.evidencias)) {
-      const ti = await transicionar(db, execucaoId, "INTERVENCAO_NECESSARIA", "reverificação da liberação divergente", { intervencao: { em: new Date(), motivo: "destino diferente do VERIFICADO" } });
-      return { ok: false, estado: ti.ok ? "INTERVENCAO_NECESSARIA" : "VERIFICADO", motivo: "o destino não é mais idêntico ao VERIFICADO", verificacoes: v.verificacoes, divergencias: v.comparacoes.filter((x) => !x.ok) };
+    const r = await reverificar(c, o, banco, execucaoId, instanciaId);
+    if (r.posse.documento?.estado !== "VERIFICADO") return { ok: false, estado: r.posse.documento?.estado ?? null, motivo: `liberação exige posse VERIFICADO desta execução (${r.posse.detalhe})`, verificacoes: r.verificacoes };
+    if (!r.ok) {
+      const ti = await intervirPorDivergencia(c, o, banco, execucaoId, instanciaId, "reverificação da liberação divergente");
+      return { ok: false, estado: ti.ok ? "INTERVENCAO_NECESSARIA" : "VERIFICADO", motivo: "o destino (ou a âncora) não confere com o VERIFICADO", verificacoes: r.verificacoes, divergencias: r.divergencias };
     }
     exigirTrava(o, operacao);
-    const t = await transicionar(db, execucaoId, "LIBERACAO_AUTORIZADA", `liberado por ${operador}`, { liberacao: { autorizadaEm: new Date(), operador, operacaoId: operacao } }, ["VERIFICADO"]);
+    const t = await transicionar(c.db(banco), execucaoId, instanciaId, "LIBERACAO_AUTORIZADA", `liberado por ${operador} (destino continua congelado)`, ancoradorPara(o["raiz"], banco, execucaoId, instanciaId), { liberacao: { autorizadaEm: new Date(), operador, operacaoId: operacao } }, ["VERIFICADO"]);
     return { ok: t.ok, estado: t.ok ? "LIBERACAO_AUTORIZADA" : t.de, motivo: t.detalhe };
   });
 }
 
-const ESTADOS_POR_MODO: Record<string, readonly EstadoDestino[]> = {
-  /** Falha do próprio restore (depois de iniciar a escrita). */
-  falha: ["FALHOU_DESTINO_PARCIAL"],
-  /** Execução interrompida (dono comprovadamente encerrado) — recuperar-destino.ps1. */
-  recuperacao: ESTADOS_INTERROMPIVEIS,
-  /** Remoção de um restore concluído, por decisão do operador — gerir-restore.ps1 -Acao Remover. */
-  remocao: ["VERIFICADO", "LIBERACAO_AUTORIZADA"],
-};
+/** A21-7-05 — LIBERACAO_AUTORIZADA → EM_USO (descongela). Só por comando explícito; reverifica antes. */
+async function iniciarUsoCmd(o: Record<string, string>) {
+  const banco = exigir(o, "banco");
+  exigirBancoRestore(banco);
+  const operacao = exigirExecucao(exigir(o, "trava-execucao"));
+  const execucaoId = exigirExecucao(exigir(o, "posse-execucao"));
+  const operador = exigir(o, "operador");
+  if (o["confirmar-banco"] !== banco) throw new UsoInvalidoErro("início de uso exige --confirmar-banco com o nome EXATO do destino");
+  return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
+    const { instanciaId } = await contextoIsolado(c, o);
+    exigirTrava(o, operacao);
+    const db = c.db(banco);
+    const p = await posseAtual(db, execucaoId, instanciaId);
+    if (p.documento?.estado === "LIBERACAO_AUTORIZADA") {
+      const r = await reverificar(c, o, banco, execucaoId, instanciaId);
+      if (!r.ok) {
+        const ti = await intervirPorDivergencia(c, o, banco, execucaoId, instanciaId, "reverificação do início de uso divergente");
+        return { ok: false, estado: ti.ok ? "INTERVENCAO_NECESSARIA" : "LIBERACAO_AUTORIZADA", motivo: "o destino não confere com o VERIFICADO", verificacoes: r.verificacoes };
+      }
+    } else {
+      const anc = await conferirAncoraCmd(o, banco, instanciaId, p.documento);
+      if (falhasDe(anc).length) return { ok: false, estado: p.documento?.estado ?? null, motivo: "âncora externa não confere", verificacoes: anc };
+    }
+    exigirTrava(o, operacao);
+    return iniciarUso(db, execucaoId, instanciaId, referenciaDoArchive(exigir(o, "arquivo")), operador, operacao, ancoradorPara(o["raiz"], banco, execucaoId, instanciaId));
+  });
+}
 
 /**
  * Limpeza COMPROVADA. `--trava-execucao` = operação que MANTÉM a trava agora; `--posse-execucao` = dona do destino.
- * `--modo` define em que estados a remoção é admissível. Nunca `dropDatabase`.
+ * `--modo` define em que estados a remoção é admissível. Sempre com a âncora externa conferida. Nunca `dropDatabase`.
  */
 async function limparDestinoCmd(o: Record<string, string>) {
   const banco = exigir(o, "banco");
   exigirBancoRestore(banco);
   const travaExecucao = exigirExecucao(exigir(o, "trava-execucao"));
   const posseExecucao = exigirExecucao(exigir(o, "posse-execucao"));
-  const modo = exigir(o, "modo");
-  const permitidos = ESTADOS_POR_MODO[modo];
-  if (!permitidos) throw new UsoInvalidoErro(`--modo deve ser ${Object.keys(ESTADOS_POR_MODO).join(", ")}`);
+  const modo = exigir(o, "modo") as ModoLimpeza;
+  if (!(modo in ESTADOS_POR_MODO)) throw new UsoInvalidoErro(`--modo deve ser ${Object.keys(ESTADOS_POR_MODO).join(", ")}`);
+  if (modo === "descarte" && o["confirmar-banco"] !== banco) throw new UsoInvalidoErro("descarte exige --confirmar-banco com o nome EXATO do destino");
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
-    await exigirInstanciaIsolada(c, o["raiz"]);
+    const { instanciaId } = await contextoIsolado(c, o);
     exigirTrava(o, travaExecucao);
     const db = c.db(banco);
-    const posse = await posseAtual(db, posseExecucao);
+    const posse = await posseAtual(db, posseExecucao, instanciaId);
     if (!posse.ok) return { ok: false, limpo: false, motivo: "POSSE_NAO_COMPROVADA", detalhe: posse.detalhe, estadoFinal: posse.documento?.estado ?? null };
-    const vinculo = await referenciaVinculada(o, posse.documento);
-    if ("erro" in vinculo) return { ok: false, limpo: false, motivo: vinculo.erro.split(":")[0], detalhe: vinculo.erro, estadoFinal: posse.documento?.estado ?? null };
-    const r = await limparDestinoComPosse(db, posseExecucao, vinculo.ref, permitidos, {
+    const anc = await conferirAncoraCmd(o, banco, instanciaId, posse.documento);
+    if (falhasDe(anc).length) return { ok: false, limpo: false, motivo: "ANCORA_NAO_CONFERE", detalhe: falhasDe(anc).map((f) => `${f.id} (${f.detalhe})`).join("; "), estadoFinal: posse.documento?.estado ?? null, verificacoes: anc };
+    const r = await limparDestinoComPosse(db, posseExecucao, instanciaId, referenciaDoArchive(exigir(o, "arquivo")), modo, travaExecucao, ancoradorPara(o["raiz"], banco, posseExecucao, instanciaId), {
       antesDeRemover: async () => exigirTrava(o, travaExecucao),
     });
     return { ok: r.limpo, ...r };
   });
 }
 
-/** Somente leitura: estado de um destino (posse, estado, histórico, evidências). */
+/** Somente leitura: estado de um destino (posse, estado, garantias, histórico, evidências, âncora). */
 async function inspecionarDestinoCmd(o: Record<string, string>) {
   const banco = exigir(o, "banco");
   exigirBancoRestore(banco);
   return comCliente(uriLocal(exigir(o, "porta"), [RESTORE.porta]), async (c) => {
-    await exigirInstanciaIsolada(c, o["raiz"]);
+    const { instanciaId } = await contextoIsolado(c, o);
     const db = c.db(banco);
     const existe = (await c.db("admin").admin().listDatabases({ nameOnly: true })).databases.some((d) => d.name === banco);
-    const colecoes = existe ? (await db.listCollections({}, { nameOnly: true }).toArray()).map((x) => x.name).sort() : [];
+    const info = existe ? await infoColecoes(db) : [];
+    const colecoes = info.map((x) => x.nome).sort();
     const docs = colecoes.includes(COLECAO_POSSE) ? await db.collection(COLECAO_POSSE).find({}).limit(10).toArray() : [];
-    const p = docs.length === 1 ? docs[0]! : null;
+    const p = docs.length === 1 ? (docs[0] as unknown as DocumentoPosse) : null;
+    const ancoraTexto = p ? lerAncora(o["raiz"], banco, p.execucaoId) : null;
+    const cadeia = ancoraTexto ? lerCadeia(ancoraTexto) : null;
     return {
       ok: true,
       existe,
       colecoes,
+      congeladas: info.filter((x) => x.nome !== COLECAO_POSSE && estaCongelada(x)).length,
+      identidade: p ? conferirIdentidadePosse(p, { execucaoId: p.execucaoId, banco, instanciaId }) : null,
+      ancora: cadeia ? { ok: cadeia.ok, motivo: cadeia.motivo, entradas: cadeia.entradas.length, estadosAdmitidos: estadosAdmitidos(cadeia.entradas) } : { ok: false, motivo: "registro local ausente" },
       posse: p
         ? {
-            execucaoId: p["execucaoId"],
-            estado: p["estado"],
-            pid: p["pid"],
-            processoInicio: p["processoInicio"],
-            processoInicioTicks: p["processoInicioTicks"],
-            executavel: p["executavel"],
-            archive: p["archive"],
-            archiveSha256: p["archiveSha256"],
-            manifesto: p["manifesto"],
-            manifestoSha256: p["manifestoSha256"],
-            criadoEm: p["criadoEm"],
-            historico: p["historico"],
-            evidencias: p["evidencias"] ? { verificadoEm: p["evidencias"].verificadoEm, documentos: p["evidencias"].documentos, hashesPorColecao: p["evidencias"].hashesPorColecao } : null,
-            liberacao: p["liberacao"] ?? null,
-            intervencao: p["intervencao"] ?? null,
+            execucaoId: p.execucaoId,
+            estado: p.estado,
+            garantias: garantiasDoEstado(p.estado),
+            banco: p.banco,
+            instanciaId: p.instanciaId,
+            pid: p.pid,
+            processoInicio: p.processoInicio,
+            processoInicioTicks: p.processoInicioTicks,
+            executavel: p.executavel,
+            archive: p.archive,
+            archiveSha256: p.archiveSha256,
+            manifesto: p.manifesto,
+            manifestoSha256: p.manifestoSha256,
+            criadoEm: p.criadoEm,
+            historico: p.historico,
+            evidencias: p.evidencias ? { verificadoEm: p.evidencias.verificadoEm, documentos: p.evidencias.documentos, hashesPorColecao: p.evidencias.hashesPorColecao } : null,
+            liberacao: p.liberacao ?? null,
+            uso: p.uso ?? null,
+            remocao: p.remocao ?? null,
+            intervencao: p.intervencao ?? null,
           }
         : null,
       documentosDePosse: docs.length,
@@ -607,18 +746,21 @@ async function listarBancosCmd(o: Record<string, string>) {
 }
 
 /**
- * A-03 — configura a autenticação da instância isolada (idempotente). Stdin: `{"admin":{…},"restore":{…},"leitor":{…}}`
- * (senhas SINTÉTICAS geradas pelo mongod-isolado.ps1). Sem usuários ainda: cria o bootstrap pela exceção de localhost.
- * Depois: papel `marielaRestore` (PRIVILEGIOS_RESTORE) e os usuários de restore e leitura. Confere que conexão sem
- * autenticação é recusada.
+ * A-03/A21-7-01/A21-7-06 — configura a autenticação da instância isolada (idempotente). Stdin:
+ * `{"admin":{…},"restore":{…},"guardiao":{…},"leitor":{…}}` (senhas SINTÉTICAS geradas pelo mongod-isolado.ps1).
+ * Sem usuários ainda: cria o bootstrap pela exceção de localhost. Depois: papéis `marielaRestore` e `marielaGuardiao`
+ * (privilégios mínimos e SEPARADOS), usuários, e a IDENTIDADE da instância (documento na instância + cópia local).
  */
 async function configurarAutenticacaoCmd(o: Record<string, string>) {
   const e = await lerEntradaStdin();
   const admin = credencialDe(e["admin"], "admin");
   const restore = credencialDe(e["restore"], "restore");
+  const guardiao = credencialDe(e["guardiao"], "guardiao");
   const leitor = credencialDe(e["leitor"], "leitor");
+  const a0 = RESTORE.autenticacao;
+  if (admin.usuario !== a0.usuarioAdmin || restore.usuario !== a0.usuarioRestore || guardiao.usuario !== a0.usuarioGuardiao || leitor.usuario !== a0.usuarioLeitor) throw new UsoInvalidoErro("nomes de usuário diferentes da política");
   const uri = uriLocal(exigir(o, "porta"), [RESTORE.porta]);
-  const opcoesAdmin = { auth: { username: admin.usuario, password: admin.senha }, authSource: RESTORE.autenticacao.authSource, serverSelectionTimeoutMS: 15_000 };
+  const opcoesAdmin = { auth: { username: admin.usuario, password: admin.senha }, authSource: a0.authSource, serverSelectionTimeoutMS: 15_000 };
   let bootstrapCriado = false;
   const tentarAdmin = async () => {
     const c = new MongoClient(uri, opcoesAdmin);
@@ -635,7 +777,6 @@ async function configurarAutenticacaoCmd(o: Record<string, string>) {
   try {
     c = await tentarAdmin();
   } catch {
-    // Exceção de localhost: só funciona enquanto NÃO há nenhum usuário.
     const sem = new MongoClient(uri, { serverSelectionTimeoutMS: 15_000 });
     try {
       await sem.connect();
@@ -646,27 +787,48 @@ async function configurarAutenticacaoCmd(o: Record<string, string>) {
     }
     c = await tentarAdmin();
   }
+  let instanciaId: string;
+  let identidadeCriada = false;
   try {
     const a = c.db("admin");
     await exigirInstanciaIsolada(c, o["raiz"]);
-    const papeis = (await a.command({ rolesInfo: RESTORE.autenticacao.papelRestore }))["roles"] as unknown[];
-    const privilegios = PRIVILEGIOS_RESTORE.map((p) => ({ resource: p.resource, actions: [...p.actions] }));
-    if (papeis.length) await a.command({ updateRole: RESTORE.autenticacao.papelRestore, privileges: privilegios, roles: [] });
-    else await a.command({ createRole: RESTORE.autenticacao.papelRestore, privileges: privilegios, roles: [] });
+    const garantirPapel = async (nome: string, privs: readonly { resource: object; actions: readonly string[] }[]) => {
+      const privilegios = privs.map((p) => ({ resource: p.resource, actions: [...p.actions] }));
+      const existe = ((await a.command({ rolesInfo: nome }))["roles"] as unknown[]).length > 0;
+      if (existe) await a.command({ updateRole: nome, privileges: privilegios, roles: [] });
+      else await a.command({ createRole: nome, privileges: privilegios, roles: [] });
+    };
+    await garantirPapel(a0.papelRestore, PRIVILEGIOS_RESTORE);
+    await garantirPapel(a0.papelGuardiao, PRIVILEGIOS_GUARDIAO);
     const garantirUsuario = async (u: Credencial, roles: Document[]) => {
       const existe = ((await a.command({ usersInfo: u.usuario }))["users"] as unknown[]).length > 0;
       if (existe) await a.command({ updateUser: u.usuario, pwd: u.senha, roles });
       else await a.command({ createUser: u.usuario, pwd: u.senha, roles });
     };
-    await garantirUsuario(restore, [{ role: RESTORE.autenticacao.papelRestore, db: "admin" }]);
+    await garantirUsuario(restore, [{ role: a0.papelRestore, db: "admin" }]);
+    await garantirUsuario(guardiao, [{ role: a0.papelGuardiao, db: "admin" }]);
     await garantirUsuario(leitor, [{ role: "readAnyDatabase", db: "admin" }]);
-    if (admin.usuario !== RESTORE.autenticacao.usuarioAdmin || restore.usuario !== RESTORE.autenticacao.usuarioRestore || leitor.usuario !== RESTORE.autenticacao.usuarioLeitor) {
-      throw new UsoInvalidoErro("nomes de usuário diferentes da política");
+    // Identidade da instância (A21-7-06): documento NA instância + cópia local; nunca troca uma existente.
+    const col = c.db(RESTORE.identidade.banco).collection(RESTORE.identidade.colecao);
+    const doc = await col.findOne({ _id: RESTORE.identidade.id as never });
+    const arq = join(raizIsolada(o["raiz"]), ...RESTORE.identidade.arquivoLocal.split("/"));
+    const local = existsSync(arq) ? (JSON.parse(readFileSync(arq, "utf8").replace(/^﻿/, "")) as { instanciaId?: string }) : null;
+    if (doc?.["instanciaId"]) {
+      instanciaId = doc["instanciaId"] as string;
+      if (local?.instanciaId && local.instanciaId !== instanciaId) throw new Error("identidade local DIFERENTE da gravada na instância — nada alterado (intervenção manual)");
+    } else {
+      if (local?.instanciaId) throw new Error("identidade local existe mas a instância não tem a sua — outra instância? nada alterado (intervenção manual)");
+      instanciaId = crypto.randomUUID();
+      await col.insertOne({ _id: RESTORE.identidade.id as never, instanciaId, criadaEm: new Date() });
+      identidadeCriada = true;
+    }
+    if (!local?.instanciaId) {
+      mkdirSync(dirname(arq), { recursive: true });
+      writeFileSync(arq, JSON.stringify({ instanciaId }, null, 2), { flag: "wx" });
     }
   } finally {
     await c.close().catch(() => undefined);
   }
-  // Prova: sem credencial nada é permitido.
   const sem = new MongoClient(uri, { serverSelectionTimeoutMS: 15_000 });
   let semAuthRecusado = false;
   try {
@@ -678,7 +840,7 @@ async function configurarAutenticacaoCmd(o: Record<string, string>) {
     await sem.close().catch(() => undefined);
   }
   if (!semAuthRecusado) throw new Error("a instância aceitou listDatabases SEM autenticação — --auth não está ativo");
-  return { bootstrapCriado, papel: RESTORE.autenticacao.papelRestore, usuarios: [admin.usuario, restore.usuario, leitor.usuario], semAuthRecusado };
+  return { bootstrapCriado, identidadeCriada, papeis: [a0.papelRestore, a0.papelGuardiao], usuarios: [admin.usuario, restore.usuario, guardiao.usuario, leitor.usuario], semAuthRecusado };
 }
 
 async function localEstado(o: Record<string, string>) {
@@ -820,6 +982,9 @@ async function principal(): Promise<number> {
         break;
       case "liberar-restore":
         resultado = await liberarRestoreCmd(o);
+        break;
+      case "iniciar-uso":
+        resultado = await iniciarUsoCmd(o);
         break;
       case "listar-bancos":
         resultado = await listarBancosCmd(o);

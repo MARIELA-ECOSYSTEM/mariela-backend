@@ -248,9 +248,9 @@ function ConvertFrom-SenhaSegura([System.Security.SecureString]$Senha) {
 #   máquina, as decifra. Arquivo: "<usuario>`n<blob DPAPI>", pasta <Raiz>\seguranca com ACL restrita. Nunca impressas,
 #   nunca em argumento: chegam aos processos SÓ pelo stdin (Invoke-CliBackup -Credencial; mongorestore -Entrada).
 # ===============================================================================================================
-$script:UsuariosIsolados = @{ admin = 'mariela_bootstrap'; restore = 'mariela_restore'; leitor = 'mariela_leitor' }
+$script:UsuariosIsolados = @{ admin = 'mariela_bootstrap'; restore = 'mariela_restore'; guardiao = 'mariela_guardiao'; leitor = 'mariela_leitor' }
 
-function Get-CaminhoCredencial([string]$Raiz, [ValidateSet('admin', 'restore', 'leitor')][string]$Papel) {
+function Get-CaminhoCredencial([string]$Raiz, [ValidateSet('admin', 'restore', 'guardiao', 'leitor')][string]$Papel) {
   return (Join-Path $Raiz "seguranca\$Papel.cred")
 }
 
@@ -267,7 +267,7 @@ function New-SenhaAleatoria {
 }
 
 <# Cria a credencial (se não existir). Devolve $true se criou. Nunca sobrescreve. #>
-function New-CredencialIsolada([string]$Raiz, [ValidateSet('admin', 'restore', 'leitor')][string]$Papel) {
+function New-CredencialIsolada([string]$Raiz, [ValidateSet('admin', 'restore', 'guardiao', 'leitor')][string]$Papel) {
   $arq = Get-CaminhoCredencial $Raiz $Papel
   if (Test-Path -LiteralPath $arq) { return $false }
   $pasta = Split-Path -Parent $arq
@@ -278,7 +278,7 @@ function New-CredencialIsolada([string]$Raiz, [ValidateSet('admin', 'restore', '
   return $true
 }
 
-function Get-CredencialIsolada([string]$Raiz, [ValidateSet('admin', 'restore', 'leitor')][string]$Papel) {
+function Get-CredencialIsolada([string]$Raiz, [ValidateSet('admin', 'restore', 'guardiao', 'leitor')][string]$Papel) {
   $arq = Get-CaminhoCredencial $Raiz $Papel
   if (-not (Test-Path -LiteralPath $arq -PathType Leaf)) { throw "credencial '$Papel' da instância isolada ausente (execute mongod-isolado.ps1 -Acao ConfigurarAutenticacao)." }
   $acl = Test-AclRestrita $arq
@@ -323,17 +323,27 @@ public static class MarielaControleJob {
     if (!AssignProcessToJobObject(j, GetCurrentProcess())) throw new Exception("AssignProcessToJobObject " + Marshal.GetLastWin32Error());
     return j;
   }
-  /// PIDs de TODOS os processos ativos no job (JobObjectBasicProcessIdList).
+  /// PIDs de TODOS os processos ativos no job (JobObjectBasicProcessIdList). Fase 21.2.8 (A21-7-08): sem limite fixo —
+  /// se a lista não couber (ERROR_MORE_DATA, ou NumberOfAssigned > NumberOfIdsInList), o buffer cresce e a consulta é
+  /// refeita; qualquer outra falha lança (o chamador NÃO declara "sem processo filho").
   public static long[] Processos(IntPtr j) {
-    int cap = 256; int tam = 8 + cap * IntPtr.Size;
-    IntPtr buf = Marshal.AllocHGlobal(tam);
-    try {
-      if (!QueryInformationJobObject(j, 3, buf, (uint)tam, IntPtr.Zero)) throw new Exception("QueryInformationJobObject " + Marshal.GetLastWin32Error());
-      int n = Marshal.ReadInt32(buf, 4);
-      long[] r = new long[n];
-      for (int i = 0; i < n; i++) r[i] = Marshal.ReadIntPtr(buf, 8 + i * IntPtr.Size).ToInt64();
-      return r;
-    } finally { Marshal.FreeHGlobal(buf); }
+    int cap = 256;
+    for (int tentativa = 0; tentativa < 8; tentativa++) {
+      int tam = 8 + cap * IntPtr.Size;
+      IntPtr buf = Marshal.AllocHGlobal(tam);
+      try {
+        bool ok = QueryInformationJobObject(j, 3, buf, (uint)tam, IntPtr.Zero);
+        int erro = ok ? 0 : Marshal.GetLastWin32Error();
+        int atribuidos = Marshal.ReadInt32(buf, 0);
+        int naLista = Marshal.ReadInt32(buf, 4);
+        if (!ok && erro != 234) throw new Exception("QueryInformationJobObject " + erro);
+        if (!ok || atribuidos > naLista) { cap = Math.Max(cap * 4, atribuidos + 16); continue; }
+        long[] r = new long[naLista];
+        for (int i = 0; i < naLista; i++) r[i] = Marshal.ReadIntPtr(buf, 8 + i * IntPtr.Size).ToInt64();
+        return r;
+      } finally { Marshal.FreeHGlobal(buf); }
+    }
+    throw new Exception("lista de processos do job não pôde ser lida por completo");
   }
 }
 '@
@@ -347,17 +357,33 @@ function Enable-ControleDeProcessos {
   return $script:JobControle
 }
 
-<# Processos do job além do próprio coordenador (conhost.exe do console é ignorado: não escreve no banco). #>
+<#
+  Processos do job além do próprio coordenador. Só o host de console do WINDOWS é ignorado — conferido pelo CAMINHO do
+  executável (%SystemRoot%\System32\conhost.exe), não pelo nome (Fase 21.2.8, A21-7-08). Qualquer outro, ou um conhost
+  de caminho ilegível/diferente, conta como filho ativo (falha fechada).
+#>
 function Get-ProcessosFilhosAtivos {
   if (-not $script:JobControle) { throw "controle de processos não habilitado" }
+  $conhost = [System.IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\conhost.exe'))
   $r = @()
   foreach ($id in [MarielaControleJob]::Processos($script:JobControle)) {
     if ($id -eq $PID) { continue }
     $p = Get-Process -Id $id -ErrorAction SilentlyContinue
-    if ($p -and $p.ProcessName -eq 'conhost') { continue }
-    $r += [pscustomobject]@{ Pid = $id; Nome = $(if ($p) { $p.ProcessName } else { '?' }) }
+    $caminho = $null
+    if ($p) { try { $caminho = $p.Path } catch { $caminho = $null } }
+    if ($caminho -and [string]::Equals([System.IO.Path]::GetFullPath($caminho), $conhost, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+    $r += [pscustomobject]@{ Pid = $id; Nome = $(if ($p) { $p.ProcessName } else { '?' }); Caminho = $caminho }
   }
   return , $r
+}
+
+<# Pasta da âncora externa (Fase 21.2.8, A21-7-02): <Raiz>\evidencias, criada com ACL restrita (conta atual + SYSTEM). #>
+function Initialize-PastaEvidencias([string]$Raiz) {
+  $pasta = Join-Path $Raiz "evidencias"
+  if (-not (Test-Path -LiteralPath $pasta -PathType Container)) { New-Item -ItemType Directory -Path $pasta | Out-Null; Set-AclRestrita $pasta }
+  $acl = Test-AclRestrita $pasta
+  if (-not $acl.Ok) { throw "pasta de evidências com ACL aberta: $($acl.Detalhe)" }
+  return $pasta
 }
 
 <# Horário de criação (FILETIME UTC) de um processo; $null se não existir; 'SEM_ACESSO' se existir sem leitura. #>

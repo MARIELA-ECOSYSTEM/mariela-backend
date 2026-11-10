@@ -8,8 +8,10 @@
     T. TRAVA local (<Raiz>\locks\restore.lock) mantida até o fim; execucaoId (GUID) próprio.
     J. CONTROLE DE PROCESSOS (A-06): este PowerShell entra num Job Object kill-on-close — se ele morrer, por qualquer
        motivo, o Windows mata todo processo que ele criou (bun/CLI, mongorestore).
-    0. IDENTIDADE da instância (processo, bind, dbPath, marcador, replica set). Credencial do usuário de RESTORE
-       (DPAPI), passada SÓ pelo stdin.
+    0. IDENTIDADE da instância (processo, bind, dbPath, marcador, replica set e instanciaId). Credenciais (DPAPI, SÓ
+       pelo stdin): RESTORE para mongorestore e leituras; GUARDIÃO para posse, transições, congelamento e limpeza
+       (Fase 21.2.8: nenhum dos dois consegue, sozinho, descongelar E escrever dados). Toda transição é registrada na
+       âncora externa <Raiz>\evidencias (A21-7-02).
     1. Antes de qualquer escrita: SHA-256 = manifesto = .sha256; manifesto VALIDO_LOCAL; 27 namespaces e contagens;
        mesma série de versão; banco de destino inexistente.
     2. POSSE ATÔMICA e PERSISTENTE: documento `_id:"posse"` (estado PREPARANDO) com execucaoId, processo (PID + horário
@@ -113,8 +115,14 @@ function Etapa([string]$Nome, $Resposta) {
 }
 
 $cred = $null
+$guard = $null
+# Fase 21.2.8 (A21-7-01): papéis SEPARADOS. Restore (mongorestore/leitura) NÃO descongela nem remove; guardião (posse,
+# transições, congelamento, limpeza) NÃO escreve dados.
 function ChamarCli([string[]]$A) { return Invoke-CliBackup -Argumentos $A -Credencial $cred }
+function ChamarGuardiao([string[]]$A) { return Invoke-CliBackup -Argumentos $A -Credencial $guard }
 $comuns = @("--porta", "$Porta", "--banco", $BancoDestino, "--raiz", $Raiz)
+# Âncora externa (A21-7-02): os arquivos informados pelo operador acompanham toda operação de estado.
+$vinculo = @("--arquivo", $ArquivoBackup, "--manifesto", $Manifesto)
 
 <#
   Destino inválido depois de iniciar a escrita: FALHOU_DESTINO_PARCIAL + limpeza COMPROVADA. Limpo ⇒ "FALHOU" (destino
@@ -129,9 +137,9 @@ function TratarDestinoParcial([string]$Motivo) {
   }
   $l = $null
   try {
-    $m = ChamarCli (@("marcar-estado") + $comuns + @("--execucao", $execucaoId, "--para", "FALHOU_DESTINO_PARCIAL", "--detalhe", $Motivo))
+    $m = ChamarGuardiao (@("marcar-estado") + $comuns + $vinculo + @("--execucao", $execucaoId, "--para", "FALHOU_DESTINO_PARCIAL", "--detalhe", $Motivo))
     $relatorio.etapas += @{ etapa = "marcar-falha"; ok = [bool]($m.ok -and $m.resultado.ok); motivo = $m.resultado.detalhe; erro = $m.mensagem }
-    $l = ChamarCli (@("limpar-destino") + $comuns + @("--modo", "falha", "--trava-execucao", $execucaoId, "--posse-execucao", $execucaoId, "--arquivo", $ArquivoBackup, "--manifesto", $Manifesto))
+    $l = ChamarGuardiao (@("limpar-destino") + $comuns + $vinculo + @("--modo", "falha", "--trava-execucao", $execucaoId, "--posse-execucao", $execucaoId))
   } catch {
     $relatorio.limpeza = @{ executada = $false; motivo = $Motivo; erro = (ConvertTo-MensagemSegura $_) }
   }
@@ -153,6 +161,7 @@ try {
   try {
     $null = Enable-ControleDeProcessos
     $relatorio.controleDeProcessos = "job-kill-on-close"
+    $null = Initialize-PastaEvidencias $Raiz
   } catch {
     $relatorio.etapas += @{ etapa = "controle-de-processos"; ok = $false; erro = (ConvertTo-MensagemSegura $_) }
     Encerrar "FALHOU" 1
@@ -162,7 +171,7 @@ try {
   $identidade = Test-EvidenciaInstancia (Get-EvidenciaPorta $Porta) (Join-Path $Raiz "mongodb-8.0.37\bin\mongod.exe")
   $relatorio.etapas += @{ etapa = "identidade-processo"; ok = $identidade.Ok; erro = $identidade.Detalhe }
   if (-not $identidade.Ok) { Encerrar "FALHOU" 1 }
-  try { $cred = Get-CredencialIsolada $Raiz 'restore' }
+  try { $cred = Get-CredencialIsolada $Raiz 'restore'; $guard = Get-CredencialIsolada $Raiz 'guardiao' }
   catch { $relatorio.etapas += @{ etapa = "credencial"; ok = $false; erro = (ConvertTo-MensagemSegura $_) }; Encerrar "FALHOU" 1 }
 
   # --- 1. Validações ANTES de qualquer escrita -----------------------------------------------------------------
@@ -173,13 +182,13 @@ try {
   if ($colecoes.Count -ne 27) { $relatorio.etapas += @{ etapa = "politica"; ok = $false; erro = "lista positiva com $($colecoes.Count) coleções" }; Encerrar "FALHOU" 1 }
 
   # --- 2. Posse ATÔMICA e persistente (PREPARANDO) ------------------------------------------------------------------
-  $posse = ChamarCli (@("adquirir-posse") + $comuns + @("--execucao", $execucaoId, "--arquivo", $ArquivoBackup, "--manifesto", $Manifesto, "--processo-inicio", $trava.ProcessoInicio, "--processo-inicio-ticks", $trava.ProcessoInicioTicks, "--executavel", $trava.Executavel))
+  $posse = ChamarGuardiao (@("adquirir-posse") + $comuns + $vinculo + @("--execucao", $execucaoId, "--processo-inicio", $trava.ProcessoInicio, "--processo-inicio-ticks", $trava.ProcessoInicioTicks, "--executavel", $trava.Executavel))
   if (-not (Etapa "adquirir-posse" $posse)) { Encerrar "FALHOU" 1 }
   $relatorio.posseAdquirida = $true
   $relatorio.estadoDestino = "PREPARANDO"
 
   # --- 3. RESTAURANDO: mongorestore com o usuário de restore (senha SÓ pelo stdin) ----------------------------------
-  $m = ChamarCli (@("marcar-estado") + $comuns + @("--execucao", $execucaoId, "--para", "RESTAURANDO", "--detalhe", "iniciando mongorestore"))
+  $m = ChamarGuardiao (@("marcar-estado") + $comuns + $vinculo + @("--execucao", $execucaoId, "--para", "RESTAURANDO", "--detalhe", "iniciando mongorestore"))
   if (-not (Etapa "marcar-restaurando" $m)) { Encerrar (TratarDestinoParcial "não foi possível marcar RESTAURANDO") 1 }
   $relatorio.estadoDestino = "RESTAURANDO"
   $argsRestore = @("--uri=mongodb://127.0.0.1:27118/?directConnection=true", "--username=$($cred.Usuario)", "--authenticationDatabase=admin", "--gzip", "--archive=$ArquivoBackup", "--nsFrom=marielaDB.*", "--nsTo=$BancoDestino.*", "--stopOnError")
@@ -196,7 +205,7 @@ try {
   if (-not $okRestore) { Encerrar (TratarDestinoParcial "mongorestore falhou (código $($r.Codigo))") 1 }
 
   # --- 4/5. VALIDANDO (congelado) → verificação integral → VERIFICADO ----------------------------------------------
-  $v = ChamarCli (@("congelar-e-verificar") + $comuns + @("--execucao", $execucaoId, "--arquivo", $ArquivoBackup, "--manifesto", $Manifesto))
+  $v = ChamarGuardiao (@("congelar-e-verificar") + $comuns + $vinculo + @("--execucao", $execucaoId))
   $okV = Etapa "congelar-e-verificar" $v
   if ($v.ok) { $relatorio.estadoDestino = $v.resultado.estado }
   if (-not $okV) {
@@ -216,7 +225,7 @@ try {
     semAlheios = [bool]($int.ok -and $int.resultado.ok -and @($int.resultado.divergencias).Count -eq 0)
     protecaoAtiva = [bool]($int.ok -and @($int.resultado.verificacoes | Where-Object { $_.id -eq "destino.protegido" -and $_.ok }).Count -eq 1)
     posseVerificado = [bool]($insp.ok -and $insp.resultado.posse.estado -eq "VERIFICADO" -and $insp.resultado.posse.execucaoId -eq $execucaoId)
-    archiveEManifestoVinculados = [bool]($insp.ok -and $insp.resultado.posse.archiveSha256 -eq (Get-Sha256 $ArquivoBackup) -and $insp.resultado.posse.manifestoSha256 -eq (Get-Sha256 $Manifesto))
+    archiveEManifestoVinculados = [bool]($insp.ok -and $insp.resultado.posse.archiveSha256 -eq (Get-Sha256 $ArquivoBackup) -and $insp.resultado.posse.manifestoSha256 -eq (Get-Sha256 $Manifesto) -and $int.ok -and @($int.resultado.verificacoes | Where-Object { $_.id -like "ancora.*" }).Count -ge 5 -and @($int.resultado.verificacoes | Where-Object { $_.id -like "ancora.*" -and -not $_.ok }).Count -eq 0)
     semProcessoFilhoAtivo = (@($filhos).Count -eq 0)
     travaEIdentidade = [bool]($travaOk.ok -and $travaOk.resultado.ok -and (Test-EvidenciaInstancia (Get-EvidenciaPorta $Porta) (Join-Path $Raiz "mongodb-8.0.37\bin\mongod.exe")).Ok)
   }
@@ -234,5 +243,6 @@ try {
   Encerrar $final 1
 } finally {
   $cred = $null
+  $guard = $null
   Exit-TravaRestore $trava
 }

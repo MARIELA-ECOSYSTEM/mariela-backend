@@ -89,6 +89,9 @@ try {
   if (-not $aclConfig.Ok) { Finalizar "BLOQUEADO" "ACL do arquivo de configuração não é restrita: $($aclConfig.Detalhe)" 1 }
   $aclPasta = Test-AclRestrita $BackupDir
   if (-not $aclPasta.Ok) { Finalizar "BLOQUEADO" "ACL da pasta de backup não é restrita: $($aclPasta.Detalhe)" 1 }
+  # Fase 21.2.8 (A21-7-08): mongodump e CLI morrem junto com este PowerShell (Job Object kill-on-close) — um mongodump
+  # órfão não continua gravando o temporário depois de uma queda. Sem o job, o backup não prossegue.
+  try { $null = Enable-ControleDeProcessos } catch { Finalizar "FALHA" ("controle de processos indisponível: " + (ConvertTo-MensagemSegura $_)) 1 }
 
   if (-not $Mongodump) {
     $cmd = Get-Command mongodump -ErrorAction SilentlyContinue

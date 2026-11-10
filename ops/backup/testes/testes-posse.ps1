@@ -46,7 +46,7 @@ function Banco([int]$N) { $b = "mariela_restore_20260103_" + $N.ToString("000000
 
 # --- credenciais sintéticas (só stdin) -------------------------------------------------------------------------
 $creds = @{}
-foreach ($p in 'admin', 'restore', 'leitor') { $creds[$p] = Get-CredencialIsolada $raizIsolada $p }
+foreach ($p in 'admin', 'restore', 'guardiao', 'leitor') { $creds[$p] = Get-CredencialIsolada $raizIsolada $p }
 function EntradaDe([string]$Papel) { if ($Papel -eq "nenhum") { return "" } return (ConvertTo-EntradaCredencial $creds[$Papel]) }
 
 function Aux([string[]]$Argumentos, [string]$Papel = "admin") {
@@ -86,7 +86,10 @@ function Esperar($Proc, [int]$Segundos = 300) {
   if ($Proc.TOut) { return [pscustomobject]@{ Codigo = $Proc.P.ExitCode; Saida = $Proc.TOut.Result; Erro = $Proc.TErr.Result } }
   return [pscustomobject]@{ Codigo = $Proc.P.ExitCode; Saida = (Get-Content -LiteralPath $Proc.Out -Raw -ErrorAction SilentlyContinue); Erro = (Get-Content -LiteralPath $Proc.Err -Raw -ErrorAction SilentlyContinue) }
 }
+# Fase 21.2.8 (A21-7-02): o archive de cada destino é lembrado para ser INFORMADO nos comandos do operador.
+$script:archivePorBanco = @{}
 function RestoreAsync([string]$Archive, [string]$B, [string[]]$Extra = @()) {
+  $script:archivePorBanco[$B] = $Archive
   return Disparar $shell (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ops "restore-test.ps1"), "-ArquivoBackup", $Archive, "-BancoDestino", $B, "-DiretorioRelatorio", $relDir) + $Extra)
 }
 function Restore([string]$Archive, [string]$B) { $r = Esperar (RestoreAsync $Archive $B); return [pscustomobject]@{ Codigo = $r.Codigo; Erro = $r.Erro; Rel = (Relatorio $B) } }
@@ -95,9 +98,11 @@ function Relatorio([string]$B) {
   $a = Join-Path $relDir "restore_$B.json"
   if (Test-Path -LiteralPath $a) { return (Get-Content -LiteralPath $a -Raw -Encoding UTF8 | ConvertFrom-Json) } return $null
 }
-function Gerir([string]$Acao, [string]$B, [string]$Execucao) {
+function Gerir([string]$Acao, [string]$B, [string]$Execucao, [switch]$Confirmar) {
   $a = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ops "gerir-restore.ps1"), "-Acao", $Acao, "-BancoDestino", $B, "-DiretorioRelatorio", $relDir)
   if ($Execucao) { $a += @("-ExecucaoId", $Execucao) }
+  if ($Acao -ne "Inspecionar" -and $script:archivePorBanco[$B]) { $a += @("-ArquivoBackup", $script:archivePorBanco[$B], "-Manifesto", ($script:archivePorBanco[$B] -replace '\.archive\.gz$', '.manifest.json')) }
+  if ($Confirmar) { $a += @("-ConfirmarBanco", $B) }
   $r = Invoke-Nativo -Programa $shell -Argumentos $a
   $arq = Join-Path $relDir ("gestao_{0}_{1}.json" -f $B, $Acao.ToLowerInvariant())
   $rel = if (Test-Path -LiteralPath $arq) { Get-Content -LiteralPath $arq -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
@@ -106,7 +111,7 @@ function Gerir([string]$Acao, [string]$B, [string]$Execucao) {
 }
 function Recuperar([string]$B, [switch]$Remover) {
   $a = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ops "recuperar-destino.ps1"), "-BancoDestino", $B, "-DiretorioRelatorio", $relDir)
-  if ($Remover) { $a += "-Remover" }
+  if ($Remover) { $a += "-Remover"; if ($script:archivePorBanco[$B]) { $a += @("-ArquivoBackup", $script:archivePorBanco[$B], "-Manifesto", ($script:archivePorBanco[$B] -replace '\.archive\.gz$', '.manifest.json')) } }
   $r = Invoke-Nativo -Programa $shell -Argumentos $a
   $arq = Join-Path $relDir "recuperacao_$B.json"
   $rel = if (Test-Path -LiteralPath $arq) { Get-Content -LiteralPath $arq -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
@@ -507,8 +512,8 @@ try {
     Exigir ($find.aceita -and $aceitas.Count -eq 0) "leitor: find=$($find.aceita) aceitas=$($aceitas -join ',')"
     "find aceito; $($ops.Count) operações de escrita/administração recusadas"
   }
-  Caso "AU03" "restore (papel mínimo): sem bypass, sem update/delete de dados, sem dropDatabase; insert no congelado → 121" {
-    $esperado = @{ insert = $false; insertBypass = $false; update = $false; delete = $false; dropDatabase = $false; find = $true }
+  Caso "AU03" "restore (papel mínimo, 21.2.8): sem collMod, rename, drop, bypass, update/delete, dropDatabase, posse; insert no congelado → 121" {
+    $esperado = @{ insert = $false; insertBypass = $false; update = $false; delete = $false; dropDatabase = $false; find = $true; collMod = $false; collModWarn = $false; rename = $false; dropReal = $false; posseUpdate = $false; posseRemove = $false }
     $res = @{}
     foreach ($o in $esperado.Keys) { $res[$o] = (Aux @("tentar", $bA, $o) "restore") }
     $erradas = @($esperado.Keys | Where-Object { [bool]$res[$_].aceita -ne $esperado[$_] })
@@ -516,17 +521,18 @@ try {
     Exigir ($res.insert.codigo -eq 121 -and $res.insertBypass.codigo -eq 13 -and $res.update.codigo -eq 13 -and $res.dropDatabase.codigo -eq 13) "códigos: insert=$($res.insert.codigo) bypass=$($res.insertBypass.codigo) update=$($res.update.codigo) dropDatabase=$($res.dropDatabase.codigo)"
     "insert→121 (congelado); bypass/update/delete/dropDatabase→13 (Unauthorized); find ok"
   }
-  Caso "AU04" "restore: collMod (descongelar) e rename SÃO possíveis (principal confiável) — mas são DETECTADOS pela reverificação" {
-    $cm = Aux @("tentar", $bA, "collMod", "vendas") "restore"
-    Exigir $cm.aceita "collMod do restore recusado (inesperado)"
+  Caso "AU04" "guardião (21.2.8): não escreve dados nem renomeia; o collMod dele (validationAction warn) é DETECTADO (A21-7-01)" {
+    foreach ($o in "insert", "insertBypass", "update", "delete", "rename", "createIndex") {
+      $x = Aux @("tentar", $bA, $o, "produtos") "guardiao"
+      Exigir (-not $x.aceita) "guardião executou $o"
+    }
+    $cm = Aux @("tentar", $bA, "collModWarn", "vendas") "guardiao"
+    Exigir $cm.aceita "collMod (warn) do guardião recusado (inesperado)"
     $v = Gerir "Verificar" $bA $rA.Rel.execucaoId
-    Exigir ($v.Rel.resultado -eq "DIVERGENTE" -and @($v.Rel.verificacoes | Where-Object { $_.id -eq "destino.protegido" -and -not $_.ok }).Count -eq 1) "descongelamento não detectado"
-    $rn = Aux @("tentar", $bA, "rename", "produtos") "restore"
-    $v2 = Gerir "Verificar" $bA $rA.Rel.execucaoId
-    Exigir ($rn.aceita -and $v2.Rel.resultado -eq "DIVERGENTE") "rename não detectado"
-    $rm = Gerir "Remover" $bA $rA.Rel.execucaoId
-    Exigir ($rm.Codigo -eq 1 -and (Estado $bA).colecoes -contains "produtos_renomeada") "remoção com coleção renomeada não foi recusada"
-    "collMod → Verificar DIVERGENTE (destino.protegido); rename → DIVERGENTE; Remover recusa (coleção fora da política preservada)"
+    Exigir ($v.Rel.resultado -eq "DIVERGENTE" -and @($v.Rel.verificacoes | Where-Object { $_.id -eq "destino.protegido" -and -not $_.ok }).Count -eq 1) "validationAction=warn NÃO detectado"
+    $lb = Gerir "Liberar" $bA $rA.Rel.execucaoId
+    Exigir ($lb.Codigo -eq 1 -and $lb.Rel.estadoDepois -eq "INTERVENCAO_NECESSARIA") "liberação com proteção incompleta não foi recusada"
+    "guardião sem escrita/rename; validationAction=warn → Verificar DIVERGENTE (destino.protegido); Liberar → INTERVENCAO_NECESSARIA"
   }
   Caso "AU05" "bootstrap (root): pode tudo (bypass, collMod, drop) — uso restrito à configuração; alterações detectadas" {
     $t = Aux @("tentar", $bA, "insertBypass", "eventos_auth") "admin"
@@ -534,7 +540,7 @@ try {
     "root aceita bypassDocumentValidation (documentado: credencial bootstrap fora do fluxo, DPAPI)"
   }
   Caso "AU06" "a senha sintética nunca aparece em relatório, linha de comando de processo ou log da fase" {
-    $senhas = @(foreach ($p in 'admin', 'restore', 'leitor') { ConvertFrom-SenhaSegura $creds[$p].Senha })
+    $senhas = @(foreach ($p in 'admin', 'restore', 'guardiao', 'leitor') { ConvertFrom-SenhaSegura $creds[$p].Senha })
     $textos = (Get-ChildItem -LiteralPath $relDir -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
     $textos += (Get-ChildItem -LiteralPath $raiz -Filter "proc-*" -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue }) -join "`n"
     $textos += (Get-ChildItem -LiteralPath (Join-Path $raizIsolada "logs") -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue }) -join "`n"
@@ -582,7 +588,7 @@ try {
     $b = Banco 43
     $r = Restore $archVol $b
     Exigir ($r.Codigo -eq 0) "restore de apoio: $($r.Rel.resultado)"
-    $g = Disparar $shell @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ops "gerir-restore.ps1"), "-Acao", "Remover", "-BancoDestino", $b, "-ExecucaoId", $r.Rel.execucaoId, "-DiretorioRelatorio", $relDir)
+    $g = Disparar $shell @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ops "gerir-restore.ps1"), "-Acao", "Remover", "-BancoDestino", $b, "-ExecucaoId", $r.Rel.execucaoId, "-ArquivoBackup", $archVol, "-Manifesto", $manVol, "-DiretorioRelatorio", $relDir)
     try { $cli = @(EsperarProcesso $b "*limpar-destino*") } finally { if ($cli.Count -eq 0) { Stop-Process -Id $g.P.Id -Force -ErrorAction SilentlyContinue } }
     Exigir ($cli.Count -ge 1) "a limpeza não começou; gerir saiu=$($g.P.HasExited); stderr=$(Get-Content -LiteralPath $g.Err -Raw -ErrorAction SilentlyContinue); saída=$(Get-Content -LiteralPath $g.Out -Raw -ErrorAction SilentlyContinue)"
     Start-Sleep -Milliseconds 700

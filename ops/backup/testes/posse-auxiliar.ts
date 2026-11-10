@@ -1,9 +1,9 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { Binary, BSON, Decimal128, Int32, Long, MongoClient, MongoServerError, Timestamp, type Db, type Document } from "mongodb";
-import { conteudoDoArchiveGzipDoArquivo } from "../lib/archive.js";
+import { conteudoDoArchive, descompactar, lerArchive, type EspecificacaoIndice } from "../lib/archive.js";
 import { conteudoPorColecao } from "../lib/integridade.js";
-import { adquirirPosse, COLECAO_POSSE, estaCongelada, infoColecoes, limparDestinoComPosse } from "../lib/posse.js";
-import { COLECOES_BACKUP, ESTADOS_INTERROMPIVEIS, type EstadoDestino } from "../lib/politica.js";
+import { adquirirPosse, COLECAO_POSSE, estaCongelada, infoColecoes, limparDestinoComPosse, type Ancorador, type ReferenciaArchive } from "../lib/posse.js";
+import { COLECOES_BACKUP, RESTORE, type EstadoDestino } from "../lib/politica.js";
 
 /**
  * Fases 60.4.3.4.21.2.4/21.2.6 — SOMENTE TESTES (testes-posse.ps1, testes-seguranca.ps1). Age APENAS na instância
@@ -64,10 +64,27 @@ async function inserirAlheio(db: Db, colecao: string, marca: string, bypass = fa
   }
 }
 
-function referencia(arquivo: string, manifesto: string) {
-  const m = JSON.parse(readFileSync(manifesto, "utf8").replace(/^﻿/, ""));
-  return { conteudoPorColecao: conteudoPorColecao(conteudoDoArchiveGzipDoArquivo(arquivo)), indicesPorColecao: m.indices?.porColecao ?? {} };
+/** Referência do archive (conteúdo, índices COMPLETOS, opções) — a mesma da CLI. */
+function referencia(arquivo: string): ReferenciaArchive {
+  const dados = descompactar(readFileSync(arquivo));
+  const lido = lerArchive(dados);
+  const especificacoesPorColecao: Record<string, EspecificacaoIndice[]> = {};
+  const opcoesPorColecao: Record<string, Record<string, unknown>> = {};
+  for (const x of lido.colecoes) if (x.db === "marielaDB") {
+    especificacoesPorColecao[x.colecao] = x.especificacoes;
+    opcoesPorColecao[x.colecao] = x.opcoes;
+  }
+  return { conteudoPorColecao: conteudoPorColecao(conteudoDoArchive(dados)), especificacoesPorColecao, opcoesPorColecao };
 }
+
+/** Identidade da instância (documento gravado pelo bootstrap) — exige credencial com leitura. */
+async function instanciaAtual(cli: MongoClient): Promise<string> {
+  const d = await cli.db(RESTORE.identidade.banco).collection(RESTORE.identidade.colecao).findOne({ _id: RESTORE.identidade.id as never });
+  return (d?.["instanciaId"] as string) ?? "SEM-IDENTIDADE";
+}
+
+/** SOMENTE TESTES de biblioteca: a âncora externa é da CLI; aqui os ganchos testam a limpeza isoladamente. */
+const ANCORA_DE_TESTE: Ancorador = { intencao: () => undefined, confirmacao: () => undefined, evidencias: () => undefined };
 
 const BRUTO = { promoteValues: false, promoteLongs: false, promoteBuffers: false, bsonRegExp: true } as const;
 
@@ -116,6 +133,9 @@ try {
         update: () => db.collection(colecao).updateOne({}, { $set: { alterado: true } }),
         delete: () => db.collection(colecao).deleteOne({ _id: "inexistente" as never }),
         collMod: () => db.command({ collMod: colecao, validator: {} }),
+        // A21-7-01: validador intacto, mas ação/nível deixam de bloquear.
+        collModWarn: () => db.command({ collMod: colecao, validationAction: "warn" }),
+        collModOff: () => db.command({ collMod: colecao, validationLevel: "off" }),
         drop: () => db.command({ drop: `inexistente_${Date.now()}` }),
         dropReal: () => db.command({ drop: colecao }),
         rename: () => c.db("admin").command({ renameCollection: `${banco}.${colecao}`, to: `${banco}.${colecao}_renomeada` }),
@@ -140,7 +160,7 @@ try {
     case "adquirir-na-barreira": {
       const [execucaoId, barreira] = args as [string, string];
       while (Date.now() < Number(barreira)) await dormir(1);
-      const r = await adquirirPosse(db, { execucaoId, pid: process.pid, processoInicio: "teste", processoInicioTicks: "0", executavel: "teste", banco, archive: "-", archiveSha256: "-", manifesto: "-", manifestoSha256: "-" });
+      const r = await adquirirPosse(db, { execucaoId, banco, instanciaId: await instanciaAtual(c), pid: process.pid, processoInicio: "teste", processoInicioTicks: "0", executavel: "teste", archive: "-", archiveSha256: "-", manifesto: "-", manifestoSha256: "-" });
       saida = { execucaoId, ...r };
       break;
     }
@@ -153,10 +173,11 @@ try {
     }
     // Limpeza com ganchos: escrita alheia DEPOIS do congelamento, DEPOIS da verificação e entre as remoções.
     case "limpar-com-ganchos": {
-      const [execucaoId, arquivo, manifesto, modo] = args as [string, string, string, string];
+      // (o 3º argumento — manifesto — é aceito por compatibilidade; a referência vem do archive)
+      const [execucaoId, arquivo, , modo] = args as [string, string, string, string];
       const eventos: unknown[] = [];
       let primeira = true;
-      const r = await limparDestinoComPosse(db, execucaoId, referencia(arquivo, manifesto), ESTADOS_INTERROMPIVEIS, {
+      const r = await limparDestinoComPosse(db, execucaoId, await instanciaAtual(c), referencia(arquivo), "recuperacao", "00000000-0000-0000-0000-00000000aaaa", ANCORA_DE_TESTE, {
         aposCongelar: async () => { if (modo === "congelar" || modo === "ambos") eventos.push({ aposCongelar: await inserirAlheio(db, "produtos", "T05-congelado") }); },
         aposVerificar: async () => {
           if (modo === "verificar" || modo === "ambos") {
@@ -164,14 +185,20 @@ try {
             eventos.push({ aposVerificarNova: await inserirAlheio(db, "alheia_t05", "T05-nova") });
           }
         },
-        antesDeRemover: async (col) => {
+        antesDeRemover: async (col: string) => {
           // "trocar": na PRIMEIRA remoção, alguém apaga a coleção e a RECRIA com dado alheio (mesmo nome, outro UUID).
           if (modo === "trocar" && primeira) {
             primeira = false;
             await db.command({ drop: col });
             await db.collection(col).insertOne({ _id: "ALHEIO-T05-trocada" as never, alheio: true });
-            await db.command({ collMod: col, validator: { $expr: { $eq: [1, 0] } } });
+            await db.command({ collMod: col, validator: { $expr: { $eq: [1, 0] } }, validationLevel: "strict", validationAction: "error" });
             eventos.push({ trocada: col });
+          }
+          // A21-7-01: "warn"/"nivel-off" — o validador fica, mas a ação/nível deixa de bloquear; um alheio entra.
+          if ((modo === "warn" || modo === "nivel-off") && primeira) {
+            primeira = false;
+            await db.command(modo === "warn" ? { collMod: col, validationAction: "warn" } : { collMod: col, validationLevel: "off" });
+            eventos.push({ desprotegida: col, modo, insercao: await inserirAlheio(db, col, `T05-${modo}`) });
           }
         },
       });

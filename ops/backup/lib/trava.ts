@@ -39,14 +39,21 @@ export function lerTrava(caminho: string): ConteudoTrava | null {
   }
 }
 
-/** A trava está SEGURA por algum processo? (abrir para escrita é recusado pelo compartilhamento do SO). */
+/**
+ * A trava está SEGURA por algum processo? Só a VIOLAÇÃO DE COMPARTILHAMENTO do Windows (ERROR_SHARING_VIOLATION, que o
+ * Node/Bun expõe como `EBUSY`) prova que outro handle a mantém aberta. Fase 21.2.8 (A21-7-08): `EPERM`/`EACCES` (ACL,
+ * somente-leitura) NÃO contam — não provam que alguém segura a trava.
+ */
 export function travaSegura(caminho: string): boolean {
+  return codigoAberturaTrava(caminho) === "EBUSY";
+}
+
+export function codigoAberturaTrava(caminho: string): string | null {
   try {
     closeSync(openSync(caminho, "r+"));
-    return false;
+    return null;
   } catch (erro) {
-    const codigo = (erro as { code?: string }).code;
-    return codigo === "EBUSY" || codigo === "EPERM" || codigo === "EACCES";
+    return (erro as { code?: string }).code ?? "ERRO";
   }
 }
 

@@ -58,8 +58,9 @@ function Restore([string]$Archive, [string[]]$Extra = @(), [string]$Shell = "pow
 # Fase 21.2.6: a instância isolada exige credencial (DPAPI; só pelo stdin).
 $credRestore = Get-CredencialIsolada (Join-Path $env:USERPROFILE "mariela-restore-isolado") 'restore'
 function BancosNoRestore { $r = Invoke-CliBackup -Argumentos @("listar-bancos", "--porta", "27118") -Credencial $credRestore; if (-not $r.ok) { throw "listar-bancos: $($r.mensagem)" }; return @($r.resultado.bancos) }
-function RemoverRestore([string]$Banco, [string]$ExecucaoId, [string]$Shell = "powershell.exe") {
-  $r = Invoke-Nativo -Programa $Shell -Argumentos @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ops "gerir-restore.ps1"), "-Acao", "Remover", "-BancoDestino", $Banco, "-ExecucaoId", $ExecucaoId, "-DiretorioRelatorio", (Join-Path $raiz "relatorios"))
+# Fase 21.2.8 (A21-7-02): a remoção exige o archive e o manifesto do backup escolhido pelo operador.
+function RemoverRestore([string]$Banco, [string]$ExecucaoId, [string]$Arquivo, [string]$Shell = "powershell.exe") {
+  $r = Invoke-Nativo -Programa $Shell -Argumentos @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ops "gerir-restore.ps1"), "-Acao", "Remover", "-BancoDestino", $Banco, "-ExecucaoId", $ExecucaoId, "-ArquivoBackup", $Arquivo, "-Manifesto", ($Arquivo -replace '\.archive\.gz$', '.manifest.json'), "-DiretorioRelatorio", (Join-Path $raiz "relatorios"))
   return $r.Codigo
 }
 function SemArchiveValido([string]$Dir) { return @(Get-ChildItem -LiteralPath $Dir -File | Where-Object { $_.Name -match '^mariela_(prod|extra)_.*\.archive\.gz$' }).Count -eq 0 }
@@ -311,7 +312,7 @@ try {
     Exigir ($vr.ok -and @($vr.verificacoes | Where-Object { -not $_.ok }).Count -eq 0) "verificação integral pós-restore"
     Exigir ($rel.estadoDestino -eq "VERIFICADO") "estado do destino: $($rel.estadoDestino)"
     Exigir ((BancosNoRestore) -contains "mariela_restore_20260101_000002" -and (BancosNoRestore) -notcontains "marielaDB") "banco de destino"
-    Exigir ((RemoverRestore "mariela_restore_20260101_000002" $rel.execucaoId) -eq 0 -and (BancosNoRestore) -notcontains "mariela_restore_20260101_000002") "remoção comprovada"
+    Exigir ((RemoverRestore "mariela_restore_20260101_000002" $rel.execucaoId $archiveA) -eq 0 -and (BancosNoRestore) -notcontains "mariela_restore_20260101_000002") "remoção comprovada"
     "PASSOU (VERIFICADO) em $($rel.duracaoSegundos)s; $($mr.documentosRestaurados) documentos; " + (($vr.verificacoes | ForEach-Object { $_.detalhe }) -join " | ")
   }
 
@@ -347,7 +348,7 @@ try {
     $rr = Restore $arq @("-BancoDestino", "mariela_restore_20260101_000004") "pwsh"
     Exigir ($rr.Codigo -eq 0) "restore pwsh falhou"
     $rel4 = Get-Content -LiteralPath (Join-Path $raiz "relatorios\restore_mariela_restore_20260101_000004.json") -Raw -Encoding UTF8 | ConvertFrom-Json
-    Exigir ((RemoverRestore "mariela_restore_20260101_000004" $rel4.execucaoId "pwsh") -eq 0 -and (BancosNoRestore) -notcontains "mariela_restore_20260101_000004") "remoção comprovada (pwsh) não removeu"
+    Exigir ((RemoverRestore "mariela_restore_20260101_000004" $rel4.execucaoId $arq "pwsh") -eq 0 -and (BancosNoRestore) -notcontains "mariela_restore_20260101_000004") "remoção comprovada (pwsh) não removeu"
     "backup e restore no PowerShell $(pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'); 5.1 coberto nos demais casos"
   }
 

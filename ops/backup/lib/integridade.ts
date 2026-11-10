@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Db, Document } from "mongodb";
-import { chaveDoIdBruto, hashDoDocumentoBruto, normalizarIndice, type IndiceNormalizado, type Verificacao } from "./archive.js";
+import { chaveDoIdBruto, especificacaoIndice, hashDoDocumentoBruto, opcoesComparaveis, type EspecificacaoIndice, type Verificacao } from "./archive.js";
 import { BANCO_ORIGEM } from "./politica.js";
 
 /**
@@ -49,52 +49,70 @@ export function hashDaColecao(conteudo: ConteudoColecao): string {
  * Comparação PURA. `modo: "igual"` (validação final: conjunto e conteúdo idênticos) ou `"subconjunto"` (limpeza de um
  * restore parcial: tudo o que existe no destino tem de existir, IDÊNTICO, no archive — faltar é aceito).
  */
-export function compararColecao(colecao: string, esperado: ConteudoColecao, documentos: Iterable<Uint8Array>, modo: "igual" | "subconjunto"): ComparacaoColecao {
-  const encontrado: ConteudoColecao = new Map();
-  let alheios = 0;
-  let divergentes = 0;
-  let invalidos = 0;
-  for (const doc of documentos) {
+/**
+ * Comparador INCREMENTAL (Fase 21.2.8, A21-7-08): cada documento é processado e descartado; só ficam na memória as
+ * chaves e os hashes (não os documentos).
+ */
+export class ComparadorColecao {
+  private readonly encontrado: ConteudoColecao = new Map();
+  private alheios = 0;
+  private divergentes = 0;
+  private invalidos = 0;
+  constructor(
+    private readonly colecao: string,
+    private readonly esperado: ConteudoColecao,
+    private readonly modo: "igual" | "subconjunto",
+  ) {}
+
+  adicionar(doc: Uint8Array): void {
     let chave: string;
     try {
       chave = chaveDoIdBruto(doc);
     } catch {
-      invalidos += 1;
-      continue;
+      this.invalidos += 1;
+      return;
     }
-    if (encontrado.has(chave)) {
-      invalidos += 1;
-      continue;
+    if (this.encontrado.has(chave)) {
+      this.invalidos += 1;
+      return;
     }
     const hash = hashDoDocumentoBruto(doc);
-    encontrado.set(chave, hash);
-    const esp = esperado.get(chave);
-    if (esp === undefined) alheios += 1;
-    else if (esp !== hash) divergentes += 1;
+    this.encontrado.set(chave, hash);
+    const esp = this.esperado.get(chave);
+    if (esp === undefined) this.alheios += 1;
+    else if (esp !== hash) this.divergentes += 1;
   }
-  let faltando = 0;
-  for (const chave of esperado.keys()) if (!encontrado.has(chave)) faltando += 1;
-  const ok = alheios === 0 && divergentes === 0 && invalidos === 0 && (modo === "subconjunto" || faltando === 0);
-  return {
-    colecao,
-    ok,
-    esperados: esperado.size,
-    encontrados: encontrado.size,
-    faltando,
-    alheios,
-    divergentes,
-    invalidos,
-    hashEncontrado: hashDaColecao(encontrado),
-    hashEsperado: hashDaColecao(esperado),
-  };
+
+  finalizar(): ComparacaoColecao {
+    let faltando = 0;
+    for (const chave of this.esperado.keys()) if (!this.encontrado.has(chave)) faltando += 1;
+    const ok = this.alheios === 0 && this.divergentes === 0 && this.invalidos === 0 && (this.modo === "subconjunto" || faltando === 0);
+    return {
+      colecao: this.colecao,
+      ok,
+      esperados: this.esperado.size,
+      encontrados: this.encontrado.size,
+      faltando,
+      alheios: this.alheios,
+      divergentes: this.divergentes,
+      invalidos: this.invalidos,
+      hashEncontrado: hashDaColecao(this.encontrado),
+      hashEsperado: hashDaColecao(this.esperado),
+    };
+  }
 }
 
-/** Lê TODOS os documentos de uma coleção como BSON bruto (sem desserializar). */
-export async function documentosBrutos(db: Db, colecao: string): Promise<Uint8Array[]> {
-  const docs: Uint8Array[] = [];
-  // `raw: true`: o driver entrega os bytes exatamente como o servidor os enviou.
-  for await (const d of db.collection(colecao).find({}, { raw: true } as Document)) docs.push(d as unknown as Uint8Array);
-  return docs;
+export function compararColecao(colecao: string, esperado: ConteudoColecao, documentos: Iterable<Uint8Array>, modo: "igual" | "subconjunto"): ComparacaoColecao {
+  const c = new ComparadorColecao(colecao, esperado, modo);
+  for (const doc of documentos) c.adicionar(doc);
+  return c.finalizar();
+}
+
+/** Compara a coleção do destino LENDO EM FLUXO (`raw: true`: os bytes exatamente como o servidor os enviou). */
+export async function compararColecaoDoDestino(db: Db, colecao: string, esperado: ConteudoColecao, modo: "igual" | "subconjunto"): Promise<ComparacaoColecao> {
+  const c = new ComparadorColecao(colecao, esperado, modo);
+  for await (const d of db.collection(colecao).find({}, { raw: true } as Document)) c.adicionar(d as unknown as Uint8Array);
+  return c.finalizar();
 }
 
 /** Conteúdo esperado de cada coleção (sem o prefixo do banco), a partir do mapa por namespace do archive. */
@@ -106,18 +124,33 @@ export function conteudoPorColecao(porNamespace: Map<string, Map<string, string>
 
 export async function compararConteudoDoDestino(db: Db, esperado: Map<string, ConteudoColecao>, colecoes: readonly string[], modo: "igual" | "subconjunto"): Promise<ComparacaoColecao[]> {
   const r: ComparacaoColecao[] = [];
-  for (const c of colecoes) r.push(compararColecao(c, esperado.get(c) ?? new Map(), await documentosBrutos(db, c), modo));
+  for (const c of colecoes) r.push(await compararColecaoDoDestino(db, c, esperado.get(c) ?? new Map(), modo));
   return r;
 }
 
-/** Índices do destino × manifesto: `igual` (validação final) ou `subconjunto` (limpeza). */
-export async function compararIndices(db: Db, colecao: string, esperados: IndiceNormalizado[], modo: "igual" | "subconjunto"): Promise<{ ok: boolean; alheios: string[]; faltando: string[] }> {
-  const atuais = (await db.collection(colecao).indexes()).map((i) => normalizarIndice(i as Document));
-  const esp = new Set(esperados.map((i) => JSON.stringify(i)));
-  const atu = new Set(atuais.map((i) => JSON.stringify(i)));
-  const alheios = atuais.filter((i) => !esp.has(JSON.stringify(i))).map((i) => i.nome);
-  const faltando = esperados.filter((i) => !atu.has(JSON.stringify(i))).map((i) => i.nome);
+/**
+ * Comparação PURA de índices pela especificação COMPLETA (Fase 21.2.8, A21-7-03). Um índice com o mesmo nome e outra
+ * opção (collation, hidden, weights, 2dsphere, TTL…) é ao mesmo tempo "alheio" (o atual) e "faltando" (o esperado).
+ */
+export function compararEspecificacoes(atuais: EspecificacaoIndice[], esperados: EspecificacaoIndice[], modo: "igual" | "subconjunto"): { ok: boolean; alheios: string[]; faltando: string[] } {
+  const esp = new Set(esperados.map((i) => `${i.nome}\u0000${i.especificacao}`));
+  const atu = new Set(atuais.map((i) => `${i.nome}\u0000${i.especificacao}`));
+  const alheios = atuais.filter((i) => !esp.has(`${i.nome}\u0000${i.especificacao}`)).map((i) => i.nome);
+  const faltando = esperados.filter((i) => !atu.has(`${i.nome}\u0000${i.especificacao}`)).map((i) => i.nome);
   return { ok: alheios.length === 0 && (modo === "subconjunto" || faltando.length === 0), alheios, faltando };
+}
+
+/** Índices do destino × archive (especificação completa): `igual` (validação final) ou `subconjunto` (limpeza). */
+export async function compararIndices(db: Db, colecao: string, esperados: EspecificacaoIndice[], modo: "igual" | "subconjunto"): Promise<{ ok: boolean; alheios: string[]; faltando: string[] }> {
+  const atuais = (await db.collection(colecao).indexes()).map((i) => especificacaoIndice(i as Document));
+  return compararEspecificacoes(atuais, esperados, modo);
+}
+
+/** Opções da coleção (sem o trio de validação) iguais às do archive? (A21-7-03) */
+export function compararOpcoesColecao(atuais: Record<string, unknown> | null | undefined, doArchive: Record<string, unknown> | null | undefined): { ok: boolean; atual: string; esperado: string } {
+  const atual = opcoesComparaveis(atuais);
+  const esperado = opcoesComparaveis(doArchive);
+  return { ok: atual === esperado, atual, esperado };
 }
 
 export function resumoComparacao(c: ComparacaoColecao[]): Verificacao {

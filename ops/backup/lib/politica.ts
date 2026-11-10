@@ -138,46 +138,69 @@ export const RESTORE = {
   /** Trava de exclusão mútua LOCAL (arquivo aberto com FileShare.Read durante TODA a execução), relativa à raiz. */
   arquivoTrava: "locks/restore.lock",
   /**
-   * Fase 60.4.3.4.21.2.6 (A-03) — AUTENTICAÇÃO da instância isolada (`--auth --keyFile`). Credenciais SINTÉTICAS geradas
-   * localmente, guardadas com DPAPI (só a conta Windows que as criou as decifra), relativas à raiz. Nunca em argumento.
+   * Fase 60.4.3.4.21.2.6 (A-03) / 21.2.8 (A21-7-01) — AUTENTICAÇÃO da instância isolada (`--auth --keyFile`).
+   * Credenciais SINTÉTICAS geradas localmente, guardadas com DPAPI (só a conta Windows que as criou as decifra),
+   * relativas à raiz. Nunca em argumento. DPAPI NÃO impede que outro processo da MESMA conta as use.
    */
   autenticacao: {
     authSource: "admin",
-    /** Bootstrap: `root`, usado SÓ para configurar usuários e desligar a instância. Nunca pelo fluxo de restore. */
+    /** Bootstrap: `root`, usado SÓ para configurar usuários/identidade e desligar a instância. Nunca pelo fluxo. */
     usuarioAdmin: "mariela_bootstrap",
-    /** Usuário do fluxo de restore: papel `marielaRestore` (mínimo; sem bypass, sem update/remove de dados, sem dropDatabase). */
+    /** Escrita do restore (mongorestore) e leitura: papel `marielaRestore` — SEM collMod, drop, rename ou escrita na posse. */
     usuarioRestore: "mariela_restore",
     papelRestore: "marielaRestore",
+    /** Guardião (Fase 21.2.8): posse, transições, congelamento e limpeza — papel `marielaGuardiao`, SEM escrita em dados. */
+    usuarioGuardiao: "mariela_guardiao",
+    papelGuardiao: "marielaGuardiao",
     /** Usuário só-leitura (inspeção e testes de recusa). */
     usuarioLeitor: "mariela_leitor",
     arquivoChave: "seguranca/mongod.key",
-    credenciais: { admin: "seguranca/admin.cred", restore: "seguranca/restore.cred", leitor: "seguranca/leitor.cred" },
+    credenciais: { admin: "seguranca/admin.cred", restore: "seguranca/restore.cred", guardiao: "seguranca/guardiao.cred", leitor: "seguranca/leitor.cred" },
   },
+  /**
+   * Fase 60.4.3.4.21.2.8 (A21-7-06) — IDENTIDADE da instância: documento gravado NA instância (pelo bootstrap, ao configurar)
+   * e cópia local em `<raiz>/seguranca/instancia.json`. As duas têm de coincidir; a posse guarda o `instanciaId`.
+   */
+  identidade: { banco: "mariela_isolada_meta", colecao: "identidade", id: "instancia", arquivoLocal: "seguranca/instancia.json" },
+  /** Fase 60.4.3.4.21.2.8 (A21-7-02) — âncora EXTERNA ao banco: registro local de evidências por execução, relativo à raiz. */
+  pastaEvidencias: "evidencias",
 } as const;
 
 /**
- * Fase 60.4.3.4.21.2.6 (A-03) — privilégios do papel `marielaRestore`, o MÍNIMO para o fluxo:
- *   - mongorestore: insert, createCollection, createIndex, listCollections/listIndexes;
- *   - validação/integridade: find, listCollections, listIndexes, collStats, dbStats; identidade: getCmdLineOpts, listDatabases;
- *   - congelamento: collMod; limpeza comprovada: dropCollection (com `collectionUUID`);
- *   - posse: update/remove SÓ na coleção de controle.
- * NÃO tem: bypassDocumentValidation, update/remove em coleções de dados, dropDatabase, renameCollectionSameDB, shutdown,
- * nem gestão de usuários. (Observação comprovada: find+insert+createIndex+dropCollection permitem `renameCollection` no
- * mesmo banco; por isso toda remoção exige o `collectionUUID` verificado.)
+ * Fase 60.4.3.4.21.2.8 (A21-7-01) — SEPARAÇÃO DE PAPÉIS. Nenhum usuário consegue, sozinho, descongelar E escrever dados.
+ *
+ * `marielaRestore` (mongorestore, leitura, verificação): insert, createCollection, createIndex, find, listagens.
+ *   NÃO tem: collMod (não descongela), dropCollection (não remove nem renomeia), update/remove, bypassDocumentValidation,
+ *   dropDatabase, escrita na posse.
+ *   Ainda consegue (e é DETECTADO): criar coleção/índice; inserir em coleção NÃO congelada; inserir documento na coleção de
+ *   controle (a posse passa a ter 2 documentos ⇒ recusa, falha fechada).
+ *
+ * `marielaGuardiao` (posse, transições, congelar, limpeza): find, listagens, collMod (congelar/descongelar), dropCollection
+ *   (sempre com `collectionUUID`); createCollection/insert/update/remove SÓ na coleção de controle.
+ *   NÃO tem: insert/update/remove em coleções de dados, createIndex, bypassDocumentValidation, dropDatabase.
+ *   Consegue descongelar (collMod) — por isso o congelamento é sempre RECONFERIDO por completo (validator + nível + ação).
+ *
+ * Os dois ficam na MESMA conta Windows (DPAPI): a separação limita o raio de uma ferramenta/credencial, não um adversário
+ * com a conta inteira — contra esse a defesa é a DETECÇÃO (congelamento completo, âncora externa, comparação integral).
  */
 export const PRIVILEGIOS_RESTORE = [
   { resource: { cluster: true }, actions: ["listDatabases", "getCmdLineOpts"] },
-  { resource: { db: "", collection: "" }, actions: ["find", "insert", "createCollection", "createIndex", "dropCollection", "collMod", "listCollections", "listIndexes", "collStats", "dbStats"] },
-  { resource: { db: "", collection: "_mariela_restore_posse" }, actions: ["update", "remove"] },
+  { resource: { db: "", collection: "" }, actions: ["find", "insert", "createCollection", "createIndex", "listCollections", "listIndexes", "collStats", "dbStats"] },
+] as const;
+
+export const PRIVILEGIOS_GUARDIAO = [
+  { resource: { cluster: true }, actions: ["listDatabases", "getCmdLineOpts"] },
+  { resource: { db: "", collection: "" }, actions: ["find", "listCollections", "listIndexes", "collStats", "dbStats", "collMod", "dropCollection"] },
+  { resource: { db: "", collection: "_mariela_restore_posse" }, actions: ["createCollection", "insert", "update", "remove"] },
 ] as const;
 
 /**
- * Fase 60.4.3.4.21.2.6 (A-01) — MÁQUINA DE ESTADOS do destino de restore (persistida no documento de posse).
- *   PREPARANDO → RESTAURANDO → VALIDANDO → VERIFICADO → LIBERACAO_AUTORIZADA (só por comando explícito do operador)
- *   PREPARANDO|RESTAURANDO|VALIDANDO → FALHOU_DESTINO_PARCIAL (falha depois de iniciar a escrita)
- *   FALHOU_DESTINO_PARCIAL|VERIFICADO|LIBERACAO_AUTORIZADA|INTERVENCAO_NECESSARIA|interrompidos → CANCELADO_COM_LIMPEZA_COMPROVADA
+ * MÁQUINA DE ESTADOS do destino de restore (persistida na posse E no registro local de evidências).
+ *   PREPARANDO → RESTAURANDO → VALIDANDO → VERIFICADO → LIBERACAO_AUTORIZADA → EM_USO (cada passo do operador é explícito)
+ *   PREPARANDO|RESTAURANDO|VALIDANDO → FALHOU_DESTINO_PARCIAL (falha depois de adquirir a posse)
+ *   remoção comprovada: (falha|interrompido|VERIFICADO|LIBERACAO_AUTORIZADA) → REMOVENDO → CANCELADO_COM_LIMPEZA_COMPROVADA
+ *   descarte de destino USADO: EM_USO → REMOVENDO → DESCARTADO
  *   qualquer estado não final → INTERVENCAO_NECESSARIA (a segurança de seguir ou remover não pôde ser provada)
- * CANCELADO_COM_LIMPEZA_COMPROVADA é final: o banco deixou de existir (registrado no relatório da operação).
  */
 export const ESTADOS_DESTINO = [
   "PREPARANDO",
@@ -186,28 +209,54 @@ export const ESTADOS_DESTINO = [
   "FALHOU_DESTINO_PARCIAL",
   "VERIFICADO",
   "LIBERACAO_AUTORIZADA",
+  "EM_USO",
+  "REMOVENDO",
   "CANCELADO_COM_LIMPEZA_COMPROVADA",
+  "DESCARTADO",
   "INTERVENCAO_NECESSARIA",
 ] as const;
 export type EstadoDestino = (typeof ESTADOS_DESTINO)[number];
 
 export const TRANSICOES_DESTINO: Record<EstadoDestino, readonly EstadoDestino[]> = {
-  PREPARANDO: ["RESTAURANDO", "FALHOU_DESTINO_PARCIAL", "INTERVENCAO_NECESSARIA", "CANCELADO_COM_LIMPEZA_COMPROVADA"],
-  RESTAURANDO: ["VALIDANDO", "FALHOU_DESTINO_PARCIAL", "INTERVENCAO_NECESSARIA", "CANCELADO_COM_LIMPEZA_COMPROVADA"],
-  VALIDANDO: ["VERIFICADO", "FALHOU_DESTINO_PARCIAL", "INTERVENCAO_NECESSARIA", "CANCELADO_COM_LIMPEZA_COMPROVADA"],
-  FALHOU_DESTINO_PARCIAL: ["CANCELADO_COM_LIMPEZA_COMPROVADA", "INTERVENCAO_NECESSARIA"],
-  VERIFICADO: ["LIBERACAO_AUTORIZADA", "CANCELADO_COM_LIMPEZA_COMPROVADA", "INTERVENCAO_NECESSARIA"],
-  LIBERACAO_AUTORIZADA: ["CANCELADO_COM_LIMPEZA_COMPROVADA", "INTERVENCAO_NECESSARIA"],
-  INTERVENCAO_NECESSARIA: ["CANCELADO_COM_LIMPEZA_COMPROVADA"],
+  PREPARANDO: ["RESTAURANDO", "FALHOU_DESTINO_PARCIAL", "INTERVENCAO_NECESSARIA", "REMOVENDO"],
+  RESTAURANDO: ["VALIDANDO", "FALHOU_DESTINO_PARCIAL", "INTERVENCAO_NECESSARIA", "REMOVENDO"],
+  VALIDANDO: ["VERIFICADO", "FALHOU_DESTINO_PARCIAL", "INTERVENCAO_NECESSARIA", "REMOVENDO"],
+  FALHOU_DESTINO_PARCIAL: ["REMOVENDO", "INTERVENCAO_NECESSARIA"],
+  VERIFICADO: ["LIBERACAO_AUTORIZADA", "REMOVENDO", "INTERVENCAO_NECESSARIA"],
+  LIBERACAO_AUTORIZADA: ["EM_USO", "REMOVENDO", "INTERVENCAO_NECESSARIA"],
+  EM_USO: ["REMOVENDO", "INTERVENCAO_NECESSARIA"],
+  REMOVENDO: ["CANCELADO_COM_LIMPEZA_COMPROVADA", "DESCARTADO", "INTERVENCAO_NECESSARIA"],
+  INTERVENCAO_NECESSARIA: ["REMOVENDO"],
   CANCELADO_COM_LIMPEZA_COMPROVADA: [],
+  DESCARTADO: [],
 };
 
 export function transicaoPermitida(de: EstadoDestino, para: EstadoDestino): boolean {
   return TRANSICOES_DESTINO[de]?.includes(para) ?? false;
 }
 
+/** Estados FINAIS: o destino deixou de existir (ou só resta a coleção de controle órfã, que a recuperação conclui). */
+export const ESTADOS_FINAIS: readonly EstadoDestino[] = ["CANCELADO_COM_LIMPEZA_COMPROVADA", "DESCARTADO"];
+
+/**
+ * O que cada estado GARANTE sobre o destino (A21-7-05). Só VERIFICADO e LIBERACAO_AUTORIZADA afirmam igualdade com o
+ * archive e imutabilidade — e mesmo assim só no instante da última verificação, com a proteção reconferida.
+ */
+export function garantiasDoEstado(estado: EstadoDestino): { igualAoArchive: boolean; protegido: boolean; utilizavel: boolean } {
+  switch (estado) {
+    case "VERIFICADO":
+      return { igualAoArchive: true, protegido: true, utilizavel: false };
+    case "LIBERACAO_AUTORIZADA":
+      return { igualAoArchive: true, protegido: true, utilizavel: false };
+    case "EM_USO":
+      return { igualAoArchive: false, protegido: false, utilizavel: true };
+    default:
+      return { igualAoArchive: false, protegido: false, utilizavel: false };
+  }
+}
+
 /** Estados de uma execução que NÃO terminou (só a recuperação manual, com o dono comprovadamente encerrado, age neles). */
-export const ESTADOS_INTERROMPIVEIS: readonly EstadoDestino[] = ["PREPARANDO", "RESTAURANDO", "VALIDANDO", "FALHOU_DESTINO_PARCIAL", "INTERVENCAO_NECESSARIA"];
+export const ESTADOS_INTERROMPIVEIS: readonly EstadoDestino[] = ["PREPARANDO", "RESTAURANDO", "VALIDANDO", "FALHOU_DESTINO_PARCIAL", "INTERVENCAO_NECESSARIA", "REMOVENDO"];
 
 /**
  * Sequência → campo de código da entidade (para conferir que `sequencias.valor` ≥ maior código já emitido; senão a
