@@ -3,6 +3,7 @@ import { MongooseModule } from "@nestjs/mongoose";
 import { CampanhasModule } from "../campanhas/campanhas.module.js";
 import { ColecoesModule } from "../colecoes/colecoes.module.js";
 import { ConfiguracoesModule } from "../configuracoes/configuracoes.module.js";
+import { MovimentacaoEstoque, MovimentacaoEstoqueSchema } from "../estoque/schemas/movimentacao-estoque.schema.js";
 import { FornecedoresModule } from "../fornecedores/fornecedores.module.js";
 import { SequenciasModule } from "../sequencias/sequencias.module.js";
 import { ProdutosController } from "./produtos.controller.js";
@@ -16,6 +17,10 @@ import { Produto, ProdutoSchema } from "./schemas/produto.schema.js";
     MongooseModule.forFeature([
       { name: Produto.name, schema: ProdutoSchema },
       { name: EventoProduto.name, schema: EventoProdutoSchema },
+      // Fase 22.3 — o cadastro de tamanho com saldo inicial grava a linha do ledger na MESMA transação do saldo. Só o
+      // schema (mesmo padrão de `VendasModule`), nunca `EstoqueModule`: este já importa `ProdutosModule`, e importá-lo
+      // aqui criaria um ciclo de módulos.
+      { name: MovimentacaoEstoque.name, schema: MovimentacaoEstoqueSchema },
     ]),
     SequenciasModule,
     // Etapa 10.23 — correção 6.10: `ProdutosService.criar/atualizar` agora

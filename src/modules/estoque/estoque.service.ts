@@ -11,6 +11,7 @@ import { normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
 import type { EntradaEstoqueDto } from "./dto/entrada-estoque.dto.js";
 import type { ListarEstoqueQueryDto } from "./dto/listar-estoque-query.dto.js";
 import type { SaidaEstoqueDto } from "./dto/saida-estoque.dto.js";
+import { registrarMovimentacaoEstoque } from "./registrar-movimentacao-estoque.js";
 import {
   MovimentacaoEstoque,
   type MovimentacaoEstoqueDocument,
@@ -135,26 +136,26 @@ export class EstoqueService implements OnModuleInit {
       sessao,
     );
 
-    const [movimentacao] = await this.movimentacaoModel.create(
-      [
-        {
-          produtoId: produto.id,
-          varianteId: dados.varianteId,
-          tamanhoId,
-          tipo: dados.tipo,
-          quantidade: dados.quantidade,
-          saldoResultante,
-          motivo: dados.motivo,
-          usuarioId: dados.usuarioId,
-          origem: dados.origem,
-          vendaId: dados.vendaId ?? null,
-          ...(dados.idempotencyKey ? { idempotencyKey: dados.idempotencyKey, idempotencyAssinatura: dados.idempotencyAssinatura } : {}),
-        },
-      ],
-      { session: sessao },
+    const movimentacao = await registrarMovimentacaoEstoque(
+      this.movimentacaoModel,
+      {
+        produtoId: produto.id,
+        varianteId: dados.varianteId,
+        tamanhoId,
+        tipo: dados.tipo,
+        quantidade: dados.quantidade,
+        saldoResultante,
+        motivo: dados.motivo,
+        usuarioId: dados.usuarioId,
+        origem: dados.origem,
+        vendaId: dados.vendaId ?? null,
+        idempotencyKey: dados.idempotencyKey,
+        idempotencyAssinatura: dados.idempotencyAssinatura,
+      },
+      sessao,
     );
 
-    return { produto, tamanhoId, saldoResultante, movimentacao: movimentacao! };
+    return { produto, tamanhoId, saldoResultante, movimentacao };
   }
 
   async entrada(dto: EntradaEstoqueDto, usuarioId: string | null): Promise<ProdutoDocument> {

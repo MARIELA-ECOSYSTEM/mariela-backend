@@ -1,7 +1,11 @@
-import { forwardRef, Inject, Injectable } from "@nestjs/common";
-import { InjectModel } from "@nestjs/mongoose";
-import type { ClientSession, Model, Types } from "mongoose";
+import { forwardRef, HttpStatus, Inject, Injectable } from "@nestjs/common";
+import { InjectConnection, InjectModel } from "@nestjs/mongoose";
+import type { ClientSession, Connection, Model, Types } from "mongoose";
+import { ERROR_CODES } from "../../common/constants/error-codes.constant.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
+import { executarEmTransacao } from "../../database/transacao.util.js";
+import { registrarMovimentacaoEstoque } from "../estoque/registrar-movimentacao-estoque.js";
+import { MovimentacaoEstoque, type MovimentacaoEstoqueDocument } from "../estoque/schemas/movimentacao-estoque.schema.js";
 import type { ApiFacets, ApiMeta } from "../../common/types/api-response.interface.js";
 import { CampanhasRepository } from "../campanhas/campanhas.repository.js";
 import { ColecoesRepository } from "../colecoes/colecoes.repository.js";
@@ -50,6 +54,9 @@ export class ProdutosService {
     // Fase 54.2 — autoridade para validar se uma cor/tamanho usado por uma
     // variante existe em `configuracoes.cores`/`configuracoes.tamanhos`.
     @Inject(forwardRef(() => ConfiguracoesRepository)) private readonly configuracoesRepository: ConfiguracoesRepository,
+    // Fase 22.3 — ledger do saldo inicial de um tamanho, gravado na mesma transação do saldo.
+    @InjectModel(MovimentacaoEstoque.name) private readonly movimentacaoModel: Model<MovimentacaoEstoqueDocument>,
+    @InjectConnection() private readonly conexao: Connection,
   ) {}
 
   async criar(dto: CriarProdutoDto, usuarioId: string | null): Promise<ProdutoDocument> {
@@ -383,6 +390,16 @@ export class ProdutosService {
 
     await this.produtosRepository.salvarComRetentativa(produtoId, (documento) => {
       const variante = this.encontrarVarianteOuFalhar(documento, varianteId);
+      // Fase 22.3 — nunca apaga saldo sem histórico: com estoque em qualquer tamanho, a remoção é recusada (422) ANTES de
+      // qualquer mudança. A checagem roda sobre o documento lido nesta tentativa (concorrência otimista: uma entrada
+      // concorrente invalida a versão e a checagem é refeita). Nenhuma baixa automática.
+      const saldoDaVariante = variante.tamanhos.reduce((total, tamanho) => total + tamanho.quantidade, 0);
+      if (saldoDaVariante > 0) {
+        throw recusaPorSaldo(
+          `Esta variante ainda tem ${saldoDaVariante} peça(s) em estoque. Zere o estoque de todos os tamanhos com uma saída de estoque (com motivo) antes de remover a variante.`,
+          "varianteId",
+        );
+      }
       snapshot = { cor: variante.cor, codVariante: variante.codVariante };
       if (String(documento.fotoPrincipalVarianteId) === varianteId) {
         documento.fotoPrincipalVarianteId = null;
@@ -408,23 +425,66 @@ export class ProdutosService {
     const tamanhoNormalizado = normalizarTamanho(dto.tamanho);
     await this.validarTamanhoCadastrado(dto.tamanho);
 
-    const produto = await this.produtosRepository.salvarComRetentativa(produtoId, (documento) => {
-      const variante = this.encontrarVarianteOuFalhar(documento, varianteId);
-      const tamanhosExistentes = variante.tamanhos.map((item) => item.tamanho);
+    /**
+     * Valida e cria o tamanho na variante (regras de duplicidade e de tamanho único inalteradas). Com `saldoInicial`, o
+     * saldo é aplicado na MESMA escrita pela regra única (`aplicarAjuste`, a mesma de `ajustarQuantidadeTamanho`).
+     */
+    const criarTamanho = (quantidadeGravada: number, saldoInicial: number | null, sessao?: ClientSession) => {
+      let aplicado: { tamanhoId: string; saldoResultante: number } | null = null;
+      const salvo = this.produtosRepository.salvarComRetentativa(produtoId, (documento) => {
+        const variante = this.encontrarVarianteOuFalhar(documento, varianteId);
+        const tamanhosExistentes = variante.tamanhos.map((item) => item.tamanho);
 
-      if (tamanhosExistentes.some((tamanho) => normalizarTamanho(tamanho) === tamanhoNormalizado)) {
-        throw ApiException.validation("Dados inválidos.", [
-          { field: "tamanho", message: "Este tamanho já está cadastrado nesta variante." },
-        ]);
-      }
-      const conflito = conflitoTamanhoUnico(tamanhosExistentes, tamanhoNormalizado);
-      if (conflito) {
-        throw ApiException.validation("Dados inválidos.", [{ field: "tamanho", message: conflito }]);
-      }
+        if (tamanhosExistentes.some((tamanho) => normalizarTamanho(tamanho) === tamanhoNormalizado)) {
+          throw ApiException.validation("Dados inválidos.", [
+            { field: "tamanho", message: "Este tamanho já está cadastrado nesta variante." },
+          ]);
+        }
+        const conflito = conflitoTamanhoUnico(tamanhosExistentes, tamanhoNormalizado);
+        if (conflito) {
+          throw ApiException.validation("Dados inválidos.", [{ field: "tamanho", message: conflito }]);
+        }
 
-      variante.tamanhos.push({ tamanho: tamanhoNormalizado, quantidade: dto.quantidade });
-      this.recalcularDerivados(documento);
-    });
+        variante.tamanhos.push({ tamanho: tamanhoNormalizado, quantidade: quantidadeGravada });
+        const criado = variante.tamanhos[variante.tamanhos.length - 1]!;
+        aplicado = saldoInicial === null
+          ? null
+          : this.aplicarAjuste(documento, varianteId, { tamanhoId: String(criado._id), delta: saldoInicial, exigirExistente: true });
+        this.recalcularDerivados(documento);
+      }, 3, sessao);
+      return salvo.then((produto) => ({ produto, aplicado: aplicado as { tamanhoId: string; saldoResultante: number } | null }));
+    };
+
+    let produto: ProdutoDocument;
+    if (dto.quantidade <= 0) {
+      // Sem saldo inicial: nada entra no estoque, então não há movimentação — exatamente o caminho de antes (inclusive a
+      // recusa do schema a uma quantidade negativa, que chega aqui sem passar pelo DTO).
+      ({ produto } = await criarTamanho(dto.quantidade, null));
+    } else {
+      // Fase 22.3 — saldo inicial positivo: UMA transação com UMA leitura e UMA gravação do produto (tamanho criado com 0
+      // e saldo aplicado pela regra única) + UMA entrada no ledger (`origem: "cadastro"`). Qualquer falha desfaz tudo; um
+      // conflito transitório repete a transação inteira (`executarEmTransacao`), então o commit é um só.
+      produto = await executarEmTransacao(this.conexao, async (sessao) => {
+        const { produto: gravado, aplicado } = await criarTamanho(0, dto.quantidade, sessao);
+        if (!aplicado) throw new Error("saldo inicial não aplicado"); // invariante: saldoInicial informado
+        await registrarMovimentacaoEstoque(
+          this.movimentacaoModel,
+          {
+            produtoId,
+            varianteId,
+            tamanhoId: aplicado.tamanhoId,
+            tipo: "entrada",
+            quantidade: dto.quantidade,
+            saldoResultante: aplicado.saldoResultante,
+            motivo: `Saldo inicial do tamanho ${tamanhoNormalizado}`,
+            usuarioId,
+            origem: "cadastro",
+          },
+          sessao,
+        );
+        return gravado;
+      });
+    }
 
     const variante = this.encontrarVarianteOuFalhar(produto, varianteId);
     await this.registrarEvento(produtoId, varianteId, "tamanho.adicionado", usuarioId, {
@@ -444,6 +504,14 @@ export class ProdutosService {
       const variante = this.encontrarVarianteOuFalhar(documento, varianteId);
       const tamanho = variante.tamanhos.find((item) => String(item._id) === tamanhoId);
       if (!tamanho) throw ApiException.notFound("Tamanho não encontrado.");
+      // Fase 22.3 — nunca apaga saldo sem histórico: com estoque, a remoção é recusada (422) antes de qualquer mudança.
+      // Nenhuma baixa automática — a saída precisa ser explícita, com motivo.
+      if (tamanho.quantidade > 0) {
+        throw recusaPorSaldo(
+          `Este tamanho ainda tem ${tamanho.quantidade} peça(s) em estoque. Registre uma saída de estoque (com motivo) para zerar o saldo antes de remover o tamanho.`,
+          "tamanhoId",
+        );
+      }
       variante.tamanhos.pull({ _id: tamanhoId });
       this.recalcularDerivados(documento);
     });
@@ -492,6 +560,23 @@ export class ProdutosService {
     let saldoResultante = 0;
 
     const produto = await this.produtosRepository.salvarComRetentativa(produtoId, (documento) => {
+      ({ tamanhoId: tamanhoIdAfetado, saldoResultante } = this.aplicarAjuste(documento, varianteId, ajuste));
+    }, 3, sessao);
+
+    return { produto, tamanhoId: tamanhoIdAfetado, saldoResultante };
+  }
+
+  /**
+   * Fase 22.3 — a regra de alteração de saldo de `ajustarQuantidadeTamanho`, extraída SEM mudança para ser aplicada
+   * também dentro da escrita do cadastro de tamanho (uma leitura e uma gravação por tentativa). Muta o documento já lido:
+   * localiza (ou, sem `exigirExistente`, cria pelo nome) o tamanho, recusa saldo negativo e recalcula os derivados.
+   * Continua sendo o ÚNICO ponto onde a quantidade de um tamanho existente muda.
+   */
+  private aplicarAjuste(
+    documento: ProdutoDocument,
+    varianteId: string,
+    ajuste: { tamanhoId?: string; tamanho?: string; delta: number; exigirExistente: boolean },
+  ): { tamanhoId: string; saldoResultante: number } {
       const variante = this.encontrarVarianteOuFalhar(documento, varianteId);
 
       let tamanho = ajuste.tamanhoId
@@ -526,12 +611,8 @@ export class ProdutosService {
         ]);
       }
       tamanho!.quantidade = resultado;
-      tamanhoIdAfetado = String(tamanho!._id);
-      saldoResultante = resultado;
       this.recalcularDerivados(documento);
-    }, 3, sessao);
-
-    return { produto, tamanhoId: tamanhoIdAfetado, saldoResultante };
+      return { tamanhoId: String(tamanho!._id), saldoResultante: resultado };
   }
 
   private encontrarVarianteOuFalhar(produto: ProdutoDocument, varianteId: string): VarianteDocument {
@@ -661,4 +742,18 @@ export class ProdutosService {
   ): Promise<void> {
     await this.eventoModel.create({ produtoId, varianteId, tipo, usuarioId, detalhes });
   }
+}
+
+/**
+ * Fase 22.3 — remoção recusada porque ainda há saldo: HTTP 422 (a requisição é válida, mas a regra de negócio a impede
+ * no estado atual). Mantém o código público `VALIDATION_ERROR` (nenhum código novo no contrato) e a mensagem também no
+ * nível superior, que é o que o Backoffice exibe.
+ */
+function recusaPorSaldo(mensagem: string, campo: string): ApiException {
+  return new ApiException({
+    statusCode: HttpStatus.UNPROCESSABLE_ENTITY,
+    code: ERROR_CODES.VALIDATION_ERROR,
+    message: mensagem,
+    errors: [{ field: campo, message: mensagem }],
+  });
 }

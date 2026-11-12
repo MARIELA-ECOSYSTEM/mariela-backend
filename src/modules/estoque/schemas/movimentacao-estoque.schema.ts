@@ -3,7 +3,8 @@ import { SchemaTypes, type HydratedDocument, type Types } from "mongoose";
 import { aplicarSerializacaoPadrao } from "../../../database/mongoose-json.util.js";
 
 export type TipoMovimentacaoEstoque = "entrada" | "saida";
-export const ORIGENS_MOVIMENTACAO_ESTOQUE = ["manual", "venda", "cancelamento"] as const;
+/** Fase 22.3 — `cadastro`: saldo inicial informado ao cadastrar um tamanho (`POST /produtos/:id/variantes/:vid/tamanhos`). */
+export const ORIGENS_MOVIMENTACAO_ESTOQUE = ["manual", "venda", "cancelamento", "cadastro"] as const;
 export type OrigemMovimentacaoEstoque = (typeof ORIGENS_MOVIMENTACAO_ESTOQUE)[number];
 
 /**

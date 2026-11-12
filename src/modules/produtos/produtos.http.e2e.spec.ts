@@ -437,11 +437,22 @@ describe("HTTP — Produtos (integração — servidor real)", () => {
     it("remove uma variante e recalcula quantidadeTotal", async () => {
       const produto = await criarProdutoViaHttp();
       const variante = await adicionarVarianteViaHttp(produto.id, { cor: "Bege" });
-      await fetch(`${baseUrl}/api/v1/produtos/${produto.id}/variantes/${variante.id}/tamanhos`, {
+      const criado = await fetch(`${baseUrl}/api/v1/produtos/${produto.id}/variantes/${variante.id}/tamanhos`, {
         method: "POST",
         headers: jsonHeaders(adminAccessToken),
         body: JSON.stringify({ tamanho: "M", quantidade: 5 }),
       });
+      const tamanhoId = ((await criado.json()) as { data: { tamanhos: { id: string }[] } }).data.tamanhos[0]!.id;
+
+      // Fase 22.3 — com saldo, a remoção é recusada (422) e nada muda; a saída explícita (com motivo) zera o saldo antes.
+      const recusada = await fetch(`${baseUrl}/api/v1/produtos/${produto.id}/variantes/${variante.id}`, { method: "DELETE", headers: jsonHeaders(adminAccessToken) });
+      expect(recusada.status).toBe(422);
+      const saida = await fetch(`${baseUrl}/api/v1/estoque/saida`, {
+        method: "POST",
+        headers: jsonHeaders(adminAccessToken),
+        body: JSON.stringify({ produtoId: produto.id, varianteId: variante.id, tamanhoId, quantidade: 5, motivo: "Zerar antes de remover a variante" }),
+      });
+      expect(saida.status).toBe(201);
 
       const remocao = await fetch(`${baseUrl}/api/v1/produtos/${produto.id}/variantes/${variante.id}`, { method: "DELETE", headers: jsonHeaders(adminAccessToken) });
       expect(remocao.status).toBe(200);
@@ -504,6 +515,19 @@ describe("HTTP — Produtos (integração — servidor real)", () => {
         body: JSON.stringify({ tamanho: "M", quantidade: 6 }),
       });
       const tamanho = ((await criado.json()) as { data: { tamanhos: { id: string }[] } }).data.tamanhos[0]!;
+
+      // Fase 22.3 — com saldo, a remoção é recusada (422) e nada muda; a saída explícita (com motivo) zera o saldo antes.
+      const recusada = await fetch(`${baseUrl}/api/v1/produtos/${produto.id}/variantes/${variante.id}/tamanhos/${tamanho.id}`, {
+        method: "DELETE",
+        headers: jsonHeaders(adminAccessToken),
+      });
+      expect(recusada.status).toBe(422);
+      const saida = await fetch(`${baseUrl}/api/v1/estoque/saida`, {
+        method: "POST",
+        headers: jsonHeaders(adminAccessToken),
+        body: JSON.stringify({ produtoId: produto.id, varianteId: variante.id, tamanhoId: tamanho.id, quantidade: 6, motivo: "Zerar antes de remover o tamanho" }),
+      });
+      expect(saida.status).toBe(201);
 
       const remocao = await fetch(`${baseUrl}/api/v1/produtos/${produto.id}/variantes/${variante.id}/tamanhos/${tamanho.id}`, {
         method: "DELETE",

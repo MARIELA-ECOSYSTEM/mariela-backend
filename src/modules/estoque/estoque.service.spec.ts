@@ -97,8 +97,16 @@ describe("EstoqueService (integração — MongoDB real)", () => {
   }
 
   /** `produtoId` é persistido como `ObjectId` no schema — a query direta via `Connection` (fora do Model) não faz o cast automático do Mongoose. */
+  /**
+   * Movimentações das OPERAÇÕES DE ESTOQUE sob teste. Fase 22.3 — o saldo inicial que `criarProdutoComTamanho` informa
+   * no cadastro do tamanho passou a gerar uma entrada `origem: "cadastro"` (preparação, não a operação testada); ela fica
+   * de fora aqui e é verificada pelos testes da Fase 22.3 abaixo.
+   */
   async function movimentacoesDoProduto(produtoId: string) {
-    return connection.collection("movimentacoes_estoque").find({ produtoId: new Types.ObjectId(produtoId) }).toArray();
+    return connection
+      .collection("movimentacoes_estoque")
+      .find({ produtoId: new Types.ObjectId(produtoId), origem: { $ne: "cadastro" } })
+      .toArray();
   }
 
   describe("entrada", () => {

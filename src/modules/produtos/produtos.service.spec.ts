@@ -1,12 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { JwtModule } from "@nestjs/jwt";
-import { getConnectionToken } from "@nestjs/mongoose";
+import { getConnectionToken, getModelToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import { Error as MongooseErrors, Types, type Connection } from "mongoose";
+import { Error as MongooseErrors, Types, type Connection, type Model } from "mongoose";
 import { mongooseModuloDeTeste } from "../../test-utils/mongo-teste.util.js";
 import { garantirItemConfiguracao } from "../../test-utils/configuracoes-teste.util.js";
 import { liberarTudo, novoPonto, type PontoDeParada } from "../../test-utils/barreira.util.js";
 import { ApiException } from "../../common/exceptions/api.exception.js";
+import { MAXIMO_TENTATIVAS_TRANSACAO, MENSAGEM_CONFLITO_TRANSACAO } from "../../database/transacao.util.js";
+import { MovimentacaoEstoque, type MovimentacaoEstoqueDocument } from "../estoque/schemas/movimentacao-estoque.schema.js";
 import { CampanhasService } from "../campanhas/campanhas.service.js";
 import { ColecoesService } from "../colecoes/colecoes.service.js";
 import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js";
@@ -1162,11 +1164,14 @@ describe("ProdutosService (integração — MongoDB real)", () => {
         ]);
       });
 
+      // Fase 22.3 — o limite de 3 tentativas de `salvarComRetentativa` continua sendo o contrato do cadastro SEM saldo
+      // inicial (caminho inalterado, sem transação): `quantidade: 0`. Com saldo inicial o cadastro roda numa transação
+      // (tamanho + ledger) e o conflito é tratado por `executarEmTransacao` — ver o teste "C-transação" logo abaixo.
       it("C. as 3 tentativas conflitam: termina com o conflito do contrato (409 CONFLICT), nunca o VersionError cru — sem gravação parcial", async () => {
         const { produtoId, varianteId, tamanhoMId } = await varianteComTamanhoM("ESG-C");
         const { a, tentativasDeA } = await forcarConflitos(
           3,
-          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 5 }, null),
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 0 }, null),
           () => service.ajustarQuantidadeTamanho(produtoId, varianteId, { tamanhoId: tamanhoMId, delta: 1, exigirExistente: true }),
         );
         expect(a.ok).toBe(false);
@@ -1179,6 +1184,26 @@ describe("ProdutosService (integração — MongoDB real)", () => {
         expect(tentativasDeA).toBe(3); // limite inalterado
         // Só as 3 escritas concorrentes entraram; o P de A nunca foi gravado.
         expect(await tamanhosPersistidos(produtoId, varianteId)).toEqual([{ tamanho: "M", quantidade: 4 }]);
+      });
+
+      it("C-transação (Fase 22.3). com saldo inicial, conflitos esgotados terminam em 409 CONFLICT (limite da transação), sem VersionError cru, sem tamanho e sem linha no ledger", async () => {
+        const { produtoId, varianteId, tamanhoMId } = await varianteComTamanhoM("ESG-CT");
+        const ledgerAntes = await connection.collection("movimentacoes_estoque").countDocuments({ produtoId: new Types.ObjectId(produtoId) });
+        const { a, tentativasDeA } = await forcarConflitos(
+          MAXIMO_TENTATIVAS_TRANSACAO,
+          () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 5 }, null),
+          () => service.ajustarQuantidadeTamanho(produtoId, varianteId, { tamanhoId: tamanhoMId, delta: 1, exigirExistente: true }),
+        );
+        expect(a.ok).toBe(false);
+        const erro = erroDe(a);
+        expect(erro).not.toBeInstanceOf(MongooseErrors.VersionError);
+        expect(erro).toBeInstanceOf(ApiException);
+        expect(erro).toMatchObject({ code: "CONFLICT", message: MENSAGEM_CONFLITO_TRANSACAO, errors: [] });
+        expect(erro instanceof ApiException ? erro.getStatus() : null).toBe(409);
+        expect(tentativasDeA).toBe(MAXIMO_TENTATIVAS_TRANSACAO);
+        // Só as escritas concorrentes entraram (M: 1 + 8); o P de A e a entrada "cadastro" nunca foram gravados.
+        expect(await tamanhosPersistidos(produtoId, varianteId)).toEqual([{ tamanho: "M", quantidade: 1 + MAXIMO_TENTATIVAS_TRANSACAO }]);
+        expect(await connection.collection("movimentacoes_estoque").countDocuments({ produtoId: new Types.ObjectId(produtoId) })).toBe(ledgerAntes);
       });
 
       it("D. erro que não é VersionError (validação do schema no save) não é convertido em 409 nem retentado", async () => {
@@ -1214,6 +1239,237 @@ describe("ProdutosService (integração — MongoDB real)", () => {
         expect(erro instanceof ApiException ? erro.getStatus() : null).toBe(400);
         expect(tentativasDeA).toBe(2); // a 2ª tentativa releu, viu o U e parou na regra
         expect(await tamanhosPersistidos(produtoId, varianteId)).toEqual([{ tamanho: "U", quantidade: 1 }]);
+      });
+    });
+  });
+
+  // Fase 22.3 — histórico consistente no cadastro de tamanho com saldo inicial e bloqueio de remoção com saldo.
+  describe("Fase 22.3 — ledger no cadastro de tamanho e remoção bloqueada com saldo", () => {
+    // Autossuficiente: "G" não está no `beforeAll` do arquivo (M, P, U) — sem isto o bloco dependeria de outro spec.
+    beforeAll(async () => {
+      await garantirItemConfiguracao(configuracoesService, "tamanhos", "G");
+    });
+
+    function modelDoLedger(): Model<MovimentacaoEstoqueDocument> {
+      return moduleRef.get<Model<MovimentacaoEstoqueDocument>>(getModelToken(MovimentacaoEstoque.name));
+    }
+
+    async function ledgerDoProduto(produtoId: string) {
+      return connection.collection("movimentacoes_estoque").find({ produtoId: new Types.ObjectId(produtoId) }).toArray();
+    }
+
+    async function produtoComVarianteVazia(sufixo: string) {
+      const produto = await service.criar(payloadProduto(`F223-${sufixo}`), null);
+      const variante = await service.adicionarVariante(produto.id, { cor: "Preto" }, null);
+      return { produtoId: produto.id, varianteId: String(variante._id) };
+    }
+
+    async function tamanhosNoBanco(produtoId: string, varianteId: string) {
+      const produto = await service.obterPorId(produtoId);
+      const variante = produto.variantes.find((item) => String(item._id) === varianteId);
+      return {
+        total: produto.quantidadeTotal,
+        tamanhos: (variante?.tamanhos ?? []).map((item) => ({ id: String(item._id), tamanho: item.tamanho, quantidade: item.quantidade })),
+      };
+    }
+
+    async function erroDaOperacao(promessa: Promise<unknown>): Promise<unknown> {
+      try {
+        await promessa;
+      } catch (erro) {
+        return erro;
+      }
+      return null;
+    }
+
+    describe("cadastro de tamanho", () => {
+      it("(1) saldo inicial ZERO: tamanho criado e NENHUMA movimentação no ledger", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("C1");
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 0 }, "usuario-22.3");
+        expect((await tamanhosNoBanco(produtoId, varianteId)).tamanhos.map((t) => [t.tamanho, t.quantidade])).toEqual([["M", 0]]);
+        expect(await ledgerDoProduto(produtoId)).toHaveLength(0);
+      });
+
+      it("(2)(3)(4) saldo inicial positivo: EXATAMENTE uma entrada, origem 'cadastro', saldoResultante correto", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("C2");
+        const variante = await service.adicionarTamanho(produtoId, varianteId, { tamanho: " g ", quantidade: 7 }, "usuario-22.3");
+        const tamanho = variante.tamanhos[0]!;
+        expect(tamanho.quantidade).toBe(7);
+        expect(variante.quantidadeVariante).toBe(7);
+
+        const ledger = await ledgerDoProduto(produtoId);
+        expect(ledger).toHaveLength(1);
+        expect(ledger[0]).toMatchObject({
+          varianteId,
+          tamanhoId: String(tamanho._id),
+          tipo: "entrada",
+          quantidade: 7,
+          saldoResultante: 7,
+          origem: "cadastro",
+          motivo: "Saldo inicial do tamanho G",
+          usuarioId: "usuario-22.3",
+          vendaId: null,
+        });
+        expect("idempotencyKey" in ledger[0]!).toBe(false);
+        expect((await service.obterPorId(produtoId)).quantidadeTotal).toBe(7);
+      });
+
+      it("(5) falha na gravação do ledger DESFAZ o tamanho e o saldo (rollback da transação)", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("C5");
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 3 }, null);
+        const antes = await tamanhosNoBanco(produtoId, varianteId);
+
+        const espiao = spyOn(modelDoLedger(), "create").mockImplementationOnce((async () => {
+          throw new Error("falha injetada no ledger do cadastro");
+        }) as never);
+        try {
+          const erro = await erroDaOperacao(service.adicionarTamanho(produtoId, varianteId, { tamanho: "G", quantidade: 4 }, null));
+          expect(String(erro)).toContain("falha injetada no ledger do cadastro");
+          expect(espiao).toHaveBeenCalledTimes(1);
+        } finally {
+          espiao.mockRestore();
+        }
+        expect(await tamanhosNoBanco(produtoId, varianteId)).toEqual(antes); // o G não ficou, o total não mudou
+        expect(await ledgerDoProduto(produtoId)).toHaveLength(1); // só o cadastro do M
+      });
+
+      it("(6) falha na criação do tamanho não deixa registro no ledger (o ledger nem é chamado)", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("C6");
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 2 }, null);
+        const espiaoLedger = spyOn(modelDoLedger(), "create");
+        const espiaoSalvar = spyOn(produtosRepository, "salvarComRetentativa").mockImplementationOnce((async () => {
+          throw new Error("falha injetada ao gravar o tamanho");
+        }) as never);
+        try {
+          const erro = await erroDaOperacao(service.adicionarTamanho(produtoId, varianteId, { tamanho: "G", quantidade: 5 }, null));
+          expect(String(erro)).toContain("falha injetada ao gravar o tamanho");
+          expect(espiaoLedger).toHaveBeenCalledTimes(0);
+        } finally {
+          espiaoSalvar.mockRestore();
+          espiaoLedger.mockRestore();
+        }
+        expect((await tamanhosNoBanco(produtoId, varianteId)).tamanhos.map((t) => t.tamanho)).toEqual(["M"]);
+        expect(await ledgerDoProduto(produtoId)).toHaveLength(1);
+      });
+
+      it("(6b) regra de negócio recusada (tamanho duplicado) não deixa registro no ledger", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("C6B");
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 2 }, null);
+        const erro = await erroDaOperacao(service.adicionarTamanho(produtoId, varianteId, { tamanho: "m", quantidade: 9 }, null));
+        expect(erro).toBeInstanceOf(ApiException);
+        expect((erro as ApiException).getStatus()).toBe(400);
+        expect((await tamanhosNoBanco(produtoId, varianteId)).tamanhos.map((t) => [t.tamanho, t.quantidade])).toEqual([["M", 2]]);
+        expect(await ledgerDoProduto(produtoId)).toHaveLength(1);
+      });
+
+      it("(7) repetições não duplicam: o reenvio do mesmo cadastro é recusado (já cadastrado) e cadastros simultâneos do MESMO tamanho gravam uma única entrada", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("C7");
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 3 }, null);
+        const reenvio = await erroDaOperacao(service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 3 }, null));
+        expect((reenvio as ApiException).getStatus()).toBe(400);
+        expect(await ledgerDoProduto(produtoId)).toHaveLength(1);
+
+        const resultados = await Promise.allSettled(
+          Array.from({ length: 4 }, () => service.adicionarTamanho(produtoId, varianteId, { tamanho: "G", quantidade: 6 }, null)),
+        );
+        expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+        for (const r of resultados) {
+          if (r.status === "rejected") expect(r.reason).toBeInstanceOf(ApiException); // regra (400) ou conflito esgotado (409)
+        }
+        const ledgerG = (await ledgerDoProduto(produtoId)).filter((linha) => linha["quantidade"] === 6);
+        expect(ledgerG).toHaveLength(1);
+        const estado = await tamanhosNoBanco(produtoId, varianteId);
+        expect(estado.tamanhos.map((t) => [t.tamanho, t.quantidade])).toEqual([["P", 3], ["G", 6]]);
+        expect(estado.total).toBe(9);
+      });
+
+      it("cadastros simultâneos de tamanhos DIFERENTES: cada um grava exatamente a sua entrada", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("C7D");
+        const resultados = await Promise.allSettled([
+          service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 1 }, null),
+          service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 2 }, null),
+          service.adicionarTamanho(produtoId, varianteId, { tamanho: "G", quantidade: 4 }, null),
+        ]);
+        const aplicados = resultados.filter((r) => r.status === "fulfilled").length;
+        const ledger = await ledgerDoProduto(produtoId);
+        const estado = await tamanhosNoBanco(produtoId, varianteId);
+        // Cada cadastro confirmado tem exatamente uma entrada; nenhum recusado deixa entrada; total = soma do ledger.
+        expect(ledger).toHaveLength(aplicados);
+        expect(estado.tamanhos).toHaveLength(aplicados);
+        expect(estado.total).toBe(ledger.reduce((soma, linha) => soma + Number(linha["quantidade"]), 0));
+        for (const t of estado.tamanhos) expect(ledger.filter((linha) => linha["tamanhoId"] === t.id)).toHaveLength(1);
+      });
+    });
+
+    describe("remoção de tamanho", () => {
+      it("(1)(3)(4) com saldo: 422 orientando a saída de estoque; nada muda e nenhuma movimentação (sem baixa automática)", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("RT1");
+        const variante = await service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 4 }, null);
+        const tamanhoId = String(variante.tamanhos[0]!._id);
+        const antes = await tamanhosNoBanco(produtoId, varianteId);
+        const ledgerAntes = await ledgerDoProduto(produtoId);
+
+        const erro = await erroDaOperacao(service.removerTamanho(produtoId, varianteId, tamanhoId, null));
+        expect(erro).toBeInstanceOf(ApiException);
+        expect((erro as ApiException).getStatus()).toBe(422);
+        expect(erro).toMatchObject({ code: "VALIDATION_ERROR", errors: [{ field: "tamanhoId" }] });
+        expect((erro as ApiException).message).toContain("Registre uma saída de estoque");
+
+        expect(await tamanhosNoBanco(produtoId, varianteId)).toEqual(antes);
+        expect(await ledgerDoProduto(produtoId)).toEqual(ledgerAntes);
+      });
+
+      it("(2) com saldo zero: a remoção continua permitida (e não gera movimentação)", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("RT2");
+        const variante = await service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 0 }, null);
+        await service.removerTamanho(produtoId, varianteId, String(variante.tamanhos[0]!._id), null);
+        expect((await tamanhosNoBanco(produtoId, varianteId)).tamanhos).toHaveLength(0);
+        expect(await ledgerDoProduto(produtoId)).toHaveLength(0);
+      });
+
+      it("saldo zerado por uma saída explícita: depois a remoção é permitida", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("RT3");
+        const variante = await service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 2 }, null);
+        const tamanhoId = String(variante.tamanhos[0]!._id);
+        await service.ajustarQuantidadeTamanho(produtoId, varianteId, { tamanhoId, delta: -2, exigirExistente: true });
+        await service.removerTamanho(produtoId, varianteId, tamanhoId, null);
+        expect((await tamanhosNoBanco(produtoId, varianteId)).tamanhos).toHaveLength(0);
+      });
+    });
+
+    describe("remoção de variante", () => {
+      it("(1)(3) um tamanho com saldo: 422 orientando a zerar o estoque; nenhum tamanho ou saldo muda", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("RV1");
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "P", quantidade: 0 }, null);
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "M", quantidade: 0 }, null);
+        await service.adicionarTamanho(produtoId, varianteId, { tamanho: "G", quantidade: 2 }, null);
+        const antes = await tamanhosNoBanco(produtoId, varianteId);
+        const ledgerAntes = await ledgerDoProduto(produtoId);
+
+        const erro = await erroDaOperacao(service.removerVariante(produtoId, varianteId, null));
+        expect(erro).toBeInstanceOf(ApiException);
+        expect((erro as ApiException).getStatus()).toBe(422);
+        expect(erro).toMatchObject({ code: "VALIDATION_ERROR", errors: [{ field: "varianteId" }] });
+        expect((erro as ApiException).message).toContain("Zere o estoque de todos os tamanhos");
+
+        expect(await tamanhosNoBanco(produtoId, varianteId)).toEqual(antes);
+        expect((await service.obterPorId(produtoId)).variantes.some((v) => String(v._id) === varianteId)).toBe(true);
+        expect(await ledgerDoProduto(produtoId)).toEqual(ledgerAntes);
+      });
+
+      it("(2) vários tamanhos, todos com saldo zero: a remoção continua permitida", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("RV2");
+        for (const tamanho of ["P", "M", "G"]) await service.adicionarTamanho(produtoId, varianteId, { tamanho, quantidade: 0 }, null);
+        await service.removerVariante(produtoId, varianteId, null);
+        const produto = await service.obterPorId(produtoId);
+        expect(produto.variantes.some((v) => String(v._id) === varianteId)).toBe(false);
+        expect(produto.quantidadeTotal).toBe(0);
+      });
+
+      it("variante sem nenhum tamanho continua removível", async () => {
+        const { produtoId, varianteId } = await produtoComVarianteVazia("RV3");
+        await service.removerVariante(produtoId, varianteId, null);
+        expect((await service.obterPorId(produtoId)).variantes).toHaveLength(0);
       });
     });
   });
