@@ -237,6 +237,10 @@ describe("comando seed:admin em contexto mínimo (Fase 60.4.3.2.1)", () => {
       moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
       auth = moduleRef.get(AuthService);
       connection = moduleRef.get(getConnectionToken());
+      // Fase 22.1.2 — a fotografia "antes" só é válida depois que os models do PRÓPRIO AppModule do teste terminaram de
+      // criar coleções/índices (autoCreate/autoIndex rodam em segundo plano e o compile() não os aguarda). `init()`
+      // devolve a mesma promessa da inicialização automática: não recria nada.
+      await Promise.all(Object.values(connection.models).map((model) => model.init()));
     });
 
     afterAll(async () => {
