@@ -162,7 +162,7 @@ export class VendasRepository {
     const valorNormalizado = normalizarFormaPagamento(forma);
     const candidatos = await this.vendaModel
       .find({}, { formaPagamento: 1, "pagamentos.forma": 1, "parcelas.formaPagamento": 1 })
-      .lean()
+      .lean<Pick<Venda, "formaPagamento" | "pagamentos" | "parcelas">[]>()
       .exec();
 
     return candidatos.some((venda) => {
