@@ -1094,6 +1094,10 @@ export class VendasService {
    * conviver com um crash, não uma transação.
    */
   async cancelar(vendaId: string, dto: CancelamentoDto, usuarioId: string | null): Promise<VendaDocument> {
+    // Fase 22.4 (B) — antes de QUALQUER leitura, cálculo ou escrita: um pedido parcial com o mesmo `itemId` repetido
+    // calcularia o restante de cada repetição sobre o mesmo valor e devolveria além do vendido. Recusado (400) aqui, no
+    // serviço — vale para qualquer chamador, não depende do DTO nem do Backoffice.
+    exigirItensDistintosNaDevolucao(dto);
     const vendaAtual = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
 
     // Etapa 10.14 — a checagem de replay/conflito por `idempotencyKey` roda
@@ -1209,6 +1213,13 @@ export class VendasService {
       for (const devolvido of devolvidosDaTentativa) {
         const item = documento.itens.find((registro) => String(registro._id) === devolvido.itemId);
         if (item) item.quantidadeDevolvida += devolvido.quantidade;
+        // Fase 22.4 (B) — invariante: nunca devolver além do vendido. Com itens distintos e o limite ao restante isto não
+        // ocorre; se ocorrer, a escrita inteira é abortada (nada é gravado) em vez de persistir um estado impossível.
+        if (item && item.quantidadeDevolvida > item.quantidade) {
+          throw ApiException.validation("Dados inválidos.", [
+            { field: "itens", message: "A quantidade devolvida não pode ultrapassar a quantidade vendida." },
+          ]);
+        }
       }
 
       const valorDevolvidoDaTentativa = arredondar(devolvidosDaTentativa.reduce((total, item) => total + item.valor, 0));
@@ -1225,6 +1236,8 @@ export class VendasService {
         valorDevolvido: valorDevolvidoDaTentativa,
         itens: devolvidosDaTentativa,
         idempotencyKey: dto.idempotencyKey ?? null,
+        // Fase 22.4 (A) — o que foi PEDIDO (não o aplicado), para reconhecer o retry legítimo.
+        assinaturaSolicitacao: assinaturaDaSolicitacaoDeCancelamento(dto),
       } as never);
       const eventoRecemCriado = documento.cancelamentos[documento.cancelamentos.length - 1]!;
       eventoAplicado = eventoRecemCriado as CancelamentoVenda;
@@ -1295,6 +1308,15 @@ export class VendasService {
    */
   private verificarMesmaOperacaoDeCancelamento(existente: CancelamentoVenda, dto: CancelamentoDto): void {
     const mensagem = "Esta idempotencyKey já foi usada para um cancelamento diferente. Gere uma nova chave para esta operação.";
+    // Fase 22.4 (A) — evento com a assinatura da solicitação original: a MESMA solicitação (tipo + itens pedidos, com a
+    // quantidade PEDIDA) é replay; qualquer diferença é 409 — inclusive uma solicitação diferente que resultaria na mesma
+    // quantidade aplicada. Eventos anteriores (sem o campo) seguem a comparação legada abaixo, inalterada.
+    if (existente.assinaturaSolicitacao) {
+      if (existente.assinaturaSolicitacao !== assinaturaDaSolicitacaoDeCancelamento(dto)) {
+        throw ApiException.conflict(mensagem);
+      }
+      return;
+    }
     if (existente.tipo !== dto.tipo) {
       throw ApiException.conflict(mensagem);
     }
@@ -2139,5 +2161,39 @@ export class VendasService {
       return;
     }
     await this.eventoModel.create({ vendaId, tipo, usuarioId, detalhes });
+  }
+}
+
+/**
+ * Fase 22.4 (A) — assinatura determinística da SOLICITAÇÃO de cancelamento: JSON canônico com `tipo` e, no parcial, os
+ * itens ordenados por `itemId` com a quantidade PEDIDA. Fica de fora o que não muda a operação (motivo — que a
+ * comparação legada também nunca considerou —, horários e ids gerados). No integral, os itens não fazem parte da
+ * operação (devolve-se todo o restante), então só o `tipo` entra — mesma regra da comparação legada.
+ */
+export function assinaturaDaSolicitacaoDeCancelamento(dto: Pick<CancelamentoDto, "tipo" | "itens">): string {
+  if (dto.tipo !== "parcial") return JSON.stringify({ tipo: dto.tipo });
+  const itens = [...(dto.itens ?? [])]
+    .map((item) => ({ itemId: item.itemId, quantidade: item.quantidade }))
+    .sort((a, b) => (a.itemId < b.itemId ? -1 : a.itemId > b.itemId ? 1 : 0));
+  return JSON.stringify({ tipo: dto.tipo, itens });
+}
+
+/**
+ * Fase 22.4 (B) — um pedido parcial com o mesmo `itemId` mais de uma vez é recusado (400) antes de qualquer leitura,
+ * cálculo ou escrita (nenhum evento, devolução, estoque, ledger ou caixa).
+ */
+function exigirItensDistintosNaDevolucao(dto: Pick<CancelamentoDto, "tipo" | "itens">): void {
+  if (dto.tipo !== "parcial") return;
+  const vistos = new Set<string>();
+  for (const item of dto.itens ?? []) {
+    if (vistos.has(item.itemId)) {
+      throw ApiException.validation("Dados inválidos.", [
+        {
+          field: "itens",
+          message: "O mesmo item foi informado mais de uma vez. Informe cada item uma única vez, com a quantidade total a devolver.",
+        },
+      ]);
+    }
+    vistos.add(item.itemId);
   }
 }

@@ -366,9 +366,18 @@ export class CancelamentoVenda {
    */
   @Prop({ type: String, default: null })
   idempotencyKey!: string | null;
+
+  /**
+   * Fase 22.4 — assinatura da SOLICITAÇÃO original (tipo + itens pedidos, com a quantidade PEDIDA — não a aplicada
+   * depois do limite ao restante), em JSON canônico. Reconhece o retry legítimo de uma devolução parcial limitada ou com
+   * item já sem restante. Opcional e sem `default`: eventos anteriores não têm o campo e continuam pela comparação
+   * legada. Interno — nunca serializado na resposta HTTP.
+   */
+  @Prop({ type: String, required: false })
+  assinaturaSolicitacao?: string;
 }
 export const CancelamentoVendaSchema = SchemaFactory.createForClass(CancelamentoVenda);
-aplicarSerializacaoPadrao(CancelamentoVendaSchema);
+aplicarSerializacaoPadrao(CancelamentoVendaSchema, ["assinaturaSolicitacao"]);
 
 /**
  * Contrato alinhado a `VendaDetalhe`/`VendaResumo` (`src/types/venda.ts`).

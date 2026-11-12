@@ -6640,4 +6640,280 @@ describe("VendasService (integração — MongoDB real)", () => {
       }
     });
   });
+
+  // Fase 22.4 — (A) idempotência do reenvio de devolução parcial pela assinatura da SOLICITAÇÃO; (B) itemId repetido.
+  describe("Fase 22.4 — reenvio de devolução parcial e itens repetidos", () => {
+    const CONFLITO = "Esta idempotencyKey já foi usada para um cancelamento diferente. Gere uma nova chave para esta operação.";
+    let sequencia = 0;
+    const chave = (prefixo: string) => `f224-${prefixo}-${Date.now()}-${(sequencia += 1)}`;
+
+    /** Fotografia de tudo que um cancelamento pode alterar: venda, estoque, ledger e caixa. */
+    async function fotografia(vendaId: string, produtos: { produtoId: string; tamanhoId: string }[]) {
+      const venda = await service.obterPorId(vendaId);
+      const saldos: number[] = [];
+      for (const p of produtos) {
+        const produto = await produtosService.obterPorId(p.produtoId);
+        saldos.push(produto.variantes[0]!.tamanhos.find((t) => String(t._id) === p.tamanhoId)!.quantidade);
+      }
+      return {
+        status: venda.status,
+        valorDevolvido: venda.valorDevolvido,
+        quantidadeDevolvida: venda.itens.map((item) => item.quantidadeDevolvida),
+        eventos: venda.cancelamentos.length,
+        linhas: venda.cancelamentos.reduce((total, evento) => total + evento.itens.length, 0),
+        pendentes: venda.cancelamentos.reduce((total, evento) => total + evento.itens.filter((linha) => linha.restaurado !== true).length, 0),
+        saldos,
+        ledger: await connection.collection("movimentacoes_estoque").countDocuments({ vendaId, origem: "cancelamento" }),
+        movimentosCaixa: await connection.collection("movimentos_caixa").countDocuments({ vendaId }),
+      };
+    }
+
+    async function erroDe(promessa: Promise<unknown>): Promise<ApiException | null> {
+      try {
+        await promessa;
+        return null;
+      } catch (erro) {
+        if (erro instanceof ApiException) return erro;
+        throw erro;
+      }
+    }
+
+    async function fecharCaixa(caixaId: string) {
+      await caixasService.fechar(caixaId, { valorInformado: 0, observacao: "Fechamento do teste da Fase 22.4" }, null);
+    }
+
+    /** Venda de N unidades de um produto, paga integralmente. */
+    async function vendaDe(quantidade: number, caixaId: string) {
+      const produto = await criarProdutoComEstoque(100, 10);
+      const vendedor = await criarVendedor();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId,
+          itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade }],
+          pagamentos: [{ forma: "Dinheiro", valor: 100 * quantidade }],
+        },
+        null,
+      );
+      return { venda, produto, itemId: String(venda.itens[0]!._id) };
+    }
+
+    /** Venda com dois itens (A: 2 unidades, B: 1 unidade). */
+    async function vendaComDoisItens(caixaId: string) {
+      const a = await criarProdutoComEstoque(100, 10);
+      const b = await criarProdutoComEstoque(50, 10);
+      const vendedor = await criarVendedor();
+      const venda = await service.criar(
+        {
+          vendedorId: vendedor.id,
+          caixaId,
+          itens: [
+            { produtoId: a.produtoId, varianteId: a.varianteId, tamanhoId: a.tamanhoId, quantidade: 2 },
+            { produtoId: b.produtoId, varianteId: b.varianteId, tamanhoId: b.tamanhoId, quantidade: 1 },
+          ],
+          pagamentos: [{ forma: "Dinheiro", valor: 250 }],
+        },
+        null,
+      );
+      return { venda, a, b, itemA: String(venda.itens[0]!._id), itemB: String(venda.itens[1]!._id) };
+    }
+
+    describe("(A) assinatura da solicitação", () => {
+      it("R1. quantidade LIMITADA ao restante: aplica 2 de 5; o reenvio idêntico é replay — nada muda", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { venda, produto, itemId } = await vendaDe(3, caixa.id);
+          await service.cancelar(venda.id, { tipo: "parcial", motivo: "primeira", itens: [{ itemId, quantidade: 1 }] }, null);
+          const corpo = { tipo: "parcial" as const, motivo: "pede 5, restam 2", itens: [{ itemId, quantidade: 5 }], idempotencyKey: chave("r1") };
+
+          const primeira = await service.cancelar(venda.id, corpo, null);
+          expect(primeira.cancelamentos.at(-1)!.itens.map((linha) => linha.quantidade)).toEqual([2]); // limite inalterado
+          const depoisDaPrimeira = await fotografia(venda.id, [produto]);
+          expect(depoisDaPrimeira).toMatchObject({ quantidadeDevolvida: [3], eventos: 2, linhas: 2, pendentes: 0, saldos: [10], ledger: 2 });
+
+          const replay = await service.cancelar(venda.id, corpo, null); // antes da Fase 22.4: 409 indevido
+          expect(replay.id).toBe(venda.id);
+          expect(await fotografia(venda.id, [produto])).toEqual(depoisDaPrimeira);
+        } finally {
+          await fecharCaixa(caixa.id);
+        }
+      });
+
+      it("R2. item SEM restante ignorado (regra atual): o reenvio idêntico é replay — nada muda", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { venda, a, b, itemA, itemB } = await vendaComDoisItens(caixa.id);
+          await service.cancelar(venda.id, { tipo: "parcial", motivo: "B inteiro", itens: [{ itemId: itemB, quantidade: 1 }] }, null);
+          const corpo = {
+            tipo: "parcial" as const,
+            motivo: "A1 + B já devolvido",
+            itens: [{ itemId: itemA, quantidade: 1 }, { itemId: itemB, quantidade: 1 }],
+            idempotencyKey: chave("r2"),
+          };
+
+          const primeira = await service.cancelar(venda.id, corpo, null);
+          expect(primeira.cancelamentos.at(-1)!.itens.map((linha) => linha.itemId)).toEqual([itemA]); // B ignorado, como antes
+          const depoisDaPrimeira = await fotografia(venda.id, [a, b]);
+          expect(depoisDaPrimeira).toMatchObject({ quantidadeDevolvida: [1, 1], eventos: 2, linhas: 2, ledger: 2 });
+
+          await service.cancelar(venda.id, corpo, null); // antes da Fase 22.4: 409 indevido
+          expect(await fotografia(venda.id, [a, b])).toEqual(depoisDaPrimeira);
+        } finally {
+          await fecharCaixa(caixa.id);
+        }
+      });
+
+      it("R3. a mesma chave com conteúdo DIFERENTE continua 409 — inclusive quando aplicaria a mesma quantidade — sem efeito colateral", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { venda, a, b, itemA, itemB } = await vendaComDoisItens(caixa.id);
+          const k = chave("r3");
+          // A tem 2: pedir 5 aplica 2 (limitado).
+          await service.cancelar(venda.id, { tipo: "parcial", motivo: "original", itens: [{ itemId: itemA, quantidade: 5 }], idempotencyKey: k }, null);
+          const antes = await fotografia(venda.id, [a, b]);
+
+          const variantes = [
+            { tipo: "parcial" as const, motivo: "original", itens: [{ itemId: itemA, quantidade: 6 }] }, // também aplicaria 2
+            { tipo: "parcial" as const, motivo: "original", itens: [{ itemId: itemA, quantidade: 2 }] }, // = quantidade aplicada
+            { tipo: "parcial" as const, motivo: "original", itens: [{ itemId: itemB, quantidade: 1 }] }, // outro item
+            { tipo: "parcial" as const, motivo: "original", itens: [{ itemId: itemA, quantidade: 5 }, { itemId: itemB, quantidade: 1 }] },
+            { tipo: "integral" as const, motivo: "original" },
+          ];
+          for (const corpo of variantes) {
+            const erro = await erroDe(service.cancelar(venda.id, { ...corpo, idempotencyKey: k }, null));
+            expect(erro?.getStatus()).toBe(409);
+            expect(erro?.message).toBe(CONFLITO);
+          }
+          expect(await fotografia(venda.id, [a, b])).toEqual(antes);
+        } finally {
+          await fecharCaixa(caixa.id);
+        }
+      });
+
+      it("persistência: o evento guarda a assinatura determinística da solicitação (quantidade PEDIDA), que NÃO aparece na resposta", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { venda, itemA, itemB } = await vendaComDoisItens(caixa.id);
+          // ordem invertida no pedido: a assinatura ordena por itemId
+          const resposta = await service.cancelar(
+            venda.id,
+            { tipo: "parcial", motivo: "x", itens: [{ itemId: itemB, quantidade: 9 }, { itemId: itemA, quantidade: 1 }], idempotencyKey: chave("fmt") },
+            null,
+          );
+          const bruto = await connection.collection("vendas").findOne({ _id: new Types.ObjectId(venda.id) });
+          const evento = (bruto?.["cancelamentos"] as { assinaturaSolicitacao?: string }[]).at(-1)!;
+          const [primeiro, segundo] = [itemA, itemB].sort();
+          expect(evento.assinaturaSolicitacao).toBe(
+            JSON.stringify({ tipo: "parcial", itens: [{ itemId: primeiro, quantidade: primeiro === itemA ? 1 : 9 }, { itemId: segundo, quantidade: segundo === itemA ? 1 : 9 }] }),
+          );
+          const serializado = JSON.parse(JSON.stringify(resposta)) as { cancelamentos: Record<string, unknown>[] };
+          expect("assinaturaSolicitacao" in serializado.cancelamentos.at(-1)!).toBe(false);
+        } finally {
+          await fecharCaixa(caixa.id);
+        }
+      });
+
+      it("eventos LEGADOS (sem assinatura) seguem a comparação legada: replay exato aceito, diferente é 409, e o caso limitado continua 409 como antes", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { venda, a, b, itemA, itemB } = await vendaComDoisItens(caixa.id);
+          const kExato = chave("leg-exato");
+          const kLimitado = chave("leg-limitado");
+          await service.cancelar(venda.id, { tipo: "parcial", motivo: "exato", itens: [{ itemId: itemB, quantidade: 1 }], idempotencyKey: kExato }, null);
+          await service.cancelar(venda.id, { tipo: "parcial", motivo: "limitado", itens: [{ itemId: itemA, quantidade: 5 }], idempotencyKey: kLimitado }, null);
+          // Simula eventos gravados antes da Fase 22.4: remove a assinatura direto no banco.
+          await connection.collection("vendas").updateOne(
+            { _id: new Types.ObjectId(venda.id) },
+            { $unset: { "cancelamentos.$[].assinaturaSolicitacao": "" } },
+          );
+          const antes = await fotografia(venda.id, [a, b]);
+
+          await service.cancelar(venda.id, { tipo: "parcial", motivo: "exato", itens: [{ itemId: itemB, quantidade: 1 }], idempotencyKey: kExato }, null);
+          expect((await erroDe(service.cancelar(venda.id, { tipo: "parcial", motivo: "exato", itens: [{ itemId: itemB, quantidade: 2 }], idempotencyKey: kExato }, null)))?.getStatus()).toBe(409);
+          // Limitação conhecida e preservada: sem a assinatura, o reenvio de um pedido limitado não é reconhecível.
+          expect((await erroDe(service.cancelar(venda.id, { tipo: "parcial", motivo: "limitado", itens: [{ itemId: itemA, quantidade: 5 }], idempotencyKey: kLimitado }, null)))?.getStatus()).toBe(409);
+          expect(await fotografia(venda.id, [a, b])).toEqual(antes);
+        } finally {
+          await fecharCaixa(caixa.id);
+        }
+      });
+
+      it("D. concorrência: duas requisições SIMULTÂNEAS com a mesma chave e o mesmo corpo (limitado) — uma única devolução, restauração e entrada no ledger", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { venda, produto, itemId } = await vendaDe(3, caixa.id);
+          await service.cancelar(venda.id, { tipo: "parcial", motivo: "primeira", itens: [{ itemId, quantidade: 1 }] }, null);
+          const corpo = { tipo: "parcial" as const, motivo: "simultâneo", itens: [{ itemId, quantidade: 5 }], idempotencyKey: chave("conc") };
+
+          const resultados = await Promise.allSettled([service.cancelar(venda.id, corpo, null), service.cancelar(venda.id, corpo, null)]);
+          expect(resultados.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+          const final = await fotografia(venda.id, [produto]);
+          expect(final).toMatchObject({ quantidadeDevolvida: [3], eventos: 2, linhas: 2, pendentes: 0, saldos: [10], ledger: 2 });
+          const venda2 = await service.obterPorId(venda.id);
+          expect(venda2.cancelamentos.filter((evento) => evento.idempotencyKey === corpo.idempotencyKey)).toHaveLength(1);
+        } finally {
+          await fecharCaixa(caixa.id);
+        }
+      });
+    });
+
+    describe("(B) itemId repetido no pedido parcial", () => {
+      it("[A:2, A:2] numa venda de 2: 400 ANTES de qualquer escrita — nada muda (venda, estoque, ledger, caixa, linhas)", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { venda, produto, itemId } = await vendaDe(2, caixa.id);
+          const antes = await fotografia(venda.id, [produto]);
+          expect(antes).toMatchObject({ quantidadeDevolvida: [0], eventos: 0, linhas: 0, saldos: [8], ledger: 0 });
+
+          const erro = await erroDe(
+            service.cancelar(venda.id, { tipo: "parcial", motivo: "repetido", itens: [{ itemId, quantidade: 2 }, { itemId, quantidade: 2 }], idempotencyKey: chave("dup") }, null),
+          );
+          expect(erro?.getStatus()).toBe(400);
+          expect(erro).toMatchObject({ code: "VALIDATION_ERROR", errors: [{ field: "itens" }] });
+          expect(await fotografia(venda.id, [produto])).toEqual(antes);
+          // Nenhuma linha para o worker recuperar.
+          expect((await service.listarPendenciasDeRestauracao(100)).itens.some((linha) => linha.vendaId === venda.id)).toBe(false);
+        } finally {
+          await fecharCaixa(caixa.id);
+        }
+      });
+
+      it("duplicidade em qualquer posição de pedidos com vários itens é recusada; sem efeito colateral", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { venda, a, b, itemA, itemB } = await vendaComDoisItens(caixa.id);
+          const antes = await fotografia(venda.id, [a, b]);
+          const pedidos = [
+            [itemA, itemB, itemA],
+            [itemB, itemA, itemA],
+            [itemA, itemA, itemB],
+            [itemB, itemB],
+          ];
+          for (const ids of pedidos) {
+            const erro = await erroDe(service.cancelar(venda.id, { tipo: "parcial", motivo: "dup", itens: ids.map((itemId) => ({ itemId, quantidade: 1 })) }, null));
+            expect(erro?.getStatus()).toBe(400);
+          }
+          expect(await fotografia(venda.id, [a, b])).toEqual(antes);
+        } finally {
+          await fecharCaixa(caixa.id);
+        }
+      });
+
+      it("pedido válido com itens DISTINTOS continua funcionando normalmente", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { venda, a, b, itemA, itemB } = await vendaComDoisItens(caixa.id);
+          const devolvida = await service.cancelar(
+            venda.id,
+            { tipo: "parcial", motivo: "válido", itens: [{ itemId: itemA, quantidade: 1 }, { itemId: itemB, quantidade: 1 }] },
+            null,
+          );
+          expect(devolvida.cancelamentos).toHaveLength(1);
+          expect(await fotografia(venda.id, [a, b])).toMatchObject({ quantidadeDevolvida: [1, 1], linhas: 2, pendentes: 0, saldos: [9, 10], ledger: 2 });
+        } finally {
+          await fecharCaixa(caixa.id);
+        }
+      });
+    });
+  });
 });
