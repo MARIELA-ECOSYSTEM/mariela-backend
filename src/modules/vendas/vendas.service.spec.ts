@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, setSystemTime } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, setSystemTime, spyOn } from "bun:test";
 import { JwtModule } from "@nestjs/jwt";
 import { getConnectionToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
@@ -24,6 +24,8 @@ import type { ListarVendasQueryDto } from "./dto/listar-vendas-query.dto.js";
 import { VendasModule } from "./vendas.module.js";
 import { VendasRepository } from "./vendas.repository.js";
 import { VendasService } from "./vendas.service.js";
+import { VendedoresRepository } from "../vendedores/vendedores.repository.js";
+import { MAXIMO_TENTATIVAS_TRANSACAO } from "../../database/transacao.util.js";
 import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 import type { Configuracao } from "../configuracoes/schemas/configuracao.schema.js";
 
@@ -6912,6 +6914,443 @@ describe("VendasService (integração — MongoDB real)", () => {
           expect(await fotografia(venda.id, [a, b])).toMatchObject({ quantidadeDevolvida: [1, 1], linhas: 2, pendentes: 0, saldos: [9, 10], ledger: 2 });
         } finally {
           await fecharCaixa(caixa.id);
+        }
+      });
+    });
+  });
+  describe("Fase 22.6.2 — efeitos posteriores ao cancelamento: registros excluídos, falhas parciais e replay", () => {
+    let sequencia = 0;
+    const chave = (prefixo: string) => `f2262-${prefixo}-${Date.now()}-${(sequencia += 1)}`;
+    const oid = (id: string) => new Types.ObjectId(id);
+
+    async function capturar(promessa: Promise<unknown>): Promise<unknown> {
+      try {
+        await promessa;
+        return null;
+      } catch (erro) {
+        return erro;
+      }
+    }
+
+    async function fecharCaixa(caixaId: string) {
+      await caixasService.fechar(caixaId, { valorInformado: 0, observacao: "Fechamento do teste da Fase 22.6.2" }, null);
+    }
+
+    /** Fecha o caixa aberto, se houver — os testes de falha de caixa trocam o caixa no meio. */
+    async function fecharCaixaAtual() {
+      const atual = await caixasService.obterAtual();
+      if (atual) await fecharCaixa(atual.id);
+    }
+
+    /**
+     * Vendedor e cliente com DUAS vendas pagas de 100 cada (agregados 2 / 200). Duas vendas, e não uma, para que uma
+     * reversão em dobro apareça (o `Math.max(0, …)` esconderia a segunda reversão de quem só tem uma venda).
+     */
+    async function cenario(caixaId: string) {
+      const produto = await criarProdutoComEstoque(100, 10);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const dados = {
+        clienteId: cliente.id,
+        vendedorId: vendedor.id,
+        caixaId,
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }],
+        pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+      };
+      const primeira = await service.criar(dados, null);
+      const venda = await service.criar(dados, null);
+      return { produto, vendedor, cliente, primeira, venda };
+    }
+
+    async function estado(vendaId: string, vendedorId: string, clienteId: string, produto: { produtoId: string; tamanhoId: string }) {
+      const vendedor = await connection.collection("vendedores").findOne({ _id: oid(vendedorId) });
+      const cliente = await connection.collection("clientes").findOne({ _id: oid(clienteId) });
+      const venda = await connection.collection("vendas").findOne({ _id: oid(vendaId) });
+      const produtoAtual = await produtosService.obterPorId(produto.produtoId);
+      return {
+        status: venda?.["status"],
+        eventos: (venda?.["cancelamentos"] as unknown[] | undefined)?.length ?? 0,
+        pendencias: ((venda?.["efeitosPendentesCancelamento"] as { efeito: string }[] | undefined) ?? []).map((p) => p.efeito),
+        saldo: produtoAtual.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!.quantidade,
+        movimentosCaixa: await connection.collection("movimentos_caixa").countDocuments({ vendaId, tipo: "cancelamento" }),
+        auditoria: await connection.collection("eventos_venda").countDocuments({ vendaId: oid(vendaId), tipo: { $in: ["venda.cancelada", "venda.devolvida"] } }),
+        vendedor: {
+          vendas: vendedor?.["vendas"],
+          totalVendido: vendedor?.["totalVendido"],
+          ultimaVenda: (vendedor?.["ultimaVenda"] as Date | null | undefined)?.toISOString() ?? null,
+          excluido: vendedor ? vendedor["excluidoEm"] != null : null,
+        },
+        cliente: {
+          compras: cliente?.["compras"],
+          totalComprado: cliente?.["totalComprado"],
+          ultimaCompra: (cliente?.["ultimaCompra"] as Date | null | undefined)?.toISOString() ?? null,
+          excluido: cliente ? cliente["excluidoEm"] != null : null,
+        },
+      };
+    }
+
+    describe("8.1 vendedor e cliente excluídos logicamente", () => {
+      const casos = [
+        { nome: "vendedor excluído", vendedor: true, cliente: false },
+        { nome: "cliente excluído", vendedor: false, cliente: true },
+        { nome: "vendedor E cliente excluídos", vendedor: true, cliente: true },
+      ];
+      for (const caso of casos) {
+        it(`${caso.nome}: cancelamento integral conclui, reverte os agregados uma vez e não reativa; replay não reverte de novo`, async () => {
+          const caixa = await abrirCaixa();
+          try {
+            const { produto, vendedor, cliente, primeira, venda } = await cenario(caixa.id);
+            const inicial = await estado(venda.id, vendedor.id, cliente.id, produto);
+            expect(inicial.vendedor).toMatchObject({ vendas: 2, totalVendido: 200, excluido: false });
+            expect(inicial.cliente).toMatchObject({ compras: 2, totalComprado: 200, excluido: false });
+            if (caso.vendedor) await vendedoresService.excluir(vendedor.id, null);
+            if (caso.cliente) await clientesService.excluir(cliente.id, null);
+
+            const corpo = { tipo: "integral" as const, motivo: `22.6.2 ${caso.nome}`, idempotencyKey: chave("excluido") };
+            const cancelada = await service.cancelar(venda.id, corpo, null); // antes da Fase 22.6.2: 404 depois da gravação
+            expect(cancelada.status).toBe("cancelada");
+
+            const depois = await estado(venda.id, vendedor.id, cliente.id, produto);
+            expect(depois).toMatchObject({ status: "cancelada", eventos: 1, pendencias: [], saldo: 9, movimentosCaixa: 1, auditoria: 1 });
+            expect(depois.vendedor).toEqual({ vendas: 1, totalVendido: 100, ultimaVenda: primeira.dataVenda.toISOString(), excluido: caso.vendedor });
+            expect(depois.cliente).toEqual({ compras: 1, totalComprado: 100, ultimaCompra: primeira.dataVenda.toISOString(), excluido: caso.cliente });
+            // Excluído continua fora das consultas cadastrais (não foi reativado).
+            if (caso.vendedor) expect(await capturar(vendedoresService.obterPorId(vendedor.id))).toBeInstanceOf(ApiException);
+            if (caso.cliente) expect(await capturar(clientesService.obterPorId(cliente.id))).toBeInstanceOf(ApiException);
+
+            const replay = await service.cancelar(venda.id, corpo, null);
+            expect(replay.status).toBe("cancelada");
+            expect(await estado(venda.id, vendedor.id, cliente.id, produto)).toEqual(depois); // nada revertido em dobro
+          } finally {
+            await fecharCaixaAtual();
+          }
+        });
+      }
+
+      it("devolução parcial com vendedor e cliente excluídos (venda segue ativa): conclui sem tocar agregados", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const produto = await criarProdutoComEstoque(100, 10);
+          const vendedor = await criarVendedor();
+          const cliente = await criarCliente();
+          const venda = await service.criar(
+            {
+              clienteId: cliente.id,
+              vendedorId: vendedor.id,
+              caixaId: caixa.id,
+              itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+              pagamentos: [{ forma: "Dinheiro", valor: 200 }],
+            },
+            null,
+          );
+          await vendedoresService.excluir(vendedor.id, null);
+          await clientesService.excluir(cliente.id, null);
+          const itemId = String(venda.itens[0]!._id);
+          const corpo = { tipo: "parcial" as const, motivo: "parcial com excluídos", itens: [{ itemId, quantidade: 1 }], idempotencyKey: chave("parcial") };
+          await service.cancelar(venda.id, corpo, null);
+          const depois = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(depois).toMatchObject({ eventos: 1, pendencias: [], saldo: 9, movimentosCaixa: 1, auditoria: 1 });
+          expect(depois.vendedor).toMatchObject({ vendas: 1, totalVendido: 200, excluido: true });
+          expect(depois.cliente).toMatchObject({ compras: 1, totalComprado: 200, excluido: true });
+          await service.cancelar(venda.id, corpo, null);
+          expect(await estado(venda.id, vendedor.id, cliente.id, produto)).toEqual(depois);
+        } finally {
+          await fecharCaixaAtual();
+        }
+      });
+
+      it("vendedor FISICAMENTE inexistente: nada é recriado nem inventado; o cliente é revertido e a operação conclui", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { produto, vendedor, cliente, primeira, venda } = await cenario(caixa.id);
+          await connection.collection("vendedores").deleteOne({ _id: oid(vendedor.id) });
+          const corpo = { tipo: "integral" as const, motivo: "vendedor removido do banco", idempotencyKey: chave("fisico") };
+          await service.cancelar(venda.id, corpo, null);
+          const depois = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(depois).toMatchObject({ status: "cancelada", pendencias: [], saldo: 9, movimentosCaixa: 1, auditoria: 1 });
+          expect(depois.vendedor).toEqual({ vendas: undefined, totalVendido: undefined, ultimaVenda: null, excluido: null }); // não recriado
+          expect(await connection.collection("vendedores").countDocuments({ _id: oid(vendedor.id) })).toBe(0);
+          expect(depois.cliente).toEqual({ compras: 1, totalComprado: 100, ultimaCompra: primeira.dataVenda.toISOString(), excluido: false });
+          await service.cancelar(venda.id, corpo, null);
+          expect(await estado(venda.id, vendedor.id, cliente.id, produto)).toEqual(depois);
+        } finally {
+          await fecharCaixaAtual();
+        }
+      });
+    });
+
+    describe("8.2 falhas posteriores à gravação do evento", () => {
+      it("falha ao registrar a AUDITORIA: erro propagado (não vira sucesso), pendência gravada; replay conclui uma única vez", async () => {
+        const caixa = await abrirCaixa();
+        const modelo = (service as unknown as { eventoModel: { create: (...args: unknown[]) => Promise<unknown> } }).eventoModel;
+        try {
+          const { produto, vendedor, cliente, venda } = await cenario(caixa.id);
+          const corpo = { tipo: "integral" as const, motivo: "auditoria falha", idempotencyKey: chave("auditoria") };
+          const espiao = spyOn(modelo, "create").mockImplementation(async () => {
+            throw new Error("falha injetada no registro de auditoria");
+          });
+          let erro: unknown;
+          try {
+            erro = await capturar(service.cancelar(venda.id, corpo, null));
+          } finally {
+            espiao.mockRestore();
+          }
+          expect((erro as Error | null)?.message).toBe("falha injetada no registro de auditoria");
+
+          const parcial = await estado(venda.id, vendedor.id, cliente.id, produto);
+          // Evento gravado; estoque, caixa e agregados concluídos; só a auditoria ficou pendente.
+          expect(parcial).toMatchObject({ status: "cancelada", eventos: 1, pendencias: ["auditoria"], saldo: 9, movimentosCaixa: 1, auditoria: 0 });
+          expect(parcial.vendedor).toMatchObject({ vendas: 1, totalVendido: 100 });
+
+          await service.cancelar(venda.id, corpo, null);
+          const final = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(final).toEqual({ ...parcial, pendencias: [], auditoria: 1 });
+          await service.cancelar(venda.id, corpo, null);
+          expect(await estado(venda.id, vendedor.id, cliente.id, produto)).toEqual(final);
+        } finally {
+          await fecharCaixaAtual();
+        }
+      });
+
+      it("conflito persistente nos AGREGADOS (tentativas esgotadas): 409, pendência gravada; replay reverte uma única vez", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { produto, vendedor, cliente, primeira, venda } = await cenario(caixa.id);
+          const corpo = { tipo: "integral" as const, motivo: "agregados em conflito", idempotencyKey: chave("agregados") };
+          let chamadas = 0;
+          const espiao = spyOn(VendedoresRepository.prototype, "encontrarPorIdIncluindoExcluidos").mockImplementation(async () => {
+            chamadas += 1;
+            throw new MongooseErrors.VersionError({ _doc: { _id: vendedor.id } } as never, 0, []);
+          });
+          let erro: unknown;
+          try {
+            erro = await capturar(service.cancelar(venda.id, corpo, null));
+          } finally {
+            espiao.mockRestore();
+          }
+          expect(erro).toBeInstanceOf(ApiException);
+          expect((erro as ApiException).getStatus()).toBe(409);
+          expect(chamadas).toBe(MAXIMO_TENTATIVAS_TRANSACAO);
+
+          const parcial = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(parcial).toMatchObject({ status: "cancelada", pendencias: ["agregados"], saldo: 9, movimentosCaixa: 1, auditoria: 1 });
+          expect(parcial.vendedor).toMatchObject({ vendas: 2, totalVendido: 200 }); // nada aplicado pela transação abortada
+          expect(parcial.cliente).toMatchObject({ compras: 2, totalComprado: 200 });
+
+          await service.cancelar(venda.id, corpo, null);
+          const final = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(final).toMatchObject({ pendencias: [], movimentosCaixa: 1, auditoria: 1, saldo: 9 });
+          expect(final.vendedor).toMatchObject({ vendas: 1, totalVendido: 100, ultimaVenda: primeira.dataVenda.toISOString() });
+          expect(final.cliente).toMatchObject({ compras: 1, totalComprado: 100 });
+          await service.cancelar(venda.id, corpo, null);
+          expect(await estado(venda.id, vendedor.id, cliente.id, produto)).toEqual(final);
+        } finally {
+          await fecharCaixaAtual();
+        }
+      });
+
+      it("CAIXA fechado entre a gravação e o lançamento: 400, pendência de caixa; sem caixa o replay segue pendente; com caixa conclui", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { produto, vendedor, cliente, venda } = await cenario(caixa.id);
+          const corpo = { tipo: "integral" as const, motivo: "caixa fecha no meio", idempotencyKey: chave("caixa") };
+          const original = CaixasService.prototype.registrarMovimentoDeVenda;
+          const espiao = spyOn(CaixasService.prototype, "registrarMovimentoDeVenda").mockImplementation(async function (
+            this: CaixasService,
+            ...args: Parameters<CaixasService["registrarMovimentoDeVenda"]>
+          ) {
+            espiao.mockRestore();
+            await this.fechar(args[0].caixaId, { valorInformado: 0, observacao: "fechado no meio do cancelamento" }, null);
+            return original.apply(this, args); // o caixa real recusa: está fechado
+          });
+          let erro: unknown;
+          try {
+            erro = await capturar(service.cancelar(venda.id, corpo, null));
+          } finally {
+            espiao.mockRestore();
+          }
+          expect(erro).toBeInstanceOf(ApiException);
+          expect((erro as ApiException).getStatus()).toBe(400);
+
+          const parcial = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(parcial).toMatchObject({ status: "cancelada", pendencias: ["caixa"], saldo: 9, movimentosCaixa: 0, auditoria: 1 });
+          expect(parcial.vendedor).toMatchObject({ vendas: 1, totalVendido: 100 });
+
+          // Sem caixa aberto: o replay não finge sucesso — 400 e a pendência continua.
+          const semCaixa = await capturar(service.cancelar(venda.id, corpo, null));
+          expect((semCaixa as ApiException).getStatus()).toBe(400);
+          expect((await estado(venda.id, vendedor.id, cliente.id, produto)).pendencias).toEqual(["caixa"]);
+
+          const novoCaixa = await abrirCaixa();
+          await service.cancelar(venda.id, corpo, null);
+          const final = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(final).toEqual({ ...parcial, pendencias: [], movimentosCaixa: 1 });
+          expect(await connection.collection("movimentos_caixa").countDocuments({ vendaId: venda.id, tipo: "cancelamento", caixaId: oid(novoCaixa.id) })).toBe(1);
+          await service.cancelar(venda.id, corpo, null);
+          expect(await estado(venda.id, vendedor.id, cliente.id, produto)).toEqual(final);
+        } finally {
+          await fecharCaixaAtual();
+        }
+      });
+
+      it("SEM idempotencyKey e caixa fechado no meio: o lançamento é tentado no máximo uma vez (sem deduplicação possível) e o erro é propagado", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { produto, vendedor, cliente, venda } = await cenario(caixa.id);
+          const original = CaixasService.prototype.registrarMovimentoDeVenda;
+          const espiao = spyOn(CaixasService.prototype, "registrarMovimentoDeVenda").mockImplementation(async function (
+            this: CaixasService,
+            ...args: Parameters<CaixasService["registrarMovimentoDeVenda"]>
+          ) {
+            espiao.mockRestore();
+            await this.fechar(args[0].caixaId, { valorInformado: 0, observacao: "fechado no meio do cancelamento" }, null);
+            return original.apply(this, args);
+          });
+          let erro: unknown;
+          try {
+            erro = await capturar(service.cancelar(venda.id, { tipo: "integral", motivo: "sem chave" }, null));
+          } finally {
+            espiao.mockRestore();
+          }
+          expect((erro as ApiException).getStatus()).toBe(400);
+          const depois = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(depois).toMatchObject({ status: "cancelada", pendencias: [], movimentosCaixa: 0, auditoria: 1, saldo: 9 });
+          expect(depois.vendedor).toMatchObject({ vendas: 1, totalVendido: 100 });
+        } finally {
+          await fecharCaixaAtual();
+        }
+      });
+
+      it("estoque com referência ausente fica PENDENTE e explícito na resposta; os demais efeitos concluem", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { produto, vendedor, cliente, venda } = await cenario(caixa.id);
+          await produtosService.excluir(produto.produtoId, null);
+          const corpo = { tipo: "integral" as const, motivo: "produto excluído", idempotencyKey: chave("estoque") };
+          const resposta = await service.cancelar(venda.id, corpo, null);
+          const resumo = (resposta.toJSON() as { restauracaoEstoque?: { requerIntervencao?: number; concluidos?: number } }).restauracaoEstoque;
+          expect(resumo).toMatchObject({ requerIntervencao: 1, concluidos: 0 });
+          const linha = resposta.cancelamentos[0]!.itens[0]!;
+          expect(linha.restaurado).not.toBe(true);
+          expect(linha.estadoRestauracao).toBe("requer_intervencao");
+          const vendaBruta = await connection.collection("vendas").findOne({ _id: oid(venda.id) });
+          expect(vendaBruta?.["efeitosPendentesCancelamento"]).toEqual([]);
+          expect(await connection.collection("movimentos_caixa").countDocuments({ vendaId: venda.id, tipo: "cancelamento" })).toBe(1);
+          expect((await connection.collection("vendedores").findOne({ _id: oid(vendedor.id) }))?.["vendas"]).toBe(1);
+          expect((await connection.collection("clientes").findOne({ _id: oid(cliente.id) }))?.["compras"]).toBe(1);
+        } finally {
+          await fecharCaixaAtual();
+        }
+      });
+
+      it("evento ANTERIOR à fase (sem pendências gravadas): replay não reaplica agregados nem auditoria", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { produto, vendedor, cliente, venda } = await cenario(caixa.id);
+          const corpo = { tipo: "integral" as const, motivo: "legado", idempotencyKey: chave("legado") };
+          await service.cancelar(venda.id, corpo, null);
+          // Documento como gravado antes da Fase 22.6.2: o campo não existe.
+          await connection.collection("vendas").updateOne({ _id: oid(venda.id) }, { $unset: { efeitosPendentesCancelamento: "" } });
+          const antes = await estado(venda.id, vendedor.id, cliente.id, produto);
+          await service.cancelar(venda.id, corpo, null);
+          expect(await estado(venda.id, vendedor.id, cliente.id, produto)).toEqual(antes);
+        } finally {
+          await fecharCaixaAtual();
+        }
+      });
+    });
+
+    describe("8.3 concorrência", () => {
+      it("duas requisições simultâneas com a MESMA chave (vendedor e cliente excluídos): um evento, uma reversão, uma auditoria, um caixa", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { produto, vendedor, cliente, venda } = await cenario(caixa.id);
+          await vendedoresService.excluir(vendedor.id, null);
+          await clientesService.excluir(cliente.id, null);
+          const corpo = { tipo: "integral" as const, motivo: "simultâneo", idempotencyKey: chave("mesma") };
+          const resultados = await Promise.allSettled([service.cancelar(venda.id, corpo, null), service.cancelar(venda.id, corpo, null)]);
+          expect(resultados.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+          const depois = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(depois).toMatchObject({ status: "cancelada", eventos: 1, pendencias: [], saldo: 9, movimentosCaixa: 1, auditoria: 1 });
+          expect(depois.vendedor).toMatchObject({ vendas: 1, totalVendido: 100, excluido: true });
+          expect(depois.cliente).toMatchObject({ compras: 1, totalComprado: 100, excluido: true });
+        } finally {
+          await fecharCaixaAtual();
+        }
+      });
+
+      it("mesma chave com payload DIFERENTE em simultâneo: uma operação aplicada, a outra recusada; efeitos uma vez", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { produto, vendedor, cliente, venda } = await cenario(caixa.id);
+          const itemId = String(venda.itens[0]!._id);
+          const mesmaChave = chave("divergente");
+          const resultados = await Promise.allSettled([
+            service.cancelar(venda.id, { tipo: "integral", motivo: "A", idempotencyKey: mesmaChave }, null),
+            service.cancelar(venda.id, { tipo: "parcial", motivo: "B", itens: [{ itemId, quantidade: 1 }], idempotencyKey: mesmaChave }, null),
+          ]);
+          expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+          const recusa = resultados.find((r) => r.status === "rejected") as PromiseRejectedResult;
+          expect((recusa.reason as ApiException).getStatus()).toBe(409);
+          const depois = await estado(venda.id, vendedor.id, cliente.id, produto);
+          // A venda tem 1 unidade: integral ou parcial(1) levam ao mesmo fim — cancelada, uma única vez.
+          expect(depois).toMatchObject({ status: "cancelada", eventos: 1, pendencias: [], saldo: 9, movimentosCaixa: 1, auditoria: 1 });
+          expect(depois.vendedor).toMatchObject({ vendas: 1, totalVendido: 100 });
+        } finally {
+          await fecharCaixaAtual();
+        }
+      });
+
+      it("duas requisições simultâneas com chaves DIFERENTES: só uma aplica; agregados revertidos uma vez", async () => {
+        const caixa = await abrirCaixa();
+        try {
+          const { produto, vendedor, cliente, venda } = await cenario(caixa.id);
+          await vendedoresService.excluir(vendedor.id, null);
+          const resultados = await Promise.allSettled([
+            service.cancelar(venda.id, { tipo: "integral", motivo: "A", idempotencyKey: chave("a") }, null),
+            service.cancelar(venda.id, { tipo: "integral", motivo: "B", idempotencyKey: chave("b") }, null),
+          ]);
+          expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+          const depois = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(depois).toMatchObject({ status: "cancelada", eventos: 1, pendencias: [], saldo: 9, movimentosCaixa: 1, auditoria: 1 });
+          expect(depois.vendedor).toMatchObject({ vendas: 1, totalVendido: 100, excluido: true });
+          expect(depois.cliente).toMatchObject({ compras: 1, totalComprado: 100 });
+        } finally {
+          await fecharCaixaAtual();
+        }
+      });
+
+      it("dois replays SIMULTÂNEOS depois de uma falha parcial (agregados + auditoria pendentes): cada efeito uma única vez", async () => {
+        const caixa = await abrirCaixa();
+        const modelo = (service as unknown as { eventoModel: { create: (...args: unknown[]) => Promise<unknown> } }).eventoModel;
+        try {
+          const { produto, vendedor, cliente, venda } = await cenario(caixa.id);
+          await vendedoresService.excluir(vendedor.id, null);
+          const corpo = { tipo: "integral" as const, motivo: "falha dupla", idempotencyKey: chave("replay-concorrente") };
+          const espiaoAgregados = spyOn(VendedoresRepository.prototype, "encontrarPorIdIncluindoExcluidos").mockImplementation(async () => {
+            throw new Error("falha injetada nos agregados");
+          });
+          const espiaoAuditoria = spyOn(modelo, "create").mockImplementation(async () => {
+            throw new Error("falha injetada no registro de auditoria");
+          });
+          try {
+            expect(await capturar(service.cancelar(venda.id, corpo, null))).toBeInstanceOf(Error);
+          } finally {
+            espiaoAgregados.mockRestore();
+            espiaoAuditoria.mockRestore();
+          }
+          const parcial = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(parcial).toMatchObject({ pendencias: ["agregados", "auditoria"], movimentosCaixa: 1, auditoria: 0, saldo: 9 });
+          expect(parcial.vendedor).toMatchObject({ vendas: 2, totalVendido: 200 });
+
+          const resultados = await Promise.allSettled([service.cancelar(venda.id, corpo, null), service.cancelar(venda.id, corpo, null)]);
+          expect(resultados.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+          const final = await estado(venda.id, vendedor.id, cliente.id, produto);
+          expect(final).toMatchObject({ pendencias: [], movimentosCaixa: 1, auditoria: 1, saldo: 9 });
+          expect(final.vendedor).toMatchObject({ vendas: 1, totalVendido: 100, excluido: true });
+          expect(final.cliente).toMatchObject({ compras: 1, totalComprado: 100 });
+        } finally {
+          await fecharCaixaAtual();
         }
       });
     });

@@ -379,6 +379,38 @@ export class CancelamentoVenda {
 export const CancelamentoVendaSchema = SchemaFactory.createForClass(CancelamentoVenda);
 aplicarSerializacaoPadrao(CancelamentoVendaSchema, ["assinaturaSolicitacao"]);
 
+/** Fase 22.6.2 — efeitos de um evento de cancelamento/devolução executados DEPOIS da gravação do evento. */
+export const EFEITOS_POS_CANCELAMENTO = ["caixa", "agregados", "auditoria"] as const;
+export type EfeitoPosCancelamento = (typeof EFEITOS_POS_CANCELAMENTO)[number];
+
+/**
+ * Fase 22.6.2 — um efeito posterior AINDA NÃO concluído de um evento de `cancelamentos[]`. Gravado na MESMA escrita
+ * que cria o evento (nunca existe evento sem as pendências dele) e retirado só por quem conclui o efeito
+ * (`VendasRepository.retirarEfeitoPendente`, condicional). Enquanto a entrada existir, o efeito está pendente e
+ * visível no banco; a repetição com a mesma `idempotencyKey` (ou qualquer cancelamento posterior da venda) o retoma.
+ * Interno — nunca serializado na resposta HTTP.
+ */
+@Schema({ _id: true })
+export class EfeitoPendenteCancelamento {
+  _id!: Types.ObjectId;
+
+  @Prop({ type: String, required: true, enum: EFEITOS_POS_CANCELAMENTO })
+  efeito!: EfeitoPosCancelamento;
+
+  /** `_id` do evento em `cancelamentos[]` a que o efeito pertence. */
+  @Prop({ type: String, required: true })
+  eventoId!: string;
+
+  /** Autor da operação original — usado no evento de auditoria (`eventos_venda.usuarioId`). */
+  @Prop({ type: String, default: null })
+  usuarioId!: string | null;
+
+  @Prop({ type: Date, required: true })
+  registradoEm!: Date;
+}
+export const EfeitoPendenteCancelamentoSchema = SchemaFactory.createForClass(EfeitoPendenteCancelamento);
+aplicarSerializacaoPadrao(EfeitoPendenteCancelamentoSchema);
+
 /**
  * Contrato alinhado a `VendaDetalhe`/`VendaResumo` (`src/types/venda.ts`).
  * A venda é criada exclusivamente pelo futuro MARIELA PDV (ver
@@ -511,6 +543,14 @@ export class Venda {
   @Prop({ type: [CancelamentoVendaSchema], default: [] })
   cancelamentos!: Types.DocumentArray<CancelamentoVenda>;
 
+  /**
+   * Fase 22.6.2 — efeitos posteriores (caixa, agregados, auditoria) de eventos de `cancelamentos[]` ainda não
+   * concluídos. Vazio = nada pendente. Vendas canceladas antes desta fase não têm entradas: nunca são reprocessadas
+   * (nenhum efeito é reaplicado sem prova de que está pendente). Interno — oculto na serialização.
+   */
+  @Prop({ type: [EfeitoPendenteCancelamentoSchema], default: [] })
+  efeitosPendentesCancelamento!: Types.DocumentArray<EfeitoPendenteCancelamento>;
+
   @Prop({ type: String, required: true, enum: STATUS_VENDA, default: "em_pagamento" })
   status!: StatusVenda;
 
@@ -534,7 +574,7 @@ VendaSchema.virtual("restauracaoEstoque").get(function (this: VendaDocument): Re
   if (!this.isSelected("cancelamentos")) return undefined;
   return resumoRestauracao(this.cancelamentos);
 });
-aplicarSerializacaoPadrao(VendaSchema);
+aplicarSerializacaoPadrao(VendaSchema, ["efeitosPendentesCancelamento"]);
 
 VendaSchema.index({ status: 1 });
 VendaSchema.index({ criadoEm: 1 });

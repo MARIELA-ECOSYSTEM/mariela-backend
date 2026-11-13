@@ -464,12 +464,32 @@ export class VendasRepository {
   }
 
   /** Todas as vendas de um vendedor/cliente ainda válidas (não canceladas) — usado para recalcular `ultimaVenda`/`ultimaCompra` após um cancelamento. */
-  async encontrarUltimaValidaPorVendedor(vendedorId: string): Promise<VendaDocument | null> {
-    return this.vendaModel.findOne({ vendedorId, status: { $ne: "cancelada" } }).sort({ dataVenda: -1 }).exec();
+  async encontrarUltimaValidaPorVendedor(vendedorId: string, sessao?: ClientSession): Promise<VendaDocument | null> {
+    return this.vendaModel.findOne({ vendedorId, status: { $ne: "cancelada" } }).sort({ dataVenda: -1 }).session(sessao ?? null).exec();
   }
 
-  async encontrarUltimaValidaPorCliente(clienteId: string): Promise<VendaDocument | null> {
-    return this.vendaModel.findOne({ clienteId, status: { $ne: "cancelada" } }).sort({ dataVenda: -1 }).exec();
+  async encontrarUltimaValidaPorCliente(clienteId: string, sessao?: ClientSession): Promise<VendaDocument | null> {
+    return this.vendaModel.findOne({ clienteId, status: { $ne: "cancelada" } }).sort({ dataVenda: -1 }).session(sessao ?? null).exec();
+  }
+
+  /**
+   * Fase 22.6.2 — retira UMA entrada de `efeitosPendentesCancelamento` (o efeito posterior foi — ou, dentro de
+   * `sessao`, será confirmado junto — concluído). Compare-and-swap: devolve `true` só para quem de fato retirou a
+   * entrada; `false` = outra execução já a retirou, e o chamador NÃO deve executar o efeito (dentro de uma transação,
+   * nada é confirmado). Incrementa `__v` de propósito: uma gravação concorrente da venda feita a partir de uma leitura
+   * anterior (`salvarComRetentativa`, versionamento otimista) recebe `VersionError` e relê o documento, em vez de
+   * regravar uma lista antiga e ressuscitar a pendência.
+   */
+  async retirarEfeitoPendente(vendaId: string, entradaId: string, sessao?: ClientSession): Promise<boolean> {
+    const id = new Types.ObjectId(entradaId);
+    const resultado = await this.vendaModel
+      .updateOne(
+        { _id: vendaId, "efeitosPendentesCancelamento._id": id },
+        { $pull: { efeitosPendentesCancelamento: { _id: id } }, $inc: { __v: 1 } },
+        sessao ? { session: sessao } : {},
+      )
+      .exec();
+    return resultado.modifiedCount === 1;
   }
 
   /**

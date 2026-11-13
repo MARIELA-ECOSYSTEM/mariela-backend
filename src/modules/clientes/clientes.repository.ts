@@ -84,6 +84,17 @@ export class ClientesRepository {
     return cliente;
   }
 
+  /**
+   * Fase 22.6.2 — busca por id INCLUINDO excluídos logicamente (`excluidoEm` preenchido). Uso exclusivo do ajuste de
+   * agregados históricos de uma venda (`VendasService` ao cancelar): a exclusão lógica não apaga o histórico do
+   * cliente, então os agregados dele continuam sendo corrigidos. Nunca usar para operações cadastrais. `null` só
+   * quando o documento não existe fisicamente (ou o id é inválido).
+   */
+  async encontrarPorIdIncluindoExcluidos(id: string, sessao?: ClientSession): Promise<ClienteDocument | null> {
+    if (!isValidObjectId(id)) return null;
+    return this.clienteModel.findOne({ _id: id }).session(sessao ?? null).exec();
+  }
+
   /** Base da checagem de telefone duplicado — ignora o próprio registro em atualizações. */
   async encontrarPorTelefoneNormalizado(telefoneNormalizado: string, ignorarId?: string): Promise<ClienteDocument | null> {
     const filtro: Record<string, unknown> = { telefoneNormalizado, excluidoEm: null };

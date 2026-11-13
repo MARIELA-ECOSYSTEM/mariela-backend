@@ -45,7 +45,7 @@ import type { BaixarParcelaDto } from "./dto/baixar-parcela.dto.js";
 import type { CancelamentoDto } from "./dto/cancelamento.dto.js";
 import type { ListarVendasQueryDto } from "./dto/listar-vendas-query.dto.js";
 import { EventoVenda, type EventoVendaDocument } from "./schemas/evento-venda.schema.js";
-import type { CancelamentoVenda, ItemDevolvido, ItemVenda, PagamentoVenda, VendaDocument } from "./schemas/venda.schema.js";
+import type { CancelamentoVenda, EfeitoPosCancelamento, ItemDevolvido, ItemVenda, PagamentoVenda, VendaDocument } from "./schemas/venda.schema.js";
 import type { DadosCriarVenda, DadosPersistirVenda, DadosReceberPagamento, Desconto, PagamentoSolicitado, TarifaAplicada } from "./vendas.types.js";
 
 export interface ResultadoListaVendas {
@@ -1133,19 +1133,6 @@ export class VendasService {
 
     const motivo = dto.motivo.trim();
     const agora = new Date();
-    let eraReplayConcorrente = false;
-    // Etapa 10.22 — o evento EFETIVAMENTE aplicado nesta chamada (novo ou
-    // reconhecido como replay concorrente dentro do retry) — capturado
-    // diretamente do documento que acaba sendo salvo, mesmo padrão já usado
-    // por `pagamentoAplicado` em `receberPagamento`/`baixarParcela`. Evita
-    // qualquer ambiguidade de "qual evento é este" depois do retry: cada
-    // tentativa reatribui estas variáveis contra o documento FRESCO dela.
-    // `valorDevolvidoDoEvento` é capturado separadamente (nunca lido de volta
-    // de `eventoAplicado` fora do callback) só para contornar uma inferência
-    // do compilador (`never`) ao ler uma propriedade de um subdocumento
-    // Mongoose armazenado numa variável `let` de escopo externo.
-    let eventoAplicado: CancelamentoVenda | null = null;
-    let valorDevolvidoDoEvento = 0;
 
     const venda = await this.vendasRepository.salvarComRetentativa(vendaId, (documento) => {
       // Mesma checagem de replay/conflito da entrada da função, agora contra
@@ -1158,11 +1145,8 @@ export class VendasService {
         : undefined;
       if (eventoExistenteNaTentativa) {
         this.verificarMesmaOperacaoDeCancelamento(eventoExistenteNaTentativa, dto);
-        // É a MESMA operação — não muta de novo; a reconciliação fora deste
-        // callback cuida do resto (estoque/caixa).
-        eraReplayConcorrente = true;
-        eventoAplicado = eventoExistenteNaTentativa as CancelamentoVenda;
-        valorDevolvidoDoEvento = eventoExistenteNaTentativa.valorDevolvido;
+        // É a MESMA operação — não muta de novo; a conclusão fora deste callback cuida do resto (estoque e as
+        // pendências registradas pela chamada que gravou o evento — Fase 22.6.2).
         return;
       }
       if (documento.status === "cancelada") {
@@ -1240,8 +1224,7 @@ export class VendasService {
         assinaturaSolicitacao: assinaturaDaSolicitacaoDeCancelamento(dto),
       } as never);
       const eventoRecemCriado = documento.cancelamentos[documento.cancelamentos.length - 1]!;
-      eventoAplicado = eventoRecemCriado as CancelamentoVenda;
-      valorDevolvidoDoEvento = eventoRecemCriado.valorDevolvido;
+      const eventoId = String(eventoRecemCriado._id);
       documento.historico.push({
         dataHora: agora,
         tipo: dto.tipo === "integral" ? "cancelamento" : "devolucao",
@@ -1253,43 +1236,36 @@ export class VendasService {
       });
 
       const todosDevolvidos = documento.itens.every((item) => item.quantidadeDevolvida >= item.quantidade);
-      if (dto.tipo === "integral" || todosDevolvidos) {
+      // A checagem acima garante que a venda NÃO estava cancelada nesta tentativa: entrar aqui é a transição.
+      const transitouParaCancelada = dto.tipo === "integral" || todosDevolvidos;
+      if (transitouParaCancelada) {
         documento.status = "cancelada";
         documento.valorPendente = 0;
       }
+
+      // Fase 22.6.2 — os efeitos posteriores nascem PENDENTES na mesma escrita do evento: se a requisição falhar
+      // depois daqui (caixa fechado, conflito, falha de auditoria, processo derrubado), a pendência fica gravada e é
+      // retomada pela repetição com a mesma chave — nunca some sem rastro. Agregados só na transição para cancelada
+      // (mesma regra de antes: devolução parcial que mantém a venda ativa não mexe nos agregados).
+      const pendentes: EfeitoPosCancelamento[] = transitouParaCancelada ? ["caixa", "agregados", "auditoria"] : ["caixa", "auditoria"];
+      for (const efeito of pendentes) {
+        documento.efeitosPendentesCancelamento.push({ efeito, eventoId, usuarioId, registradoEm: agora } as never);
+      }
     });
 
-    // Estoque e movimento de caixa passam SEMPRE pela mesma via de
-    // reconciliação (idempotente item a item / por chave global) usada num
-    // replay explícito — cobre também a corrida "perdi a gravação, mas a
-    // operação é minha" (`eraReplayConcorrente`) sem nenhum código duplicado.
-    //
-    // Etapa 10.22 — `restaurarEstoquePendente` processa TODOS os eventos da
-    // venda (não só o desta chamada): isso é o que torna qualquer chamada
-    // subsequente a `cancelar()`/reconciliação capaz de completar uma
-    // restauração que ficou pendente de uma tentativa ANTERIOR (retry
-    // orgânico, sem mecanismo dedicado). `garantirMovimentoDeCancelamento`
-    // agora opera sobre o evento ESPECÍFICO capturado acima — nunca mais
-    // "o" cancelamento (que deixou de existir como conceito único).
-    const eventoFinal: CancelamentoVenda | null = eventoAplicado;
+    // Etapa 10.22 — `restaurarEstoquePendente` processa TODOS os eventos da venda (não só o desta chamada): qualquer
+    // chamada subsequente completa uma restauração que ficou pendente de uma tentativa ANTERIOR.
     // Fase 60.4.3.4.18 — modo "manual": a própria requisição tenta restaurar AGORA todas as linhas não concluídas da
     // venda (sem respeitar o backoff do worker). Falha não interrompe o cancelamento: fica registrada na linha e o
     // `ReconciliacaoEstoqueWorker` a retoma.
     await this.restaurarEstoquePendente(venda.id, { modo: "manual" });
-    if (eventoFinal) {
-      await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, eventoFinal);
-    }
 
-    // `vendaAtual` já não podia estar cancelada aqui (a checagem no início da
-    // função teria lançado ou reconciliado antes) — os agregados revertem só
-    // na tentativa que efetivamente fez a transição, nunca num replay.
-    if (!eraReplayConcorrente && venda.status === "cancelada") {
-      await this.reverterAgregados(venda);
-    }
-
-    await this.registrarEvento(venda.id, dto.tipo === "integral" ? "venda.cancelada" : "venda.devolvida", usuarioId, {
-      valorDevolvido: valorDevolvidoDoEvento,
-    });
+    // Fase 22.6.2 — caixa, agregados e auditoria: cada pendência da venda (desta chamada e de anteriores) é concluída
+    // com o próprio controle de idempotência. Também cobre a corrida "perdi a gravação, mas a operação é minha" (replay
+    // concorrente com a mesma chave): as pendências gravadas pela outra chamada são concluídas uma única vez, por quem
+    // chegar primeiro. Qualquer falha é PROPAGADA (nunca vira sucesso) depois de tentar as demais; a pendência que
+    // falhou continua gravada.
+    await this.concluirEfeitosPosCancelamento(venda.id);
     // Fase 60.4.3.4.18 — devolve a venda RELIDA depois da restauração: o `restauracaoEstoque` serializado reflete o
     // estado real (concluída × pendente), nunca o snapshot anterior à devolução de estoque.
     return this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
@@ -1350,8 +1326,97 @@ export class VendasService {
       throw ApiException.validation("Nenhum caixa aberto. Abra o caixa antes de concluir o cancelamento.");
     }
     await this.restaurarEstoquePendente(venda.id, { modo: "manual" });
+    // Mantido para eventos anteriores à Fase 22.6.2 (sem pendências gravadas): idempotente pela chave global do caixa.
     await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, evento);
+    // Fase 22.6.2 — retoma o que a chamada original deixou pendente (agregados, auditoria, caixa), cada efeito uma vez.
+    await this.concluirEfeitosPosCancelamento(venda.id);
     return this.vendasRepository.encontrarPorIdOuFalhar(venda.id);
+  }
+
+  /**
+   * Fase 22.6.2 — conclui as pendências gravadas em `efeitosPendentesCancelamento` (de qualquer evento da venda).
+   * Cada efeito tem o próprio controle — nunca "executar tudo de novo":
+   *   - caixa: chave idempotente global do movimento (índice único) e só então a pendência é retirada; evento sem
+   *     `idempotencyKey` (sem deduplicação possível) retira a pendência ANTES de lançar — no máximo uma vez, como antes;
+   *   - agregados e auditoria: uma transação retira a pendência (CAS) e aplica o efeito juntos — exatamente uma vez,
+   *     mesmo com chamadas concorrentes.
+   * Tenta todas as pendências; se alguma falhar, as demais seguem e a PRIMEIRA falha é propagada ao chamador com o
+   * status original (400/409/500) — nunca vira sucesso. O que falhou continua gravado e é retomado depois.
+   */
+  private async concluirEfeitosPosCancelamento(vendaId: string): Promise<void> {
+    const venda = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId);
+    const pendentes = [...(venda.efeitosPendentesCancelamento ?? [])];
+    let primeiraFalha: { erro: unknown } | null = null;
+    for (const pendente of pendentes) {
+      const entradaId = String(pendente._id);
+      try {
+        if (pendente.efeito === "caixa") await this.concluirEfeitoCaixa(venda, entradaId, pendente.eventoId);
+        else if (pendente.efeito === "agregados") await this.concluirEfeitoAgregados(venda.id, entradaId, pendente.eventoId);
+        else await this.concluirEfeitoAuditoria(venda.id, entradaId, pendente.eventoId, pendente.usuarioId);
+      } catch (erro) {
+        primeiraFalha ??= { erro };
+        const falha = descreverFalhaDeRestauracao(erro);
+        emitirSeguro(this.logger, "warn", {
+          evento: "cancelamento.efeito_pendente.falha",
+          vendaId: venda.id,
+          vendaCodigo: venda.codigo,
+          eventoId: pendente.eventoId,
+          efeito: pendente.efeito,
+          erroClasse: falha.classe,
+          erroCodigo: falha.codigo,
+          erroMensagem: falha.mensagem,
+        });
+      }
+    }
+    if (primeiraFalha) throw primeiraFalha.erro;
+  }
+
+  private async concluirEfeitoCaixa(venda: VendaDocument, entradaId: string, eventoId: string): Promise<void> {
+    const evento = venda.cancelamentos.find((registro) => String(registro._id) === eventoId);
+    if (!evento) {
+      // Defensivo: eventos são append-only; uma pendência sem evento não tem o que lançar.
+      await this.vendasRepository.retirarEfeitoPendente(venda.id, entradaId);
+      emitirSeguro(this.logger, "error", { evento: "cancelamento.efeito_pendente.evento_inexistente", vendaId: venda.id, eventoId, efeito: "caixa" });
+      return;
+    }
+    const caixaAtual = await this.caixasService.obterAtual();
+    if (!caixaAtual) {
+      throw ApiException.validation("Nenhum caixa aberto. Abra o caixa antes de concluir o cancelamento.");
+    }
+    if (evento.idempotencyKey) {
+      await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, evento);
+      await this.vendasRepository.retirarEfeitoPendente(venda.id, entradaId);
+      return;
+    }
+    // Sem chave não há deduplicação do movimento: quem retira a pendência é o único que lança (no máximo uma vez).
+    if (!(await this.vendasRepository.retirarEfeitoPendente(venda.id, entradaId))) return;
+    try {
+      await this.garantirMovimentoDeCancelamento(caixaAtual.id, venda, evento);
+    } catch (erro) {
+      emitirSeguro(this.logger, "error", { evento: "cancelamento.caixa.nao_lancado_sem_chave", vendaId: venda.id, vendaCodigo: venda.codigo, eventoId });
+      throw erro;
+    }
+  }
+
+  private async concluirEfeitoAgregados(vendaId: string, entradaId: string, eventoId: string): Promise<void> {
+    const resultado = await executarEmTransacao(this.conexao, async (sessao) => {
+      if (!(await this.vendasRepository.retirarEfeitoPendente(vendaId, entradaId, sessao))) return null;
+      const venda = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId, sessao);
+      return this.reverterAgregados(venda, sessao);
+    });
+    if (resultado && (resultado.vendedor === "inexistente" || resultado.cliente === "inexistente")) {
+      emitirSeguro(this.logger, "warn", { evento: "cancelamento.agregados.registro_inexistente", vendaId, eventoId, ...resultado });
+    }
+  }
+
+  private async concluirEfeitoAuditoria(vendaId: string, entradaId: string, eventoId: string, usuarioId: string | null): Promise<void> {
+    await executarEmTransacao(this.conexao, async (sessao) => {
+      if (!(await this.vendasRepository.retirarEfeitoPendente(vendaId, entradaId, sessao))) return;
+      const venda = await this.vendasRepository.encontrarPorIdOuFalhar(vendaId, sessao);
+      const evento = venda.cancelamentos.find((registro) => String(registro._id) === eventoId);
+      if (!evento) return; // defensivo: eventos são append-only.
+      await this.registrarEvento(venda.id, evento.tipo === "integral" ? "venda.cancelada" : "venda.devolvida", usuarioId, { valorDevolvido: evento.valorDevolvido }, sessao);
+    });
   }
 
   /**
@@ -2124,27 +2189,39 @@ export class VendasService {
     }
   }
 
-  /** Chamado só quando uma venda TRANSITA para cancelada — nunca em devolução parcial que mantém a venda ativa. */
-  private async reverterAgregados(venda: VendaDocument): Promise<void> {
-    await this.vendedoresRepository.salvarComRetentativa(venda.vendedorId, (documento) => {
-      documento.vendas = Math.max(0, documento.vendas - 1);
-      documento.totalVendido = arredondar(Math.max(0, documento.totalVendido - venda.valorFinal));
-    });
-    const ultimaVendedor = await this.vendasRepository.encontrarUltimaValidaPorVendedor(venda.vendedorId);
-    await this.vendedoresRepository.salvarComRetentativa(venda.vendedorId, (documento) => {
-      documento.ultimaVenda = ultimaVendedor?.dataVenda ?? null;
-    });
-
-    if (venda.clienteId) {
-      await this.clientesRepository.salvarComRetentativa(venda.clienteId, (documento) => {
-        documento.compras = Math.max(0, documento.compras - 1);
-        documento.totalComprado = arredondar(Math.max(0, documento.totalComprado - venda.valorFinal));
-      });
-      const ultimaCliente = await this.vendasRepository.encontrarUltimaValidaPorCliente(venda.clienteId);
-      await this.clientesRepository.salvarComRetentativa(venda.clienteId, (documento) => {
-        documento.ultimaCompra = ultimaCliente?.dataVenda ?? null;
-      });
+  /**
+   * Chamado só quando uma venda TRANSITA para cancelada — nunca em devolução parcial que mantém a venda ativa.
+   *
+   * Fase 22.6.2 — sempre dentro da transação que retira a pendência `agregados` (exatamente uma vez). Vendedor e
+   * cliente são lidos INCLUINDO os excluídos logicamente: a exclusão não apaga o histórico, então os agregados
+   * continuam corretos — só `vendas`/`totalVendido`/`ultimaVenda` (e equivalentes do cliente) mudam; `excluidoEm`,
+   * `ativo` e dados cadastrais nunca são tocados. Documento FISICAMENTE inexistente: não há agregado a ajustar —
+   * nada é recriado nem inventado; o lado ausente é informado ao chamador (log) e a reversão do outro lado prossegue.
+   */
+  private async reverterAgregados(
+    venda: VendaDocument,
+    sessao: ClientSession,
+  ): Promise<{ vendedor: "revertido" | "inexistente"; cliente: "revertido" | "inexistente" | "sem_cliente" }> {
+    let resultadoVendedor: "revertido" | "inexistente" = "inexistente";
+    const vendedor = await this.vendedoresRepository.encontrarPorIdIncluindoExcluidos(venda.vendedorId, sessao);
+    if (vendedor) {
+      const ultimaVendedor = await this.vendasRepository.encontrarUltimaValidaPorVendedor(venda.vendedorId, sessao);
+      vendedor.vendas = Math.max(0, vendedor.vendas - 1);
+      vendedor.totalVendido = arredondar(Math.max(0, vendedor.totalVendido - venda.valorFinal));
+      vendedor.ultimaVenda = ultimaVendedor?.dataVenda ?? null;
+      await vendedor.save({ session: sessao });
+      resultadoVendedor = "revertido";
     }
+
+    if (!venda.clienteId) return { vendedor: resultadoVendedor, cliente: "sem_cliente" };
+    const cliente = await this.clientesRepository.encontrarPorIdIncluindoExcluidos(venda.clienteId, sessao);
+    if (!cliente) return { vendedor: resultadoVendedor, cliente: "inexistente" };
+    const ultimaCliente = await this.vendasRepository.encontrarUltimaValidaPorCliente(venda.clienteId, sessao);
+    cliente.compras = Math.max(0, cliente.compras - 1);
+    cliente.totalComprado = arredondar(Math.max(0, cliente.totalComprado - venda.valorFinal));
+    cliente.ultimaCompra = ultimaCliente?.dataVenda ?? null;
+    await cliente.save({ session: sessao });
+    return { vendedor: resultadoVendedor, cliente: "revertido" };
   }
 
   private async registrarEvento(
