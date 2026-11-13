@@ -5,7 +5,7 @@ import { getConnectionToken } from "@nestjs/mongoose";
 import type { NestExpressApplication } from "@nestjs/platform-express";
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
 import type { AddressInfo } from "node:net";
-import type { Connection } from "mongoose";
+import { Types, type Connection } from "mongoose";
 import { AppModule } from "../../app.module.js";
 import { HttpExceptionFilter } from "../../common/filters/http-exception.filter.js";
 import { ResponseInterceptor } from "../../common/interceptors/response.interceptor.js";
@@ -256,6 +256,31 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
       expect(resposta.status).toBe(201);
       expect(corpo.data.status).toBe("cancelada");
       expect(corpo.data.restauracaoEstoque).toMatchObject({ status: "concluida", concluidos: 1, totalItens: 1 });
+    });
+
+    it("Fase 22.6.3 — POST e GET expõem `efeitosPosteriores` por evento, sem a estrutura interna de pendências", async () => {
+      const { venda } = await criarVendaFiadaViaHttpSetup(70, 70);
+      const chave = `http-f2263-${Date.now()}`;
+      const resposta = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}/cancelamento`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ tipo: "integral", motivo: "Teste 22.6.3 HTTP", idempotencyKey: chave }),
+      });
+      const texto = await resposta.text();
+      expect(resposta.status).toBe(201);
+      for (const interno of ["efeitosPendentesCancelamento", "efeitosRastreados", "assinaturaSolicitacao"]) expect(texto).not.toContain(interno);
+      const corpo = JSON.parse(texto) as { data: { cancelamentos: { idempotencyKey: string; efeitosPosteriores: string }[] } };
+      expect(corpo.data.cancelamentos).toHaveLength(1);
+      expect(corpo.data.cancelamentos[0]).toMatchObject({ idempotencyKey: chave, efeitosPosteriores: "concluidos" });
+
+      // Evento anterior à fase (sem o marcador interno): a leitura não afirma conclusão.
+      await connection.collection("vendas").updateOne({ _id: new Types.ObjectId(venda.id) }, { $unset: { "cancelamentos.0.efeitosRastreados": "" } });
+      const leitura = await fetch(`${baseUrl}/api/v1/vendas/${venda.id}`, { headers: authHeaders() });
+      const textoLeitura = await leitura.text();
+      expect(leitura.status).toBe(200);
+      expect(textoLeitura).not.toContain("efeitosPendentesCancelamento");
+      const corpoLeitura = JSON.parse(textoLeitura) as { data: { cancelamentos: { efeitosPosteriores: string }[] } };
+      expect(corpoLeitura.data.cancelamentos[0]?.efeitosPosteriores).toBe("nao_rastreados");
     });
 
     it("rotas de pendências e de reconciliação exigem autenticação (401 sem token)", async () => {

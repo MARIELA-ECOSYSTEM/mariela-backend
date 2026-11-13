@@ -7355,4 +7355,218 @@ describe("VendasService (integração — MongoDB real)", () => {
       });
     });
   });
+  describe("Fase 22.6.3 — indicador `efeitosPosteriores` por operação (contrato de conclusão)", () => {
+    let sequencia = 0;
+    const chave = (prefixo: string) => `f2263-${prefixo}-${Date.now()}-${(sequencia += 1)}`;
+    const oid = (id: string) => new Types.ObjectId(id);
+    type EventoJson = { id: string; idempotencyKey: string | null; efeitosPosteriores?: string; itens: { estadoRestauracao?: string }[] };
+    type VendaJson = { cancelamentos: EventoJson[]; restauracaoEstoque?: { requerIntervencao: number; concluidos: number } };
+
+    /** A venda exatamente como sai na resposta HTTP (`toJSON` do documento). */
+    const json = (venda: unknown): VendaJson => JSON.parse(JSON.stringify(venda)) as VendaJson;
+    const eventoDe = (venda: VendaJson, idempotencyKey: string) => venda.cancelamentos.find((evento) => evento.idempotencyKey === idempotencyKey);
+    const lida = async (vendaId: string) => json(await service.obterPorId(vendaId));
+
+    async function capturar(promessa: Promise<unknown>): Promise<unknown> {
+      try {
+        await promessa;
+        return null;
+      } catch (erro) {
+        return erro;
+      }
+    }
+
+    async function fecharCaixaAtual() {
+      const atual = await caixasService.obterAtual();
+      if (atual) await caixasService.fechar(atual.id, { valorInformado: 0, observacao: "Fechamento do teste da Fase 22.6.3" }, null);
+    }
+
+    /** Vendedor/cliente com DUAS vendas de 100 (a segunda com 2 unidades de 50), para uma reversão em dobro aparecer. */
+    async function cenario(caixaId: string) {
+      const produto = await criarProdutoComEstoque(50, 10);
+      const vendedor = await criarVendedor();
+      const cliente = await criarCliente();
+      const dados = {
+        clienteId: cliente.id,
+        vendedorId: vendedor.id,
+        caixaId,
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+        pagamentos: [{ forma: "Dinheiro", valor: 100 }],
+      };
+      await service.criar(dados, null);
+      const venda = await service.criar(dados, null);
+      return { produto, vendedor, cliente, venda, itemId: String(venda.itens[0]!._id) };
+    }
+
+    async function contagens(vendaId: string, vendedorId: string) {
+      const vendedor = await connection.collection("vendedores").findOne({ _id: oid(vendedorId) });
+      const venda = await connection.collection("vendas").findOne({ _id: oid(vendaId) });
+      return {
+        eventos: (venda?.["cancelamentos"] as unknown[]).length,
+        movimentosCaixa: await connection.collection("movimentos_caixa").countDocuments({ vendaId, tipo: "cancelamento" }),
+        auditoria: await connection.collection("eventos_venda").countDocuments({ vendaId: oid(vendaId), tipo: { $in: ["venda.cancelada", "venda.devolvida"] } }),
+        vendedor: { vendas: vendedor?.["vendas"], totalVendido: vendedor?.["totalVendido"] },
+      };
+    }
+
+    /** Fecha o caixa de verdade no instante do lançamento (depois da gravação do evento) — uma vez. */
+    function fecharCaixaNoLancamento() {
+      const original = CaixasService.prototype.registrarMovimentoDeVenda;
+      const espiao = spyOn(CaixasService.prototype, "registrarMovimentoDeVenda").mockImplementation(async function (
+        this: CaixasService,
+        ...args: Parameters<CaixasService["registrarMovimentoDeVenda"]>
+      ) {
+        espiao.mockRestore();
+        await this.fechar(args[0].caixaId, { valorInformado: 0, observacao: "fechado no meio do cancelamento" }, null);
+        return original.apply(this, args);
+      });
+      return espiao;
+    }
+
+    it("1/11/12. todos os efeitos concluídos: POST e leitura dizem `concluidos`; nada interno vaza", async () => {
+      const caixa = await abrirCaixa();
+      try {
+        const { venda } = await cenario(caixa.id);
+        const k = chave("ok");
+        const resposta = await service.cancelar(venda.id, { tipo: "integral", motivo: "tudo certo", idempotencyKey: k }, null);
+        expect(eventoDe(json(resposta), k)?.efeitosPosteriores).toBe("concluidos");
+        expect(eventoDe(await lida(venda.id), k)?.efeitosPosteriores).toBe("concluidos");
+        const texto = JSON.stringify(resposta);
+        for (const interno of ["efeitosPendentesCancelamento", "efeitosRastreados", "assinaturaSolicitacao", "registradoEm"]) expect(texto).not.toContain(interno);
+      } finally {
+        await fecharCaixaAtual();
+      }
+    });
+
+    it("2–7. devolução PARCIAL com caixa fechado após a gravação: 400 + `pendentes`; replay sem caixa segue pendente; com caixa conclui sem duplicar", async () => {
+      const caixa = await abrirCaixa();
+      try {
+        const { venda, vendedor, itemId } = await cenario(caixa.id);
+        const corpo = { tipo: "parcial" as const, motivo: "caixa fecha no meio", itens: [{ itemId, quantidade: 1 }], idempotencyKey: chave("caixa") };
+        const espiao = fecharCaixaNoLancamento();
+        let erro: unknown;
+        try {
+          erro = await capturar(service.cancelar(venda.id, corpo, null));
+        } finally {
+          espiao.mockRestore();
+        }
+        expect((erro as ApiException).getStatus()).toBe(400);
+        const depoisDoErro = await lida(venda.id);
+        expect(depoisDoErro.cancelamentos).toHaveLength(1);
+        expect(eventoDe(depoisDoErro, corpo.idempotencyKey)?.efeitosPosteriores).toBe("pendentes");
+        expect(await contagens(venda.id, vendedor.id)).toEqual({ eventos: 1, movimentosCaixa: 0, auditoria: 1, vendedor: { vendas: 2, totalVendido: 200 } });
+
+        const semCaixa = await capturar(service.cancelar(venda.id, corpo, null));
+        expect((semCaixa as ApiException).getStatus()).toBe(400);
+        expect(eventoDe(await lida(venda.id), corpo.idempotencyKey)?.efeitosPosteriores).toBe("pendentes");
+
+        await abrirCaixa();
+        const replay = await service.cancelar(venda.id, corpo, null);
+        expect(eventoDe(json(replay), corpo.idempotencyKey)?.efeitosPosteriores).toBe("concluidos");
+        expect(eventoDe(await lida(venda.id), corpo.idempotencyKey)?.efeitosPosteriores).toBe("concluidos");
+        const final = await contagens(venda.id, vendedor.id);
+        // Parcial que mantém a venda ativa: agregados intocados; um evento, um movimento, uma auditoria.
+        expect(final).toEqual({ eventos: 1, movimentosCaixa: 1, auditoria: 1, vendedor: { vendas: 2, totalVendido: 200 } });
+        await service.cancelar(venda.id, corpo, null);
+        expect(await contagens(venda.id, vendedor.id)).toEqual(final);
+      } finally {
+        await fecharCaixaAtual();
+      }
+    });
+
+    it("evidência de pendência vence a falta do marcador: evento sem `efeitosRastreados` mas com pendência é `pendentes`", async () => {
+      const caixa = await abrirCaixa();
+      try {
+        const { venda } = await cenario(caixa.id);
+        const corpo = { tipo: "integral" as const, motivo: "pendência sem marcador", idempotencyKey: chave("evidencia") };
+        const espiao = fecharCaixaNoLancamento();
+        try {
+          await capturar(service.cancelar(venda.id, corpo, null));
+        } finally {
+          espiao.mockRestore();
+        }
+        await connection.collection("vendas").updateOne({ _id: oid(venda.id) }, { $unset: { "cancelamentos.0.efeitosRastreados": "" } });
+        expect(eventoDe(await lida(venda.id), corpo.idempotencyKey)?.efeitosPosteriores).toBe("pendentes");
+      } finally {
+        await fecharCaixaAtual();
+      }
+    });
+
+    it("6/8. duas requisições simultâneas com a mesma chave (integral): ambas `concluidos`; agregados, caixa e auditoria uma vez", async () => {
+      const caixa = await abrirCaixa();
+      try {
+        const { venda, vendedor } = await cenario(caixa.id);
+        const corpo = { tipo: "integral" as const, motivo: "simultâneo", idempotencyKey: chave("simultaneo") };
+        const [a, b] = await Promise.all([service.cancelar(venda.id, corpo, null), service.cancelar(venda.id, corpo, null)]);
+        expect(eventoDe(json(a), corpo.idempotencyKey)?.efeitosPosteriores).toBe("concluidos");
+        expect(eventoDe(json(b), corpo.idempotencyKey)?.efeitosPosteriores).toBe("concluidos");
+        expect(await contagens(venda.id, vendedor.id)).toEqual({ eventos: 1, movimentosCaixa: 1, auditoria: 1, vendedor: { vendas: 1, totalVendido: 100 } });
+      } finally {
+        await fecharCaixaAtual();
+      }
+    });
+
+    it("9/10. evento ANTIGO (sem marcador, sem pendências e sem assinatura): `nao_rastreados`, nunca `pendentes`; replay compatível sem duplicar", async () => {
+      const caixa = await abrirCaixa();
+      try {
+        const { venda, vendedor } = await cenario(caixa.id);
+        const corpo = { tipo: "integral" as const, motivo: "legado", idempotencyKey: chave("legado") };
+        await service.cancelar(venda.id, corpo, null);
+        await connection.collection("vendas").updateOne(
+          { _id: oid(venda.id) },
+          { $unset: { "cancelamentos.0.efeitosRastreados": "", "cancelamentos.0.assinaturaSolicitacao": "", efeitosPendentesCancelamento: "" } },
+        );
+        const antes = await contagens(venda.id, vendedor.id);
+        expect(eventoDe(await lida(venda.id), corpo.idempotencyKey)?.efeitosPosteriores).toBe("nao_rastreados");
+        const replay = await service.cancelar(venda.id, corpo, null); // comparação legada (sem assinatura) reconhece o replay
+        expect(eventoDe(json(replay), corpo.idempotencyKey)?.efeitosPosteriores).toBe("nao_rastreados");
+        expect(await contagens(venda.id, vendedor.id)).toEqual(antes);
+      } finally {
+        await fecharCaixaAtual();
+      }
+    });
+
+    it("evento SEM idempotencyKey: `nao_rastreados` (não há operação identificável para afirmar conclusão)", async () => {
+      const caixa = await abrirCaixa();
+      try {
+        const { venda } = await cenario(caixa.id);
+        const resposta = json(await service.cancelar(venda.id, { tipo: "integral", motivo: "sem chave" }, null));
+        expect(resposta.cancelamentos[0]?.efeitosPosteriores).toBe("nao_rastreados");
+      } finally {
+        await fecharCaixaAtual();
+      }
+    });
+
+    it("13. estoque independente: linha `requer_intervencao` não muda `efeitosPosteriores` (concluidos) nem vice-versa", async () => {
+      const caixa = await abrirCaixa();
+      try {
+        const { venda, produto } = await cenario(caixa.id);
+        await produtosService.excluir(produto.produtoId, null);
+        const k = chave("estoque");
+        const resposta = json(await service.cancelar(venda.id, { tipo: "integral", motivo: "produto excluído", idempotencyKey: k }, null));
+        const evento = eventoDe(resposta, k)!;
+        expect(evento.efeitosPosteriores).toBe("concluidos");
+        expect(evento.itens[0]?.estadoRestauracao).toBe("requer_intervencao");
+        expect(resposta.restauracaoEstoque).toMatchObject({ requerIntervencao: 1, concluidos: 0 });
+      } finally {
+        await fecharCaixaAtual();
+      }
+    });
+
+    it("projeção sem `efeitosPendentesCancelamento` não recebe indicador (nunca um `concluidos` sem base)", async () => {
+      const caixa = await abrirCaixa();
+      try {
+        const { venda } = await cenario(caixa.id);
+        const k = chave("projecao");
+        await service.cancelar(venda.id, { tipo: "integral", motivo: "projeção", idempotencyKey: k }, null);
+        const modelo = connection.model("Venda");
+        const parcial = await modelo.findById(venda.id).select("codigo cancelamentos").exec();
+        const evento = eventoDe(json(parcial), k)!;
+        expect(evento).toBeDefined();
+        expect(evento.efeitosPosteriores).toBeUndefined();
+      } finally {
+        await fecharCaixaAtual();
+      }
+    });
+  });
 });

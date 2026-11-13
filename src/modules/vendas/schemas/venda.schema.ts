@@ -375,9 +375,42 @@ export class CancelamentoVenda {
    */
   @Prop({ type: String, required: false })
   assinaturaSolicitacao?: string;
+
+  /**
+   * Fase 22.6.3 — `true` em todo evento criado a partir desta fase: os efeitos posteriores dele (caixa, agregados,
+   * auditoria) são acompanhados por `Venda.efeitosPendentesCancelamento`, então a AUSÊNCIA de pendência prova a
+   * conclusão. Eventos anteriores não têm o campo — para eles a ausência não prova nada (`nao_rastreados`). Interno.
+   */
+  @Prop({ type: Boolean, required: false })
+  efeitosRastreados?: boolean;
 }
 export const CancelamentoVendaSchema = SchemaFactory.createForClass(CancelamentoVenda);
-aplicarSerializacaoPadrao(CancelamentoVendaSchema, ["assinaturaSolicitacao"]);
+aplicarSerializacaoPadrao(CancelamentoVendaSchema, ["assinaturaSolicitacao", "efeitosRastreados"]);
+
+/**
+ * Fase 22.6.3 — situação dos efeitos OBRIGATÓRIOS posteriores à gravação de um evento de cancelamento/devolução,
+ * exposta em cada item de `cancelamentos[]` da resposta (`efeitosPosteriores`). Efeitos obrigatórios: lançamento no
+ * caixa, reversão dos agregados de vendedor/cliente (só quando o evento levou a venda a cancelada) e registro de
+ * auditoria. A devolução de ESTOQUE não entra: tem estado próprio por linha (`itens[].estadoRestauracao`) e no resumo
+ * `restauracaoEstoque`.
+ *   - `pendentes`: há ao menos um efeito obrigatório registrado como pendente para este evento (repetir a mesma
+ *     operação, com a mesma `idempotencyKey`, conclui só o que falta);
+ *   - `concluidos`: evento acompanhado desde a gravação, com chave, e sem nenhuma pendência;
+ *   - `nao_rastreados`: evento anterior ao acompanhamento (ou sem `idempotencyKey`) — não há como afirmar conclusão.
+ */
+export const SITUACOES_EFEITOS_POSTERIORES = ["pendentes", "concluidos", "nao_rastreados"] as const;
+export type SituacaoEfeitosPosteriores = (typeof SITUACOES_EFEITOS_POSTERIORES)[number];
+
+export function situacaoDosEfeitosPosteriores(
+  evento: { _id: unknown; idempotencyKey?: string | null; efeitosRastreados?: boolean },
+  pendencias: readonly { eventoId: string }[],
+): SituacaoEfeitosPosteriores {
+  const eventoId = String(evento._id);
+  // Evidência de pendência vence sempre — inclusive num evento sem chave ou sem o marcador.
+  if (pendencias.some((pendencia) => pendencia.eventoId === eventoId)) return "pendentes";
+  if (evento.efeitosRastreados !== true || !evento.idempotencyKey) return "nao_rastreados";
+  return "concluidos";
+}
 
 /** Fase 22.6.2 — efeitos de um evento de cancelamento/devolução executados DEPOIS da gravação do evento. */
 export const EFEITOS_POS_CANCELAMENTO = ["caixa", "agregados", "auditoria"] as const;
@@ -575,6 +608,37 @@ VendaSchema.virtual("restauracaoEstoque").get(function (this: VendaDocument): Re
   return resumoRestauracao(this.cancelamentos);
 });
 aplicarSerializacaoPadrao(VendaSchema, ["efeitosPendentesCancelamento"]);
+
+/**
+ * Fase 22.6.3 — anota cada evento serializado de `cancelamentos[]` com `efeitosPosteriores` (ver
+ * `situacaoDosEfeitosPosteriores`), ANTES de a serialização padrão ocultar `efeitosPendentesCancelamento`: o cliente
+ * recebe só o indicador por evento, nunca a estrutura interna. Projeções que não trazem `cancelamentos` E
+ * `efeitosPendentesCancelamento` (listagens enxutas) ficam SEM o indicador — nunca um "concluídos" sem base.
+ */
+{
+  const opcoesPadrao = VendaSchema.get("toJSON") as { transform: (doc: unknown, ret: Record<string, unknown>, opcoes: unknown) => unknown };
+  const transformarPadrao = opcoesPadrao.transform;
+  VendaSchema.set("toJSON", {
+    ...opcoesPadrao,
+    transform: ((doc: unknown, ret: Record<string, unknown>, opcoes: unknown) => {
+      anotarEfeitosPosteriores(doc as VendaDocument, ret);
+      return transformarPadrao(doc, ret, opcoes);
+    }) as never,
+  });
+}
+
+function anotarEfeitosPosteriores(venda: VendaDocument, ret: Record<string, unknown>): void {
+  if (typeof venda?.isSelected !== "function") return;
+  if (!venda.isSelected("cancelamentos") || !venda.isSelected("efeitosPendentesCancelamento")) return;
+  const serializados = ret["cancelamentos"];
+  if (!Array.isArray(serializados) || !Array.isArray(venda.cancelamentos)) return;
+  const pendencias = (venda.efeitosPendentesCancelamento ?? []).map((pendencia) => ({ eventoId: pendencia.eventoId }));
+  for (const serializado of serializados as Record<string, unknown>[]) {
+    const original = venda.cancelamentos.find((evento) => String(evento._id) === serializado["id"]);
+    if (!original) continue; // sem o documento de origem não há base para afirmar nada: fica sem o indicador.
+    serializado["efeitosPosteriores"] = situacaoDosEfeitosPosteriores(original, pendencias);
+  }
+}
 
 VendaSchema.index({ status: 1 });
 VendaSchema.index({ criadoEm: 1 });

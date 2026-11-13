@@ -1222,6 +1222,8 @@ export class VendasService {
         idempotencyKey: dto.idempotencyKey ?? null,
         // Fase 22.4 (A) — o que foi PEDIDO (não o aplicado), para reconhecer o retry legítimo.
         assinaturaSolicitacao: assinaturaDaSolicitacaoDeCancelamento(dto),
+        // Fase 22.6.3 — os efeitos posteriores deste evento são acompanhados desde a gravação (pendências abaixo).
+        efeitosRastreados: true,
       } as never);
       const eventoRecemCriado = documento.cancelamentos[documento.cancelamentos.length - 1]!;
       const eventoId = String(eventoRecemCriado._id);
