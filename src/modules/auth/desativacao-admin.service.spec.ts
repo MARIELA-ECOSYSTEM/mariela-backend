@@ -3,7 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
 import { getConnectionToken, getModelToken } from "@nestjs/mongoose";
 import { Test, type TestingModule } from "@nestjs/testing";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { Types, type Connection, type Model } from "mongoose";
 import { AppModule } from "../../app.module.js";
 import { ERROR_CODES, type ErrorCode } from "../../common/constants/error-codes.constant.js";
@@ -190,7 +190,7 @@ describe("DesativacaoAdminService (integração — MongoDB real, Fase 60.4.3.1.
     it("já inativo e auditado, com uma sessão remanescente: revoga e registra ADMIN_SESSIONS_REVOKED (sem duplicar ADMIN_DEACTIVATED)", async () => {
       const alvo = await criarAdmin("remanescente");
       esperarConcluido(await desativar(alvo.email));
-      await tokens.criar({ usuarioId: alvo.objectId, tokenHash: randomBytes(32).toString("hex"), expiresAt: new Date(Date.now() + 60_000), userAgent: null, ip: null });
+      await tokens.criar({ usuarioId: alvo.objectId, tokenHash: randomBytes(32).toString("hex"), expiresAt: new Date(Date.now() + 60_000), userAgent: null, ip: null, familiaId: randomUUID() });
 
       const resultado = esperarConcluido(await desativar(alvo.email));
 
@@ -211,7 +211,7 @@ describe("DesativacaoAdminService (integração — MongoDB real, Fase 60.4.3.1.
       const _id = new Types.ObjectId();
       // O schema só admite ADMIN hoje; o documento cru simula um papel futuro (ou um dado inconsistente).
       await connection.collection("usuarios").insertOne({ _id, codigo: `USR-T${Date.now()}`, nome: "Não admin", email, senhaHash: "x", role: "OPERADOR", ativo: true });
-      await tokens.criar({ usuarioId: _id, tokenHash: randomBytes(32).toString("hex"), expiresAt: new Date(Date.now() + 60_000), userAgent: null, ip: null });
+      await tokens.criar({ usuarioId: _id, tokenHash: randomBytes(32).toString("hex"), expiresAt: new Date(Date.now() + 60_000), userAgent: null, ip: null, familiaId: randomUUID() });
       const antes = await documento(email);
 
       const resultado = await desativar(email);
@@ -353,10 +353,12 @@ describe("DesativacaoAdminService (integração — MongoDB real, Fase 60.4.3.1.
       const alvo = await criarAdmin("corrida-refresh-1");
       const sessao = await login(alvo.email);
       const ponto = novoPonto();
-      const original = tokens.revogarSeValido.bind(tokens);
+      // Fase 22.8.7.2 — a decisão atômica da rotação (com candidato) passou a ser `rotacionarSeValido` (revoga R1 e
+      // aponta o sucessor numa só operação); o ponto de parada é o mesmo: logo depois dela, antes de ler `ativo`.
+      const original = tokens.rotacionarSeValido.bind(tokens);
       let pausar = true;
-      restaurar.push(spyOn(tokens, "revogarSeValido").mockImplementation(async (hash, agora) => {
-        const anterior = await original(hash, agora);
+      restaurar.push(spyOn(tokens, "rotacionarSeValido").mockImplementation(async (hash, agora, sucessor) => {
+        const anterior = await original(hash, agora, sucessor);
         if (pausar) {
           pausar = false;
           ponto.chegou.liberar();
@@ -382,11 +384,26 @@ describe("DesativacaoAdminService (integração — MongoDB real, Fase 60.4.3.1.
       const alvo = await criarAdmin("corrida-refresh-2");
       const sessao = await login(alvo.email);
       const ponto = novoPonto();
-      const original = tokens.marcarSubstituto.bind(tokens);
-      restaurar.push(spyOn(tokens, "marcarSubstituto").mockImplementation(async (antigo, novo) => {
-        ponto.chegou.liberar();
-        await ponto.liberacao.promessa;
-        return original(antigo, novo);
+      // Fase 22.8.7.2 — `marcarSubstituto` não existe mais nesse caminho (o sucessor é apontado na decisão atômica).
+      // Mesmo ponto de parada, agora marcado diretamente: a releitura do usuário que acontece DEPOIS da decisão
+      // atômica já devolveu `ativo: true`; a requisição para antes de concluir.
+      const rotacionar = tokens.rotacionarSeValido.bind(tokens);
+      const encontrarPorId = usuarios.encontrarPorId.bind(usuarios);
+      let decidido = false;
+      let pausar = true;
+      restaurar.push(spyOn(tokens, "rotacionarSeValido").mockImplementation(async (hash, agora, sucessor) => {
+        const anterior = await rotacionar(hash, agora, sucessor);
+        decidido = true;
+        return anterior;
+      }));
+      restaurar.push(spyOn(usuarios, "encontrarPorId").mockImplementation(async (id) => {
+        const usuario = await encontrarPorId(id);
+        if (decidido && pausar) {
+          pausar = false;
+          ponto.chegou.liberar();
+          await ponto.liberacao.promessa;
+        }
+        return usuario;
       }));
 
       let renovado: Awaited<ReturnType<AuthService["refresh"]>> | null = null;

@@ -1,5 +1,7 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Post, Req, UseGuards } from "@nestjs/common";
-import { ApiBearerAuth, ApiOperation, ApiTags } from "@nestjs/swagger";
+import { Body, Controller, Get, Headers, HttpCode, HttpStatus, Post, Req, UseGuards } from "@nestjs/common";
+import { ApiBearerAuth, ApiHeader, ApiOperation, ApiTags } from "@nestjs/swagger";
+import { ApiException } from "../../common/exceptions/api.exception.js";
+import { ChaveIdempotenciaInvalidaError, lerChaveIdempotencia } from "./recuperacao-refresh.crypto.js";
 import { Throttle } from "@nestjs/throttler";
 import type { Request } from "express";
 import { CurrentUser } from "../../common/decorators/current-user.decorator.js";
@@ -23,10 +25,30 @@ export class AuthController {
     return { data: await this.authService.login(dto, this.extrairContexto(request)) };
   }
 
+  /**
+   * Fase 22.8.7.2 — `Idempotency-Key` OPCIONAL (cabeçalho, nunca no corpo — o corpo continua estrito,
+   * `forbidNonWhitelisted`). Sem ele: comportamento anterior. Com ele: precisa ser um UUID canônico, senão 400
+   * `VALIDATION_ERROR` ANTES de qualquer leitura ou escrita da sessão (o valor nunca aparece na resposta nem em log).
+   * Permitido pelo CORS desde a Fase 58 (`CABECALHOS_CORS`).
+   */
   @Post("refresh")
   @ApiOperation({ summary: "Renova a sessão: revoga o refresh token informado e emite um par novo (rotação)." })
-  async refresh(@Body() dto: RefreshTokenDto, @Req() request: Request) {
-    return { data: await this.authService.refresh(dto, this.extrairContexto(request)) };
+  @ApiHeader({
+    name: "Idempotency-Key",
+    required: false,
+    description: "UUID da tentativa de renovação; repetir a MESMA chave com o MESMO refresh token recupera o par já emitido (até 15 min, 5 vezes).",
+  })
+  async refresh(@Body() dto: RefreshTokenDto, @Req() request: Request, @Headers("idempotency-key") chave?: string) {
+    let chaveIdempotencia: string | null;
+    try {
+      chaveIdempotencia = lerChaveIdempotencia(chave);
+    } catch (erro) {
+      if (erro instanceof ChaveIdempotenciaInvalidaError) {
+        throw ApiException.validation("Dados inválidos.", [{ field: "Idempotency-Key", message: erro.message }]);
+      }
+      throw erro;
+    }
+    return { data: await this.authService.refresh(dto, this.extrairContexto(request), chaveIdempotencia) };
   }
 
   @Post("logout")

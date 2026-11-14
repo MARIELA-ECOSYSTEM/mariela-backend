@@ -31,3 +31,10 @@ export const LOGIN_THROTTLE_MAX_TENTATIVAS = 5;
  */
 export const AUTH_LOGIN_THROTTLE_LIMITE = 10;
 export const AUTH_LOGIN_THROTTLE_TTL_MS = 10_000;
+
+/**
+ * Fase 22.8.7.2 — recuperação idempotente da rotação do refresh token (decisões do projeto, Fase 22.8.6): a repetição
+ * de R1 com a MESMA `Idempotency-Key` devolve o mesmo sucessor R2 por até 15 minutos após a rotação, no máximo 5 vezes.
+ */
+export const JANELA_RECUPERACAO_REFRESH_MS = 15 * 60 * 1000;
+export const LIMITE_RECUPERACOES_REFRESH = 5;

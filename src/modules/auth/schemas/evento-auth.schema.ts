@@ -7,7 +7,19 @@ import { aplicarSerializacaoPadrao } from "../../../database/mongoose-json.util.
  * `ADMIN_SESSIONS_REVOKED` (revogação de sessões remanescentes de um usuário que já estava inativo), ambos só pelo
  * comando local `admin:desativar`.
  */
-export type TipoEventoAuth = "LOGIN_SUCCESS" | "LOGIN_FAILED" | "LOGOUT" | "REFRESH" | "REFRESH_REUSED" | "ADMIN_DEACTIVATED" | "ADMIN_SESSIONS_REVOKED";
+export type TipoEventoAuth =
+  | "LOGIN_SUCCESS"
+  | "LOGIN_FAILED"
+  | "LOGOUT"
+  | "REFRESH"
+  | "REFRESH_REUSED"
+  | "ADMIN_DEACTIVATED"
+  | "ADMIN_SESSIONS_REVOKED"
+  // Fase 22.8.7.2 — recuperação idempotente: concedida; recusada por janela vencida; recusada por falha de
+  // integridade (selo adulterado/inconsistente). Nenhum deles carrega token, hash, chave ou família.
+  | "REFRESH_RECOVERED"
+  | "REFRESH_RECOVERY_EXPIRED"
+  | "REFRESH_RECOVERY_FAILED";
 
 /**
  * Auditoria mínima de autenticação — mesmo padrão de `eventos_produto`

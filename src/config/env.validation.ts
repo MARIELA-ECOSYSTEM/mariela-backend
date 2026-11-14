@@ -73,6 +73,15 @@ class EnvironmentVariables {
   @Matches(/\S/, { message: "JWT_REFRESH_SECRET não pode ser vazio ou conter somente espaços." })
   JWT_REFRESH_SECRET!: string;
 
+  /**
+   * Fase 22.8.7.2 — chave HMAC exclusiva do hash da `Idempotency-Key` da recuperação do refresh token. OPCIONAL:
+   * ausente ou vazia desliga a recuperação (comportamento da Fase 22.8.7.1). Quando presente, é validada em
+   * `validarSegredoRecuperacao` (tamanho mínimo e distinta dos segredos JWT) em QUALQUER ambiente — nunca há fallback.
+   */
+  @IsOptional()
+  @IsString()
+  REFRESH_IDEMPOTENCIA_HMAC_SECRET?: string;
+
   @IsOptional()
   @IsString()
   JWT_ACCESS_EXPIRES_IN = "15m";
@@ -301,6 +310,28 @@ function validarSegredosDeProducao(env: EnvironmentVariables): void {
 }
 
 /**
+ * Fase 22.8.7.2 — o segredo da recuperação, QUANDO presente, precisa ser forte em qualquer ambiente (o mecanismo é
+ * novo: não há segredo curto legado a preservar) e INDEPENDENTE de todos os segredos JWT — reaproveitar um deles
+ * acoplaria o vazamento de um ao outro. Ausente/vazio = mecanismo desligado (não é erro). Nunca inclui o valor na
+ * mensagem.
+ */
+function validarSegredoRecuperacao(env: EnvironmentVariables): void {
+  const segredo = env.REFRESH_IDEMPOTENCIA_HMAC_SECRET;
+  if (segredo === undefined || segredo === "") return;
+  if (segredo.trim().length < TAMANHO_MINIMO_SEGREDO_PRODUCAO) {
+    throw new Error(
+      `Configuração de ambiente inválida: REFRESH_IDEMPOTENCIA_HMAC_SECRET, quando definida, deve ter pelo menos ${TAMANHO_MINIMO_SEGREDO_PRODUCAO} caracteres (sem contar espaços nas pontas).`,
+    );
+  }
+  const repetido = CAMPOS_SEGREDO_JWT.filter((campo) => env[campo] === segredo);
+  if (repetido.length > 0) {
+    throw new Error(
+      `Configuração de ambiente inválida: REFRESH_IDEMPOTENCIA_HMAC_SECRET não pode reutilizar o valor de ${repetido.join(", ")}.`,
+    );
+  }
+}
+
+/**
  * Fase 58 — cada origem de `CORS_ORIGINS` precisa ser exata (ver
  * `motivoOrigemCorsInvalida`): um curinga, um caminho ou uma barra final nunca
  * são aceitos em silêncio (o `cors` simplesmente nunca casaria a origem, ou
@@ -334,6 +365,7 @@ export function validateEnv(config: Record<string, unknown>): EnvironmentVariabl
   }
 
   validarOrigensCors(validado);
+  validarSegredoRecuperacao(validado);
 
   if (validado.NODE_ENV === Ambiente.Production) {
     validarSegredosDeProducao(validado);

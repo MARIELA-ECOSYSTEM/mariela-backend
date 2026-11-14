@@ -193,7 +193,7 @@ describe("AuthService (integração — MongoDB real)", () => {
       );
     });
 
-    it("detecta reutilização de um refresh token já revogado e derruba a família inteira de sessões", async () => {
+    it("detecta reutilização de um refresh token já revogado e derruba a família inteira daquela sessão (Fase 22.8.7.1: só ela)", async () => {
       const email = emailUnico("REUSE");
       await service.criarAdminSeed({ nome: "Reuse", email, senha: "senha-correta-123" });
 
@@ -208,14 +208,13 @@ describe("AuthService (integração — MongoDB real)", () => {
         ApiException,
       );
 
-      // A resposta a uma reutilização derruba TODA a família — inclusive a
-      // sessão2 (nunca usada indevidamente) e o token novo da rotação.
-      await expect(service.refresh({ refreshToken: sessao2.refreshToken }, contextoTeste)).rejects.toThrow(
-        ApiException,
-      );
+      // A resposta a uma reutilização derruba TODA a família da sessão1 — inclusive o token novo da rotação.
       await expect(service.refresh({ refreshToken: rotacionado.refreshToken }, contextoTeste)).rejects.toThrow(
         ApiException,
       );
+      // Fase 22.8.7.1 — decisão do projeto: a sessão2 (outro dispositivo, outra família, nunca usada indevidamente)
+      // NÃO é mais derrubada. Antes desta fase, ela também era revogada.
+      await expect(service.refresh({ refreshToken: sessao2.refreshToken }, contextoTeste)).resolves.toBeDefined();
     });
 
     it("Etapa 26 — duas requisições CONCORRENTES com o MESMO refresh token: só uma rotaciona, a outra é rejeitada (CAS real, nunca duas sessões válidas)", async () => {
