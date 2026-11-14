@@ -176,32 +176,73 @@ describe("REFRESH_IDEMPOTENCIA_HMAC_SECRET — validação de ambiente (sem fall
     PDV_JWT_REFRESH_SECRET: "pdv-refresh-ficticio-para-validacao",
   };
 
-  it("ausente ou vazio: aceito (mecanismo desligado, comportamento da Fase 22.8.7.1)", () => {
-    expect(() => validateEnv({ ...base })).not.toThrow();
-    expect(() => validateEnv({ ...base, REFRESH_IDEMPOTENCIA_HMAC_SECRET: "" })).not.toThrow();
-  });
+  /** Mensagem do erro de `validateEnv` (ou "" se aceitou). */
+  function erroDe(env: Record<string, unknown>): string {
+    try {
+      validateEnv(env);
+      return "";
+    } catch (erro) {
+      return (erro as Error).message;
+    }
+  }
+  /** Valor efetivo que a aplicação usaria (mesma normalização de `configuration.ts`). */
+  async function segredoEfetivo(valor: string | undefined): Promise<string | null> {
+    const anterior = process.env["REFRESH_IDEMPOTENCIA_HMAC_SECRET"];
+    if (valor === undefined) delete process.env["REFRESH_IDEMPOTENCIA_HMAC_SECRET"];
+    else process.env["REFRESH_IDEMPOTENCIA_HMAC_SECRET"] = valor;
+    try {
+      const { default: configuracao } = await import("../../config/configuration.js");
+      return configuracao().recuperacaoRefresh.segredoHmac;
+    } finally {
+      if (anterior === undefined) delete process.env["REFRESH_IDEMPOTENCIA_HMAC_SECRET"];
+      else process.env["REFRESH_IDEMPOTENCIA_HMAC_SECRET"] = anterior;
+    }
+  }
+  const CAMPOS_JWT = ["JWT_ACCESS_SECRET", "JWT_REFRESH_SECRET", "PDV_JWT_ACCESS_SECRET", "PDV_JWT_REFRESH_SECRET"] as const;
 
-  it("presente e forte (≥ 32, distinto dos segredos JWT): aceito", () => {
-    expect(() => validateEnv({ ...base, REFRESH_IDEMPOTENCIA_HMAC_SECRET: randomBytes(48).toString("base64url") })).not.toThrow();
-  });
-
-  it("presente mas curto ou só espaços: o boot falha — nunca liga o mecanismo com segredo fraco", () => {
-    for (const fraco of ["curto", " ".repeat(40), `  ${"a".repeat(20)}  `]) {
-      expect(() => validateEnv({ ...base, REFRESH_IDEMPOTENCIA_HMAC_SECRET: fraco })).toThrow(/REFRESH_IDEMPOTENCIA_HMAC_SECRET/);
+  it("ausente, vazio ou SÓ ESPAÇOS: aceito com o mecanismo DESLIGADO (Fase 22.8.7.5 — vazio após trim)", async () => {
+    expect(erroDe({ ...base })).toBe("");
+    expect(await segredoEfetivo(undefined)).toBeNull();
+    for (const vazio of ["", " ", " ".repeat(40), "\t \n"]) {
+      expect(erroDe({ ...base, REFRESH_IDEMPOTENCIA_HMAC_SECRET: vazio })).toBe("");
+      expect(await segredoEfetivo(vazio)).toBeNull();
     }
   });
 
-  it("reutilizar qualquer segredo JWT: o boot falha, e a mensagem não contém o valor", () => {
-    for (const campo of ["JWT_ACCESS_SECRET", "JWT_REFRESH_SECRET", "PDV_JWT_ACCESS_SECRET", "PDV_JWT_REFRESH_SECRET"] as const) {
+  it("presente e forte (≥ 32, distinto dos segredos JWT): aceito e ligado com o próprio valor", async () => {
+    const forte = randomBytes(48).toString("base64url");
+    expect(erroDe({ ...base, REFRESH_IDEMPOTENCIA_HMAC_SECRET: forte })).toBe("");
+    expect(await segredoEfetivo(forte)).toBe(forte);
+  });
+
+  it("forte com espaços nas pontas: aceito; a chave HMAC efetiva é o valor normalizado (o MESMO validado)", async () => {
+    const forte = randomBytes(48).toString("base64url");
+    expect(erroDe({ ...base, REFRESH_IDEMPOTENCIA_HMAC_SECRET: `  ${forte}\n` })).toBe("");
+    expect(await segredoEfetivo(`  ${forte}\n`)).toBe(forte);
+  });
+
+  it("curto (mesmo com espaços completando o tamanho): o boot falha, sem ecoar o valor", () => {
+    for (const fraco of ["curto", `  ${"a".repeat(20)}  `, `${" ".repeat(20)}${"b".repeat(31)}${" ".repeat(20)}`]) {
+      const mensagem = erroDe({ ...base, REFRESH_IDEMPOTENCIA_HMAC_SECRET: fraco });
+      expect(mensagem).toContain("REFRESH_IDEMPOTENCIA_HMAC_SECRET");
+      expect(mensagem).not.toContain(fraco.trim());
+    }
+  });
+
+  it("igual a qualquer um dos 4 segredos JWT — também com espaços externos DIFERENTES dos dois lados: o boot falha", () => {
+    for (const campo of CAMPOS_JWT) {
       const valor = `${base[campo]}-com-tamanho-suficiente`;
-      let mensagem = "";
-      try {
-        validateEnv({ ...base, [campo]: valor, REFRESH_IDEMPOTENCIA_HMAC_SECRET: valor });
-      } catch (erro) {
-        mensagem = (erro as Error).message;
+      for (const [jwt, hmac] of [
+        [valor, valor],
+        [valor, `  ${valor}  `],
+        [`${valor} `, `\t${valor}`],
+        [`  ${valor}`, valor],
+      ]) {
+        const mensagem = erroDe({ ...base, [campo]: jwt, REFRESH_IDEMPOTENCIA_HMAC_SECRET: hmac });
+        expect(mensagem).toContain(campo);
+        expect(mensagem).toContain("REFRESH_IDEMPOTENCIA_HMAC_SECRET");
+        expect(mensagem).not.toContain(valor);
       }
-      expect(mensagem).toContain(campo);
-      expect(mensagem).not.toContain(valor);
     }
   });
 });

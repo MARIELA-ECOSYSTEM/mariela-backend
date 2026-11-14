@@ -117,7 +117,8 @@ export interface ReconciliacaoEstoqueConfig {
 
 /**
  * Fase 22.8.7.2 — recuperação idempotente da rotação do refresh token administrativo. `segredoHmac` é a chave HMAC
- * EXCLUSIVA do hash da `Idempotency-Key` (nunca um segredo JWT). `null` (variável ausente ou vazia) = mecanismo
+ * EXCLUSIVA do hash da `Idempotency-Key` (nunca um segredo JWT), já normalizada com `trim` (Fase 22.8.7.5). `null`
+ * (variável ausente ou vazia após `trim`) = mecanismo
  * DESLIGADO: nenhuma rotação grava material de recuperação e uma chave apresentada com R1 já rotacionado é tratada
  * como reutilização — exatamente o comportamento da Fase 22.8.7.1. Valor presente mas inválido impede o boot
  * (`validateEnv`).
@@ -161,7 +162,8 @@ export default (): Configuration => {
       refreshExpiresIn: process.env["JWT_REFRESH_EXPIRES_IN"] ?? "7d",
     },
     recuperacaoRefresh: {
-      segredoHmac: process.env["REFRESH_IDEMPOTENCIA_HMAC_SECRET"] || null,
+      // Fase 22.8.7.5 (F6) — mesmo valor normalizado validado em `validarSegredoRecuperacao`; vazio após `trim` = desligado.
+      segredoHmac: process.env["REFRESH_IDEMPOTENCIA_HMAC_SECRET"]?.trim() || null,
     },
     pdvJwt: {
       accessSecret: process.env["PDV_JWT_ACCESS_SECRET"] ?? "",

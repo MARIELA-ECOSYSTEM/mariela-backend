@@ -316,14 +316,17 @@ function validarSegredosDeProducao(env: EnvironmentVariables): void {
  * mensagem.
  */
 function validarSegredoRecuperacao(env: EnvironmentVariables): void {
-  const segredo = env.REFRESH_IDEMPOTENCIA_HMAC_SECRET;
-  if (segredo === undefined || segredo === "") return;
-  if (segredo.trim().length < TAMANHO_MINIMO_SEGREDO_PRODUCAO) {
+  // Fase 22.8.7.5 (F6) — UM valor normalizado (`trim`) para tudo: ausente/vazio, tamanho e independência. É o mesmo
+  // valor que `configuration.ts` entrega como chave HMAC. Vazio depois do `trim` (inclusive só espaços) = desligado.
+  const segredo = env.REFRESH_IDEMPOTENCIA_HMAC_SECRET?.trim() ?? "";
+  if (segredo === "") return;
+  if (segredo.length < TAMANHO_MINIMO_SEGREDO_PRODUCAO) {
     throw new Error(
       `Configuração de ambiente inválida: REFRESH_IDEMPOTENCIA_HMAC_SECRET, quando definida, deve ter pelo menos ${TAMANHO_MINIMO_SEGREDO_PRODUCAO} caracteres (sem contar espaços nas pontas).`,
     );
   }
-  const repetido = CAMPOS_SEGREDO_JWT.filter((campo) => env[campo] === segredo);
+  // Os segredos JWT também são comparados normalizados: espaços nas pontas não tornam dois segredos "diferentes".
+  const repetido = CAMPOS_SEGREDO_JWT.filter((campo) => (env[campo] as string).trim() === segredo);
   if (repetido.length > 0) {
     throw new Error(
       `Configuração de ambiente inválida: REFRESH_IDEMPOTENCIA_HMAC_SECRET não pode reutilizar o valor de ${repetido.join(", ")}.`,

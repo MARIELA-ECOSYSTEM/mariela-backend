@@ -3,7 +3,7 @@ import { Injectable, Logger, type OnModuleInit } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { InjectModel } from "@nestjs/mongoose";
 import { JwtService } from "@nestjs/jwt";
-import type { Model, Types } from "mongoose";
+import { mongo, type Model, type Types } from "mongoose";
 import { ApiException } from "../../common/exceptions/api.exception.js";
 import type { Configuration } from "../../config/configuration.js";
 import type { JwtPayload } from "../../common/types/jwt-payload.interface.js";
@@ -46,6 +46,23 @@ const HASH_FANTASMA = Bun.password.hashSync(randomBytes(32).toString("hex"), {
   memoryCost: ARGON2_MEMORY_COST,
   timeCost: ARGON2_TIME_COST,
 });
+
+/**
+ * Fase 22.8.7.5 (F5) — `true` só quando é CERTO que a decisão atômica da rotação (um `findOneAndUpdate` de UM
+ * documento) NÃO foi aplicada, e portanto o candidato desta requisição não pode ter sido adotado:
+ *   - `MongoServerSelectionError`: nenhum servidor foi selecionado — o comando nunca saiu do cliente;
+ *   - `MongoServerError` que não seja de write concern e sem o rótulo `RetryableWriteError`: o servidor RECUSOU o
+ *     comando (operação de documento único é atômica — recusada, não aplicou nada).
+ * Todo o resto é AMBÍGUO e devolve `false`: erro de rede/timeout (o servidor pode ter aplicado antes de a resposta se
+ * perder), `MongoWriteConcernError` (aplicada no primário, só a confirmação de replicação falhou), erros com
+ * `RetryableWriteError` e qualquer erro não reconhecido. Na dúvida, o candidato é preservado.
+ */
+export function decisaoCertamenteNaoAplicada(erro: unknown): boolean {
+  if (erro instanceof mongo.MongoServerSelectionError) return true;
+  if (erro instanceof mongo.MongoWriteConcernError) return false; // subclasse de MongoServerError: testar antes
+  if (erro instanceof mongo.MongoServerError) return !erro.hasErrorLabel("RetryableWriteError");
+  return false;
+}
 
 @Injectable()
 export class AuthService implements OnModuleInit {
@@ -197,35 +214,52 @@ export class AuthService implements OnModuleInit {
     let candidato: { accessToken: string; refreshToken: string; expiresIn: number } | null = null;
     let candidatoTokenHash: string | null = null;
     let recuperacao: { chaveHash: string; sucessorSelado: SucessorSelado; recuperavelAte: Date } | undefined;
+    // Fase 22.8.7.5 (F5) — `true` a partir do instante em que a decisão atômica é ENVIADA ao banco. Antes disso, o
+    // candidato desta requisição nunca pode ter sido adotado (só esta requisição conhece o hash dele).
+    let decisaoEnviada = false;
+    let anterior: RefreshTokenDocument | null;
 
-    if (pareceValido) {
-      const usuarioDoCandidato = await this.usuariosRepository.encontrarPorId(String(antesDaDecisao!.usuarioId));
-      if (usuarioDoCandidato) {
-        candidato = await this.emitirTokens(usuarioDoCandidato, contexto, familiaDoSucessor);
-        candidatoTokenHash = this.hashRefreshToken(candidato.refreshToken);
-        const segredoRecuperacao = this.segredoRecuperacao();
-        // Só documentos COM família são recuperáveis (legado nunca usa recuperação criptográfica).
-        if (chaveIdempotencia && segredoRecuperacao && antesDaDecisao!.familiaId) {
-          recuperacao = {
-            chaveHash: hashDaChave(segredoRecuperacao, chaveIdempotencia),
-            sucessorSelado: selarSucessor(
-              this.contextoDoSelo(antesDaDecisao!, dto.refreshToken, chaveIdempotencia),
-              candidato.refreshToken,
-            ),
-            recuperavelAte: new Date(agora.getTime() + JANELA_RECUPERACAO_REFRESH_MS),
-          };
+    try {
+      if (pareceValido) {
+        const usuarioDoCandidato = await this.usuariosRepository.encontrarPorId(String(antesDaDecisao!.usuarioId));
+        if (usuarioDoCandidato) {
+          // O token bruto (e o hash) do candidato é definido ANTES de gravar: se a própria gravação falhar (inclusive
+          // com resultado ambíguo), a compensação sabe exatamente qual documento é desta requisição.
+          const refreshCandidato = randomBytes(REFRESH_TOKEN_BYTES).toString("base64url");
+          candidatoTokenHash = this.hashRefreshToken(refreshCandidato);
+          candidato = await this.emitirTokens(usuarioDoCandidato, contexto, familiaDoSucessor, refreshCandidato);
+          const segredoRecuperacao = this.segredoRecuperacao();
+          // Só documentos COM família são recuperáveis (legado nunca usa recuperação criptográfica).
+          if (chaveIdempotencia && segredoRecuperacao && antesDaDecisao!.familiaId) {
+            recuperacao = {
+              chaveHash: hashDaChave(segredoRecuperacao, chaveIdempotencia),
+              sucessorSelado: selarSucessor(
+                this.contextoDoSelo(antesDaDecisao!, dto.refreshToken, chaveIdempotencia),
+                candidato.refreshToken,
+              ),
+              recuperavelAte: new Date(agora.getTime() + JANELA_RECUPERACAO_REFRESH_MS),
+            };
+          }
         }
       }
-    }
 
-    // Decisão atômica: com candidato, revoga R1 E aponta o sucessor (+ recuperação) numa só operação; sem candidato
-    // (R1 já parecia inválido — esta chamada praticamente sempre perde), só a reivindicação de antes.
-    const anterior = candidatoTokenHash
-      ? await this.refreshTokensRepository.rotacionarSeValido(tokenHash, agora, {
-          substituidoPor: candidatoTokenHash,
-          recuperacao,
-        })
-      : await this.refreshTokensRepository.revogarSeValido(tokenHash, agora);
+      // Decisão atômica: com candidato, revoga R1 E aponta o sucessor (+ recuperação) numa só operação; sem candidato
+      // (R1 já parecia inválido — esta chamada praticamente sempre perde), só a reivindicação de antes.
+      decisaoEnviada = true;
+      anterior = candidatoTokenHash
+        ? await this.refreshTokensRepository.rotacionarSeValido(tokenHash, agora, {
+            substituidoPor: candidatoTokenHash,
+            recuperacao,
+          })
+        : await this.refreshTokensRepository.revogarSeValido(tokenHash, agora);
+    } catch (erro) {
+      // F5 — falha entre a criação do candidato e a CONCLUSÃO da decisão atômica: compensa só se for certo que o
+      // candidato não foi adotado; o erro original segue para o cliente (5xx → o Backoffice preserva R1 e a chave).
+      if (candidatoTokenHash) {
+        await this.compensarCandidato(tokenHash, candidatoTokenHash, decisaoEnviada ? erro : null);
+      }
+      throw erro;
+    }
 
     if (!anterior) {
       if (candidatoTokenHash) await this.refreshTokensRepository.revogarSeValido(candidatoTokenHash, agora);
@@ -421,6 +455,32 @@ export class AuthService implements OnModuleInit {
     return { ...acesso, refreshToken: r2, usuario: this.paraUsuarioPublico(usuario) };
   }
 
+  /**
+   * Fase 22.8.7.5 (F5) — limpeza compensatória do CANDIDATO desta requisição quando a rotação falha antes de concluir.
+   * Revoga SÓ esse documento (pelo hash dele — nunca a família, nunca R1, nunca o sucessor de outra requisição), e
+   * apenas quando é CERTO que ele não foi adotado:
+   *   - `erroDaDecisao === null`: a decisão atômica nem foi enviada → impossível ter sido adotado;
+   *   - erro da decisão "certamente não aplicado" (`decisaoCertamenteNaoAplicada`).
+   * Mesmo assim, relê R1 antes: se `substituidoPor` aponta para o candidato, ele FOI adotado e é preservado (a
+   * recuperação idempotente o devolve). Resultado ambíguo (rede, timeout, write concern, erro desconhecido) ou banco
+   * indisponível na própria compensação → preserva: o candidato não é conhecido por ninguém, expira com o TTL e cai com
+   * o logout da família. Nunca lança — o erro original é o que importa para o cliente.
+   */
+  private async compensarCandidato(
+    tokenHashR1: string,
+    candidatoTokenHash: string,
+    erroDaDecisao: unknown,
+  ): Promise<void> {
+    if (erroDaDecisao !== null && !decisaoCertamenteNaoAplicada(erroDaDecisao)) return;
+    try {
+      const r1 = await this.refreshTokensRepository.encontrarPorHash(tokenHashR1);
+      if (r1?.substituidoPor === candidatoTokenHash) return;
+      await this.refreshTokensRepository.revogarSeValido(candidatoTokenHash, new Date());
+    } catch {
+      // Banco indisponível também na compensação: preserva (ver acima).
+    }
+  }
+
   /** `null` = mecanismo de recuperação desligado (segredo ausente — ver `RecuperacaoRefreshConfig`). */
   private segredoRecuperacao(): string | null {
     return this.configService.get("recuperacaoRefresh.segredoHmac", { infer: true }) ?? null;
@@ -447,10 +507,12 @@ export class AuthService implements OnModuleInit {
     usuario: UsuarioDocument,
     contexto: ContextoRequisicao,
     familiaId: string,
+    /** Fase 22.8.7.5 — o refresh pré-gera o token do candidato (para conhecer o hash antes de gravar). */
+    refreshTokenPregerado?: string,
   ): Promise<{ accessToken: string; refreshToken: string; expiresIn: number }> {
     const { accessToken, expiresIn } = await this.assinarAccessToken(usuario);
 
-    const refreshTokenBruto = randomBytes(REFRESH_TOKEN_BYTES).toString("base64url");
+    const refreshTokenBruto = refreshTokenPregerado ?? randomBytes(REFRESH_TOKEN_BYTES).toString("base64url");
     const refreshExpiresIn = this.configService.get("jwt.refreshExpiresIn", { infer: true })!;
     const expiresAt = new Date(Date.now() + paraMilissegundos(refreshExpiresIn));
 
