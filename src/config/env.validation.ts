@@ -13,6 +13,12 @@ enum Ambiente {
 const TAMANHO_MINIMO_SEGREDO_PRODUCAO = 32;
 
 /**
+ * Fase 22.8.9.2 (B-02) — o ÚNICO banco aceito em produção. Comparação exata (maiúsculas/minúsculas inclusive): um
+ * `marieladb` ou `MarielaDB` seria outro banco no Atlas, vazio, e a API subiria "saudável" sem os dados reais.
+ */
+const BANCO_OFICIAL_PRODUCAO = "marielaDB";
+
+/**
  * Fase 60.4.1 — variável numérica OPCIONAL: vazia (como em `.env.example`, `R2_MAX_ATTEMPTS=`) conta como
  * ausente (vale o padrão do projeto); qualquer outro texto vira número e passa pelas validações (texto inválido
  * vira `NaN` e é recusado).
@@ -310,6 +316,35 @@ function validarSegredosDeProducao(env: EnvironmentVariables): void {
 }
 
 /**
+ * Fase 22.8.9.2 (B-02) — nome do banco no path da URI: tudo entre a barra após o host e a query string, decodificado
+ * como o driver faz (`%xx`). `null` quando não há path ou a decodificação falha (tratado como banco inválido).
+ */
+function bancoDaUriMongo(uri: string): string | null {
+  const m = /^mongodb(?:\+srv)?:\/\/[^/]+\/([^?#]*)/.exec(uri);
+  if (!m) return null;
+  try {
+    return decodeURIComponent(m[1]!);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fase 22.8.9.2 (B-02) — SÓ em produção: `MONGODB_URI` precisa apontar exatamente para `BANCO_OFICIAL_PRODUCAO`.
+ * Sem banco, `test` ou qualquer outro nome = a API não sobe. Roda dentro de `validateEnv`, isto é, no
+ * `ConfigModule.forRoot` — antes de o `DatabaseModule` criar a conexão. Não há variável/parâmetro de exceção: fora de
+ * produção (desenvolvimento e testes com bancos descartáveis) nada muda. A mensagem nunca inclui a URI nem o nome
+ * recebido (a URI carrega credenciais).
+ */
+function validarBancoDeProducao(env: EnvironmentVariables): void {
+  if (bancoDaUriMongo(env.MONGODB_URI) !== BANCO_OFICIAL_PRODUCAO) {
+    throw new Error(
+      `Configuração de ambiente inválida: em produção (NODE_ENV=production), MONGODB_URI deve apontar para o banco "${BANCO_OFICIAL_PRODUCAO}" (nome exato no path da URI). A API não foi iniciada e nenhuma conexão com o MongoDB foi aberta.`,
+    );
+  }
+}
+
+/**
  * Fase 22.8.7.2 — o segredo da recuperação, QUANDO presente, precisa ser forte em qualquer ambiente (o mecanismo é
  * novo: não há segredo curto legado a preservar) e INDEPENDENTE de todos os segredos JWT — reaproveitar um deles
  * acoplaria o vazamento de um ao outro. Ausente/vazio = mecanismo desligado (não é erro). Nunca inclui o valor na
@@ -371,6 +406,7 @@ export function validateEnv(config: Record<string, unknown>): EnvironmentVariabl
   validarSegredoRecuperacao(validado);
 
   if (validado.NODE_ENV === Ambiente.Production) {
+    validarBancoDeProducao(validado);
     validarSegredosDeProducao(validado);
   }
 

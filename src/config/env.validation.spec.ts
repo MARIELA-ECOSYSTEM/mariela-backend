@@ -4,6 +4,8 @@ import { validateEnv } from "./env.validation.js";
 
 const SEGREDO_VALIDO_CURTO = "segredo-de-teste-123";
 const SEGREDO_VALIDO_LONGO = "a".repeat(32);
+/** Fase 22.8.9.2 (B-02) — URI fictícia apontando para o banco oficial: obrigatória em qualquer configuração de produção. */
+const URI_PRODUCAO_FICTICIA = "mongodb+srv://usuario:senha@cluster0.exemplo.mongodb.net/marielaDB?retryWrites=true&w=majority";
 
 function baseEnv(overrides: Record<string, string> = {}): Record<string, string> {
   return {
@@ -124,7 +126,7 @@ describe("validateEnv", () => {
     });
 
     it("rejeita segredo curto quando NODE_ENV=production", () => {
-      expect(() => validateEnv(baseEnv({ NODE_ENV: "production" }))).toThrow(/pelo menos 32 caracteres/);
+      expect(() => validateEnv(baseEnv({ NODE_ENV: "production", MONGODB_URI: URI_PRODUCAO_FICTICIA }))).toThrow(/pelo menos 32 caracteres/);
     });
 
     it("aceita todos os segredos com pelo menos 32 caracteres quando NODE_ENV=production", () => {
@@ -132,6 +134,7 @@ describe("validateEnv", () => {
         validateEnv(
           baseEnv({
             NODE_ENV: "production",
+            MONGODB_URI: URI_PRODUCAO_FICTICIA,
             JWT_ACCESS_SECRET: SEGREDO_VALIDO_LONGO,
             JWT_REFRESH_SECRET: SEGREDO_VALIDO_LONGO,
             PDV_JWT_ACCESS_SECRET: SEGREDO_VALIDO_LONGO,
@@ -147,6 +150,7 @@ describe("validateEnv", () => {
         validateEnv(
           baseEnv({
             NODE_ENV: "production",
+            MONGODB_URI: URI_PRODUCAO_FICTICIA,
             JWT_ACCESS_SECRET: SEGREDO_VALIDO_LONGO,
             JWT_REFRESH_SECRET: SEGREDO_VALIDO_CURTO,
             PDV_JWT_ACCESS_SECRET: SEGREDO_VALIDO_LONGO,
@@ -165,6 +169,7 @@ describe("validateEnv", () => {
   describe("Fase 58 — CORS_ORIGINS só aceita origens exatas", () => {
     const PRODUCAO = {
       NODE_ENV: "production",
+      MONGODB_URI: URI_PRODUCAO_FICTICIA,
       JWT_ACCESS_SECRET: SEGREDO_VALIDO_LONGO,
       JWT_REFRESH_SECRET: SEGREDO_VALIDO_LONGO,
       PDV_JWT_ACCESS_SECRET: SEGREDO_VALIDO_LONGO,
@@ -194,6 +199,93 @@ describe("validateEnv", () => {
       expect(() => validateEnv(baseEnv({ ...PRODUCAO, CORS_ORIGINS: "http://tauri.localhost,tauri://localhost" }))).not.toThrow();
     });
   });
+  describe("Fase 22.8.9.2 (B-02) — produção só aceita o banco marielaDB", () => {
+    const SEGREDOS_PRODUCAO = {
+      NODE_ENV: "production",
+      JWT_ACCESS_SECRET: SEGREDO_VALIDO_LONGO,
+      JWT_REFRESH_SECRET: SEGREDO_VALIDO_LONGO,
+      PDV_JWT_ACCESS_SECRET: SEGREDO_VALIDO_LONGO,
+      PDV_JWT_REFRESH_SECRET: SEGREDO_VALIDO_LONGO,
+    };
+    const HOST = "mongodb+srv://usuario:senha-ficticia-b02@cluster0.exemplo.mongodb.net";
+    const producao = (uri: string) => () => validateEnv(baseEnv({ ...SEGREDOS_PRODUCAO, MONGODB_URI: uri }));
+
+    function mensagemDe(fn: () => unknown): string {
+      try {
+        fn();
+      } catch (erro) {
+        return erro instanceof Error ? erro.message : String(erro);
+      }
+      throw new Error("deveria ter lançado");
+    }
+
+    it("produção + marielaDB: aceita (mongodb+srv com query, mongodb:// sem query)", () => {
+      expect(producao(`${HOST}/marielaDB?retryWrites=true&w=majority`)).not.toThrow();
+      expect(producao("mongodb://localhost:27017/marielaDB")).not.toThrow();
+    });
+
+    it("produção + test: rejeita", () => {
+      expect(producao(`${HOST}/test?retryWrites=true`)).toThrow(/deve apontar para o banco "marielaDB"/);
+    });
+
+    it("produção + outro banco: rejeita (inclusive variações de caixa, prefixos, sufixos e subcaminhos)", () => {
+      for (const banco of ["outroBanco", "mariela", "mariela_test", "marieladb", "MarielaDB", "MARIELADB", "marielaDB2", "xmarielaDB", "marielaDB/extra", "marielaDB%20", "admin"]) {
+        expect(producao(`${HOST}/${banco}?retryWrites=true`)).toThrow(/deve apontar para o banco "marielaDB"/);
+      }
+    });
+
+    it("produção sem banco: rejeita (path ausente, só a barra, só a query)", () => {
+      for (const uri of [HOST, `${HOST}/`, `${HOST}/?retryWrites=true&w=majority`]) {
+        expect(producao(uri)).toThrow(/MONGODB_URI/);
+      }
+    });
+
+    it("produção: percent-encoding é decodificado como no driver (só vale se o resultado for exatamente marielaDB)", () => {
+      expect(producao(`${HOST}/%6DarielaDB?retryWrites=true`)).not.toThrow();
+      expect(producao(`${HOST}/%74est?retryWrites=true`)).toThrow(/marielaDB/);
+      expect(producao(`${HOST}/mariela%ZZ?retryWrites=true`)).toThrow(/marielaDB/);
+    });
+
+    it("produção: a mensagem não expõe a URI, a credencial nem o banco recebido", () => {
+      const mensagem = mensagemDe(producao(`${HOST}/bancoErradoXYZ?retryWrites=true`));
+      expect(mensagem).toContain("MONGODB_URI");
+      for (const proibido of ["senha-ficticia-b02", "usuario:", "cluster0", "bancoErradoXYZ", "mongodb+srv://"]) {
+        expect(mensagem).not.toContain(proibido);
+      }
+    });
+
+    it("produção: o banco é verificado antes dos segredos (banco errado + segredo curto aponta o banco)", () => {
+      const mensagem = mensagemDe(() => validateEnv(baseEnv({ NODE_ENV: "production", MONGODB_URI: `${HOST}/test` })));
+      expect(mensagem).toContain('"marielaDB"');
+    });
+
+    it("sem bypass: variáveis extras não liberam outro banco em produção", () => {
+      expect(() =>
+        validateEnv(
+          baseEnv({
+            ...SEGREDOS_PRODUCAO,
+            MONGODB_URI: `${HOST}/test`,
+            MONGODB_DB_NAME: "marielaDB",
+            ALLOW_ANY_DATABASE: "true",
+            MONGODB_BACKUP_URI: `${HOST}/marielaDB`,
+          }),
+        ),
+      ).toThrow(/marielaDB/);
+    });
+
+    it("test + banco descartável: aceito como antes (qualquer nome explícito)", () => {
+      for (const banco of ["mariela_test", "mariela_test_e2e_123", "test", "marielaDB"]) {
+        expect(() => validateEnv(baseEnv({ NODE_ENV: "test", MONGODB_URI: `mongodb://127.0.0.1:27017/${banco}` }))).not.toThrow();
+      }
+    });
+
+    it("development + configuração válida: comportamento anterior inalterado (banco livre, segredos curtos, sem banco ainda rejeitado)", () => {
+      expect(() => validateEnv(baseEnv())).not.toThrow(); // NODE_ENV ausente = development, banco "mariela"
+      expect(() => validateEnv(baseEnv({ NODE_ENV: "development", MONGODB_URI: "mongodb://localhost:27017/qualquer_banco_local" }))).not.toThrow();
+      expect(() => validateEnv(baseEnv({ NODE_ENV: "development", MONGODB_URI: "mongodb://localhost:27017/" }))).toThrow(/MONGODB_URI/);
+    });
+  });
+
   describe("transporte do R2 (Fase 60.4.1)", () => {
     it("ausentes são aceitas (os padrões do projeto valem)", () => {
       const validado = validateEnv(baseEnv());
