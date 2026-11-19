@@ -1,9 +1,11 @@
 import "reflect-metadata";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { Controller, Get, Module, type INestApplication } from "@nestjs/common";
+import { Controller, Get, Injectable, Module, Post, UseGuards, type CanActivate, type ExecutionContext, type INestApplication } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import type { AddressInfo } from "node:net";
-import { CABECALHOS_CORS, lerOrigensCors, METODOS_CORS, montarOpcoesCors, motivoOrigemCorsInvalida } from "./cors.config.js";
+import { LimitarUploadMidia, LimiteUploadMidiaGuard, LimiteUploadMidiaService } from "../modules/media/limite-upload-midia.js";
+import { LIMITE_REQUISICOES_UPLOAD } from "../modules/media/media.constants.js";
+import { CABECALHOS_CORS, CABECALHOS_EXPOSTOS_CORS, lerOrigensCors, METODOS_CORS, montarOpcoesCors, motivoOrigemCorsInvalida } from "./cors.config.js";
 
 /**
  * Fase 58 — política de CORS. Os testes HTTP sobem um app Nest mínimo (sem
@@ -66,8 +68,11 @@ describe("CORS (Fase 58)", () => {
         origin: [BACKOFFICE_DEV],
         methods: [...METODOS_CORS],
         allowedHeaders: [...CABECALHOS_CORS],
+        exposedHeaders: [...CABECALHOS_EXPOSTOS_CORS],
         credentials: false,
       });
+      // Fase 22.8.9.9.3 — só o Retry-After é exposto; nada de curinga.
+      expect(CABECALHOS_EXPOSTOS_CORS).toEqual(["Retry-After"]);
       expect(CABECALHOS_CORS).toEqual(expect.arrayContaining(["Authorization", "Content-Type", "Idempotency-Key"]));
     });
   });
@@ -141,6 +146,91 @@ describe("CORS (Fase 58)", () => {
         expect(resposta.headers.get("access-control-allow-origin")).toBeNull();
       }
       expect((await preflight(url, BACKOFFICE_DEV)).headers.get("access-control-allow-origin")).toBeNull();
+    });
+  });
+
+  // Fase 22.8.9.9.3 — o 429 do limite de upload de mídia leva `Retry-After`, e o CORS deixa o app desktop LER esse
+  // cabeçalho. Usa o guard REAL (`LimiteUploadMidiaGuard`, mesma contagem de produção); a identidade ADMIN, que em
+  // produção vem do JWT, é posta por um guard de teste. Sem banco.
+  describe("Retry-After do limite de upload de mídia (Fase 22.8.9.9.3)", () => {
+    @Injectable()
+    class IdentidadeDeTeste implements CanActivate {
+      canActivate(contexto: ExecutionContext): boolean {
+        contexto.switchToHttp().getRequest<{ user?: { sub: string } }>().user = { sub: "admin-teste-cors" };
+        return true;
+      }
+    }
+
+    @Controller("upload-limitado")
+    @UseGuards(IdentidadeDeTeste)
+    class UploadLimitadoController {
+      @Post()
+      @LimitarUploadMidia("solicitacao")
+      solicitar() {
+        return { ok: true };
+      }
+    }
+
+    @Module({ controllers: [UploadLimitadoController], providers: [LimiteUploadMidiaService, LimiteUploadMidiaGuard, IdentidadeDeTeste] })
+    class UploadLimitadoModule {}
+
+    let app: INestApplication;
+    let url: string;
+    const ORIGENS = [BACKOFFICE_DEV, PDV_DEV, TAURI_WINDOWS, TAURI_MAC_LINUX];
+
+    beforeAll(async () => {
+      app = await NestFactory.create(UploadLimitadoModule, { logger: false });
+      app.enableCors(montarOpcoesCors(ORIGENS));
+      await app.listen(0, "127.0.0.1");
+      const { port } = app.getHttpServer().address() as AddressInfo;
+      url = `http://127.0.0.1:${port}/upload-limitado`;
+    });
+
+    afterAll(async () => {
+      await app.close();
+    });
+
+    const postar = (origem: string) => fetch(url, { method: "POST", headers: { Origin: origem } });
+
+    it("16 e 17. o 429 traz Retry-After e Access-Control-Expose-Headers com Retry-After para a origem do Tauri", async () => {
+      const { limite, janelaMs } = LIMITE_REQUISICOES_UPLOAD.solicitacao;
+      for (let i = 0; i < limite; i += 1) {
+        const ok = await postar(TAURI_WINDOWS);
+        expect(ok.status).toBe(201);
+        // Respostas normais também expõem o cabeçalho (o navegador decide pela resposta que recebeu).
+        expect(ok.headers.get("access-control-expose-headers")).toBe("Retry-After");
+      }
+      const recusada = await postar(TAURI_WINDOWS);
+      expect(recusada.status).toBe(429);
+      const segundos = Number(recusada.headers.get("retry-after"));
+      expect(Number.isInteger(segundos)).toBe(true);
+      expect(segundos).toBeGreaterThanOrEqual(1);
+      expect(segundos).toBeLessThanOrEqual(Math.ceil(janelaMs / 1000));
+      expect(recusada.headers.get("access-control-allow-origin")).toBe(TAURI_WINDOWS);
+      expect(recusada.headers.get("access-control-expose-headers")).toBe("Retry-After");
+      expect(recusada.headers.get("access-control-allow-credentials")).toBeNull();
+    });
+
+    it("18 e 19. origens preservadas: cada origem configurada recebe o cabeçalho exposto; origem não autorizada não recebe nada; nada de curinga", async () => {
+      for (const origem of ORIGENS) {
+        const r = await postar(origem);
+        expect(r.headers.get("access-control-allow-origin")).toBe(origem);
+        expect(r.headers.get("access-control-expose-headers")).toBe("Retry-After");
+      }
+      for (const origem of ["http://localhost:9999", "https://site-malicioso.example", "null"]) {
+        const r = await postar(origem);
+        expect(r.headers.get("access-control-allow-origin")).toBeNull();
+      }
+      const preflight = await fetch(url, { method: "OPTIONS", headers: { Origin: TAURI_WINDOWS, "Access-Control-Request-Method": "POST" } });
+      expect(preflight.headers.get("access-control-allow-origin")).toBe(TAURI_WINDOWS);
+      for (const valor of [
+        preflight.headers.get("access-control-allow-origin"),
+        preflight.headers.get("access-control-allow-headers"),
+        preflight.headers.get("access-control-allow-methods"),
+      ]) {
+        expect(valor ?? "").not.toContain("*");
+      }
+      expect(montarOpcoesCors(ORIGENS).origin).toEqual(ORIGENS);
     });
   });
 });

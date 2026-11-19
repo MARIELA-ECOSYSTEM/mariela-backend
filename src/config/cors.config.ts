@@ -23,6 +23,14 @@ export const METODOS_CORS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "O
 export const CABECALHOS_CORS = ["Authorization", "Content-Type", "Accept", "Idempotency-Key"] as const;
 
 /**
+ * Fase 22.8.9.9.3 — cabeçalhos de RESPOSTA que o navegador pode ler numa requisição de outra origem (o app desktop
+ * fala com a API a partir de `http://tauri.localhost`). Fora dos "safelisted" do CORS, um cabeçalho só é legível pelo
+ * JavaScript se listado em `Access-Control-Expose-Headers`. `Retry-After`: segundos de espera do 429 do limite de
+ * upload de mídia (`LimiteUploadMidiaGuard`). Lista explícita — nunca `*`.
+ */
+export const CABECALHOS_EXPOSTOS_CORS = ["Retry-After"] as const;
+
+/**
  * Origens aceitas em `CORS_ORIGINS`: `http(s)://host[:porta]` exato (sem
  * caminho, barra final, query, credenciais ou curinga) ou a origem do Tauri
  * empacotado em macOS/Linux (`tauri://localhost`).
@@ -57,6 +65,7 @@ export function montarOpcoesCors(origens: readonly string[]): CorsOptions {
     origin: origens.length > 0 ? [...origens] : false,
     methods: [...METODOS_CORS],
     allowedHeaders: [...CABECALHOS_CORS],
+    exposedHeaders: [...CABECALHOS_EXPOSTOS_CORS],
     credentials: false,
   };
 }
