@@ -53,6 +53,11 @@ const ROTULO_ESTADO: Record<EstadoUploadMidia, string> = {
 const MENSAGEM_MIDIA_NAO_ENCONTRADA = "Mídia não encontrada neste produto.";
 const MENSAGEM_TIPO_SUBSTITUICAO = "A substituição precisa ser do mesmo tipo: imagem por imagem, vídeo por vídeo.";
 
+function rotuloDoTipo(tipo: TipoMidia, quantidade: number): string {
+  if (tipo === "image") return quantidade === 1 ? "imagem" : "imagens";
+  return quantidade === 1 ? "vídeo" : "vídeos";
+}
+
 function contemMidia(produto: ProdutoDocument, midiaId: string): boolean {
   return produto.midias.some((midia) => midia._id === midiaId);
 }
@@ -94,6 +99,9 @@ export class GaleriaService {
     private readonly validador: ValidadorMidiaService,
   ) {}
 
+  /** Fase 22.8.9.9 — fila por `${produtoId}:${tipo}` da reserva de vaga na solicitação (ver `emFilaDaGaleria`). */
+  private readonly filasDaGaleria = new Map<string, Promise<void>>();
+
   /**
    * Autoriza um upload: cria o registro `pendente` (toda chave assinada fica rastreada) e só então assina a URL.
    * Não altera a galeria. Se a assinatura falhar, o registro vira `descartado` e a resposta é `STORAGE_UNAVAILABLE`.
@@ -110,24 +118,29 @@ export class GaleriaService {
       if (!antiga) throw ApiException.notFound("Mídia a substituir não encontrada neste produto.");
       if (antiga.tipo !== dto.kind) throw erroDeValidacao("substituiMidiaId", MENSAGEM_TIPO_SUBSTITUICAO);
     }
-    this.garantirLimite(produto, dto.kind, substituiMidiaId);
-
     const uploadId = randomUUID();
     const chave = `${PREFIXO_CHAVE_PRODUTOS}/${produto.id}/${uploadId}.${extensao}`;
-    const agora = Date.now();
-    await this.uploadsRepository.criar({
-      _id: uploadId,
-      produtoId: produto._id,
-      chave,
-      tipo: dto.kind,
-      contentType: dto.contentType,
-      tamanho: dto.size,
-      nomeOriginal: dto.fileName.trim(),
-      substituiMidiaId,
-      criadoPor: usuarioId,
-      criadoEm: new Date(agora),
-      urlExpiraEm: new Date(agora + EXPIRACAO_UPLOAD_SEGUNDOS * 1000),
-      limpezaApos: new Date(agora + PRAZO_LIMPEZA_UPLOAD_MS),
+    // Fase 22.8.9.9 — "conferir vagas" e "registrar o pendente" acontecem juntos, em fila por produto e tipo: duas
+    // solicitações simultâneas nunca contam a mesma vaga livre (cada uma vê o registro da anterior). A fila é deste
+    // processo; com mais de uma instância, a garantia final continua sendo a revalidação atômica na confirmação.
+    await this.emFilaDaGaleria(`${produto.id}:${dto.kind}`, async () => {
+      const atual = await this.produtosRepository.encontrarPorIdOuFalhar(produtoId);
+      await this.garantirVagaNaSolicitacao(atual, dto.kind, substituiMidiaId);
+      const agora = Date.now();
+      await this.uploadsRepository.criar({
+        _id: uploadId,
+        produtoId: produto._id,
+        chave,
+        tipo: dto.kind,
+        contentType: dto.contentType,
+        tamanho: dto.size,
+        nomeOriginal: dto.fileName.trim(),
+        substituiMidiaId,
+        criadoPor: usuarioId,
+        criadoEm: new Date(agora),
+        urlExpiraEm: new Date(agora + EXPIRACAO_UPLOAD_SEGUNDOS * 1000),
+        limpezaApos: new Date(agora + PRAZO_LIMPEZA_UPLOAD_MS),
+      });
     });
 
     let uploadUrl: string;
@@ -349,12 +362,57 @@ export class GaleriaService {
     }
   }
 
-  /** Conta só as mídias ATIVAS do tipo (a substituída, se houver, não conta: ela sai na mesma escrita). */
-  private garantirLimite(produto: ProdutoDocument, tipo: TipoMidia, ignorarMidiaId: string | null): void {
+  /**
+   * Conta só as mídias ATIVAS do tipo. Fase 22.8.9.9 — uma substituição (`substituida` informada) troca uma mídia por
+   * outra do mesmo tipo e nunca aumenta a galeria: não consome vaga, inclusive num produto legado que já esteja acima
+   * do limite atual (antes, a conta "ativas menos a substituída" recusava a troca nesse caso).
+   */
+  private garantirLimite(produto: ProdutoDocument, tipo: TipoMidia, substituida: string | null): void {
+    if (substituida) return;
     const limite = LIMITE_MIDIAS_POR_PRODUTO[tipo];
-    const atuais = produto.midias.filter((midia) => midia.tipo === tipo && midia._id !== ignorarMidiaId).length;
+    const atuais = produto.midias.filter((midia) => midia.tipo === tipo).length;
     if (atuais >= limite) {
-      throw ApiException.conflict(`Limite de ${limite} ${tipo === "image" ? "imagens" : "vídeos"} por produto atingido.`);
+      throw ApiException.conflict(`Limite de ${limite} ${rotuloDoTipo(tipo, limite)} por produto atingido.`);
+    }
+  }
+
+  /**
+   * Fase 22.8.9.9 — na SOLICITAÇÃO, além das mídias ativas, contam as vagas já reservadas por uploads novos em
+   * andamento (`UploadsMidiaRepository.contarReservasDeVagas`): não se emite uma URL de envio para uma vaga que não
+   * existe. Substituição não reserva vaga.
+   */
+  private async garantirVagaNaSolicitacao(produto: ProdutoDocument, tipo: TipoMidia, substituida: string | null): Promise<void> {
+    this.garantirLimite(produto, tipo, substituida);
+    if (substituida) return;
+    const limite = LIMITE_MIDIAS_POR_PRODUTO[tipo];
+    const atuais = produto.midias.filter((midia) => midia.tipo === tipo).length;
+    const reservas = await this.uploadsRepository.contarReservasDeVagas(
+      produto._id,
+      tipo,
+      new Date(),
+      produto.midias.map((midia) => midia._id),
+    );
+    if (atuais + reservas >= limite) {
+      throw ApiException.conflict(
+        `Limite de ${limite} ${rotuloDoTipo(tipo, limite)} por produto atingido, contando ${reservas} envio(s) ainda não confirmado(s). ` +
+          "Conclua esses envios ou aguarde até 10 minutos para que expirem.",
+      );
+    }
+  }
+
+  /** Executa `operacao` depois de todas as anteriores com a mesma chave (fila em memória, deste processo). */
+  private async emFilaDaGaleria<T>(chave: string, operacao: () => Promise<T>): Promise<T> {
+    const anterior = this.filasDaGaleria.get(chave) ?? Promise.resolve();
+    const atual = anterior.then(operacao, operacao);
+    const marcador = atual.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.filasDaGaleria.set(chave, marcador);
+    try {
+      return await atual;
+    } finally {
+      if (this.filasDaGaleria.get(chave) === marcador) this.filasDaGaleria.delete(chave);
     }
   }
 

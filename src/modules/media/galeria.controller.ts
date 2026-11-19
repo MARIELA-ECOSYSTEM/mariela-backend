@@ -6,6 +6,7 @@ import { JwtAuthGuard } from "../../common/guards/jwt-auth.guard.js";
 import { RolesGuard } from "../../common/guards/roles.guard.js";
 import { AssociarVarianteMidiaDto, ConfirmarUploadDto, DefinirMidiaPrincipalDto, ReordenarMidiasDto, SolicitarUploadGaleriaDto } from "./dto/galeria.dto.js";
 import { GaleriaService } from "./galeria.service.js";
+import { LimitarUploadMidia } from "./limite-upload-midia.js";
 
 /**
  * Fase 60.1 — galeria de mídia do produto. Controller fino (mesmo padrão de `MediaController`): só o Backoffice
@@ -21,6 +22,7 @@ export class GaleriaController {
 
   @Post(":id/midias/uploads")
   @HttpCode(HttpStatus.OK)
+  @LimitarUploadMidia("solicitacao")
   @ApiOperation({
     summary: "Autoriza o envio de uma imagem/vídeo da galeria (URL pré-assinada de 10 min).",
     description:
@@ -33,6 +35,7 @@ export class GaleriaController {
 
   @Post(":id/midias/uploads/:uploadId/confirmacao")
   @HttpCode(HttpStatus.CREATED)
+  @LimitarUploadMidia("confirmacao")
   @ApiOperation({
     summary: "Confirma o upload: verifica o objeto no storage e inclui a mídia na galeria (idempotente).",
     description: "Opcional: `varianteId` (só imagem), `principal` (só imagem) e `substituiMidiaId` (herda ordem, variante e principal).",

@@ -2,6 +2,7 @@ import { Module } from "@nestjs/common";
 import { ProdutosModule } from "../produtos/produtos.module.js";
 import { GaleriaController } from "./galeria.controller.js";
 import { GaleriaService } from "./galeria.service.js";
+import { LimiteUploadMidiaService } from "./limite-upload-midia.js";
 import { MEDIA_PRESIGNER, MEDIA_STORAGE } from "./media.constants.js";
 import { MediaController } from "./media.controller.js";
 import { MediaService } from "./media.service.js";
@@ -20,6 +21,8 @@ import { ValidadorMidiaService } from "./validacao/validador-midia.service.js";
   providers: [
     MediaService,
     GaleriaService,
+    // Fase 22.8.9.9 — uma instância por módulo: a contagem de `solicitacao` é compartilhada pelos dois controllers.
+    LimiteUploadMidiaService,
     ValidadorMidiaService,
     { provide: MEDIA_STORAGE, useClass: R2PresignerProvider },
     { provide: MEDIA_PRESIGNER, useExisting: MEDIA_STORAGE },

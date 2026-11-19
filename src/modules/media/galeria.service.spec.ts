@@ -19,11 +19,14 @@ import { ProdutosService } from "../produtos/produtos.service.js";
 import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 import type { ConfirmarUploadDto, SolicitarUploadGaleriaDto } from "./dto/galeria.dto.js";
 import { GaleriaService } from "./galeria.service.js";
-import { CACHE_CONTROL_MIDIA, MEDIA_STORAGE } from "./media.constants.js";
+import { CACHE_CONTROL_MIDIA, LIMITE_MIDIAS_POR_PRODUTO, MEDIA_STORAGE } from "./media.constants.js";
 import { MediaModule } from "./media.module.js";
 import { UploadsMidiaRepository } from "./uploads/uploads-midia.repository.js";
 
 const JWT_MODULO_DE_TESTE = JwtModule.register({ global: true, secret: "segredo-de-teste", signOptions: { expiresIn: "15m" } });
+/** Fase 22.8.9.9 — os testes seguem a constante (10 imagens / 1 vídeo); antes eram 20 / 3. */
+const LIMITE_IMAGENS = LIMITE_MIDIAS_POR_PRODUTO.image;
+const LIMITE_VIDEOS = LIMITE_MIDIAS_POR_PRODUTO.video;
 const BASE_PUBLICA = "https://midia.exemplo.com";
 // Credenciais FICTÍCIAS: o storage é o falso (`MediaStorageFalso`); o R2 real nunca é chamado.
 const CONFIG_DE_TESTE = () => ({
@@ -180,6 +183,14 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
     }
   }
   const idsDaGaleria = async (produtoId: string) => (await galeria.listar(produtoId)).midias.map((midia) => midia._id);
+  /**
+   * Fase 22.8.9.9 — vence a URL assinada de um upload já enviado: ele deixa de reservar vaga na SOLICITAÇÃO, mas
+   * continua confirmável (o registro vale 24 h). É o único caminho legítimo para existirem mais uploads autorizados
+   * do que vagas — e é a confirmação que decide.
+   */
+  async function vencerUrl(uploadId: string): Promise<void> {
+    await uploads().updateOne({ _id: uploadId }, { $set: { urlExpiraEm: new Date(Date.now() - 1000) } });
+  }
 
   describe("solicitação de upload", () => {
     it("válida: cria o registro pendente, assina com Content-Type, Content-Length e Cache-Control, e não altera a galeria", async () => {
@@ -252,15 +263,15 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
       expect(storage.assinaturas).toHaveLength(0);
     });
 
-    it("limite atingido (20 imagens / 3 vídeos) retorna 409; o limite é por tipo", async () => {
+    it("limite atingido (imagens / vídeos) retorna 409; o limite é por tipo", async () => {
       const produtoId = await novoProduto();
-      for (let i = 0; i < 20; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
+      for (let i = 0; i < LIMITE_IMAGENS; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
       const erro = await erroApi(solicitar(produtoId));
       expect(erro.getStatus()).toBe(409);
-      expect(erro.message).toContain("20 imagens");
+      expect(erro.message).toContain(`${LIMITE_IMAGENS} imagens`);
       // Vídeo ainda cabe.
       await solicitar(produtoId, { fileName: "v.mp4", contentType: "video/mp4", kind: "video" });
-      for (let i = 0; i < 3; i += 1) await inserirMidiaDiretamente(connection, produtoId, { tipo: "video", ordem: 20 + i });
+      for (let i = 0; i < LIMITE_VIDEOS; i += 1) await inserirMidiaDiretamente(connection, produtoId, { tipo: "video", ordem: LIMITE_IMAGENS + i });
       expect((await erroApi(solicitar(produtoId, { fileName: "v.mp4", contentType: "video/mp4", kind: "video" }))).getStatus()).toBe(409);
     });
 
@@ -590,27 +601,29 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
       expect(await idsDaGaleria(produtoId)).toEqual([]);
     });
 
-    it("limite conferido também na confirmação: dois uploads novos autorizados com 19 imagens — só o primeiro entra (409, registro pendente)", async () => {
+    it("limite conferido também na confirmação: dois uploads novos autorizados com uma vaga — só o primeiro entra (409, registro pendente)", async () => {
       const produtoId = await novoProduto();
-      for (let i = 0; i < 19; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
+      for (let i = 0; i < LIMITE_IMAGENS - 1; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
       const a = await enviado(produtoId);
+      await vencerUrl(a.uploadId); // Fase 22.8.9.9 — sem isto a 2ª solicitação já seria recusada (vaga reservada)
       const b = await enviado(produtoId);
-      await confirmar(produtoId, a.uploadId); // 20 imagens
+      await confirmar(produtoId, a.uploadId); // galeria cheia
       expect((await erroApi(confirmar(produtoId, b.uploadId))).getStatus()).toBe(409);
       expect((await registro(b.uploadId)).estado).toBe("pendente");
-      expect(await idsDaGaleria(produtoId)).toHaveLength(20);
+      expect(await idsDaGaleria(produtoId)).toHaveLength(LIMITE_IMAGENS);
     });
 
-    it("dois uploads novos CONCORRENTES com 19 imagens: o limite é revalidado na mutação e só um entra", async () => {
+    it("dois uploads novos CONCORRENTES com uma vaga: o limite é revalidado na mutação e só um entra", async () => {
       const produtoId = await novoProduto();
-      for (let i = 0; i < 19; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
+      for (let i = 0; i < LIMITE_IMAGENS - 1; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
       const a = await enviado(produtoId);
+      await vencerUrl(a.uploadId);
       const b = await enviado(produtoId);
       const resultados = await emParalelo([() => confirmar(produtoId, a.uploadId), () => confirmar(produtoId, b.uploadId)]);
       expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
       const rejeitado = resultados.find((r) => r.status === "rejected");
       expect(rejeitado?.status === "rejected" && rejeitado.reason instanceof ApiException && rejeitado.reason.getStatus()).toBe(409);
-      expect(await idsDaGaleria(produtoId)).toHaveLength(20);
+      expect(await idsDaGaleria(produtoId)).toHaveLength(LIMITE_IMAGENS);
     });
   });
 
@@ -618,7 +631,7 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
     it("galeria cheia: upload novo é 409, substituição do mesmo tipo é autorizada e o registro guarda o alvo", async () => {
       const produtoId = await novoProduto();
       const ids: string[] = [];
-      for (let i = 0; i < 20; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+      for (let i = 0; i < LIMITE_IMAGENS; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
       expect((await erroApi(solicitar(produtoId))).getStatus()).toBe(409);
 
       const autorizado = await solicitar(produtoId, { substituiMidiaId: ids[3]! });
@@ -629,13 +642,13 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
       expect((await registro((await solicitar(outroProduto)).uploadId)).substituiMidiaId).toBeNull();
     });
 
-    it("confirmar substituição com a galeria cheia: herda a ordem e a galeria continua com 20", async () => {
+    it("confirmar substituição com a galeria cheia: herda a ordem e a galeria continua cheia", async () => {
       const produtoId = await novoProduto();
       const ids: string[] = [];
-      for (let i = 0; i < 20; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+      for (let i = 0; i < LIMITE_IMAGENS; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
       const { uploadId } = await enviado(produtoId, "image/jpeg", 1024, ids[7]!);
       const resposta = await confirmar(produtoId, uploadId); // corpo sem substituiMidiaId: vale o registrado
-      expect(resposta.midias).toHaveLength(20);
+      expect(resposta.midias).toHaveLength(LIMITE_IMAGENS);
       expect(resposta.midia.ordem).toBe(7);
       expect(resposta.midias.map((midia) => midia._id)).not.toContain(ids[7]!);
       expect(resposta.midias[7]!._id).toBe(uploadId);
@@ -665,14 +678,15 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
       expect(storage.exclusoes).toHaveLength(0);
     });
 
-    it("vídeo por vídeo com 3 vídeos: autorizado e confirmado sem passar do limite; vídeo nunca vira principal", async () => {
+    it("vídeo por vídeo com o limite de vídeos atingido: autorizado e confirmado sem passar do limite; vídeo nunca vira principal", async () => {
       const produtoId = await novoProduto();
       const imagem = await confirmada(produtoId);
       const videos: string[] = [];
-      for (let i = 0; i < 3; i += 1) videos.push(await confirmada(produtoId, {}, "video/mp4"));
-      const { uploadId } = await enviado(produtoId, "video/mp4", 1024, videos[1]!);
+      for (let i = 0; i < LIMITE_VIDEOS; i += 1) videos.push(await confirmada(produtoId, {}, "video/mp4"));
+      const alvo = videos[videos.length - 1]!;
+      const { uploadId } = await enviado(produtoId, "video/mp4", 1024, alvo);
       const resposta = await confirmar(produtoId, uploadId);
-      expect(resposta.midias.filter((midia) => midia.tipo === "video").map((midia) => midia._id)).toEqual([videos[0]!, uploadId, videos[2]!]);
+      expect(resposta.midias.filter((midia) => midia.tipo === "video").map((midia) => midia._id)).toEqual([...videos.slice(0, -1), uploadId]);
       expect(resposta.midiaPrincipalId).toBe(imagem);
     });
 
@@ -694,15 +708,15 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
     it("tipos diferentes são recusados (400): imagem não substitui vídeo para liberar vaga de imagem, nem vídeo substitui imagem", async () => {
       const produtoId = await novoProduto();
       const imagens: string[] = [];
-      for (let i = 0; i < 20; i += 1) imagens.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
-      const video = await inserirMidiaDiretamente(connection, produtoId, { tipo: "video", ordem: 20 });
+      for (let i = 0; i < LIMITE_IMAGENS; i += 1) imagens.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+      const video = await inserirMidiaDiretamente(connection, produtoId, { tipo: "video", ordem: LIMITE_IMAGENS });
 
       const imagemPorVideo = await erroApi(solicitar(produtoId, { substituiMidiaId: video }));
       expect(imagemPorVideo.getStatus()).toBe(400);
       expect(imagemPorVideo.errors[0]!.field).toBe("substituiMidiaId");
       const videoPorImagem = await erroApi(solicitar(produtoId, { fileName: "v.mp4", contentType: "video/mp4", kind: "video", substituiMidiaId: imagens[0]! }));
       expect(videoPorImagem.getStatus()).toBe(400);
-      expect(await idsDaGaleria(produtoId)).toHaveLength(21);
+      expect(await idsDaGaleria(produtoId)).toHaveLength(LIMITE_IMAGENS + 1);
     });
 
     it("a confirmação não troca o alvo nem introduz substituição (409); repetir o alvo registrado funciona", async () => {
@@ -788,20 +802,21 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
       expect((await registro(alvo)).estado).toBe("removido");
     });
 
-    it("duas substituições diferentes concorrentes com a galeria cheia: ambas concluem e o limite continua em 20", async () => {
+    it("duas substituições diferentes concorrentes com a galeria cheia: ambas concluem e a galeria continua no limite", async () => {
       const produtoId = await novoProduto();
       const ids: string[] = [];
-      for (let i = 0; i < 20; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+      for (let i = 0; i < LIMITE_IMAGENS; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+      const segunda = LIMITE_IMAGENS - 2;
       const x = await enviado(produtoId, "image/jpeg", 1024, ids[2]!);
-      const y = await enviado(produtoId, "image/jpeg", 1024, ids[15]!);
+      const y = await enviado(produtoId, "image/jpeg", 1024, ids[segunda]!);
       const resultados = await emParalelo([() => confirmar(produtoId, x.uploadId), () => confirmar(produtoId, y.uploadId)]);
       expect(resultados.every((r) => r.status === "fulfilled")).toBe(true);
       const final = await galeria.listar(produtoId);
-      expect(final.midias).toHaveLength(20);
+      expect(final.midias).toHaveLength(LIMITE_IMAGENS);
       expect(final.midias[2]!._id).toBe(x.uploadId);
-      expect(final.midias[15]!._id).toBe(y.uploadId);
+      expect(final.midias[segunda]!._id).toBe(y.uploadId);
       expect(final.midias.map((midia) => midia._id)).not.toContain(ids[2]!);
-      expect(final.midias.map((midia) => midia._id)).not.toContain(ids[15]!);
+      expect(final.midias.map((midia) => midia._id)).not.toContain(ids[segunda]!);
     });
 
     it("varianteId explícito na confirmação prevalece sobre a variante herdada", async () => {
@@ -1095,7 +1110,6 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
     });
 
     it("animação, quadros, dados extras e codec recusados com a mensagem pública do motivo", async () => {
-      const produtoId = await novoProduto();
       const png = fixtureDeMidia(FIXTURES_MIDIA.png);
       const apng = new Uint8Array(Buffer.concat([png.subarray(0, 33), chunkPng("acTL", new Uint8Array(8)), png.subarray(33)]));
       const casos: [string, Uint8Array, string][] = [
@@ -1105,6 +1119,9 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
         ["video/mp4", mp4Sintetico({ duracaoVideoSegundos: 31 }), "30 segundos"],
       ];
       for (const [formato, conteudo, trecho] of casos) {
+        // Fase 22.8.9.9 — um produto por caso: o upload recusado continua pendente e, com o limite de 1 vídeo,
+        // reservaria a única vaga de vídeo do produto para o caso seguinte.
+        const produtoId = await novoProduto();
         const uploadId = await enviadoComConteudo(produtoId, formato, conteudo);
         const erro = await erroApi(confirmar(produtoId, uploadId));
         expect(erro.getStatus()).toBe(400);
@@ -1115,12 +1132,15 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
     });
 
     it("MP4 fragmentado (bateria) e MP4 com áudio AAC são confirmados", async () => {
-      const produtoId = await novoProduto();
-      const fragmentado = await enviadoComConteudo(produtoId, "video/mp4", fixtureDeMidia(FIXTURES_MIDIA.mp4Fragmentado));
-      expect((await confirmar(produtoId, fragmentado)).midia._id).toBe(fragmentado);
-      const comAudio = await enviadoComConteudo(produtoId, "video/mp4", mp4Sintetico({ trilhaExtra: { manipulador: "soun", codec: "mp4a", oti: 0x40 } }));
-      expect((await confirmar(produtoId, comAudio)).midia._id).toBe(comAudio);
-      expect(await idsDaGaleria(produtoId)).toEqual([fragmentado, comAudio]);
+      // Fase 22.8.9.9 — um produto para cada vídeo (limite de 1 vídeo por produto).
+      const produtoA = await novoProduto();
+      const fragmentado = await enviadoComConteudo(produtoA, "video/mp4", fixtureDeMidia(FIXTURES_MIDIA.mp4Fragmentado));
+      expect((await confirmar(produtoA, fragmentado)).midia._id).toBe(fragmentado);
+      const produtoB = await novoProduto();
+      const comAudio = await enviadoComConteudo(produtoB, "video/mp4", mp4Sintetico({ trilhaExtra: { manipulador: "soun", codec: "mp4a", oti: 0x40 } }));
+      expect((await confirmar(produtoB, comAudio)).midia._id).toBe(comAudio);
+      expect(await idsDaGaleria(produtoA)).toEqual([fragmentado]);
+      expect(await idsDaGaleria(produtoB)).toEqual([comAudio]);
     });
 
     it("falha operacional do validador é 503 MEDIA_VALIDATION_UNAVAILABLE, sem efeito; a nova tentativa confirma", async () => {
@@ -1158,6 +1178,163 @@ describe("GaleriaService (integração — MongoDB real, storage falso)", () => 
         espiao.mockRestore();
       }
       expect((await confirmar(produtoId, uploadId)).midia._id).toBe(uploadId);
+    });
+  });
+  describe("Fase 22.8.9.9 — limites de 10 imagens e 1 vídeo por produto", () => {
+    const VIDEO = { fileName: "v.mp4", contentType: "video/mp4", kind: "video" as const };
+    const reservasPendentes = (produtoId: string) =>
+      uploads().countDocuments({ produtoId: new Types.ObjectId(produtoId), estado: "pendente", substituiMidiaId: null });
+
+    it("valores: 10 imagens e 1 vídeo", () => {
+      expect(LIMITE_MIDIAS_POR_PRODUTO).toEqual({ image: 10, video: 1 });
+    });
+
+    describe("imagens", () => {
+      it("1/2. aceita até 10 imagens pelo fluxo completo e recusa a 11ª (409, sem registro nem assinatura)", async () => {
+        const produtoId = await novoProduto();
+        for (let i = 0; i < 10; i += 1) await confirmada(produtoId);
+        expect(await idsDaGaleria(produtoId)).toHaveLength(10);
+        storage.reiniciar();
+        const antes = await uploads().countDocuments({ produtoId: new Types.ObjectId(produtoId) });
+        const erro = await erroApi(solicitar(produtoId));
+        expect(erro.getStatus()).toBe(409);
+        expect(erro.code).toBe("CONFLICT");
+        expect(erro.message).toBe("Limite de 10 imagens por produto atingido.");
+        expect(await uploads().countDocuments({ produtoId: new Types.ObjectId(produtoId) })).toBe(antes);
+        expect(storage.assinaturas).toHaveLength(0);
+      });
+
+      it("3. uploads pendentes reservam vaga: 9 ativas + 1 pendente → a próxima solicitação é 409; vencida a URL, a vaga volta", async () => {
+        const produtoId = await novoProduto();
+        for (let i = 0; i < 9; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
+        const pendente = await solicitar(produtoId);
+        const erro = await erroApi(solicitar(produtoId));
+        expect(erro.getStatus()).toBe(409);
+        expect(erro.message).toContain("contando 1 envio(s) ainda não confirmado(s)");
+        expect(await reservasPendentes(produtoId)).toBe(1);
+        await vencerUrl(pendente.uploadId);
+        await solicitar(produtoId); // envio abandonado não bloqueia o produto por 24 h
+      });
+
+      it("4. reserva em confirmação (`confirmando`) também ocupa vaga, mesmo com a URL vencida", async () => {
+        const produtoId = await novoProduto();
+        for (let i = 0; i < 9; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
+        const { uploadId } = await solicitar(produtoId);
+        await uploads().updateOne({ _id: uploadId }, { $set: { estado: "confirmando", urlExpiraEm: new Date(Date.now() - 1000) } });
+        expect((await erroApi(solicitar(produtoId))).getStatus()).toBe(409);
+      });
+
+      it("upload já gravado no produto (registro ainda pendente) não conta duas vezes", async () => {
+        const produtoId = await novoProduto();
+        for (let i = 0; i < 8; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
+        const { uploadId } = await enviado(produtoId);
+        await confirmar(produtoId, uploadId); // 9 ativas
+        await uploads().updateOne({ _id: uploadId }, { $set: { estado: "pendente" } }); // falha parcial simulada
+        await solicitar(produtoId); // a 10ª vaga continua livre
+      });
+
+      it("5. substituir uma imagem com a galeria cheia (e com a última vaga reservada) não aumenta a contagem", async () => {
+        const produtoId = await novoProduto();
+        const ids: string[] = [];
+        for (let i = 0; i < 10; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+        const { uploadId } = await enviado(produtoId, "image/jpeg", 1024, ids[4]!);
+        const resposta = await confirmar(produtoId, uploadId);
+        expect(resposta.midias).toHaveLength(10);
+        expect(resposta.midias[4]!._id).toBe(uploadId);
+        expect((await erroApi(solicitar(produtoId))).getStatus()).toBe(409);
+      });
+
+      it("6. duas solicitações SIMULTÂNEAS pela última vaga: só uma é autorizada (a outra 409) e a galeria fecha em 10", async () => {
+        const produtoId = await novoProduto();
+        for (let i = 0; i < 9; i += 1) await inserirMidiaDiretamente(connection, produtoId, { ordem: i });
+        const resultados = await Promise.allSettled([solicitar(produtoId), solicitar(produtoId), solicitar(produtoId)]);
+        const autorizadas = resultados.filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof solicitar>>> => r.status === "fulfilled");
+        expect(autorizadas).toHaveLength(1);
+        for (const r of resultados.filter((x) => x.status === "rejected")) {
+          expect(r.status === "rejected" && r.reason instanceof ApiException && r.reason.getStatus()).toBe(409);
+        }
+        expect(await reservasPendentes(produtoId)).toBe(1);
+        expect(storage.assinaturas).toHaveLength(1);
+        const { uploadId } = autorizadas[0]!.value;
+        storage.enviar(storage.ultimaChave(), arquivoDoFormato("image/jpeg", 1024), "image/jpeg");
+        await confirmar(produtoId, uploadId);
+        expect(await idsDaGaleria(produtoId)).toHaveLength(10);
+      });
+
+      it("7/8. produto LEGADO com 12 imagens: nada é excluído; upload novo é 409; substituir, reordenar, definir principal e remover funcionam", async () => {
+        const produtoId = await novoProduto();
+        const ids: string[] = [];
+        for (let i = 0; i < 12; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+        expect(await idsDaGaleria(produtoId)).toHaveLength(12); // ler não altera nada
+
+        expect((await erroApi(solicitar(produtoId))).getStatus()).toBe(409);
+        const { uploadId } = await enviado(produtoId, "image/jpeg", 1024, ids[0]!); // antes desta fase: 409 (11 ≥ 10)
+        const trocada = await confirmar(produtoId, uploadId);
+        expect(trocada.midias).toHaveLength(12);
+        const atuais = trocada.midias.map((midia) => midia._id);
+        await galeria.reordenar(produtoId, [...atuais].reverse());
+        await galeria.definirPrincipal(produtoId, atuais[5]!);
+        expect((await galeria.remover(produtoId, atuais[11]!)).midias).toHaveLength(11);
+        // Ainda acima do limite: continua sem receber imagem nova; o storage nunca apagou nada.
+        expect((await erroApi(solicitar(produtoId))).getStatus()).toBe(409);
+        expect(storage.exclusoes).toHaveLength(0);
+        for (const id of ids.slice(1, 11)) expect(await idsDaGaleria(produtoId)).toContain(id);
+      });
+    });
+
+    describe("vídeos", () => {
+      it("9/10. aceita 1 vídeo e recusa um segundo vídeo novo (409, mensagem no singular)", async () => {
+        const produtoId = await novoProduto();
+        const video = await confirmada(produtoId, {}, "video/mp4");
+        expect(await idsDaGaleria(produtoId)).toEqual([video]);
+        const erro = await erroApi(solicitar(produtoId, VIDEO));
+        expect(erro.getStatus()).toBe(409);
+        expect(erro.message).toBe("Limite de 1 vídeo por produto atingido.");
+        await solicitar(produtoId); // imagem continua cabendo: o limite é por tipo
+      });
+
+      it("11. substituir o vídeo existente: continua 1 vídeo, sem duplicação; o registro antigo vira removido", async () => {
+        const produtoId = await novoProduto();
+        const antigo = await confirmada(produtoId, {}, "video/mp4");
+        const { uploadId } = await enviado(produtoId, "video/mp4", 1024, antigo);
+        const resposta = await confirmar(produtoId, uploadId);
+        expect(resposta.midias.filter((midia) => midia.tipo === "video").map((midia) => midia._id)).toEqual([uploadId]);
+        expect((await registro(antigo)).estado).toBe("removido");
+        expect((await confirmar(produtoId, uploadId)).midias.filter((midia) => midia.tipo === "video")).toHaveLength(1); // repetir é idempotente
+      });
+
+      it("12. vídeo pendente ou em confirmação reserva a única vaga", async () => {
+        const produtoId = await novoProduto();
+        const pendente = await solicitar(produtoId, VIDEO);
+        expect((await erroApi(solicitar(produtoId, VIDEO))).getStatus()).toBe(409);
+        await uploads().updateOne({ _id: pendente.uploadId }, { $set: { estado: "confirmando", urlExpiraEm: new Date(Date.now() - 1000) } });
+        expect((await erroApi(solicitar(produtoId, VIDEO))).getStatus()).toBe(409);
+      });
+
+      it("13. duas solicitações de vídeo SIMULTÂNEAS: uma autorizada; e duas confirmações simultâneas com URL vencida: só um vídeo entra", async () => {
+        const produtoId = await novoProduto();
+        const resultados = await Promise.allSettled([solicitar(produtoId, VIDEO), solicitar(produtoId, VIDEO)]);
+        expect(resultados.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+
+        const outro = await novoProduto();
+        const a = await enviado(outro, "video/mp4");
+        await vencerUrl(a.uploadId);
+        const b = await enviado(outro, "video/mp4");
+        const confirmacoes = await emParalelo([() => confirmar(outro, a.uploadId), () => confirmar(outro, b.uploadId)]);
+        expect(confirmacoes.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+        expect((await galeria.listar(outro)).midias.filter((midia) => midia.tipo === "video")).toHaveLength(1);
+      });
+
+      it("14. produto LEGADO com 3 vídeos: preservados; vídeo novo é 409; substituição mantém os 3", async () => {
+        const produtoId = await novoProduto();
+        const videos: string[] = [];
+        for (let i = 0; i < 3; i += 1) videos.push(await inserirMidiaDiretamente(connection, produtoId, { tipo: "video", ordem: i }));
+        expect((await erroApi(solicitar(produtoId, VIDEO))).getStatus()).toBe(409);
+        const { uploadId } = await enviado(produtoId, "video/mp4", 1024, videos[1]!);
+        const resposta = await confirmar(produtoId, uploadId);
+        expect(resposta.midias.map((midia) => midia._id)).toEqual([videos[0]!, uploadId, videos[2]!]);
+        expect(storage.exclusoes).toHaveLength(0);
+      });
     });
   });
 });

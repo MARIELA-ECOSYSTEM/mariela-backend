@@ -4,6 +4,7 @@ import { Roles } from "../../common/decorators/roles.decorator.js";
 import { JwtAuthGuard } from "../../common/guards/jwt-auth.guard.js";
 import { RolesGuard } from "../../common/guards/roles.guard.js";
 import { SolicitarUploadDto } from "./dto/solicitar-upload.dto.js";
+import { LimitarUploadMidia } from "./limite-upload-midia.js";
 import { MediaService } from "./media.service.js";
 
 /**
@@ -20,6 +21,8 @@ export class MediaController {
 
   @Post("presigned-upload")
   @HttpCode(HttpStatus.OK)
+  // Fase 22.8.9.9 — mesmo orçamento da solicitação da galeria: os dois emitem URLs de envio ao R2.
+  @LimitarUploadMidia("solicitacao")
   @ApiOperation({
     summary: "Gera uma URL pré-assinada (10 min) para enviar imagem/vídeo direto ao Cloudflare R2.",
     description:

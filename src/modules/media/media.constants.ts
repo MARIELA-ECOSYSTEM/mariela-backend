@@ -77,10 +77,39 @@ export const PREFIXO_CHAVE_PRODUTOS = "products";
  */
 export const MEDIA_STORAGE = Symbol("MEDIA_STORAGE");
 
-/** Limite de mídias ATIVAS na galeria de um produto, por tipo (decisão aprovada na Fase 60.0). */
+/**
+ * Limite de mídias ATIVAS na galeria de um produto, por tipo. Fase 60.0: 20 imagens / 3 vídeos. Fase 22.8.9.9 (M1,
+ * Backoffice v0.1.5): 10 imagens / 1 vídeo.
+ *
+ * Vale para o que AUMENTA a galeria (upload novo); a substituição troca uma mídia por outra do mesmo tipo e nunca
+ * consome vaga. Produtos legados acima do limite são preservados como estão — nada é excluído, migrado ou alterado
+ * automaticamente: eles só não recebem mídia NOVA daquele tipo até ficarem abaixo do limite (substituir, reordenar,
+ * definir principal, associar variante e remover continuam funcionando). O comando `migrar-midias-legadas` usa o
+ * mesmo limite: o que passaria dele fica pendente, sem descarte.
+ */
 export const LIMITE_MIDIAS_POR_PRODUTO: Record<TipoMidia, number> = {
-  image: 20,
-  video: 3,
+  image: 10,
+  video: 1,
+};
+
+/**
+ * Fase 22.8.9.9 — limite de REQUISIÇÕES das operações de upload, por ADMIN autenticado (`sub` do JWT), em janela
+ * fixa, em memória do processo (mesmo armazenamento do throttler global; sem Redis). Soma-se ao piso global por IP
+ * (300 req/60 s), que continua valendo para todas as rotas.
+ *   - `solicitacao`: `POST /produtos/:id/midias/uploads` e o legado `POST /media/presigned-upload` (o mesmo
+ *     orçamento — os dois assinam URLs de envio ao R2). Cada uma cria um registro de 24 h e libera um PUT de até
+ *     15 MiB.
+ *   - `confirmacao`: `POST /produtos/:id/midias/uploads/:uploadId/confirmacao` — a operação mais cara (lê o
+ *     objeto inteiro do storage e roda a validação estrutural num subprocesso).
+ * 30 por 60 s cada: preencher uma galeria inteira (10 imagens + 1 vídeo) usa 11 de cada, então sobra margem para
+ * substituições e novas tentativas sem que um laço do cliente ou um token vazado dispare centenas de URLs/validações.
+ * Leitura e edição da galeria (GET, PUT principal/ordem, PATCH, DELETE) não entram: só o piso global.
+ */
+export const OPERACOES_UPLOAD_LIMITADAS = ["solicitacao", "confirmacao"] as const;
+export type OperacaoUploadLimitada = (typeof OPERACOES_UPLOAD_LIMITADAS)[number];
+export const LIMITE_REQUISICOES_UPLOAD: Record<OperacaoUploadLimitada, { limite: number; janelaMs: number }> = {
+  solicitacao: { limite: 30, janelaMs: 60_000 },
+  confirmacao: { limite: 30, janelaMs: 60_000 },
 };
 
 /** Cache dos objetos da galeria: seguro porque a chave nunca é reaproveitada (UUID novo a cada upload). Entra na assinatura do `PUT`. */

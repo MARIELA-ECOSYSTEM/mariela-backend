@@ -18,7 +18,7 @@ import { ConfiguracoesService } from "../configuracoes/configuracoes.service.js"
 import { ProdutosService } from "../produtos/produtos.service.js";
 import type { Sequencia } from "../sequencias/schemas/sequencia.schema.js";
 import { VendedoresService } from "../vendedores/vendedores.service.js";
-import { MEDIA_STORAGE } from "./media.constants.js";
+import { LIMITE_MIDIAS_POR_PRODUTO, MEDIA_STORAGE } from "./media.constants.js";
 import { ValidadorMidiaService } from "./validacao/validador-midia.service.js";
 
 const BASE_PUBLICA = "https://midia.exemplo.com";
@@ -278,10 +278,10 @@ describe("HTTP — Galeria de mídia do produto (integração — servidor real,
   });
 
   describe("substituição com a galeria cheia (Fase 60.1.1)", () => {
-    it("galeria cheia: upload novo 409; com substituiMidiaId do mesmo tipo 200; confirmação sem corpo 201 herdando a ordem, galeria segue com 20", async () => {
+    it("galeria cheia: upload novo 409; com substituiMidiaId do mesmo tipo 200; confirmação sem corpo 201 herdando a ordem, galeria segue cheia", async () => {
       const produtoId = await novoProduto();
       const ids: string[] = [];
-      for (let i = 0; i < 20; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
+      for (let i = 0; i < LIMITE_MIDIAS_POR_PRODUTO.image; i += 1) ids.push(await inserirMidiaDiretamente(connection, produtoId, { ordem: i }));
       const caminho = `/produtos/${produtoId}/midias/uploads`;
       const cheia = await chamar("POST", caminho, adminToken, corpoUpload());
       expect(cheia.status).toBe(409);
@@ -295,7 +295,7 @@ describe("HTTP — Galeria de mídia do produto (integração — servidor real,
       const confirmado = await chamar("POST", `${caminho}/${uploadId}/confirmacao`, adminToken, {});
       expect(confirmado.status).toBe(201);
       const d = dados<GaleriaJson & { midia: MidiaJson }>(confirmado);
-      expect(d.midias).toHaveLength(20);
+      expect(d.midias).toHaveLength(LIMITE_MIDIAS_POR_PRODUTO.image);
       expect(d.midia.ordem).toBe(4);
       expect(d.midias.map((midia) => midia.id)).not.toContain(ids[4]);
     });

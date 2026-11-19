@@ -1,6 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
-import type { Model } from "mongoose";
+import type { Model, Types } from "mongoose";
+import type { TipoMidia } from "../media.constants.js";
 import { UploadMidia, type UploadMidiaDocument } from "./schemas/upload-midia.schema.js";
 
 export type DadosCriarUploadMidia = Omit<UploadMidia, "estado" | "confirmadoEm" | "removidoEm" | "tokenReserva" | "reservadoEm" | "limpezaIniciadaEm">;
@@ -20,6 +21,26 @@ export class UploadsMidiaRepository {
 
   async criar(dados: DadosCriarUploadMidia): Promise<UploadMidiaDocument> {
     return this.uploadModel.create({ ...dados, estado: "pendente", confirmadoEm: null, removidoEm: null, tokenReserva: null, reservadoEm: null, limpezaIniciadaEm: null });
+  }
+
+  /**
+   * Fase 22.8.9.9 — uploads NOVOS (sem `substituiMidiaId`) do produto e tipo que ainda podem virar mídia da galeria e,
+   * por isso, ocupam vaga: `confirmando` (confirmação em andamento) ou `pendente` com a URL assinada ainda válida e
+   * nunca tocado pela limpeza. Um `pendente` com a URL vencida deixa de reservar vaga (um envio abandonado não
+   * bloqueia o produto por 24 h); se o arquivo tiver sido enviado a tempo e for confirmado depois, o limite é
+   * conferido de novo na confirmação, dentro da escrita do produto. `idsNaGaleria`: uploads já gravados no produto
+   * (o registro ainda não foi marcado) não contam duas vezes.
+   */
+  async contarReservasDeVagas(produtoId: Types.ObjectId, tipo: TipoMidia, agora: Date, idsNaGaleria: readonly string[]): Promise<number> {
+    return this.uploadModel
+      .countDocuments({
+        produtoId,
+        tipo,
+        substituiMidiaId: null,
+        _id: { $nin: [...idsNaGaleria] },
+        $or: [{ estado: "confirmando" }, { estado: "pendente", urlExpiraEm: { $gt: agora }, limpezaIniciadaEm: null }],
+      })
+      .exec();
   }
 
   async encontrarPorId(uploadId: string): Promise<UploadMidiaDocument | null> {

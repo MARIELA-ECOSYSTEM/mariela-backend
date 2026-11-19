@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Types } from "mongoose";
+import { LIMITE_MIDIAS_POR_PRODUTO } from "../modules/media/media.constants.js";
 import { extrairChaveR2, idMidiaLegada, planejarProduto, type MidiaGravada, type ProdutoLegado, type VarianteLegada } from "./migrar-midias-legadas.plano.js";
 
 /** Fase 60.2 — regras puras da migração (nenhum banco envolvido). */
@@ -51,14 +52,15 @@ describe("planejarProduto — migração dos campos legados (Fase 60.2)", () => 
   });
 
   it("vídeo legado válido vira vídeo do produto (varianteId null); ordem segue as variantes, foto antes do vídeo", () => {
+    // Fase 22.8.9.9 — um único vídeo (limite atual: 1 por produto); antes a variante `b` também tinha vídeo.
     const a = variante({ foto: "https://x.com/a.jpg", video: "https://x.com/a.mp4" });
-    const b = variante({ video: "https://x.com/b.mp4" });
+    const b = variante({ foto: "https://x.com/b.webp" });
     const c = variante({ foto: "https://x.com/c.png" });
     const { novas } = novasDe(produto([a, b, c]));
     expect(novas.map((m) => [m.tipo, m.url, m.ordem, m.varianteId === null ? null : String(m.varianteId)])).toEqual([
       ["image", "https://x.com/a.jpg", 0, String(a._id)],
       ["video", "https://x.com/a.mp4", 1, null],
-      ["video", "https://x.com/b.mp4", 2, null],
+      ["image", "https://x.com/b.webp", 2, String(b._id)],
       ["image", "https://x.com/c.png", 3, String(c._id)],
     ]);
   });
@@ -200,21 +202,23 @@ describe("planejarProduto — migração dos campos legados (Fase 60.2)", () => 
     expect(plano(p).desfecho).toMatchObject({ status: "pendente", motivo: "conflito" });
   });
 
-  it("limites: exatamente 20 imagens e 3 vídeos migram; 21 imagens ou 4 vídeos ficam pendentes (nada descartado)", () => {
-    const vinte = produto(Array.from({ length: 20 }, (_, i) => variante({ foto: `https://x.com/${i}.jpg` })));
-    expect(novasDe(vinte).novas).toHaveLength(20);
-    const tres = produto(Array.from({ length: 3 }, (_, i) => variante({ video: `https://x.com/${i}.mp4` })));
-    expect(novasDe(tres).novas).toHaveLength(3);
+  // Fase 22.8.9.9 — o plano segue `LIMITE_MIDIAS_POR_PRODUTO` (antes 20 imagens / 3 vídeos; agora 10 / 1).
+  it("limites: exatamente o limite de imagens e de vídeos migra; uma a mais fica pendente (nada descartado)", () => {
+    const { image: IMAGENS, video: VIDEOS } = LIMITE_MIDIAS_POR_PRODUTO;
+    const noLimite = produto(Array.from({ length: IMAGENS }, (_, i) => variante({ foto: `https://x.com/${i}.jpg` })));
+    expect(novasDe(noLimite).novas).toHaveLength(IMAGENS);
+    const videosNoLimite = produto(Array.from({ length: VIDEOS }, (_, i) => variante({ video: `https://x.com/${i}.mp4` })));
+    expect(novasDe(videosNoLimite).novas).toHaveLength(VIDEOS);
 
-    const vinteUma = produto(Array.from({ length: 21 }, (_, i) => variante({ foto: `https://x.com/${i}.jpg` })));
-    expect(plano(vinteUma).desfecho).toMatchObject({ status: "pendente", motivo: "limite" });
-    const quatro = produto(Array.from({ length: 4 }, (_, i) => variante({ video: `https://x.com/${i}.mp4` })));
-    expect(plano(quatro).desfecho).toMatchObject({ status: "pendente", motivo: "limite" });
+    const umaAMais = produto(Array.from({ length: IMAGENS + 1 }, (_, i) => variante({ foto: `https://x.com/${i}.jpg` })));
+    expect(plano(umaAMais).desfecho).toMatchObject({ status: "pendente", motivo: "limite" });
+    const umVideoAMais = produto(Array.from({ length: VIDEOS + 1 }, (_, i) => variante({ video: `https://x.com/${i}.mp4` })));
+    expect(plano(umVideoAMais).desfecho).toMatchObject({ status: "pendente", motivo: "limite" });
   });
 
-  it("limite conta a galeria existente: 18 uploads + 3 fotos legadas = 21 → pendente", () => {
+  it("limite conta a galeria existente: (limite − 2) uploads + 3 fotos legadas = limite + 1 → pendente", () => {
     const p = produto(Array.from({ length: 3 }, (_, i) => variante({ foto: `https://x.com/l${i}.jpg` })), {
-      midias: Array.from({ length: 18 }, (_, i) => midiaExistente(`u${i}`, `https://x.com/u${i}.jpg`, i)),
+      midias: Array.from({ length: LIMITE_MIDIAS_POR_PRODUTO.image - 2 }, (_, i) => midiaExistente(`u${i}`, `https://x.com/u${i}.jpg`, i)),
     });
     expect(plano(p).desfecho).toMatchObject({ status: "pendente", motivo: "limite" });
   });
