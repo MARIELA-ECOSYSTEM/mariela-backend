@@ -294,7 +294,8 @@ describe("Inventário de controllers — autenticação/autorização (Fase 22.8
     for (const lista of Object.values(porCategoria)) lista.sort();
     expect(Object.keys(porCategoria).sort()).toEqual(["ADMIN", "PDV", "PUBLICO"]);
     // 25 controllers = 17 ADMIN + 5 PDV + 3 públicos (a auditoria 22.8 citou "20 administrativos" por erro de soma).
-    expect(porCategoria["ADMIN"]).toHaveLength(17);
+    // Fase 22.8.9.10.3: +2 ADMIN (`EnviosWhatsappController`, `BloqueiosWhatsappController`) → 27 = 19 + 5 + 3.
+    expect(porCategoria["ADMIN"]).toHaveLength(19);
     expect(porCategoria["PDV"]).toHaveLength(5);
     expect(porCategoria["PUBLICO"]).toHaveLength(3);
   });

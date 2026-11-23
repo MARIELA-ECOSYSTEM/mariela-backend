@@ -1,0 +1,50 @@
+import type { CodigoRecusaProvedor } from "../envios/envios-whatsapp.constants.js";
+
+/**
+ * Fase 22.8.9.10.3 — contrato do provedor de ENVIO POR TEMPLATE (Cloud API da Meta na Fase 22.8.9.10.4). Separado de
+ * `WhatsappProvider` (Evolution/Baileys, texto livre), que continua intacto durante a transição.
+ *
+ * O provedor CLASSIFICA o resultado e nunca lança para comunicar uma recusa:
+ * - `aceita`: o provedor confirmou o recebimento (id da mensagem obrigatório);
+ * - `recusada`: comprovadamente NÃO enviada (recusa explícita do provedor, ou erro de rede ANTES da conexão);
+ * - `indeterminada`: pode ter saído (timeout, conexão cortada depois do pedido, 5xx, resposta ilegível).
+ * Qualquer exceção lançada pelo provedor é tratada pelo serviço como `indeterminada` (na dúvida, nunca reenviar).
+ */
+export const PROVEDOR_ENVIO_WHATSAPP = Symbol("PROVEDOR_ENVIO_WHATSAPP");
+
+export interface EnviarTemplateWhatsappInput {
+  /** Destinatário em E.164 (`+55DDDNNNNNNNNN`), sempre resolvido do cadastro pelo backend. */
+  telefoneE164: string;
+  nomeMeta: string;
+  idioma: string;
+  parametros: readonly string[];
+  /** Id interno da mensagem — para correlação no provedor, se ele suportar (a confirmar na Fase 22.8.9.10.4). */
+  referenciaInterna: string;
+}
+
+export type ResultadoEnvioProvedorWhatsapp =
+  | { resultado: "aceita"; wamid: string; waId: string | null }
+  | { resultado: "recusada"; codigo: CodigoRecusaProvedor; codigoProvedor: string | null }
+  | { resultado: "indeterminada"; codigoProvedor: string | null };
+
+/** O que o provedor informa sobre um template cadastrado nele. */
+export interface InfoTemplateProvedorWhatsapp {
+  nomeMeta: string;
+  idioma: string;
+  /** Status bruto do provedor (ex.: `APPROVED`, `PENDING`, `REJECTED`, `PAUSED`, `DISABLED`). */
+  status: string;
+  /** Categoria segundo o provedor (ex.: `MARKETING`, `UTILITY`) — pode diferir do catálogo (reclassificação). */
+  categoria: string;
+  /** Quantidade de parâmetros do corpo. */
+  quantidadeParametros: number;
+}
+
+export interface ProvedorEnvioWhatsapp {
+  /** Nome para diagnóstico (nunca contém credencial). */
+  readonly nome: string;
+  /** Configuração completa presente? Falso → as rotas de envio respondem `WHATSAPP_NOT_CONFIGURED`. */
+  configurado(): boolean;
+  enviarTemplate(input: EnviarTemplateWhatsappInput): Promise<ResultadoEnvioProvedorWhatsapp>;
+  /** `null` = template não existe no provedor. Exceção = não foi possível consultar (aprovação DESCONHECIDA). */
+  consultarTemplate(nomeMeta: string, idioma: string): Promise<InfoTemplateProvedorWhatsapp | null>;
+}

@@ -167,4 +167,31 @@ export class ApiException extends HttpException {
       message,
     });
   }
+
+  /** Fase 22.8.9.10.3 — mesma chave de idempotência reapresentada com conteúdo diferente (nunca reenvia). */
+  static whatsappIdempotenciaConflito(
+    message = "Esta chave de envio já foi usada para outra mensagem. Gere uma nova chave.",
+  ): ApiException {
+    return new ApiException({ statusCode: HttpStatus.CONFLICT, code: ERROR_CODES.WHATSAPP_IDEMPOTENCIA_CONFLITO, message });
+  }
+
+  /** Fase 22.8.9.10.3 — o cliente já tem mensagem desta campanha no ano (reserva única por cliente/campanha/ano). */
+  static whatsappJaEnviadaCampanha(message = "Este cliente já recebeu (ou está recebendo) a mensagem desta campanha neste ano."): ApiException {
+    return new ApiException({ statusCode: HttpStatus.CONFLICT, code: ERROR_CODES.WHATSAPP_JA_ENVIADA_CAMPANHA, message });
+  }
+
+  /** Fase 22.8.9.10.3 — o número está na lista de bloqueio (pedido de não contato). */
+  static whatsappContatoBloqueado(message = "Este contato pediu para não receber mensagens de WhatsApp."): ApiException {
+    return new ApiException({ statusCode: HttpStatus.UNPROCESSABLE_ENTITY, code: ERROR_CODES.WHATSAPP_CONTATO_BLOQUEADO, message });
+  }
+
+  /** Fase 22.8.9.10.3 — template fora do catálogo, não permitido para o uso ou sem aprovação CONFIRMADA na Meta. */
+  static whatsappTemplateIndisponivel(message = "Modelo de mensagem indisponível para envio."): ApiException {
+    return new ApiException({ statusCode: HttpStatus.UNPROCESSABLE_ENTITY, code: ERROR_CODES.WHATSAPP_TEMPLATE_INDISPONIVEL, message });
+  }
+
+  /** Fase 22.8.9.10.3 — liberação de reenvio pedida para uma mensagem que não pode ser liberada (estado, prazo ou já liberada). */
+  static whatsappLiberacaoNaoPermitida(message = "Esta mensagem não pode ser liberada para reenvio."): ApiException {
+    return new ApiException({ statusCode: HttpStatus.CONFLICT, code: ERROR_CODES.WHATSAPP_LIBERACAO_NAO_PERMITIDA, message });
+  }
 }
