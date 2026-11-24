@@ -4,7 +4,12 @@ import type { WhatsappConfig } from "../../../config/configuration.js";
 import { assinaturaWebhookValida, verificarDesafioGet } from "./assinatura-webhook-meta.js";
 import { lerConfiguracaoWebhookMeta } from "./configuracao-webhook-meta.js";
 import { ErroContratoWebhookMeta, interpretarNotificacaoMeta } from "./contrato-webhook-meta.js";
-import { criarReconhecedorOptOut, PALAVRAS_CHAVE_OPT_OUT_APROVADAS } from "./opt-out-palavras-chave.js";
+import {
+  criarReconhecedorOptOut,
+  normalizarTextoOptOut,
+  PALAVRAS_CHAVE_OPT_OUT_APROVADAS,
+  TAMANHO_MAXIMO_MENSAGEM_OPT_OUT,
+} from "./opt-out-palavras-chave.js";
 
 /**
  * Fase 22.8.9.10.5 — regras PURAS do webhook (sem rede, sem MongoDB). Segredos são marcadores fictícios evidentes.
@@ -83,22 +88,83 @@ describe("configuração do webhook", () => {
   });
 });
 
-describe("palavras-chave de opt-out", () => {
-  it("lista APROVADA está vazia (decisão pendente): nada é reconhecido, nem 'SAIR'", () => {
-    expect(PALAVRAS_CHAVE_OPT_OUT_APROVADAS).toEqual([]);
-    const r = criarReconhecedorOptOut(PALAVRAS_CHAVE_OPT_OUT_APROVADAS);
-    for (const t of ["SAIR", "sair", "PARAR", "STOP", ""]) expect(r(t)).toBe(false);
+describe("palavras-chave de opt-out (Fase 22.8.9.10.7.1)", () => {
+  const r = criarReconhecedorOptOut(PALAVRAS_CHAVE_OPT_OUT_APROVADAS);
+
+  it("lista APROVADA: SAIR, PARAR, CANCELAR, STOP, UNSUBSCRIBE (congelada)", () => {
+    expect(PALAVRAS_CHAVE_OPT_OUT_APROVADAS).toEqual(["SAIR", "PARAR", "CANCELAR", "STOP", "UNSUBSCRIBE"]);
+    expect(Object.isFrozen(PALAVRAS_CHAVE_OPT_OUT_APROVADAS)).toBe(true);
   });
 
-  it("com lista: só mensagem INTEIRA igual (sem espaços nas pontas); variação só se listada", () => {
-    const r = criarReconhecedorOptOut(["SAIR", "Sair"]);
-    expect(r("SAIR")).toBe(true);
-    expect(r("  Sair \n")).toBe(true);
-    expect(r("sair")).toBe(false); // variação NÃO listada
-    expect(r("SAIR!")).toBe(false);
-    expect(r("quero SAIR")).toBe(false);
-    expect(r("SAIR da lista por favor")).toBe(false);
-    expect(r("S A I R")).toBe(false);
+  it("cada palavra-chave, em qualquer caixa, é reconhecida", () => {
+    for (const p of PALAVRAS_CHAVE_OPT_OUT_APROVADAS) {
+      const minuscula = p.toLowerCase();
+      const capitalizada = p[0] + p.slice(1).toLowerCase();
+      for (const t of [p, minuscula, capitalizada, minuscula.replace(/^./, (c) => c.toUpperCase()).replace(/.$/, (c) => c.toUpperCase())]) {
+        expect([t, r(t)]).toEqual([t, true]);
+      }
+    }
+  });
+
+  it("exemplos da especificação: 'SAIR', 'sair', ' PARAR ', 'Cancelar' bloqueiam", () => {
+    for (const t of ["SAIR", "sair", " PARAR ", "Cancelar"]) expect([t, r(t)]).toEqual([t, true]);
+  });
+
+  it("espaços e caracteres invisíveis nas pontas: tabulação, quebra de linha, espaço não separável, zero-width, BOM", () => {
+    for (const t of ["\tSAIR\n", "\n\n parar \r\n", " Stop ", "​sair​", "﻿CANCELAR", "unsubscribe⁠"]) {
+      expect([JSON.stringify(t), r(t)]).toEqual([JSON.stringify(t), true]);
+    }
+  });
+
+  it("acentos normalizados (e forma decomposta Unicode)", () => {
+    for (const t of ["SAÍR", "sáir", "Párar", "CANCELÁR", "Sáir", "ｓａｉｒ"]) expect([t, r(t)]).toEqual([t, true]);
+  });
+
+  it("uma pontuação final de afirmação é tolerada ('.', '!', até 3)", () => {
+    for (const t of ["Sair.", "PARAR!", "stop!!!", "Cancelar !", "SAIR.!"]) expect([t, r(t)]).toEqual([t, true]);
+  });
+
+  it("FALSOS POSITIVOS: palavra dentro de frase, pergunta, repetição, letras separadas, prefixo/sufixo, outra pontuação → NÃO", () => {
+    for (const t of [
+      "Quero saber como sair da promoção",
+      "Não quero cancelar meu pedido",
+      "Esse produto é ótimo",
+      "quero SAIR",
+      "SAIR da lista por favor",
+      "Sair?",
+      "parar?",
+      "SAIR SAIR",
+      "S A I R",
+      "S-A-I-R",
+      "#SAIR",
+      "SAIR123",
+      "sairr",
+      "SAIRE",
+      "Desistir",
+      "stop!!!!",
+      "\"SAIR\"",
+      "SAIR 😀",
+      "pare",
+      "não",
+      "cancela",
+      "unsubscribe me",
+      "",
+      "   ",
+      "!!!",
+      "SAIR".padEnd(80, " ") + "x",
+    ]) {
+      expect([t, r(t)]).toEqual([t, false]);
+    }
+  });
+
+  it("texto longo nunca é analisado; lista vazia não reconhece nada; listas de teste usam a mesma normalização", () => {
+    expect(normalizarTextoOptOut(`SAIR${" ".repeat(TAMANHO_MAXIMO_MENSAGEM_OPT_OUT)}`)).toBeNull();
+    expect(normalizarTextoOptOut("  sáir. ")).toBe("SAIR");
+    const vazia = criarReconhecedorOptOut([]);
+    for (const t of ["SAIR", "sair", "PARAR", "STOP", ""]) expect(vazia(t)).toBe(false);
+    const teste = criarReconhecedorOptOut(["Sair"]);
+    expect(teste("SAIR")).toBe(true);
+    expect(teste("PARAR")).toBe(false);
   });
 });
 

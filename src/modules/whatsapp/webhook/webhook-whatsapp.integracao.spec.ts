@@ -16,13 +16,13 @@ import { MensagemWhatsapp, type MensagemWhatsappDocument } from "../schemas/mens
 import { WHATSAPP_PROVIDER } from "../whatsapp.constants.js";
 import { WhatsappModule } from "../whatsapp.module.js";
 import { CONFIG_WEBHOOK_WHATSAPP } from "./configuracao-webhook-meta.js";
-import { PALAVRAS_CHAVE_OPT_OUT } from "./opt-out-palavras-chave.js";
+import { PALAVRAS_CHAVE_OPT_OUT, PALAVRAS_CHAVE_OPT_OUT_APROVADAS } from "./opt-out-palavras-chave.js";
 import { WebhookWhatsappService } from "./webhook-whatsapp.service.js";
 
 /**
  * Fase 22.8.9.10.5 — processamento do webhook com MongoDB REAL descartável: correlação por `wamid`, máquina de
- * estados, concorrência, idempotência e opt-out com bloqueio por número. Sem rede, sem credencial. A lista de
- * palavras-chave aqui é a de TESTE (`SAIR`, `Sair`) — a aprovada em produção continua vazia.
+ * estados, concorrência, idempotência e opt-out com bloqueio por número. Sem rede, sem credencial.
+ * Fase 22.8.9.10.7.1 — a lista de palavras-chave é a APROVADA (a mesma de produção; sem sobrescrita).
  */
 const PHONE_ID = "100000000000001";
 const JWT_MODULO_DE_TESTE = JwtModule.register({ global: true, secret: "segredo-de-teste", signOptions: { expiresIn: "15m" } });
@@ -103,8 +103,6 @@ describe("Webhook WhatsApp (integração — MongoDB real)", () => {
     moduleRef = await Test.createTestingModule({ imports: [mongooseModuloDeTeste(), JWT_MODULO_DE_TESTE, WhatsappModule] })
       .overrideProvider(CONFIG_WEBHOOK_WHATSAPP)
       .useValue({ verifyToken: "VERIFY-TOKEN-FICTICIO-DE-TESTE", appSecret: "SEGREDO-FICTICIO-DE-TESTE-WEBHOOK", phoneNumberId: PHONE_ID })
-      .overrideProvider(PALAVRAS_CHAVE_OPT_OUT)
-      .useValue(["SAIR", "Sair"])
       .overrideProvider(PROVEDOR_ENVIO_WHATSAPP)
       .useValue(provedor)
       .overrideProvider(WHATSAPP_PROVIDER)
@@ -307,14 +305,122 @@ describe("Webhook WhatsApp (integração — MongoDB real)", () => {
       expect(todos[1]).toMatchObject({ ativo: true, origem: "META_OPT_OUT" });
     });
 
-    it("palavra-chave da lista (SAIR / Sair) → bloqueio PALAVRA_CHAVE; variação não listada e texto livre → nada", async () => {
-      await notificarTexto("5583966660001", "SAIR");
-      await notificarTexto("5583966660002", "  Sair ");
-      await notificarTexto("5583966660003", "sair");
-      await notificarTexto("5583966660004", "Quero sair da lista");
-      await notificarTexto("5583966660005", "Obrigada!");
-      const chaves = (await bloqueioModel.find({ origem: "PALAVRA_CHAVE" }).lean()).map((b) => b.chave).sort();
-      expect(chaves).toEqual(["5583966660001", "5583966660002"]);
+    it("Fase 22.8.9.10.7.1 — o módulo usa a lista APROVADA de palavras-chave", () => {
+      expect(moduleRef.get<symbol, readonly string[]>(PALAVRAS_CHAVE_OPT_OUT)).toBe(PALAVRAS_CHAVE_OPT_OUT_APROVADAS);
+    });
+
+    it("cada palavra-chave (caixa, espaços, acento) → bloqueio WAID PALAVRA_CHAVE persistido, sem cliente; frases e perguntas → nada", async () => {
+      const bloqueiam = ["SAIR", "sair", " PARAR ", "Cancelar", "stop", "Unsubscribe", "Sáir.", "\nPARAR!\n"];
+      const naoBloqueiam = ["Quero saber como sair da promoção", "Não quero cancelar meu pedido", "Esse produto é ótimo", "Sair?", "SAIR SAIR", "Obrigada!"];
+      for (const [i, texto] of bloqueiam.entries()) await notificarTexto(`55839666600${String(i).padStart(2, "0")}`, texto);
+      for (const [i, texto] of naoBloqueiam.entries()) await notificarTexto(`55839666610${String(i).padStart(2, "0")}`, texto);
+      const bs = await bloqueioModel.find({}).sort({ chave: 1 }).lean();
+      expect(bs.map((b) => b.chave)).toEqual(bloqueiam.map((_, i) => `55839666600${String(i).padStart(2, "0")}`));
+      for (const b of bs) {
+        expect(b).toMatchObject({ tipoChave: "WAID", ativo: true, clienteId: null, origem: "PALAVRA_CHAVE", desbloqueadoEm: null });
+        expect(b.motivo).toBe("Webhook Meta: palavra-chave de opt-out.");
+      }
+      expect(await connection.collection("clientes").countDocuments({ telefone: { $regex: "^8396666" } })).toBe(0);
+    });
+
+    it("evento repetido (reentrega) e 10 'SAIR' simultâneos do mesmo número → 1 bloqueio; resume depois NÃO desbloqueia", async () => {
+      const r1 = await notificarTexto("5583967770000", "SAIR");
+      const r2 = await notificarTexto("5583967770000", "sair");
+      expect(r1).toMatchObject({ bloqueiosCriados: 1, bloqueiosExistentes: 0 });
+      expect(r2).toMatchObject({ bloqueiosCriados: 0, bloqueiosExistentes: 1 });
+      await Promise.all(Array.from({ length: 10 }, () => notificarTexto("5583967770001", "PARAR")));
+      expect(await bloqueioModel.countDocuments({ chave: "5583967770000" })).toBe(1);
+      expect(await bloqueioModel.countDocuments({ chave: "5583967770001" })).toBe(1);
+      await notificarPreferencia("5583967770000", "resume");
+      expect(await bloqueioModel.countDocuments({ chave: "5583967770000", ativo: true })).toBe(1);
+    });
+
+    it("cliente cadastrado responde 'Sair' → envio recusado ANTES do provedor (nenhuma chamada); outro cliente segue enviando", async () => {
+      const bloqueado = await clientes.criar({ nome: "Opt Out Palavra", telefone: `839${String(++contador).padStart(8, "0")}` }, null);
+      const livre = await clientes.criar({ nome: "Sem Opt Out", telefone: `839${String(++contador).padStart(8, "0")}` }, null);
+      await notificarTexto(`55${bloqueado.telefone}`, "Sair");
+      const pedido = (id: string) => ({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE" as const, id }, template: "aniversario_v1" });
+      await expect(envios.enviar(pedido(bloqueado.id), null)).rejects.toMatchObject({ code: "WHATSAPP_CONTATO_BLOQUEADO" });
+      await expect(envios.enviar({ ...pedido(bloqueado.id), campanha: { tipo: "ANIVERSARIO" } }, null)).rejects.toMatchObject({ code: "WHATSAPP_CONTATO_BLOQUEADO" });
+      expect(provedor.chamadas).toBe(0);
+      expect(await mensagemModel.countDocuments({ destinatarioId: new Types.ObjectId(bloqueado.id) })).toBe(0);
+      await envios.enviar(pedido(livre.id), null);
+      expect(provedor.chamadas).toBe(1);
+      expect((await bloqueios.statusDoCliente(bloqueado.id)).bloqueado).toBe(true);
+    });
+
+    it("bloqueio persiste se o cliente for EXCLUÍDO ou mudar de cadastro; o número continua bloqueado", async () => {
+      const c = await clientes.criar({ nome: "Persistencia Opt Out", telefone: `839${String(++contador).padStart(8, "0")}` }, null);
+      const numero = `+55${c.telefone}`;
+      await notificarTexto(numero.slice(1), "PARAR");
+      await clientes.atualizar(c.id, { nome: "Persistencia Renomeada", telefone: c.telefone, observacao: "alterado" }, null);
+      expect(await bloqueios.bloqueioAtivo(numero)).not.toBeNull();
+      await clientes.excluir(c.id, null);
+      expect(await bloqueios.bloqueioAtivo(numero)).not.toBeNull();
+      expect(await bloqueioModel.countDocuments({ chave: numero.slice(1), ativo: true })).toBe(1);
+    });
+
+    it("wa_id diferente do E.164 (ex.: sem o nono dígito): bloqueia quando esse wa_id já veio num envio a este número", async () => {
+      const c = await clientes.criar({ nome: "Waid Conhecido", telefone: `839${String(++contador).padStart(8, "0")}` }, null);
+      const waIdSemNono = `5583${c.telefone.slice(3)}`; // o provedor devolveu este wa_id ao aceitar um envio
+      const original = provedor.enviarTemplate;
+      provedor.enviarTemplate = async (i) => ({ resultado: "aceita", wamid: `wamid.W${i.referenciaInterna}`, waId: waIdSemNono });
+      try {
+        await envios.enviar({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: c.id }, template: "aniversario_v1" }, null);
+      } finally {
+        provedor.enviarTemplate = original;
+      }
+      await notificarTexto(waIdSemNono, "STOP");
+      expect(await bloqueios.bloqueioAtivo(`+55${c.telefone}`)).not.toBeNull();
+    });
+
+    it("desbloqueio só manual, com motivo; histórico preservado; nova palavra-chave depois cria NOVO bloqueio", async () => {
+      await notificarTexto("5583968880000", "CANCELAR");
+      const b = (await bloqueioModel.findOne({ chave: "5583968880000" }).lean())!;
+      await bloqueios.desbloquearPorId(String(b._id), "contato pediu para voltar", "admin-1");
+      await expect(bloqueios.desbloquearPorId(String(b._id), "de novo", "admin-1")).rejects.toMatchObject({ code: "CONFLICT" });
+      await notificarTexto("5583968880000", "cancelar");
+      const todos = await bloqueioModel.find({ chave: "5583968880000" }).sort({ criadoEm: 1 }).lean();
+      expect(todos).toHaveLength(2);
+      expect(todos[0]).toMatchObject({ ativo: false, motivoDesbloqueio: "contato pediu para voltar", origem: "PALAVRA_CHAVE" });
+      expect(todos[1]).toMatchObject({ ativo: true, origem: "PALAVRA_CHAVE" });
+    });
+
+    it("palavra-chave junto com status fora de ordem: bloqueio criado e nenhuma regressão de estado", async () => {
+      const m = await mensagemAceita();
+      await notificarStatus({ id: m.wamid, status: "read", timestamp: "1764000600" });
+      const depoisRead = await doc(m.id);
+      const r = await webhook.processar(
+        webhook.interpretar(
+          envelope([
+            {
+              field: "messages",
+              value: {
+                messaging_product: "whatsapp",
+                metadata,
+                statuses: [{ id: m.wamid, status: "delivered", timestamp: "1764000500" }, { id: m.wamid, status: "sent" }],
+                messages: [{ from: m.telefoneE164.slice(1), id: "wamid.INX", timestamp: "1", type: "text", text: { body: "SAIR" } }],
+              },
+            },
+          ]),
+        ),
+      );
+      expect(r.status.ignorado).toBe(2);
+      expect(r.bloqueiosCriados).toBe(1);
+      expect(await doc(m.id)).toEqual(depoisRead);
+      expect(await bloqueios.bloqueioAtivo(m.telefoneE164)).not.toBeNull();
+    });
+
+    it("botão (type=button) e mensagem de outro Phone Number ID com 'SAIR' NÃO bloqueiam", async () => {
+      await webhook.processar(
+        webhook.interpretar(
+          envelope([
+            { field: "messages", value: { messaging_product: "whatsapp", metadata, messages: [{ from: "5583969990000", id: "wamid.B1", timestamp: "1", type: "button", button: { text: "SAIR", payload: "SAIR" } }] } },
+            { field: "messages", value: { messaging_product: "whatsapp", metadata: { ...metadata, phone_number_id: "999999999999999" }, messages: [{ from: "5583969990001", id: "wamid.B2", timestamp: "1", type: "text", text: { body: "SAIR" } }] } },
+          ]),
+        ),
+      );
+      expect(await bloqueioModel.countDocuments({})).toBe(0);
     });
 
     it("normalização exata: número novo não herda bloqueio do anterior; sem aproximação do nono dígito", async () => {

@@ -218,6 +218,54 @@ describe("HTTP — webhook WhatsApp configurado (Meta simulada)", () => {
       expect(await connection.collection("whatsapp_bloqueios").countDocuments({ ativo: true })).toBe(1);
     });
 
+    describe("Fase 22.8.9.10.7.1 — opt-out por palavra-chave (lista aprovada, AppModule real)", () => {
+      const REMETENTE = "5583912349999";
+      const mensagemTexto = (body: string, from = REMETENTE) =>
+        JSON.stringify({
+          object: "whatsapp_business_account",
+          entry: [
+            {
+              id: "200000000000002",
+              changes: [
+                {
+                  field: "messages",
+                  value: {
+                    messaging_product: "whatsapp",
+                    metadata: { display_phone_number: "15550000000", phone_number_id: PHONE_ID },
+                    contacts: [{ profile: { name: "Contato Ficticio" }, wa_id: from }],
+                    messages: [{ from, id: `wamid.IN${randomUUID().replace(/-/g, "")}`, timestamp: "1764000000", type: "text", text: { body } }],
+                  },
+                },
+              ],
+            },
+          ],
+        });
+      const bloqueiosAtivos = () => connection.collection("whatsapp_bloqueios").countDocuments({ chave: REMETENTE, ativo: true });
+
+      it("assinatura válida + ' Sair ' → 200 e bloqueio PALAVRA_CHAVE; reentrega não duplica; logs sem texto, número ou nome", async () => {
+        const corpo = mensagemTexto(" Sair ");
+        expect((await postar(corpo)).status).toBe(200);
+        expect((await postar(corpo)).status).toBe(200);
+        expect(await bloqueiosAtivos()).toBe(1);
+        expect(await connection.collection("whatsapp_bloqueios").findOne({ chave: REMETENTE })).toMatchObject({ tipoChave: "WAID", origem: "PALAVRA_CHAVE", clienteId: null });
+        semSegredosNosLogs(REMETENTE, REMETENTE.slice(2), "Sair", "Contato Ficticio");
+      });
+
+      it("assinatura inválida/ausente com 'SAIR' → 401 e NENHUM bloqueio", async () => {
+        const corpo = mensagemTexto("SAIR");
+        expect((await postar(corpo, `sha256=${"0".repeat(64)}`)).status).toBe(401);
+        expect((await postar(corpo, null)).status).toBe(401);
+        expect((await postar(corpo, assinar(mensagemTexto("oi")))).status).toBe(401);
+        expect(await bloqueiosAtivos()).toBe(0);
+      });
+
+      it("frases com a palavra ('Não quero cancelar meu pedido') → 200 sem bloqueio e sem o texto nos logs", async () => {
+        for (const t of ["Não quero cancelar meu pedido", "Quero saber como sair da promoção", "Sair?"]) expect((await postar(mensagemTexto(t))).status).toBe(200);
+        expect(await bloqueiosAtivos()).toBe(0);
+        semSegredosNosLogs(REMETENTE, "cancelar meu pedido", "sair da promo");
+      });
+    });
+
     it("evento desconhecido / wamid inexistente → 200 sem criar registro", async () => {
       const r = await postar(notificacao([{ id: "wamid.NAO_EXISTE", status: "delivered" }, { id: "wamid.X", status: "played" }]));
       expect(r.status).toBe(200);
