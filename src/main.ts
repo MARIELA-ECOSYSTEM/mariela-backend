@@ -15,6 +15,7 @@ import { ResponseInterceptor } from "./common/interceptors/response.interceptor.
 import { StructuredLoggerService } from "./common/logger/structured-logger.service.js";
 import { validationExceptionFactory } from "./common/pipes/validation-exception-factory.js";
 import type { ApiErrorResponse } from "./common/types/api-response.interface.js";
+import { registrarCorpoBrutoWebhookWhatsapp } from "./modules/whatsapp/webhook/corpo-bruto-webhook.js";
 
 /**
  * Etapa 18.23 — fixa o timezone do processo do servidor ANTES de qualquer
@@ -59,6 +60,10 @@ async function bootstrap(): Promise<void> {
   // `/health` e `/docs` ficam fora do prefixo versionado: são infraestrutura,
   // não endpoints de negócio.
   app.setGlobalPrefix(apiPrefix, { exclude: ["health", "docs"] });
+
+  // Fase 22.8.9.10.5 — bytes originais do corpo SÓ na rota do webhook do WhatsApp (assinatura HMAC da Meta). Precisa
+  // vir antes de `app.init()`, que instala os parsers globais; nenhuma outra rota muda.
+  registrarCorpoBrutoWebhookWhatsapp(app, apiPrefix);
 
   app.useGlobalPipes(
     new ValidationPipe({

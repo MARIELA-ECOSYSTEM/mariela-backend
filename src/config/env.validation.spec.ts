@@ -44,6 +44,10 @@ describe("validateEnv — provedor do envio de WhatsApp por template (Fase 22.8.
       ),
     ).not.toThrow();
   });
+
+  it("META_WHATSAPP_WEBHOOK_VERIFY_TOKEN / META_WHATSAPP_APP_SECRET ausentes ou curtas NÃO impedem o boot (Fase 22.8.9.10.5)", () => {
+    expect(() => validateEnv(baseEnv({ META_WHATSAPP_WEBHOOK_VERIFY_TOKEN: "curto", META_WHATSAPP_APP_SECRET: "" }))).not.toThrow();
+  });
 });
 
 describe("validateEnv", () => {

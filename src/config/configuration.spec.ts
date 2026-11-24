@@ -24,6 +24,8 @@ const VARIAVEIS_ISOLADAS = [
   "META_WHATSAPP_BUSINESS_ACCOUNT_ID",
   "META_WHATSAPP_ACCESS_TOKEN",
   "META_WHATSAPP_TIMEOUT_MS",
+  "META_WHATSAPP_WEBHOOK_VERIFY_TOKEN",
+  "META_WHATSAPP_APP_SECRET",
 ] as const;
 const originais = Object.fromEntries(VARIAVEIS_ISOLADAS.map((nome) => [nome, process.env[nome]]));
 
@@ -61,6 +63,19 @@ describe("configuration — whatsapp: provedor do envio por template (Fase 22.8.
     process.env["META_WHATSAPP_TIMEOUT_MS"] = "";
     expect(configuration().whatsapp.provedorEnvio).toBe("desativado");
     expect(configuration().whatsapp.meta?.timeoutMs).toBe(10_000);
+  });
+});
+
+describe("configuration — whatsapp: webhook da Meta (Fase 22.8.9.10.5)", () => {
+  it("sem variáveis: verify token e App Secret vazios (webhook desativado)", () => {
+    for (const nome of VARIAVEIS_ISOLADAS) delete process.env[nome];
+    expect(configuration().whatsapp.metaWebhook).toEqual({ verifyToken: "", appSecret: "" });
+  });
+
+  it("lê as duas variáveis aparando espaços", () => {
+    process.env["META_WHATSAPP_WEBHOOK_VERIFY_TOKEN"] = " VERIFY-TOKEN-FICTICIO-DE-TESTE ";
+    process.env["META_WHATSAPP_APP_SECRET"] = " SEGREDO-FICTICIO-DE-TESTE-WEBHOOK ";
+    expect(configuration().whatsapp.metaWebhook).toEqual({ verifyToken: "VERIFY-TOKEN-FICTICIO-DE-TESTE", appSecret: "SEGREDO-FICTICIO-DE-TESTE-WEBHOOK" });
   });
 });
 

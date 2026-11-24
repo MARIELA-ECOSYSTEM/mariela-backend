@@ -17,6 +17,10 @@ import { criarProvedorEnvioWhatsapp } from "./providers/selecionar-provedor-envi
 import { BloqueioWhatsapp, BloqueioWhatsappSchema } from "./schemas/bloqueio-whatsapp.schema.js";
 import { MensagemWhatsapp, MensagemWhatsappSchema } from "./schemas/mensagem-whatsapp.schema.js";
 import { TemplatesWhatsappService } from "./templates/templates-whatsapp.service.js";
+import { CONFIG_WEBHOOK_WHATSAPP, lerConfiguracaoWebhookMeta } from "./webhook/configuracao-webhook-meta.js";
+import { PALAVRAS_CHAVE_OPT_OUT, PALAVRAS_CHAVE_OPT_OUT_APROVADAS } from "./webhook/opt-out-palavras-chave.js";
+import { WebhookWhatsappController } from "./webhook/webhook-whatsapp.controller.js";
+import { WebhookWhatsappService } from "./webhook/webhook-whatsapp.service.js";
 import { WHATSAPP_PROVIDER } from "./whatsapp.constants.js";
 import { WhatsappController } from "./whatsapp.controller.js";
 import { WhatsappService } from "./whatsapp.service.js";
@@ -42,7 +46,7 @@ import { WhatsappService } from "./whatsapp.service.js";
       { name: BloqueioWhatsapp.name, schema: BloqueioWhatsappSchema },
     ]),
   ],
-  controllers: [WhatsappController, EnviosWhatsappController, BloqueiosWhatsappController],
+  controllers: [WhatsappController, EnviosWhatsappController, BloqueiosWhatsappController, WebhookWhatsappController],
   providers: [
     WhatsappService,
     { provide: WHATSAPP_PROVIDER, useClass: EvolutionApiProvider },
@@ -57,6 +61,17 @@ import { WhatsappService } from "./whatsapp.service.js";
       useFactory: (config?: ConfigService<Configuration>) => criarProvedorEnvioWhatsapp(config?.get("whatsapp", { infer: true })),
       inject: [{ token: ConfigService, optional: true }],
     },
+    // Fase 22.8.9.10.5 — webhook da Meta: ativo só com configuração completa (senão `null` = desativado).
+    {
+      provide: CONFIG_WEBHOOK_WHATSAPP,
+      useFactory: (config?: ConfigService<Configuration>) => {
+        const leitura = lerConfiguracaoWebhookMeta(config?.get("whatsapp", { infer: true }));
+        return leitura.valida ? leitura.config : null;
+      },
+      inject: [{ token: ConfigService, optional: true }],
+    },
+    { provide: PALAVRAS_CHAVE_OPT_OUT, useValue: PALAVRAS_CHAVE_OPT_OUT_APROVADAS },
+    WebhookWhatsappService,
   ],
   exports: [WhatsappService],
 })

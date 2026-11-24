@@ -53,7 +53,8 @@ export function extrairErroMeta(corpo: string): { codigo: number; fbtraceId: str
   return { codigo, fbtraceId: typeof trace === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(trace) ? trace : null };
 }
 
-function recusaPorCodigo(codigo: number): CodigoRecusaProvedor {
+/** Classificação interna de um código de erro da Meta (mesma tabela do envio; reutilizada pelo webhook). */
+export function recusaPorCodigo(codigo: number): CodigoRecusaProvedor {
   if (codigoMetaDePermissao(codigo)) return "CREDENCIAL_INVALIDA";
   return META_CODIGOS_RECUSA.get(codigo) ?? "RECUSADA";
 }

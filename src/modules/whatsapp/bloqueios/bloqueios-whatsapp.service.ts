@@ -64,10 +64,27 @@ export class BloqueiosWhatsappService {
     private readonly clientesRepository: ClientesRepository,
   ) {}
 
-  /** E.164 do número + `waId`s já devolvidos pelo provedor para ESSE número. */
+  /**
+   * E.164 do número + `waId`s já devolvidos pelo provedor para ESSE número + (Fase 22.8.9.10.5) os MESMOS dígitos do
+   * E.164 sem o `+` — a forma em que o webhook entrega `wa_id`/`from`. É igualdade exata de dígitos, NÃO
+   * aproximação: nenhuma variante do nono dígito é gerada.
+   */
   private async chavesDeVerificacao(telefoneE164: string): Promise<string[]> {
     const waIds = await this.mensagensRepository.waIdsConhecidos(telefoneE164);
-    return [...new Set([telefoneE164, ...waIds])];
+    return [...new Set([telefoneE164, telefoneE164.replace(/^\+/, ""), ...waIds])];
+  }
+
+  /**
+   * Fase 22.8.9.10.5 — bloqueio pelo identificador do WhatsApp recebido no webhook (`wa_id`/`from`), EXATAMENTE como
+   * veio (chave `WAID`). Não depende de cliente cadastrado (`clienteId: null`) e é idempotente (índice único de
+   * bloqueio ativo): eventos repetidos ou simultâneos resultam em UM bloqueio.
+   */
+  async bloquearWaId(waId: string, origem: OrigemBloqueioWhatsapp, motivo: string | null): Promise<{ bloqueio: BloqueioWhatsappDocument; criado: boolean }> {
+    const resultado = await this.repository.bloquear({ chave: waId, tipoChave: "WAID", clienteId: null, origem, motivo, usuarioId: null }, this.relogio());
+    if (resultado.criado) {
+      this.logger.log(JSON.stringify({ evento: "whatsapp.bloqueio.criado", bloqueioId: String(resultado.bloqueio._id), origem, tipoChave: "WAID" }));
+    }
+    return resultado;
   }
 
   /** Bloqueio ativo que impede o envio para este número, ou `null`. */

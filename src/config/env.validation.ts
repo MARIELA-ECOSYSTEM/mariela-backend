@@ -194,6 +194,18 @@ class EnvironmentVariables {
   META_WHATSAPP_TIMEOUT_MS?: string;
 
   /**
+   * Fase 22.8.9.10.5 — webhook da Cloud API. Opcionais e validados em tempo de execução
+   * (`lerConfiguracaoWebhookMeta`): ausentes ou malformados só DESATIVAM o webhook, nunca impedem o boot.
+   */
+  @IsOptional()
+  @IsString()
+  META_WHATSAPP_WEBHOOK_VERIFY_TOKEN?: string;
+
+  @IsOptional()
+  @IsString()
+  META_WHATSAPP_APP_SECRET?: string;
+
+  /**
    * Fase 40 — storage de mídia (Cloudflare R2). Deliberadamente OPCIONAIS,
    * como o WhatsApp: ausentes, o upload responde `STORAGE_NOT_CONFIGURED` em
    * vez de impedir o boot. Só o formato de `R2_PUBLIC_BASE_URL` é validado

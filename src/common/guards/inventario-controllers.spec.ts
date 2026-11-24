@@ -9,6 +9,7 @@ import { PdvJwtAuthGuard } from "../../modules/pdv-auth/guards/pdv-jwt-auth.guar
 import { AuthController } from "../../modules/auth/auth.controller.js";
 import { PdvAuthController } from "../../modules/pdv-auth/pdv-auth.controller.js";
 import { SaudeController } from "../../modules/saude/saude.controller.js";
+import { WebhookWhatsappController } from "../../modules/whatsapp/webhook/webhook-whatsapp.controller.js";
 import { JwtAuthGuard } from "./jwt-auth.guard.js";
 import { RolesGuard } from "./roles.guard.js";
 
@@ -79,6 +80,19 @@ const PUBLICOS = new Map<Classe, ExpectativaPublica>([
     {
       justificativa: "Health check de infraestrutura (Render): status da API e do banco, sem dados de negócio.",
       publicos: { verificar: "sonda de disponibilidade" },
+      protegidos: {},
+    },
+  ],
+  [
+    WebhookWhatsappController,
+    {
+      justificativa:
+        "Fase 22.8.9.10.5 — webhook da WhatsApp Cloud API: a Meta não envia JWT. A autenticação é do próprio contrato " +
+        "da Meta, validada no handler: verify token (GET) e assinatura HMAC-SHA256 do corpo original com o App Secret (POST).",
+      publicos: {
+        verificar: "verificação da Meta (hub.verify_token comparado em tempo constante)",
+        receber: "notificações da Meta (X-Hub-Signature-256 validada ANTES de qualquer processamento)",
+      },
       protegidos: {},
     },
   ],
@@ -295,9 +309,10 @@ describe("Inventário de controllers — autenticação/autorização (Fase 22.8
     expect(Object.keys(porCategoria).sort()).toEqual(["ADMIN", "PDV", "PUBLICO"]);
     // 25 controllers = 17 ADMIN + 5 PDV + 3 públicos (a auditoria 22.8 citou "20 administrativos" por erro de soma).
     // Fase 22.8.9.10.3: +2 ADMIN (`EnviosWhatsappController`, `BloqueiosWhatsappController`) → 27 = 19 + 5 + 3.
+    // Fase 22.8.9.10.5: +1 PÚBLICO (`WebhookWhatsappController`, autenticado pela assinatura da Meta) → 28 = 19 + 5 + 4.
     expect(porCategoria["ADMIN"]).toHaveLength(19);
     expect(porCategoria["PDV"]).toHaveLength(5);
-    expect(porCategoria["PUBLICO"]).toHaveLength(3);
+    expect(porCategoria["PUBLICO"]).toHaveLength(4);
   });
 });
 

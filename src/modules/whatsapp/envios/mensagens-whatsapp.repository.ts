@@ -178,6 +178,28 @@ export class MensagensWhatsappRepository {
     return { itens, total };
   }
 
+  /** Fase 22.8.9.10.5 — correlação do webhook: SEMPRE pelo `wamid` (índice único `wamid_unico`). */
+  async encontrarPorWamid(wamid: string): Promise<MensagemWhatsappDocument | null> {
+    return this.model.findOne({ wamid }).exec();
+  }
+
+  /**
+   * Fase 22.8.9.10.5 — aplica UMA transição decidida por `aplicarEventoStatus`, condicional ao estado LIDO (e ao
+   * `wamid`): se outra escrita mudou o estado no meio, nada é alterado (`false`) e quem chamou relê e reavalia. Nunca
+   * sobrescreve um estado mais avançado.
+   */
+  async aplicarTransicaoStatus(
+    id: Types.ObjectId,
+    wamid: string,
+    de: EstadoMensagemWhatsapp,
+    para: EstadoMensagemWhatsapp,
+    campos: Partial<Pick<MensagemWhatsapp, "aceitaEm" | "entregueEm" | "lidaEm" | "falhaEm" | "erroCodigo" | "erroCodigoProvedor">>,
+    agora: Date,
+  ): Promise<boolean> {
+    const r = await this.model.updateOne({ _id: id, wamid, estado: de }, { $set: { ...campos, estado: para, atualizadoEm: agora } }).exec();
+    return r.modifiedCount === 1;
+  }
+
   /**
    * `waId`s já devolvidos pelo provedor para envios a ESTE número (verificação de bloqueio). Só pelo número, nunca
    * pelo cliente: se o cliente trocar de telefone, um bloqueio do número antigo não passa para o novo.

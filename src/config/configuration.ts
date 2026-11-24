@@ -68,6 +68,17 @@ export interface WhatsappConfig {
    */
   provedorEnvio?: string;
   meta?: MetaWhatsappConfig;
+  /**
+   * Fase 22.8.9.10.5 — webhook da Cloud API. `verifyToken` (verificação GET) e `appSecret` (HMAC do POST) são
+   * credenciais: nunca logados, devolvidos nem incluídos em erro. Incompletos = webhook desativado. Opcional no tipo
+   * pelo mesmo motivo de `meta`.
+   */
+  metaWebhook?: MetaWebhookWhatsappConfig;
+}
+
+export interface MetaWebhookWhatsappConfig {
+  verifyToken: string;
+  appSecret: string;
 }
 
 /** Fase 22.8.9.10.4 — Cloud API da Meta. `accessToken` é credencial: nunca logado, devolvido nem incluído em erro. */
@@ -212,6 +223,10 @@ export default (): Configuration => {
         businessAccountId: (process.env["META_WHATSAPP_BUSINESS_ACCOUNT_ID"] ?? "").trim(),
         accessToken: (process.env["META_WHATSAPP_ACCESS_TOKEN"] ?? "").trim(),
         timeoutMs: Number(process.env["META_WHATSAPP_TIMEOUT_MS"] || META_TIMEOUT_MS_PADRAO),
+      },
+      metaWebhook: {
+        verifyToken: (process.env["META_WHATSAPP_WEBHOOK_VERIFY_TOKEN"] ?? "").trim(),
+        appSecret: (process.env["META_WHATSAPP_APP_SECRET"] ?? "").trim(),
       },
     },
     storage: {
