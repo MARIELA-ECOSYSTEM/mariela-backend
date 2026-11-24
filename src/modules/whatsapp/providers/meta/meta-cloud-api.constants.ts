@@ -79,7 +79,12 @@ export const META_CODIGOS_RECUSA: ReadonlyMap<number, CodigoRecusaProvedor> = ne
   [132016, "TEMPLATE_INVALIDO"],
   // Destinatário.
   [131026, "SEM_WHATSAPP"],
+  // Fase 22.8.9.10.5.1 — revisado na documentação oficial (error-codes e templates/marketing-templates): "This
+  // recipient has chosen to stop receiving marketing messages on WhatsApp from your business" / "Do not retry sending
+  // messages to this user". É ESCOLHA DO DESTINATÁRIO (a mesma preferência que o webhook `user_preferences`
+  // comunica com `stop`), não política nem limite da Meta — por isso, e só por isso, gera bloqueio META_OPT_OUT.
   [131050, "OPT_OUT_MARKETING"],
+  // Limite/política da Meta ("to maintain healthy ecosystem engagement"; "Try sending at a later time"): NUNCA bloqueia.
   [131049, "LIMITE_MARKETING_DESTINATARIO"],
 ]);
 

@@ -236,6 +236,17 @@ describe("Webhook WhatsApp (integração — MongoDB real)", () => {
       expect(bs[0]).toMatchObject({ chave: m.telefoneE164, tipoChave: "E164", origem: "META_OPT_OUT", ativo: true });
     });
 
+    it("Fase 22.8.9.10.5.1 — SÓ 131050 (escolha do destinatário) bloqueia: 131049 (limite da Meta), 131026, 131000 e failed sem código NÃO", async () => {
+      for (const codigo of [131049, 131026, 131000, null]) {
+        const m = await mensagemAceita();
+        await notificarStatus({ id: m.wamid, status: "failed", ...(codigo !== null ? { errors: [{ code: codigo }] } : {}) });
+        expect((await doc(m.id)).estado).toBe("falha");
+        expect((await doc(m.id)).erroCodigoProvedor).toBe(codigo !== null ? String(codigo) : null); // diagnóstico preservado
+      }
+      expect(await bloqueioModel.countDocuments({})).toBe(0);
+      expect((await mensagemModel.findOne({ erroCodigoProvedor: "131049" }).lean())?.erroCodigo).toBe("LIMITE_MARKETING_DESTINATARIO");
+    });
+
     it("falha de escrita concorrente: a transição condicional não sobrescreve estado mais avançado", async () => {
       const m = await mensagemAceita();
       // Alguém já levou a mensagem a `lida`; uma escrita baseada na leitura antiga (`aceita`) não pode aplicar.

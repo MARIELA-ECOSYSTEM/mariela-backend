@@ -258,6 +258,21 @@ describe("Envio por template com o adaptador Meta (integração — MongoDB real
     expect(graph.posts()).toHaveLength(0);
   });
 
+  it("Fase 22.8.9.10.5.1 — recusa síncrona 131049 (limite da Meta) ou 131026: falha classificada, SEM bloqueio; novo envio não é barrado", async () => {
+    for (const [codigo, esperado] of [
+      [131049, "LIMITE_MARKETING_DESTINATARIO"],
+      [131026, "SEM_WHATSAPP"],
+    ] as const) {
+      const cliente = await novoCliente();
+      graph.envio = async () => json(400, { error: { code: codigo } });
+      const { mensagem } = await service.enviar(pedido(cliente.id), null);
+      expect(mensagem.erro?.codigo).toBe(esperado);
+      expect(await bloqueios.bloqueioAtivo(`+55${cliente.telefone}`)).toBeNull();
+      graph.restaurarEnvio();
+      expect((await service.enviar(pedido(cliente.id), null)).mensagem.estado).toBe("aceita");
+    }
+  });
+
   it("bloqueio ativo (ADMIN) → nada é gravado nem enviado à Meta", async () => {
     const cliente = await novoCliente();
     await bloqueios.bloquearNumero(`+55${cliente.telefone}`, null, "ADMIN", null);
