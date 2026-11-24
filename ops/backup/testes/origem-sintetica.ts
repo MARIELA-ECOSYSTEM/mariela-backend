@@ -56,6 +56,65 @@ async function base(c: MongoClient): Promise<void> {
   ]);
   await db.collection("adquirentes").insertOne({ nome: "Adquirente fictício", nomeNormalizado: "ADQUIRENTE FICTICIO", excluidoEm: null, ...ts });
   await db.collection("configuracoes").insertOne({ _id: "loja" as unknown as ObjectId, tamanhos: ["P", "M"], cores: ["Azul"] }); // sem timestamps → hash
+  // Fase 22.8.9.10.3.1 — coleções do WhatsApp com documentos SINTÉTICOS (números fictícios +55 00 …, sem pessoa real),
+  // para que backup, archive, contagens, hash de conteúdo e restore integral as exercitem de verdade (não vazias).
+  const clienteSintetico = new ObjectId();
+  await db.collection("mensagens_whatsapp").insertMany([
+    {
+      idempotencyKey: "00000000-0000-4000-8000-000000000001",
+      hashConteudo: "sintetico",
+      destinatarioTipo: "CLIENTE",
+      destinatarioId: clienteSintetico,
+      telefoneE164: "+5500900000001",
+      waId: "5500900000001",
+      templateChave: "aniversario_v1",
+      templateNomeMeta: "mariela_aniversario_v1",
+      templateIdioma: "pt_BR",
+      templateCategoria: "MARKETING",
+      wamid: "wamid.sintetico.1",
+      estado: "aceita",
+      origem: "CAMPANHA_ANIVERSARIO",
+      campanhaTipo: "ANIVERSARIO",
+      campanhaAno: 2026,
+      chaveDeduplicacao: `ANIVERSARIO:2026:${clienteSintetico.toHexString()}`,
+      chaveDeduplicacaoLiberada: null,
+      usuarioId: "usuario-sintetico",
+      enviandoEm: antigo,
+      aceitaEm: antigo,
+      erroCodigo: null,
+      anomalias: [],
+      ...ts,
+    },
+    {
+      idempotencyKey: "00000000-0000-4000-8000-000000000002",
+      hashConteudo: "sintetico",
+      destinatarioTipo: "CLIENTE",
+      destinatarioId: clienteSintetico,
+      telefoneE164: "+5500900000001",
+      waId: null,
+      templateChave: "aniversario_v1",
+      templateNomeMeta: "mariela_aniversario_v1",
+      templateIdioma: "pt_BR",
+      templateCategoria: "MARKETING",
+      wamid: null,
+      estado: "falha",
+      origem: "INDIVIDUAL",
+      campanhaTipo: null,
+      campanhaAno: null,
+      chaveDeduplicacao: null,
+      chaveDeduplicacaoLiberada: null,
+      usuarioId: "usuario-sintetico",
+      enviandoEm: antigo,
+      falhaEm: antigo,
+      erroCodigo: "SEM_WHATSAPP",
+      anomalias: [],
+      ...ts,
+    },
+  ]);
+  await db.collection("whatsapp_bloqueios").insertMany([
+    { chave: "+5500900000002", tipoChave: "E164", ativo: true, clienteId: null, origem: "PALAVRA_CHAVE", motivo: null, usuarioId: null, criadoEm: antigo, desbloqueadoEm: null },
+    { chave: "+5500900000003", tipoChave: "E164", ativo: false, clienteId: clienteSintetico, origem: "ADMIN", motivo: "sintético", usuarioId: "usuario-sintetico", criadoEm: antigo, desbloqueadoEm: antigo, desbloqueadoPor: "usuario-sintetico", motivoDesbloqueio: "sintético" },
+  ]);
   for (const ev of COLECOES_BACKUP.filter((n) => n.startsWith("eventos_"))) await db.collection(ev).insertOne({ tipo: "sintetico", criadoEm: antigo });
   for (const tok of COLECOES_EXCLUIDAS) {
     await db.collection(tok).insertOne({ tokenHash: `hash-${tok}`, expiresAt: new Date(Date.now() + 86400_000), criadoEm: antigo });
@@ -72,7 +131,15 @@ async function base(c: MongoClient): Promise<void> {
   await db.collection("clientes").createIndex({ telefoneNormalizado: 1 }, { unique: true, partialFilterExpression: { excluidoEm: null } });
   await db.collection("uploads_midia").createIndex({ chave: 1 }, { unique: true });
   await db.collection("movimentos_caixa").createIndex({ caixaId: 1, dataHora: -1 });
-  // Garante as 27 + 2 coleções (mesmo as que ficaram sem documento).
+  // Os mesmos tipos de índice das coleções do WhatsApp na produção (únicos e parciais) — o restore precisa reproduzi-los.
+  await db.collection("mensagens_whatsapp").createIndex({ idempotencyKey: 1 }, { unique: true, name: "idempotencyKey_unica" });
+  await db.collection("mensagens_whatsapp").createIndex(
+    { chaveDeduplicacao: 1 },
+    { unique: true, name: "chaveDeduplicacao_unica", partialFilterExpression: { chaveDeduplicacao: { $type: "string" } } },
+  );
+  await db.collection("mensagens_whatsapp").createIndex({ wamid: 1 }, { unique: true, name: "wamid_unico", partialFilterExpression: { wamid: { $type: "string" } } });
+  await db.collection("whatsapp_bloqueios").createIndex({ chave: 1 }, { unique: true, name: "chave_ativa_unica", partialFilterExpression: { ativo: true } });
+  // Garante as 29 + 2 coleções (mesmo as que ficaram sem documento).
   const existentes = (await db.listCollections({}, { nameOnly: true }).toArray()).map((x) => x.name);
   for (const n of [...COLECOES_BACKUP, ...COLECOES_EXCLUIDAS]) if (!existentes.includes(n)) await db.createCollection(n);
 }

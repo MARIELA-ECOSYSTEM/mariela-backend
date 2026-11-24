@@ -97,26 +97,28 @@ try {
     "outroDB e test recusados antes do dump (BANCO_DIVERGENTE); nenhum archive"
   }
 
-  Caso "T03" "lista positiva: exatamente as 27 coleções no archive" {
+  Caso "T03" "lista positiva: exatamente as 29 coleções no archive (inclui as do WhatsApp)" {
     $v = Invoke-CliBackup -Argumentos @("validar-para-restore", "--arquivo", $archiveA, "--manifesto", ($archiveA -replace '\.archive\.gz$', '.manifest.json'))
     Exigir $v.resultado.ok "validação do archive falhou"
     $exatas = $v.resultado.verificacoes | Where-Object { $_.id -eq "archive.colecoes_exatas" }
-    Exigir ($exatas.ok -and $exatas.detalhe -match "^27 coleções") "não são 27: $($exatas.detalhe)"
+    Exigir ($exatas.ok -and $exatas.detalhe -match "^29 coleções") "não são 29: $($exatas.detalhe)"
+    $nomesArchive = @($manA.archive.documentosPorColecao.PSObject.Properties.Name)
+    Exigir ($nomesArchive -contains "mensagens_whatsapp" -and $nomesArchive -contains "whatsapp_bloqueios") "coleções do WhatsApp fora do archive"
     $exatas.detalhe
   }
 
   Caso "T04" "tokens excluídos (refresh_tokens e vendedor_refresh_tokens fora do archive; existiam na origem)" {
     $nomes = @($manA.archive.documentosPorColecao.PSObject.Properties.Name)
-    Exigir ($nomes.Count -eq 27 -and $nomes -notcontains "refresh_tokens" -and $nomes -notcontains "vendedor_refresh_tokens") "tokens presentes"
+    Exigir ($nomes.Count -eq 29 -and $nomes -notcontains "refresh_tokens" -and $nomes -notcontains "vendedor_refresh_tokens") "tokens presentes"
     Exigir (@($manA.politica.colecoesExcluidas) -join "," -eq "refresh_tokens,vendedor_refresh_tokens") "política divergente"
-    "origem tinha 29 coleções (com 1 documento em cada token); archive tem 27"
+    "origem tinha 31 coleções (com 1 documento em cada token); archive tem 29"
   }
 
   Caso "T05" "manifesto completo e coerente" {
     Exigir ($manA.estado -eq "VALIDO_LOCAL" -and $manA.formato -eq "mariela-backup-manifesto/1") "estado/formato"
     Exigir ($manA.iniciadoEm -match '[+-]\d{2}:\d{2}$') "data/hora sem fuso: $($manA.iniciadoEm)"
     Exigir ($manA.ferramentas.mongodump -eq "100.17.0" -and $manA.servidor.versao -eq "8.0.37" -and $manA.archive.versaoServidor -eq "8.0.37") "versões"
-    Exigir ($manA.origem.banco -eq "marielaDB" -and $manA.indices.total -gt 27) "origem/índices"
+    Exigir ($manA.origem.banco -eq "marielaDB" -and $manA.indices.total -gt 29) "origem/índices"
     Exigir ($manA.consistencia -match "não é snapshot transacional") "declaração de consistência ausente"
     Exigir (@($manA.validacoes | Where-Object { -not $_.ok }).Count -eq 0) "validação com falha"
     $proibidos = Select-String -LiteralPath ($archiveA -replace '\.archive\.gz$', '.manifest.json') -Pattern 'mongodb://|127\.0\.0\.1|password|senha' -SimpleMatch:$false
@@ -301,7 +303,7 @@ try {
     "JA_REALIZADO; retomada às 09:00 do dia seguinte coletou só depois das verificações"
   }
 
-  Caso "T19" "restore sintético isolado (27118): 27 coleções, índices, contagens, referências, sequências" {
+  Caso "T19" "restore sintético isolado (27118): 29 coleções, índices, contagens, referências, sequências" {
     $r = Restore $archiveA @("-BancoDestino", "mariela_restore_20260101_000002")
     Exigir ($r.Codigo -eq 0) "restore falhou: $($r.Saida) $($r.Erro)"
     $rel = Get-Content -LiteralPath (Join-Path $raiz "relatorios\restore_mariela_restore_20260101_000002.json") -Raw -Encoding UTF8 | ConvertFrom-Json

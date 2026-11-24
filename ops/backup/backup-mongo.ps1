@@ -7,14 +7,14 @@
     1. Pré-condições locais: config do mongodump e pasta de destino com ACL restrita (conta atual + SYSTEM),
        trava contra execução concorrente.
     2. Pré-backup (só leitura na origem): banco exatamente marielaDB; coleções da origem = lista positiva
-       (27) + excluídas (refresh_tokens, vendedor_refresh_tokens), nada a mais/a menos; backup diário devido
+       (29) + excluídas (refresh_tokens, vendedor_refresh_tokens), nada a mais/a menos; backup diário devido
        (23:45; retomada quando o computador for ligado); janela sem escrita (15 min), caixas fechados,
        nenhuma reconciliação de estoque com retry vencido/próximo; assinaturas, índices, referências, sequências.
        Não elegível ⇒ nada é coletado (ADIADO / JA_REALIZADO) ou o backup é BLOQUEADO (política divergente).
     3. mongodump --config (URI nunca na linha de comando) --db marielaDB --excludeCollection (2) --gzip --archive
        para um temporário.
     4. Pós-backup: assinaturas de novo (escrita durante o dump ⇒ INVALIDO), leitura estrutural do archive
-       (exatamente os 27 namespaces de marielaDB, contagens = origem, índices = origem, versão), SHA-256, manifesto.
+       (exatamente os 29 namespaces de marielaDB, contagens = origem, índices = origem, versão), SHA-256, manifesto.
     5. VALIDO_LOCAL ⇒ nome definitivo (sem sobrescrever) + .sha256 + manifesto + retenção (14/8/12, 5 extras,
        inválidos 7 dias, piso de 2). INVALIDO ⇒ prefixo mariela_invalido_ (evidência), SEM retenção.
   A consistência é OPERACIONAL (janela sem escrita + assinaturas antes/depois), não um snapshot transacional.

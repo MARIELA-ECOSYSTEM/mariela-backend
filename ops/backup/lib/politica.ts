@@ -8,10 +8,13 @@
 export const BANCO_ORIGEM = "marielaDB";
 
 /**
- * LISTA POSITIVA das 27 coleções que entram no backup (fonte de verdade). O `mongodump` 100.17.0 não tem
+ * LISTA POSITIVA das 29 coleções que entram no backup (fonte de verdade). O `mongodump` 100.17.0 não tem
  * `--nsInclude`; por isso o backup (1) recusa a origem se ela tiver coleção fora de `COLECOES_BACKUP ∪
  * COLECOES_EXCLUIDAS` ou se faltar alguma de `COLECOES_BACKUP`, (2) passa `--excludeCollection` só para as excluídas e
- * (3) confere no archive gerado que os namespaces são EXATAMENTE estes 27.
+ * (3) confere no archive gerado que os namespaces são EXATAMENTE estes 29.
+ *
+ * Fase 22.8.9.10.3.1 — 27 → 29: `mensagens_whatsapp` (histórico de envios por template) e `whatsapp_bloqueios`
+ * (pedidos de não contato — evidência que não pode se perder num restore), criadas pela Fase 22.8.9.10.3.
  */
 export const COLECOES_BACKUP = [
   "adquirentes",
@@ -33,6 +36,7 @@ export const COLECOES_BACKUP = [
   "eventos_venda",
   "eventos_vendedor",
   "fornecedores",
+  "mensagens_whatsapp",
   "movimentacoes_estoque",
   "movimentos_caixa",
   "produtos",
@@ -41,6 +45,7 @@ export const COLECOES_BACKUP = [
   "usuarios",
   "vendas",
   "vendedores",
+  "whatsapp_bloqueios",
 ] as const;
 
 export type ColecaoBackup = (typeof COLECOES_BACKUP)[number];
@@ -87,14 +92,24 @@ export const ASSINATURA_POR_COLECAO: Record<ColecaoBackup, { estrategia: "timest
   // Datas que EXISTEM em uploads_midia (melhoram a janela), mas reservar/descartar/limpar não as atualizam — por isso hash.
   uploads_midia: { estrategia: "conteudo", camposData: ["criadoEm", "reservadoEm", "confirmadoEm", "removidoEm", "limpezaIniciadaEm"] },
   sequencias: { estrategia: "conteudo", camposData: [] },
+  // Fase 22.8.9.10.3.1 — schemas SEM `timestamps` do Mongoose (datas gravadas pelo repositório; o desbloqueio só grava
+  // `desbloqueadoEm`), então a regra é `conteudo`, como `uploads_midia`. `mensagens_whatsapp` grava `atualizadoEm` em
+  // TODA transição (melhora a janela); a garantia, porém, é o hash. Limite do hash: `LIMITE_DOCS_HASH` (janela.ts).
+  mensagens_whatsapp: {
+    estrategia: "conteudo",
+    camposData: ["atualizadoEm", "criadoEm", "enviandoEm", "aceitaEm", "entregueEm", "lidaEm", "falhaEm", "liberadaEm"],
+  },
+  whatsapp_bloqueios: { estrategia: "conteudo", camposData: ["criadoEm", "desbloqueadoEm"] },
 };
 
 /** Sessões: nunca entram no backup. O backend recria as coleções e os índices (inclusive TTL) no boot; todos fazem login de novo. */
 export const COLECOES_EXCLUIDAS = ["refresh_tokens", "vendedor_refresh_tokens"] as const;
 
 /**
- * Referência INFORMATIVA (estado lido em 09/11/2026): 103 índices nas 27 coleções. A validação usa os índices
+ * Referência INFORMATIVA (estado lido em 09/11/2026): 103 índices nas 27 coleções de então. A validação usa os índices
  * REAIS lidos da origem no momento do backup; divergência desta referência só gera aviso no manifesto.
+ * Fase 22.8.9.10.3.1: valor NÃO atualizado — as 2 coleções do WhatsApp só terão índices na origem depois do deploy,
+ * e a origem real não foi lida nesta fase. Até a próxima leitura, o manifesto mostra esse aviso (só informativo).
  */
 export const INDICES_REFERENCIA = 103;
 

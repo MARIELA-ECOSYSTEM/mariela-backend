@@ -29,7 +29,7 @@ function opcoesTimestampPorColecao(): Record<string, { atualizadoEm: boolean; cr
 
 /**
  * Fase 60.4.3.4.21.2 — a lista positiva do backup não pode divergir do código: TODA coleção declarada num schema
- * (`collection: "..."`) está em exatamente uma das listas (27 incluídas + 2 excluídas). Uma coleção nova no código
+ * (`collection: "..."`) está em exatamente uma das listas (29 incluídas + 2 excluídas). Uma coleção nova no código
  * quebra este teste até a política ser revisada.
  */
 
@@ -50,8 +50,9 @@ function colecoesDosSchemas(): string[] {
 }
 
 describe("política de backup", () => {
-  it("27 incluídas + 2 excluídas = exatamente as coleções declaradas nos schemas, sem sobreposição", () => {
-    expect(COLECOES_BACKUP).toHaveLength(27);
+  it("29 incluídas + 2 excluídas = exatamente as coleções declaradas nos schemas, sem sobreposição", () => {
+    expect(COLECOES_BACKUP).toHaveLength(29);
+    expect(new Set(COLECOES_BACKUP).size).toBe(COLECOES_BACKUP.length); // sem repetição
     expect(COLECOES_EXCLUIDAS).toEqual(["refresh_tokens", "vendedor_refresh_tokens"]);
     expect(COLECOES_BACKUP.filter((c) => (COLECOES_EXCLUIDAS as readonly string[]).includes(c))).toEqual([]);
     const declaradas: string[] = [...COLECOES_BACKUP, ...COLECOES_EXCLUIDAS].sort();
@@ -62,7 +63,19 @@ describe("política de backup", () => {
     expect(RETENCAO).toEqual({ diarios: 14, semanais: 8, mensais: 12, extraordinarios: 5, invalidosDias: 7, minimoValidos: 2 });
   });
 
-  it("R21-2.1-01: estratégia de assinatura declarada para as 27 e coerente com os schemas reais", () => {
+  it("Fase 22.8.9.10.3.1: as coleções do WhatsApp estão PROTEGIDAS (incluídas, nunca excluídas) e assinadas por conteúdo", () => {
+    for (const c of ["mensagens_whatsapp", "whatsapp_bloqueios"] as const) {
+      expect(COLECOES_BACKUP as readonly string[]).toContain(c);
+      expect(COLECOES_EXCLUIDAS as readonly string[]).not.toContain(c);
+      // Os schemas não usam `timestamps` do Mongoose: só `conteudo` detecta toda atualização.
+      expect(ASSINATURA_POR_COLECAO[c].estrategia).toBe("conteudo");
+    }
+    // Toda transição de mensagem grava `atualizadoEm`; o desbloqueio grava `desbloqueadoEm` (melhoram a janela).
+    expect(ASSINATURA_POR_COLECAO.mensagens_whatsapp.camposData).toContain("atualizadoEm");
+    expect(ASSINATURA_POR_COLECAO.whatsapp_bloqueios.camposData).toEqual(["criadoEm", "desbloqueadoEm"]);
+  });
+
+  it("R21-2.1-01: estratégia de assinatura declarada para as 29 e coerente com os schemas reais", () => {
     expect(Object.keys(ASSINATURA_POR_COLECAO).sort()).toEqual([...COLECOES_BACKUP].sort());
     const schemas = opcoesTimestampPorColecao();
     for (const [colecao, regra] of Object.entries(ASSINATURA_POR_COLECAO)) {

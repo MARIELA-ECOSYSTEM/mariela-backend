@@ -78,7 +78,7 @@ export function validarBackup(pre: PreBackup, depois: Assinatura, archive: Archi
   validacoes.push({
     id: "archive.contagens_iguais_origem",
     ok: contagensDivergentes.length === 0,
-    detalhe: contagensDivergentes.length ? `divergem: ${contagensDivergentes.map((c) => `${c}(archive=${archive.documentos[`${BANCO_ORIGEM}.${c}`] ?? 0}, origem=${depois[c]?.contagem ?? "?"})`).join(", ")}` : "27 contagens iguais",
+    detalhe: contagensDivergentes.length ? `divergem: ${contagensDivergentes.map((c) => `${c}(archive=${archive.documentos[`${BANCO_ORIGEM}.${c}`] ?? 0}, origem=${depois[c]?.contagem ?? "?"})`).join(", ")}` : `${COLECOES_BACKUP.length} contagens iguais`,
   });
 
   const indicesDivergentes = COLECOES_BACKUP.filter((c) => {
@@ -129,7 +129,7 @@ export function validarArchiveParaRestore(archive: ArchiveLido, manifesto: Manif
   const v = verificarArchiveContraPolitica(archive, BANCO_ORIGEM, COLECOES_BACKUP);
   v.push({ id: "manifesto.estado", ok: manifesto.estado === "VALIDO_LOCAL" && manifesto.formato === FORMATO_MANIFESTO, detalhe: `estado=${manifesto.estado}` });
   const divergentes = COLECOES_BACKUP.filter((c) => (archive.documentos[`${BANCO_ORIGEM}.${c}`] ?? 0) !== (manifesto.archive?.documentosPorColecao[c] ?? -1));
-  v.push({ id: "archive.contagens_iguais_manifesto", ok: divergentes.length === 0, detalhe: divergentes.length ? `divergem: ${divergentes.join(", ")}` : "27 contagens iguais ao manifesto" });
+  v.push({ id: "archive.contagens_iguais_manifesto", ok: divergentes.length === 0, detalhe: divergentes.length ? `divergem: ${divergentes.join(", ")}` : `${COLECOES_BACKUP.length} contagens iguais ao manifesto` });
   v.push({
     id: "archive.versao_igual_manifesto",
     ok: !!archive.versaoServidor && archive.versaoServidor === manifesto.archive?.versaoServidor,
@@ -167,7 +167,7 @@ export async function validarRestaurado(db: Db, manifesto: Manifesto): Promise<V
     const n = await db.collection(c).countDocuments({});
     if (n !== manifesto.assinaturaDepois?.[c]?.contagem) contagens.push(`${c}(restaurado=${n}, manifesto=${manifesto.assinaturaDepois?.[c]?.contagem ?? "?"})`);
   }
-  v.push({ id: "restaurado.contagens", ok: contagens.length === 0, detalhe: contagens.length ? contagens.join(", ") : "27 contagens iguais ao manifesto" });
+  v.push({ id: "restaurado.contagens", ok: contagens.length === 0, detalhe: contagens.length ? contagens.join(", ") : `${COLECOES_BACKUP.length} contagens iguais ao manifesto` });
 
   const indices = await lerIndices(db, COLECOES_BACKUP);
   const idxDiv = COLECOES_BACKUP.filter((c) => !iguaisJson(indices[c], manifesto.indices?.porColecao[c]));

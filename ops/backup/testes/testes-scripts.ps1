@@ -91,7 +91,7 @@ function Invoke-CliBackup {
     "retencao" { '{"ok":true,"resultado":{"apagados":[]}}' }
     "validar-para-restore" { if ($c.validarArchiveOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"verificacoes":[{"id":"archive.legivel","ok":false,"detalhe":"GZIP_INVALIDO"}]}}' } else { '{"ok":true,"resultado":{"ok":true,"verificacoes":[]}}' } }
     "preparar-restore" { '{"ok":true,"resultado":' + ($c.preparar | ConvertTo-Json -Compress -Depth 5) + '}' }
-    "politica" { '{"ok":true,"resultado":{"colecoesIncluidas":[' + ((1..27 | ForEach-Object { '"c' + $_ + '"' }) -join ",") + ']}}' }
+    "politica" { '{"ok":true,"resultado":{"colecoesIncluidas":[' + ((1..29 | ForEach-Object { '"c' + $_ + '"' }) -join ",") + ']}}' }
     "validar-restaurado" { if ($c.validarRestauradoOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"verificacoes":[{"id":"restaurado.contagens","ok":false,"detalhe":"x"}]}}' } else { '{"ok":true,"resultado":{"ok":true,"verificacoes":[]}}' } }
     "adquirir-posse" { if ($c.posseFalha) { '{"ok":true,"resultado":{"ok":false,"adquirida":false,"motivo":"' + $c.posseFalha + '","colecoesAlheias":["x"],"controleRemovido":true}}' } else { '{"ok":true,"resultado":{"ok":true,"adquirida":true}}' } }
     "marcar-estado" { if ($c.marcarFalha -eq $o["para"]) { '{"ok":true,"resultado":{"ok":false,"de":"PREPARANDO","detalhe":"transição recusada"}}' } else { '{"ok":true,"resultado":{"ok":true,"de":"X","detalhe":"ok"}}' } }
@@ -118,7 +118,7 @@ function Invoke-CliBackup {
       '{"ok":true,"resultado":' + (@{ ok = ($okI -and $prot -and $okA); estado = "VERIFICADO"; verificacoes = @($anc) + @(@{ id = "destino.protegido"; ok = $prot; detalhe = "x" }, @{ id = "integridade.conteudo"; ok = $okI; detalhe = "x" }); divergencias = @($(if (-not $okI) { @{ colecao = "c1"; divergentes = 1 } })) } | ConvertTo-Json -Compress -Depth 6) + '}'
     }
     "conferir-trava" { if ($c.travaOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"verificacoes":[{"id":"trava.dono_inicio","ok":false}]}}' } else { '{"ok":true,"resultado":{"ok":true,"verificacoes":[]}}' } }
-    "iniciar-uso" { if ($c.usoOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"estado":"INTERVENCAO_NECESSARIA","detalhe":"o destino não confere com o VERIFICADO"}}' } else { '{"ok":true,"resultado":{"ok":true,"estado":"EM_USO","detalhe":"EM_USO: 27 coleções descongeladas","descongeladas":["c1"]}}' } }
+    "iniciar-uso" { if ($c.usoOk -eq $false) { '{"ok":true,"resultado":{"ok":false,"estado":"INTERVENCAO_NECESSARIA","detalhe":"o destino não confere com o VERIFICADO"}}' } else { '{"ok":true,"resultado":{"ok":true,"estado":"EM_USO","detalhe":"EM_USO: 29 coleções descongeladas","descongeladas":["c1"]}}' } }
     "local-estado" { '{"ok":true,"resultado":' + (@{ dbPath = $c.dbPath; autenticacao = $true; porta = 27118 } | ConvertTo-Json -Compress) + '}' }
     "local-desligar" { if ($c.dormirDesligar) { Start-Sleep -Seconds ([int]$c.dormirDesligar) }; if ($c.desligarRecusado) { '{"ok":false,"codigo":"UsoInvalidoErro","mensagem":"trava de restore não comprovada"}' } else { '{"ok":true,"resultado":{"desligado":true}}' } }
     "local-rs-iniciar" { '{"ok":true,"resultado":{"replicaSet":"rs-restore","primario":true}}' }

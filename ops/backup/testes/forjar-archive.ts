@@ -6,7 +6,7 @@ import { BANCO_ORIGEM, COLECOES_BACKUP } from "../lib/politica.js";
 /**
  * Fase 60.4.3.4.21.2 — SOMENTE TESTES. Forja, a partir de um backup VÁLIDO, uma cópia "incompatível" com SHA-256
  * coerente (para provar que o restore recusa pelo CONTEÚDO, não só pelo hash):
- *   versao  → archive sintético das 27 coleções declarando server_version 8.2.1 (destino é 8.0.37)
+ *   versao  → archive sintético das 29 coleções declarando server_version 8.2.1 (destino é 8.0.37)
  *   banco   → archive sintético cujo único banco é "outroDB"
  * Uso: bun --no-env-file ops/backup/testes/forjar-archive.ts <versao|banco> <manifesto-original> <archive-saida> <manifesto-saida>
  */

@@ -19,14 +19,16 @@ function codigoDoErro(fn: () => unknown): string {
 }
 
 describe("lerArchive", () => {
-  it("archive conforme: 27 coleções, contagens, versões e todas com bloco de fim", () => {
+  it("archive conforme: 29 coleções, contagens, versões e todas com bloco de fim", () => {
     const lido = lerArchive(montarArchive({ colecoes: conformes() }));
     expect(lido.versaoServidor).toBe("8.0.37");
     expect(lido.versaoFerramenta).toBe("100.17.0");
-    expect(lido.colecoes).toHaveLength(27);
+    expect(lido.colecoes).toHaveLength(29);
     expect(lido.documentos[`${BANCO_ORIGEM}.produtos`]).toBe(2);
     expect(lido.documentos[`${BANCO_ORIGEM}.vendas`]).toBe(0);
-    expect(lido.comFim).toHaveLength(27);
+    expect(lido.documentos[`${BANCO_ORIGEM}.mensagens_whatsapp`]).toBe(0);
+    expect(lido.documentos[`${BANCO_ORIGEM}.whatsapp_bloqueios`]).toBe(0);
+    expect(lido.comFim).toHaveLength(29);
     expect(verificarArchiveContraPolitica(lido, BANCO_ORIGEM, COLECOES_BACKUP).every((v) => v.ok)).toBe(true);
   });
 

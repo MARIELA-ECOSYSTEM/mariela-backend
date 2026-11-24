@@ -23,15 +23,17 @@ Fonte de verdade dos parâmetros: [`ops/backup/lib/politica.ts`](../ops/backup/l
 ## Política (resumo)
 
 - **Banco:** só `marielaDB`. Qualquer outro (inclusive `test`) aborta antes do dump (`BANCO_DIVERGENTE`).
-- **Coleções:** o banco tem **29**; o backup leva **27** (lista positiva em `politica.ts`). Excluídas: `refresh_tokens` e
+- **Coleções:** o banco tem **31**; o backup leva **29** (lista positiva em `politica.ts`). Excluídas: `refresh_tokens` e
   `vendedor_refresh_tokens` — o backend recria as coleções e os índices (inclusive TTL) no boot; **todos fazem login de
-  novo** após um restore.
+  novo** após um restore. Fase 22.8.9.10.3.1: 27 → 29 com `mensagens_whatsapp` (histórico de envios por template) e
+  `whatsapp_bloqueios` (pedidos de não contato — evidência que não pode se perder num restore).
 - **Lista positiva aplicada:** o `mongodump` 100.17.0 **não tem `--nsInclude`**. Por isso o backup (1) recusa a origem
-  (BLOQUEADO) se ela tiver coleção fora de 27+2 ou se faltar alguma das 27, (2) passa `--excludeCollection` só para as 2
-  excluídas e (3) confere no archive que os namespaces são **exatamente** os 27 de `marielaDB`. Um teste unitário
+  (BLOQUEADO) se ela tiver coleção fora de 29+2 ou se faltar alguma das 29, (2) passa `--excludeCollection` só para as 2
+  excluídas e (3) confere no archive que os namespaces são **exatamente** os 29 de `marielaDB`. Um teste unitário
   (`politica.spec.ts`) quebra se o código ganhar uma coleção nova sem revisão da política.
-- **Índices:** 103 nas 27 coleções em 09/11/2026 (referência informativa). A validação usa os índices **reais** lidos
-  da origem no momento do backup; o archive precisa trazê-los idênticos.
+- **Índices:** 103 nas 27 coleções de então, em 09/11/2026 (referência informativa, **não** atualizada na 22.8.9.10.3.1:
+  a origem real não foi lida; até lá o manifesto mostra um aviso). A validação usa os índices **reais** lidos da origem
+  no momento do backup; o archive precisa trazê-los idênticos.
 - **Janela:** horário-alvo **23:45**; **15 min** sem escrita; retomada quando o computador for ligado.
 - **Retenção (local):** 14 diários · 8 semanais · 12 mensais · 5 extraordinários · inválidos por 7 dias · nunca menos de
   2 válidos · nunca o válido mais novo · só depois de um backup novo VÁLIDO.
@@ -134,7 +136,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops\backup\backup-mongo.
 
 Fluxo (falha FECHADA em cada etapa): ACL e trava → **pré-backup só de leitura** (banco, coleções, devido, janela,
 assinaturas, índices, referências, sequências) → `mongodump --config --db=marielaDB --readPreference=primary --gzip
---archive=<tmp> --excludeCollection=…` → **pós-backup** (assinaturas de novo, leitura estrutural do archive, 27
+--archive=<tmp> --excludeCollection=…` → **pós-backup** (assinaturas de novo, leitura estrutural do archive, 29
 namespaces, contagens = origem, índices = origem, versão, SHA-256, manifesto) → nome definitivo **sem sobrescrever**,
 na ordem archive → `.sha256` → **manifesto por último** (o manifesto é o "commit": sem ele a cópia nunca é válida) →
 retenção. A saída do `mongodump` **não** é registrada (mensagens de conexão podem conter host).
@@ -157,7 +159,7 @@ SHA-256, tamanho, retenção). Retenção: `<BackupDir>\logs\retencao_<carimbo>.
 
 ### Manifesto (`<base>.manifest.json`)
 
-Execução (`execucaoId`, tipo, início/fim com fuso, `dataLocal`), versões (mongodump, servidor), banco, política (27 +
+Execução (`execucaoId`, tipo, início/fim com fuso, `dataLocal`), versões (mongodump, servidor), banco, política (29 +
 2), verificações da janela, **assinaturas antes e depois** (por coleção, conforme a estratégia — ver "Assinatura por
 coleção"), índices normalizados por coleção,
 referências (número de ids órfãos por regra), sequências (`valor` × maior código emitido), dados do archive (SHA-256,
@@ -170,19 +172,20 @@ Limite técnico: a leitura estrutural descompacta o archive em memória até **1
 
 ### Assinatura por coleção (Fase 21.2.2, R21-2.1-01)
 
-A estratégia de cada uma das 27 coleções é **declarada** em `ASSINATURA_POR_COLECAO` (`politica.ts`), conferida contra
+A estratégia de cada uma das 29 coleções é **declarada** em `ASSINATURA_POR_COLECAO` (`politica.ts`), conferida contra
 os schemas por teste unitário — nunca deduzida só pela presença de um timestamp:
 
 | Estratégia | Coleções | Assinatura |
 | --- | --- | --- |
 | `timestamp` | adquirentes, caixas, campanhas, clientes, colecoes, configuracoes, fornecedores, produtos, usuarios, vendas, vendedores (schema com `atualizadoEm`) | contagem + maior `atualizadoEm`/`criadoEm` |
 | `insercao` | os 12 `eventos_*`, movimentacoes_estoque, movimentos_caixa (só `criadoEm`, sem atualização no código) | contagem + maior `criadoEm` |
-| `conteudo` | **uploads_midia** (reservar/descartar/limpar alteram `estado`/`tokenReserva` sem tocar em data), sequencias (sem data) | contagem + maior data disponível + **SHA-256 do conteúdo inteiro** |
+| `conteudo` | **uploads_midia** (reservar/descartar/limpar alteram `estado`/`tokenReserva` sem tocar em data), sequencias (sem data), **mensagens_whatsapp** e **whatsapp_bloqueios** (schemas sem `timestamps` do Mongoose; o desbloqueio só grava `desbloqueadoEm`) | contagem + maior data disponível + **SHA-256 do conteúdo inteiro** |
 
 O hash é determinístico (ordem por `_id`, EJSON canônico), calculado **em fluxo** (memória constante) e limitado a
 **5.000 documentos** por coleção: acima disso, ou se a contagem mudar durante a leitura, a assinatura é **não
 confiável** e o backup FALHA (nunca "estável" presumido). Custo: uma leitura completa de cada coleção `conteudo` por
-assinatura (duas por backup). Quando `uploads_midia` se aproximar do limite, a política precisa ser revista.
+assinatura (duas por backup). Quando `uploads_midia` ou **`mensagens_whatsapp`** (histórico que só cresce — o risco
+mais próximo) se aproximar do limite, a política precisa ser revista: acima de 5.000 documentos o backup FALHA.
 **Limite da janela:** atualizações SEM data (ex.: descartar um upload pendente) não podem ser datadas — a verificação
 `janela.sem_escrita` declara isso no detalhe; elas são detectadas pela comparação **antes/depois** do dump (hash), que
 invalida o backup se houver mudança durante a coleta. Escritores que gravam direto no driver sem atualizar
@@ -194,7 +197,7 @@ invalida o backup se houver mudança durante a coleta. Escritores que gravam dir
 - **Computador ligado depois das 23:45** (ou execução perdida): continua devido, mas **só coleta se a janela passar** —
   nunca "imediatamente".
 - **Verificações (todas leituras; qualquer falha → ADIADO; erro de leitura ou assinatura não confiável → FALHA):**
-  caixas abertos = 0; maior data **registrada** das 27 coleções ≥ 15 min atrás (data no futuro também adia; atualizações
+  caixas abertos = 0; maior data **registrada** das 29 coleções ≥ 15 min atrás (data no futuro também adia; atualizações
   sem data — estratégia `conteudo` — são cobertas pela comparação antes/depois, ver "Assinatura por coleção"); nenhuma linha de reconciliação `pendente`/
   `falha_recuperavel` com retry vencido ou em até 60 min (o worker poderia escrever durante o dump); vendas
   `em_pagamento` e linhas `requer_intervencao` são registradas.
@@ -284,12 +287,12 @@ Fluxo do `restore-test.ps1` (Fases 21.2.2, 21.2.4, 21.2.6 e 21.2.8):
   (bun/CLI, mongorestore) morre com ele. Sem o job, nada prossegue. (O `backup-mongo.ps1` também usa o job desde a 21.2.8.)
 - **0. Identidade:** processo da porta = `mongod.exe` da raiz, só `127.0.0.1`; já conectado: `dbPath`, marcador, bind,
   replica set **e `instanciaId`** (documento na instância = cópia local `seguranca\instancia.json`).
-- **1. Antes de qualquer escrita:** SHA-256 = manifesto = `.sha256`; manifesto `VALIDO_LOCAL`; 27 namespaces e
+- **1. Antes de qualquer escrita:** SHA-256 = manifesto = `.sha256`; manifesto `VALIDO_LOCAL`; 29 namespaces e
   contagens; mesma série de versão; banco `mariela_restore_yyyyMMdd_HHmmss` **inexistente** (nunca `marielaDB`).
 - **2. PREPARANDO:** âncora externa criada (`<Raiz>\evidencias\<destino>__<execucaoId>.jsonl`) e então a posse atômica
   (`_id:"posse"`) com `execucaoId`, **nome do banco**, **`instanciaId`**, processo, SHA-256 e caminhos de archive e manifesto.
 - **3. RESTAURANDO:** `mongorestore` com o usuário **restore** (sem `--drop`, sem bypass), senha só pelo stdin.
-- **4. VALIDANDO:** o **guardião** congela as 27 coleções (validador + `strict` + `error`) e só então declara VALIDANDO;
+- **4. VALIDANDO:** o **guardião** congela as 29 coleções (validador + `strict` + `error`) e só então declara VALIDANDO;
   verificação integral (abaixo).
 - **5. VERIFICADO:** evidências gravadas na posse **e** na âncora externa; segunda verificação com o destino já
   VERIFICADO tem de dar as mesmas evidências (senão `INTERVENCAO_NECESSARIA`).
@@ -301,7 +304,7 @@ Fluxo do `restore-test.ps1` (Fases 21.2.2, 21.2.4, 21.2.6 e 21.2.8):
 1. o restore terminou (código 0, 0 documentos com falha, sem `Cross-version`);
 2. comparação integral archive × destino aprovada (conteúdo byte a byte, índices completos, opções de coleção);
 3. nenhum documento, coleção (inclusive `system.*`) ou índice alheio;
-4. proteção **completa** ativa: as 27 coleções com validador de congelamento **e** `validationLevel: "strict"` **e**
+4. proteção **completa** ativa: as 29 coleções com validador de congelamento **e** `validationLevel: "strict"` **e**
    `validationAction: "error"` (A21-7-01 — sem os três, a coleção não está protegida);
 5. posse persistida como **VERIFICADO**, desta execução, deste banco e desta instância;
 6. archive e manifesto vinculados por SHA-256 **e âncora externa conferida** (registro local íntegro e coerente);
@@ -357,7 +360,7 @@ reprovada ⇒ **nenhuma** garantia efetiva. `Inspecionar` nunca compara com o ar
 | --- | --- | --- | --- |
 | — | PREPARANDO | restore-test (guardião) | âncora criada; posse atômica; banco só com a coleção de controle |
 | PREPARANDO | RESTAURANDO | restore-test (guardião) | trava + posse + âncora; então o mongorestore (restore) |
-| RESTAURANDO | VALIDANDO | restore-test (guardião) | **depois** de congelar (completo) as 27 coleções |
+| RESTAURANDO | VALIDANDO | restore-test (guardião) | **depois** de congelar (completo) as 29 coleções |
 | VALIDANDO | VERIFICADO | restore-test (guardião) | verificação integral aprovada; evidências na posse e na âncora; 2ª verificação igual |
 | PREPARANDO/RESTAURANDO/VALIDANDO | FALHOU_DESTINO_PARCIAL | restore-test | falha depois de adquirir a posse |
 | VERIFICADO | LIBERACAO_AUTORIZADA | operador (`Liberar`) | reverificação integral = evidências + âncora; **não descongela** |
@@ -451,7 +454,7 @@ Não foi ampliado nenhum privilégio. Revisar se a instância isolada passar a h
 Nunca `dropDatabase`. Uma função para tudo (`limpar-destino --modo falha|recuperacao|remocao|descarte`):
 
 1. trava desta operação; identidade; âncora externa; posse desta execução/banco/instância em estado do modo;
-2. nenhuma coleção fora das 27 + controle (**inclusive `system.*`**) — senão `INTERVENCAO_NECESSARIA`;
+2. nenhuma coleção fora das 29 + controle (**inclusive `system.*`**) — senão `INTERVENCAO_NECESSARIA`;
 3. congela (as não congeladas); prova: conteúdo ⊆ archive, índices ⊆ archive, opções iguais (falha/recuperação/
    remoção) — ou, no **descarte**, UUID = o registrado no início do uso;
 4. **CAS para REMOVENDO** antes do primeiro drop (nunca VERIFICADO/LIBERACAO com o destino parcial);
@@ -558,7 +561,7 @@ alcança); nunca inclui `*.cred`, `*.key`, `seguranca\`, `.env*` nem binários; 
 
 A integração exige a origem SINTÉTICA `127.0.0.1:27119` (MongoDB 8.0.37 com `dbPath` descartável; dados criados por
 `testes/origem-sintetica.ts`, que só aceita essa porta) e a instância isolada `27118`. Cobre: banco `marielaDB`/recusa
-de `outroDB` e `test`, 27 namespaces, exclusão dos tokens, manifesto, SHA-256, archive vazio/truncado/não-gzip/de outro
+de `outroDB` e `test`, 29 namespaces, exclusão dos tokens, manifesto, SHA-256, archive vazio/truncado/não-gzip/de outro
 banco, falha do mongodump, colisão e trava, retenção com 60 diários + 7 extras + inválidos + legado, cifra (senha
 errada, não-ASCII, portabilidade 5.1↔7), segunda cópia parada em `CIFRADO`, janela (escrita recente, 14 × 16 min, caixa
 aberto, reconciliação pendente, coleção não prevista), retomada, restore isolado completo, recusas de destino/porta/

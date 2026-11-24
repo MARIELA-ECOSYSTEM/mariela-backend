@@ -10,8 +10,8 @@ const ok = (mud: Partial<FatosGarantias> = {}): FatosGarantias => ({
   identidadePosseOk: true,
   identidadeInstanciaOk: true,
   ancora: { presente: true, cadeiaOk: true, estadoAdmitido: true, erro: null },
-  congeladas: 27,
-  colecoesDeDados: 27,
+  congeladas: 29,
+  colecoesDeDados: 29,
   ...mud,
 });
 const nada = { igualAoArchive: false, protegido: false, utilizavel: false };
@@ -56,9 +56,9 @@ describe("N4 — Inspecionar (sem reverificação)", () => {
     expect(garantiasEfetivas(ok({ documentosDePosse: 2 })).efetivas).toEqual(nada);
   });
   it("proteção incompleta (uma coleção descongelada) ⇒ protegido INDISPONIVEL", () => {
-    const g = garantiasEfetivas(ok({ congeladas: 26 }));
+    const g = garantiasEfetivas(ok({ congeladas: 28 }));
     expect(g.efetivas.protegido).toBe(false);
-    expect(g.situacao.protegido.motivo).toContain("26/27");
+    expect(g.situacao.protegido.motivo).toContain("28/29");
   });
   it("estado NÃO reconhecido ⇒ sem declaração, nenhuma garantia", () => {
     const g = garantiasEfetivas(ok({ estado: "LIBERADO_TALVEZ" }));

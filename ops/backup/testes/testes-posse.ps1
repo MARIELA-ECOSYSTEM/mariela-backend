@@ -175,8 +175,8 @@ try {
     $r1 = Esperar $p1; $r2 = Esperar $p2
     Exigir ((@($r1.Codigo, $r2.Codigo) | Sort-Object) -join "," -eq "0,1") "códigos $($r1.Codigo),$($r2.Codigo)"
     $s = Estado $b
-    Exigir ($s.dados -eq 27 -and $s.posse.Count -eq 1 -and $s.posse[0].estado -eq "VERIFICADO" -and $s.congeladas -eq 27) "destino: dados=$($s.dados) posse=$($s.posse | ConvertTo-Json -Compress) congeladas=$($s.congeladas)"
-    "um PASSOU (destino VERIFICADO, 27 coleções congeladas), outro recusado"
+    Exigir ($s.dados -eq 29 -and $s.posse.Count -eq 1 -and $s.posse[0].estado -eq "VERIFICADO" -and $s.congeladas -eq 29) "destino: dados=$($s.dados) posse=$($s.posse | ConvertTo-Json -Compress) congeladas=$($s.congeladas)"
+    "um PASSOU (destino VERIFICADO, 29 coleções congeladas), outro recusado"
   }
   Caso "T01b" "dois restore-test SIMULTÂNEOS em destinos DIFERENTES → a trava local serializa: um prossegue, o outro é recusado" {
     $b2 = Banco 2; $b3 = Banco 3
@@ -232,10 +232,11 @@ try {
     $v = JsonDe (Esperar $vig 130)
     $null = Esperar $p
     $rel = Relatorio $b
-    Exigir ($v.inserido -and $v.viu -lt 28) "a escrita não ocorreu durante o restore: $($v | ConvertTo-Json -Compress)"
+    # 30 = 29 coleções de dados + 1 de controle (posse): menos que isso = o mongorestore ainda não tinha terminado.
+    Exigir ($v.inserido -and $v.viu -lt 30) "a escrita não ocorreu durante o restore: $($v | ConvertTo-Json -Compress)"
     Exigir ($rel.resultado -ne "PASSOU" -and $rel.exigeIntervencao) "resultado $($rel.resultado)"
     Exigir ((Estado $b).alheios.produtos -eq 1) "documento alheio perdido"
-    "alheio inserido com $($v.viu)/28 coleções criadas; $($rel.resultado); alheio preservado"
+    "alheio inserido com $($v.viu)/30 coleções criadas; $($rel.resultado); alheio preservado"
   }
 
   # ================================== T04: durante/depois da validação ==================================
@@ -282,8 +283,8 @@ try {
     $lb = Gerir "Liberar" $b $r.Rel.execucaoId
     $rm = Gerir "Remover" $b $r.Rel.execucaoId
     $s = Estado $b
-    Exigir ($vf.Rel.resultado -eq "DIVERGENTE" -and $lb.Rel.estadoDepois -eq "INTERVENCAO_NECESSARIA" -and $rm.Codigo -eq 1 -and $s.alheios.vendas -eq 1 -and $s.dados -eq 27) "verificar=$($vf.Rel.resultado) liberar=$($lb.Rel.estadoDepois) remover=$($rm.Rel.resultado) alheio=$($s.alheios.vendas)"
-    "Verificar=DIVERGENTE; Liberar→INTERVENCAO_NECESSARIA; Remover recusado (estado incompatível); alheio e 27 coleções preservados"
+    Exigir ($vf.Rel.resultado -eq "DIVERGENTE" -and $lb.Rel.estadoDepois -eq "INTERVENCAO_NECESSARIA" -and $rm.Codigo -eq 1 -and $s.alheios.vendas -eq 1 -and $s.dados -eq 29) "verificar=$($vf.Rel.resultado) liberar=$($lb.Rel.estadoDepois) remover=$($rm.Rel.resultado) alheio=$($s.alheios.vendas)"
+    "Verificar=DIVERGENTE; Liberar→INTERVENCAO_NECESSARIA; Remover recusado (estado incompatível); alheio e 29 coleções preservados"
   }
 
   # ========================================== T05: durante a limpeza ==========================================
@@ -307,7 +308,7 @@ try {
     Exigir (-not $l.limpo -and $l.motivo -eq "ALHEIO_CRIADO_DURANTE_LIMPEZA") "resultado: $($l.motivo)"
     $s = Estado $b
     Exigir ((@($s.colecoes) -join ",") -eq "alheia_t05" -and $s.alheios.alheia_t05 -eq 1) "estado final: $($s.colecoes -join ',')"
-    "após congelar: 121; após verificar: produtos rejeitada, coleção nova criada; limpeza removeu só as 27 + controle; alheia_t05 preservada"
+    "após congelar: 121; após verificar: produtos rejeitada, coleção nova criada; limpeza removeu só as 29 + controle; alheia_t05 preservada"
   }
   Caso "T05b" "documento alheio ANTES da limpeza → nada removido, descongelamento controlado (A-07), INTERVENCAO" {
     $b = Banco 12; $x = [guid]::NewGuid().ToString(); DestinoComPosse $b $x
@@ -315,8 +316,8 @@ try {
     $l = Aux @("limpar-com-ganchos", $b, $x, $archBase, $manBase, "nenhum")
     Exigir (-not $l.limpo -and $l.motivo -eq "DADOS_ALHEIOS" -and @($l.removidas).Count -eq 0 -and $l.estadoFinal -eq "INTERVENCAO_NECESSARIA") "resultado: $($l.motivo) $($l.estadoFinal)"
     $s = Estado $b
-    Exigir ($s.dados -eq 27 -and $s.alheios.vendas -eq 1 -and $s.congeladas -eq 0) "estado: dados=$($s.dados) congeladas=$($s.congeladas)"
-    "DADOS_ALHEIOS; 0 removidas; 27 coleções intactas; o congelamento aplicado pela limpeza foi desfeito; INTERVENCAO_NECESSARIA"
+    Exigir ($s.dados -eq 29 -and $s.alheios.vendas -eq 1 -and $s.congeladas -eq 0) "estado: dados=$($s.dados) congeladas=$($s.congeladas)"
+    "DADOS_ALHEIOS; 0 removidas; 29 coleções intactas; o congelamento aplicado pela limpeza foi desfeito; INTERVENCAO_NECESSARIA"
   }
   Caso "T05c" "A-05: coleção apagada e RECRIADA com dado alheio entre a verificação e o drop → preservada (collectionUUID)" {
     $b = Banco 13; $x = [guid]::NewGuid().ToString(); DestinoComPosse $b $x
@@ -424,8 +425,8 @@ try {
       $v = JsonDe (Esperar $vig 130)
       Exigir ($v.adulterado) "adulteração não ocorreu"
       Exigir ($r.Codigo -eq 1 -and $r.Rel.resultado -eq "FALHOU_DESTINO_PARCIAL" -and $r.Rel.exigeIntervencao) "$($par[1]): $($r.Rel.resultado)"
-      Exigir ((Estado $b).dados -ge 27) "$($par[1]): coleções removidas"
-      $out += "$($par[1]) → FALHOU_DESTINO_PARCIAL, 27 coleções intactas"
+      Exigir ((Estado $b).dados -ge 29) "$($par[1]): coleções removidas"
+      $out += "$($par[1]) → FALHOU_DESTINO_PARCIAL, 29 coleções intactas"
     }
     $out -join "; "
   }
@@ -450,18 +451,18 @@ try {
   }
 
   # ======================================= T12: fluxo normal do operador =======================================
-  Caso "T12" "fluxo normal: PASSOU = VERIFICADO (posse persistente, 27 congeladas, trava livre) → Liberar → Remover (sem dropDatabase)" {
+  Caso "T12" "fluxo normal: PASSOU = VERIFICADO (posse persistente, 29 congeladas, trava livre) → Liberar → Remover (sem dropDatabase)" {
     $b = Banco 27
     $r = Restore $archBase $b
     Exigir ($r.Codigo -eq 0 -and $r.Rel.resultado -eq "PASSOU" -and $r.Rel.estadoDestino -eq "VERIFICADO") "resultado $($r.Rel.resultado)"
     $s = Estado $b
-    Exigir ($s.dados -eq 27 -and $s.congeladas -eq 27 -and $s.posse[0].estado -eq "VERIFICADO") "destino: $($s | ConvertTo-Json -Compress -Depth 3)"
+    Exigir ($s.dados -eq 29 -and $s.congeladas -eq 29 -and $s.posse[0].estado -eq "VERIFICADO") "destino: $($s | ConvertTo-Json -Compress -Depth 3)"
     $c = LerTrava
     Exigir ($c.livre -eq $true -and $c.ultimaExecucao -eq $r.Rel.execucaoId) "trava não liberada"
     Exigir (@($r.Rel.condicoesPassou.PSObject.Properties | Where-Object { -not $_.Value }).Count -eq 0) "condições do PASSOU"
     $lb = Gerir "Liberar" $b $r.Rel.execucaoId
     $s2 = Estado $b
-    Exigir ($lb.Codigo -eq 0 -and $s2.posse[0].estado -eq "LIBERACAO_AUTORIZADA" -and $s2.dados -eq 27 -and $s2.congeladas -eq 27) "liberação: $($lb.Rel.resultado)"
+    Exigir ($lb.Codigo -eq 0 -and $s2.posse[0].estado -eq "LIBERACAO_AUTORIZADA" -and $s2.dados -eq 29 -and $s2.congeladas -eq 29) "liberação: $($lb.Rel.resultado)"
     $rm = Gerir "Remover" $b $r.Rel.execucaoId
     Exigir ($rm.Codigo -eq 0 -and $rm.Rel.resultado -eq "CANCELADO_COM_LIMPEZA_COMPROVADA" -and -not (Estado $b).existe) "remoção: $($rm.Rel.resultado)"
     "PASSOU → VERIFICADO (8/8 condições); Liberar → LIBERACAO_AUTORIZADA (nada removido, ainda congelado); Remover → banco inexistente"

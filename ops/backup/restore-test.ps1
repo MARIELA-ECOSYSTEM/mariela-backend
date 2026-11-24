@@ -12,7 +12,7 @@
        pelo stdin): RESTORE para mongorestore e leituras; GUARDIÃO para posse, transições, congelamento e limpeza
        (Fase 21.2.8: nenhum dos dois consegue, sozinho, descongelar E escrever dados). Toda transição é registrada na
        âncora externa <Raiz>\evidencias (A21-7-02).
-    1. Antes de qualquer escrita: SHA-256 = manifesto = .sha256; manifesto VALIDO_LOCAL; 27 namespaces e contagens;
+    1. Antes de qualquer escrita: SHA-256 = manifesto = .sha256; manifesto VALIDO_LOCAL; 29 namespaces e contagens;
        mesma série de versão; banco de destino inexistente.
     2. POSSE ATÔMICA e PERSISTENTE: documento `_id:"posse"` (estado PREPARANDO) com execucaoId, processo (PID + horário
        de criação + executável), SHA-256 do archive E do manifesto.
@@ -179,7 +179,8 @@ try {
   if (-not (Etapa "preparar-destino" (ChamarCli (@("preparar-restore") + $comuns + @("--manifesto", $Manifesto))))) { Encerrar "FALHOU" 1 }
   $politica = Invoke-CliBackup -Argumentos @("politica")
   $colecoes = @($politica.resultado.colecoesIncluidas)
-  if ($colecoes.Count -ne 27) { $relatorio.etapas += @{ etapa = "politica"; ok = $false; erro = "lista positiva com $($colecoes.Count) coleções" }; Encerrar "FALHOU" 1 }
+  # Conferência INDEPENDENTE do tamanho da lista positiva (Fase 22.8.9.10.3.1: 27 → 29, com as coleções do WhatsApp).
+  if ($colecoes.Count -ne 29) { $relatorio.etapas += @{ etapa = "politica"; ok = $false; erro = "lista positiva com $($colecoes.Count) coleções" }; Encerrar "FALHOU" 1 }
 
   # --- 2. Posse ATÔMICA e persistente (PREPARANDO) ------------------------------------------------------------------
   $posse = ChamarGuardiao (@("adquirir-posse") + $comuns + $vinculo + @("--execucao", $execucaoId, "--processo-inicio", $trava.ProcessoInicio, "--processo-inicio-ticks", $trava.ProcessoInicioTicks, "--executavel", $trava.Executavel))

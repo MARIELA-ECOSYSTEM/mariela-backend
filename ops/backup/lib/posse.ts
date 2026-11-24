@@ -255,7 +255,7 @@ export async function congelarDestino(db: Db): Promise<{ ok: boolean; detalhe: s
 const sha = (t: string) => createHash("sha256").update(t).digest("hex");
 
 /**
- * Verificação INTEGRAL do destino: posse desta execução/banco/instância; coleções EXATAMENTE as 27 + controle (nenhuma
+ * Verificação INTEGRAL do destino: posse desta execução/banco/instância; coleções EXATAMENTE as 29 + controle (nenhuma
  * `system.*`); todas congeladas por completo; conteúdo byte a byte igual ao archive; índices (especificação completa) e
  * opções de coleção iguais ao archive.
  */
@@ -266,7 +266,7 @@ export async function verificarDestino(db: Db, execucaoId: string, instanciaId: 
   const cs = await infoColecoes(db);
   const nomes = cs.map((c) => c.nome).sort();
   const esperadas = [...COLECOES_BACKUP, COLECAO_POSSE].sort();
-  v.push({ id: "destino.colecoes_exatas", ok: JSON.stringify(nomes) === JSON.stringify(esperadas) && colecoesAlheias(cs).length === 0, detalhe: `${nomes.length} coleções (inclusive system.*); esperadas ${esperadas.length} (27 + controle)` });
+  v.push({ id: "destino.colecoes_exatas", ok: JSON.stringify(nomes) === JSON.stringify(esperadas) && colecoesAlheias(cs).length === 0, detalhe: `${nomes.length} coleções (inclusive system.*); esperadas ${esperadas.length} (${COLECOES_BACKUP.length} + controle)` });
   const dados = cs.filter((c) => c.nome !== COLECAO_POSSE && !c.nome.startsWith("system."));
   const naoCongeladas = dados.filter((c) => !estaCongelada(c)).map((c) => c.nome);
   v.push({ id: "destino.protegido", ok: naoCongeladas.length === 0 && dados.length > 0, detalhe: naoCongeladas.length ? `sem proteção completa (validador+nível+ação): ${naoCongeladas.join(", ")}` : `${dados.length} coleções congeladas (validador, strict, error)` });
