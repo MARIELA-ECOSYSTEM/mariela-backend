@@ -18,6 +18,34 @@ function baseEnv(overrides: Record<string, string> = {}): Record<string, string>
   };
 }
 
+describe("validateEnv — provedor do envio de WhatsApp por template (Fase 22.8.9.10.4)", () => {
+  it("ausente, vazio, 'desativado' ou 'meta-cloud-api' são aceitos", () => {
+    for (const valor of ["", "desativado", "meta-cloud-api"]) {
+      expect(() => validateEnv(baseEnv({ WHATSAPP_PROVEDOR_ENVIO: valor }))).not.toThrow();
+    }
+    expect(() => validateEnv(baseEnv())).not.toThrow();
+  });
+
+  it("nome desconhecido impede o boot (erro de digitação nunca vira outro provedor)", () => {
+    expect(() => validateEnv(baseEnv({ WHATSAPP_PROVEDOR_ENVIO: "meta" }))).toThrow(/WHATSAPP_PROVEDOR_ENVIO/);
+    expect(() => validateEnv(baseEnv({ WHATSAPP_PROVEDOR_ENVIO: "evolution" }))).toThrow(/WHATSAPP_PROVEDOR_ENVIO/);
+  });
+
+  it("META_WHATSAPP_* incompletas ou malformadas NÃO impedem o boot (só desativam o envio em tempo de execução)", () => {
+    expect(() =>
+      validateEnv(
+        baseEnv({
+          WHATSAPP_PROVEDOR_ENVIO: "meta-cloud-api",
+          META_WHATSAPP_GRAPH_API_VERSION: "invalida",
+          META_WHATSAPP_PHONE_NUMBER_ID: "",
+          META_WHATSAPP_ACCESS_TOKEN: "",
+          META_WHATSAPP_TIMEOUT_MS: "abc",
+        }),
+      ),
+    ).not.toThrow();
+  });
+});
+
 describe("validateEnv", () => {
   it("aceita uma configuração válida mínima (development)", () => {
     const validado = validateEnv(baseEnv());

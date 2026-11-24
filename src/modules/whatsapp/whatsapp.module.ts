@@ -1,5 +1,7 @@
 import { Module } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
 import { MongooseModule } from "@nestjs/mongoose";
+import type { Configuration } from "../../config/configuration.js";
 import { ClientesModule } from "../clientes/clientes.module.js";
 import { FornecedoresModule } from "../fornecedores/fornecedores.module.js";
 import { VendedoresModule } from "../vendedores/vendedores.module.js";
@@ -10,8 +12,8 @@ import { EnviosWhatsappController } from "./envios/envios-whatsapp.controller.js
 import { EnviosWhatsappService } from "./envios/envios-whatsapp.service.js";
 import { MensagensWhatsappRepository } from "./envios/mensagens-whatsapp.repository.js";
 import { EvolutionApiProvider } from "./providers/evolution-api.provider.js";
-import { ProvedorEnvioDesativado } from "./providers/provedor-envio-desativado.js";
 import { PROVEDOR_ENVIO_WHATSAPP } from "./providers/provedor-envio-whatsapp.interface.js";
+import { criarProvedorEnvioWhatsapp } from "./providers/selecionar-provedor-envio.js";
 import { BloqueioWhatsapp, BloqueioWhatsappSchema } from "./schemas/bloqueio-whatsapp.schema.js";
 import { MensagemWhatsapp, MensagemWhatsappSchema } from "./schemas/mensagem-whatsapp.schema.js";
 import { TemplatesWhatsappService } from "./templates/templates-whatsapp.service.js";
@@ -25,8 +27,10 @@ import { WhatsappService } from "./whatsapp.service.js";
  * desses domínios é duplicada ou alterada aqui (Etapa Pré-22, §16-18/§20).
  *
  * Fase 22.8.9.10.3 — estrutura do envio por TEMPLATE (Cloud API): mensagens persistidas, idempotência, bloqueios e
- * catálogo de templates. O provedor de envio por template é o DESATIVADO (nunca faz chamada de rede) até a Fase
- * 22.8.9.10.4; o fluxo da Evolution (`WhatsappController`/`WhatsappService`) segue intacto durante a transição.
+ * catálogo de templates. Fase 22.8.9.10.4 — o provedor de envio por template é escolhido por
+ * `criarProvedorEnvioWhatsapp`: DESATIVADO por padrão (nunca faz chamada de rede); Cloud API da Meta só com
+ * `WHATSAPP_PROVEDOR_ENVIO=meta-cloud-api` e configuração completa. O fluxo da Evolution
+ * (`WhatsappController`/`WhatsappService`) segue intacto durante a transição.
  */
 @Module({
   imports: [
@@ -47,7 +51,12 @@ import { WhatsappService } from "./whatsapp.service.js";
     BloqueiosWhatsappService,
     TemplatesWhatsappService,
     EnviosWhatsappService,
-    { provide: PROVEDOR_ENVIO_WHATSAPP, useClass: ProvedorEnvioDesativado },
+    {
+      provide: PROVEDOR_ENVIO_WHATSAPP,
+      // Sem `ConfigService` no contexto (alguns testes montam só este módulo) = sem configuração = desativado.
+      useFactory: (config?: ConfigService<Configuration>) => criarProvedorEnvioWhatsapp(config?.get("whatsapp", { infer: true })),
+      inject: [{ token: ConfigService, optional: true }],
+    },
   ],
   exports: [WhatsappService],
 })

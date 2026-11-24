@@ -1,6 +1,7 @@
 import { Transform, Type, plainToInstance, type TransformFnParams } from "class-transformer";
 import { IsIn, IsInt, IsOptional, IsString, Matches, Max, Min, ValidateIf, validateSync } from "class-validator";
 import { LIMITES_TRANSPORTE_R2 } from "../modules/media/media.constants.js";
+import { PROVEDORES_ENVIO_WHATSAPP } from "../modules/whatsapp/providers/meta/meta-cloud-api.constants.js";
 import { lerOrigensCors, motivoOrigemCorsInvalida } from "./cors.config.js";
 
 enum Ambiente {
@@ -159,6 +160,38 @@ class EnvironmentVariables {
   @IsInt()
   @Min(1000)
   EVOLUTION_TIMEOUT_MS = 10000;
+
+  /**
+   * Fase 22.8.9.10.4 — provedor do envio por template. Nome desconhecido impede o boot (erro de digitação nunca vira
+   * "outro provedor" em silêncio); ausente/vazio = desativado. As variáveis `META_WHATSAPP_*` são OPCIONAIS e
+   * validadas em tempo de execução (`lerConfiguracaoMeta`): incompletas ou malformadas só DESATIVAM o envio — nunca
+   * impedem o boot da API nem ativam a Meta parcialmente. Nenhuma mensagem de erro inclui os valores.
+   */
+  @IsOptional()
+  @IsIn([...PROVEDORES_ENVIO_WHATSAPP, ""], {
+    message: `WHATSAPP_PROVEDOR_ENVIO deve ser ${PROVEDORES_ENVIO_WHATSAPP.map((p) => `"${p}"`).join(" ou ")} (ou vazia = desativado).`,
+  })
+  WHATSAPP_PROVEDOR_ENVIO?: string;
+
+  @IsOptional()
+  @IsString()
+  META_WHATSAPP_GRAPH_API_VERSION?: string;
+
+  @IsOptional()
+  @IsString()
+  META_WHATSAPP_PHONE_NUMBER_ID?: string;
+
+  @IsOptional()
+  @IsString()
+  META_WHATSAPP_BUSINESS_ACCOUNT_ID?: string;
+
+  @IsOptional()
+  @IsString()
+  META_WHATSAPP_ACCESS_TOKEN?: string;
+
+  @IsOptional()
+  @IsString()
+  META_WHATSAPP_TIMEOUT_MS?: string;
 
   /**
    * Fase 40 — storage de mídia (Cloudflare R2). Deliberadamente OPCIONAIS,

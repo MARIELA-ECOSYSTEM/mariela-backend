@@ -1,7 +1,8 @@
 import type { CodigoRecusaProvedor } from "../envios/envios-whatsapp.constants.js";
 
 /**
- * Fase 22.8.9.10.3 — contrato do provedor de ENVIO POR TEMPLATE (Cloud API da Meta na Fase 22.8.9.10.4). Separado de
+ * Fase 22.8.9.10.3 — contrato do provedor de ENVIO POR TEMPLATE (Cloud API da Meta: `ProvedorEnvioMetaCloudApi`,
+ * Fase 22.8.9.10.4; seleção em `criarProvedorEnvioWhatsapp`). Separado de
  * `WhatsappProvider` (Evolution/Baileys, texto livre), que continua intacto durante a transição.
  *
  * O provedor CLASSIFICA o resultado e nunca lança para comunicar uma recusa:
@@ -37,6 +38,11 @@ export interface InfoTemplateProvedorWhatsapp {
   categoria: string;
   /** Quantidade de parâmetros do corpo. */
   quantidadeParametros: number;
+  /**
+   * Fase 22.8.9.10.4 — `false` quando o template exige algo que o envio não fornece (parâmetros nomeados, cabeçalho
+   * com variável/mídia, botões com variável). Ausente = compatível (provedores que não informam).
+   */
+  estruturaCompativel?: boolean;
 }
 
 export interface ProvedorEnvioWhatsapp {

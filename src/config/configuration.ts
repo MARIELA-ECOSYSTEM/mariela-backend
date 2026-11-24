@@ -1,4 +1,9 @@
 import { TRANSPORTE_R2_PADRAO } from "../modules/media/media.constants.js";
+import {
+  META_GRAPH_API_VERSION_PADRAO,
+  META_TIMEOUT_MS_PADRAO,
+  PROVEDOR_ENVIO_PADRAO,
+} from "../modules/whatsapp/providers/meta/meta-cloud-api.constants.js";
 import { RECONCILIACAO_ESTOQUE_PADRAO } from "../modules/vendas/vendas.constants.js";
 import { lerOrigensCors } from "./cors.config.js";
 
@@ -54,6 +59,24 @@ export interface WhatsappConfig {
     instanceName: string;
     timeoutMs: number;
   };
+  /**
+   * Fase 22.8.9.10.4 — provedor do envio por TEMPLATE. Só `"meta-cloud-api"` explícito seleciona a Cloud API da Meta;
+   * ausente/vazio = `"desativado"` (padrão em QUALQUER ambiente). Mesmo selecionada, a Meta só é usada com a
+   * configuração `meta` completa e válida (`lerConfiguracaoMeta`); senão o envio fica desativado.
+   * Opcional no TIPO (como `storage.transporte`): contextos que montam só a Evolution não precisam dele; ausente =
+   * desativado. `configuration()` sempre o preenche.
+   */
+  provedorEnvio?: string;
+  meta?: MetaWhatsappConfig;
+}
+
+/** Fase 22.8.9.10.4 — Cloud API da Meta. `accessToken` é credencial: nunca logado, devolvido nem incluído em erro. */
+export interface MetaWhatsappConfig {
+  graphApiVersion: string;
+  phoneNumberId: string;
+  businessAccountId: string;
+  accessToken: string;
+  timeoutMs: number;
 }
 
 /**
@@ -181,6 +204,14 @@ export default (): Configuration => {
         apiKey: process.env["EVOLUTION_API_KEY"] ?? "",
         instanceName: process.env["EVOLUTION_INSTANCE_NAME"] ?? "mariela-whatsapp",
         timeoutMs: Number(process.env["EVOLUTION_TIMEOUT_MS"] ?? 10000),
+      },
+      provedorEnvio: (process.env["WHATSAPP_PROVEDOR_ENVIO"] ?? "").trim() || PROVEDOR_ENVIO_PADRAO,
+      meta: {
+        graphApiVersion: (process.env["META_WHATSAPP_GRAPH_API_VERSION"] ?? "").trim() || META_GRAPH_API_VERSION_PADRAO,
+        phoneNumberId: (process.env["META_WHATSAPP_PHONE_NUMBER_ID"] ?? "").trim(),
+        businessAccountId: (process.env["META_WHATSAPP_BUSINESS_ACCOUNT_ID"] ?? "").trim(),
+        accessToken: (process.env["META_WHATSAPP_ACCESS_TOKEN"] ?? "").trim(),
+        timeoutMs: Number(process.env["META_WHATSAPP_TIMEOUT_MS"] || META_TIMEOUT_MS_PADRAO),
       },
     },
     storage: {

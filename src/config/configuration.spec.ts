@@ -18,6 +18,12 @@ const VARIAVEIS_ISOLADAS = [
   "RECONCILIACAO_ESTOQUE_MAX_TENTATIVAS",
   "RECONCILIACAO_ESTOQUE_BACKOFF_BASE_MS",
   "RECONCILIACAO_ESTOQUE_BACKOFF_MAX_MS",
+  "WHATSAPP_PROVEDOR_ENVIO",
+  "META_WHATSAPP_GRAPH_API_VERSION",
+  "META_WHATSAPP_PHONE_NUMBER_ID",
+  "META_WHATSAPP_BUSINESS_ACCOUNT_ID",
+  "META_WHATSAPP_ACCESS_TOKEN",
+  "META_WHATSAPP_TIMEOUT_MS",
 ] as const;
 const originais = Object.fromEntries(VARIAVEIS_ISOLADAS.map((nome) => [nome, process.env[nome]]));
 
@@ -26,6 +32,36 @@ afterEach(() => {
     if (originais[nome] === undefined) delete process.env[nome];
     else process.env[nome] = originais[nome];
   }
+});
+
+describe("configuration — whatsapp: provedor do envio por template (Fase 22.8.9.10.4)", () => {
+  it("sem variáveis: provedor desativado, versão padrão v26.0, timeout 10 s, IDs e token vazios", () => {
+    for (const nome of VARIAVEIS_ISOLADAS) delete process.env[nome];
+    const w = configuration().whatsapp;
+    expect(w.provedorEnvio).toBe("desativado");
+    expect(w.meta).toEqual({ graphApiVersion: "v26.0", phoneNumberId: "", businessAccountId: "", accessToken: "", timeoutMs: 10_000 });
+  });
+
+  it("lê as variáveis aparando espaços; vazias valem o padrão", () => {
+    process.env["WHATSAPP_PROVEDOR_ENVIO"] = " meta-cloud-api ";
+    process.env["META_WHATSAPP_GRAPH_API_VERSION"] = " v25.0 ";
+    process.env["META_WHATSAPP_PHONE_NUMBER_ID"] = " 100000000000001 ";
+    process.env["META_WHATSAPP_BUSINESS_ACCOUNT_ID"] = "200000000000002";
+    process.env["META_WHATSAPP_ACCESS_TOKEN"] = " TOKEN-FICTICIO-DE-TESTE ";
+    process.env["META_WHATSAPP_TIMEOUT_MS"] = "8000";
+    expect(configuration().whatsapp.meta).toEqual({
+      graphApiVersion: "v25.0",
+      phoneNumberId: "100000000000001",
+      businessAccountId: "200000000000002",
+      accessToken: "TOKEN-FICTICIO-DE-TESTE",
+      timeoutMs: 8000,
+    });
+    expect(configuration().whatsapp.provedorEnvio).toBe("meta-cloud-api");
+    process.env["WHATSAPP_PROVEDOR_ENVIO"] = "  ";
+    process.env["META_WHATSAPP_TIMEOUT_MS"] = "";
+    expect(configuration().whatsapp.provedorEnvio).toBe("desativado");
+    expect(configuration().whatsapp.meta?.timeoutMs).toBe(10_000);
+  });
 });
 
 describe("configuration — storage.r2 (Fase 40)", () => {

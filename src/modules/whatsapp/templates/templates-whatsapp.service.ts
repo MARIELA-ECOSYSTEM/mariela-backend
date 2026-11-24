@@ -51,7 +51,8 @@ export function avaliarAprovacaoTemplate(def: TemplateWhatsappDef, info: InfoTem
     info.nomeMeta === def.nomeMeta &&
     info.idioma === def.idioma &&
     info.categoria.toUpperCase() === def.categoria &&
-    info.quantidadeParametros === def.parametros.length;
+    info.quantidadeParametros === def.parametros.length &&
+    info.estruturaCompativel !== false;
   return confere ? "APROVADO" : "DIVERGENTE";
 }
 
