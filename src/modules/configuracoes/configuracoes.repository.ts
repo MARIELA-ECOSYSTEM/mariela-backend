@@ -1,10 +1,16 @@
+import { randomUUID } from "node:crypto";
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model } from "mongoose";
 import { normalizarCategoria, normalizarCor, normalizarFormaPagamento, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
-import { ID_CONFIGURACAO_GLOBAL, type CampoLista } from "./configuracoes.constants.js";
+import { ID_CONFIGURACAO_GLOBAL, LIMITES_MENSAGEM_WHATSAPP, MENSAGENS_WHATSAPP_INICIAIS, type CampoLista } from "./configuracoes.constants.js";
 import type { DadosLoja } from "./configuracoes.types.js";
-import { Configuracao, type ConfiguracaoDocument } from "./schemas/configuracao.schema.js";
+import { Configuracao, type ConfiguracaoDocument, type MensagemWhatsappPadrao } from "./schemas/configuracao.schema.js";
+
+/** Igualdade de título sem diferenciar maiúsculas/minúsculas (texto escapado: nunca interpretado como expressão). */
+function tituloIgual(titulo: string): RegExp {
+  return new RegExp(`^${titulo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+}
 
 /**
  * As quatro listas com regra de unicidade case-insensitive (Fase 54.0 —
@@ -157,7 +163,73 @@ export class ConfiguracoesRepository {
         { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
       )
       .exec();
+    if (documento!.mensagensWhatsapp === undefined) return this.inicializarMensagensWhatsapp();
     return documento!;
+  }
+
+  /**
+   * Fase 22.8.9.10.7.3 — grava o conjunto inicial de mensagens padrão UMA única vez: o filtro exige o campo AUSENTE,
+   * então duas inicializações simultâneas resultam em um só conjunto e uma lista já existente (inclusive vazia,
+   * depois de o ADMIN excluir tudo) nunca é sobrescrita.
+   */
+  private async inicializarMensagensWhatsapp(): Promise<ConfiguracaoDocument> {
+    const em = new Date();
+    const iniciais = MENSAGENS_WHATSAPP_INICIAIS.map((m) => ({ id: randomUUID(), titulo: m.titulo, conteudo: m.conteudo, atualizadoEm: em }));
+    await this.configuracaoModel
+      .updateOne({ _id: ID_CONFIGURACAO_GLOBAL, mensagensWhatsapp: { $exists: false } }, { $set: { mensagensWhatsapp: iniciais } })
+      .exec();
+    return (await this.configuracaoModel.findById(ID_CONFIGURACAO_GLOBAL).exec())!;
+  }
+
+  /**
+   * Fase 22.8.9.10.7.3 — cria uma mensagem padrão numa única escrita condicional: título ainda não usado (sem
+   * diferenciar maiúsculas) e lista abaixo do limite. `null` = uma das condições falhou (o service diagnostica).
+   */
+  async criarMensagemWhatsapp(mensagem: MensagemWhatsappPadrao): Promise<ConfiguracaoDocument | null> {
+    await this.obter();
+    return this.configuracaoModel
+      .findOneAndUpdate(
+        {
+          _id: ID_CONFIGURACAO_GLOBAL,
+          [`mensagensWhatsapp.${LIMITES_MENSAGEM_WHATSAPP.quantidade - 1}`]: { $exists: false },
+          mensagensWhatsapp: { $not: { $elemMatch: { titulo: tituloIgual(mensagem.titulo) } } },
+        },
+        { $push: { mensagensWhatsapp: mensagem } },
+        { returnDocument: "after" },
+      )
+      .exec();
+  }
+
+  /** Edita título e conteúdo da mensagem `id`, exigindo que nenhuma OUTRA mensagem tenha o mesmo título. */
+  async atualizarMensagemWhatsapp(id: string, titulo: string, conteudo: string, em: Date): Promise<ConfiguracaoDocument | null> {
+    await this.obter();
+    return this.configuracaoModel
+      .findOneAndUpdate(
+        {
+          _id: ID_CONFIGURACAO_GLOBAL,
+          $and: [{ "mensagensWhatsapp.id": id }, { mensagensWhatsapp: { $not: { $elemMatch: { id: { $ne: id }, titulo: tituloIgual(titulo) } } } }],
+        },
+        { $set: { "mensagensWhatsapp.$[m].titulo": titulo, "mensagensWhatsapp.$[m].conteudo": conteudo, "mensagensWhatsapp.$[m].atualizadoEm": em } },
+        { arrayFilters: [{ "m.id": id }], returnDocument: "after" },
+      )
+      .exec();
+  }
+
+  /** Remove a mensagem `id`; `null` = ela não existe. */
+  async excluirMensagemWhatsapp(id: string): Promise<ConfiguracaoDocument | null> {
+    await this.obter();
+    return this.configuracaoModel
+      .findOneAndUpdate({ _id: ID_CONFIGURACAO_GLOBAL, "mensagensWhatsapp.id": id }, { $pull: { mensagensWhatsapp: { id } } }, { returnDocument: "after" })
+      .exec();
+  }
+
+  /** Leitura crua das mensagens (diagnóstico de uma escrita recusada). */
+  async lerMensagensWhatsapp(): Promise<{ id: string; titulo: string }[]> {
+    const documento = await this.configuracaoModel
+      .findById(ID_CONFIGURACAO_GLOBAL, { "mensagensWhatsapp.id": 1, "mensagensWhatsapp.titulo": 1 })
+      .lean<{ mensagensWhatsapp?: { id: string; titulo: string }[] }>()
+      .exec();
+    return documento?.mensagensWhatsapp ?? [];
   }
 
   /**

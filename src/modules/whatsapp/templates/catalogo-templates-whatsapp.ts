@@ -11,9 +11,11 @@ import type { OrigemMensagemWhatsapp } from "../envios/envios-whatsapp.constants
  * ⚠️ Os textos abaixo são RASCUNHOS a serem revisados e submetidos à Meta pela loja (decisão pendente, spec
  * 22.8.9.10.2 §16). `previa` precisa ser IDÊNTICA ao corpo submetido; mudar o texto exige nova versão (`_v2`).
  *
- * ⚠️ Fase 22.8.9.10.7.2 — o MARIELA NÃO reconhece mais respostas como "SAIR" (palavras-chave removidas). A frase
- * "responda SAIR" do rascunho abaixo precisa ser revista ANTES da submissão à Meta, para não prometer um efeito que
- * não existe (decisão de conteúdo pendente; texto mantido sem alteração nesta fase).
+ * Fase 22.8.9.10.7.3 — `aniversario_v1` (`mariela_aniversario_v1`) SAIU do catálogo: o rascunho dizia "responda SAIR",
+ * e o MARIELA não reconhece mais respostas como pedido de bloqueio (Fase 22.8.9.10.7.2). Como a conferência de
+ * aprovação compara nome/idioma/categoria/parâmetros — não o corpo —, manter o nome antigo permitiria enviar um
+ * `_v1` aprovado com a frase antiga; por isso a correção é uma NOVA versão (`_v2`), que precisa ser submetida e
+ * aprovada na Meta antes de qualquer envio. Mensagens já registradas com `aniversario_v1` continuam no histórico.
  */
 export type CategoriaTemplateWhatsapp = "MARKETING" | "UTILITY";
 
@@ -41,14 +43,14 @@ export interface TemplateWhatsappDef {
 
 export const CATALOGO_TEMPLATES_WHATSAPP: readonly TemplateWhatsappDef[] = [
   {
-    chave: "aniversario_v1",
-    nomeMeta: "mariela_aniversario_v1",
+    chave: "aniversario_v2",
+    nomeMeta: "mariela_aniversario_v2",
     idioma: "pt_BR",
     categoria: "MARKETING",
     parametros: [{ posicao: 1, origem: "cliente.primeiroNome" }],
     previa:
       "Olá, {{1}}! A equipe MARIELA deseja a você um feliz aniversário! Que seu novo ciclo seja cheio de coisas boas. " +
-      "Esperamos você na MARIELA! Para não receber mais mensagens, responda SAIR.",
+      "Esperamos você na MARIELA!",
     usoPermitido: ["INDIVIDUAL", "CAMPANHA_ANIVERSARIO"],
   },
 ];

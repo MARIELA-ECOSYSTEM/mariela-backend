@@ -59,7 +59,7 @@ export class EnviarTemplateWhatsappDto {
   @Type(() => DestinatarioEnvioWhatsappDto)
   destinatario!: DestinatarioEnvioWhatsappDto;
 
-  @ApiProperty({ example: "aniversario_v1", description: "Chave interna do catálogo de templates." })
+  @ApiProperty({ example: "aniversario_v2", description: "Chave interna do catálogo de templates." })
   @IsString()
   @MinLength(1)
   @MaxLength(64)

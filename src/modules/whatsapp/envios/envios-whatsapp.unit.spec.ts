@@ -15,7 +15,7 @@ import { aplicarEventoStatus, podeLiberarReenvio } from "./maquina-estados-whats
  * Fase 22.8.9.10.3 — testes UNITÁRIOS (sem MongoDB, sem rede): regras puras do envio por template. A integração com
  * MongoDB real está em `envios-whatsapp.integracao.spec.ts`; a HTTP, em `envios-whatsapp.http.e2e.spec.ts`.
  */
-const DEF = obterTemplateDoCatalogo("aniversario_v1")!;
+const DEF = obterTemplateDoCatalogo("aniversario_v2")!;
 
 describe("máquina de estados (webhook futuro — regra pura)", () => {
   it("progressão monotônica: sent → aceita, delivered → entregue, read → lida", () => {
@@ -216,7 +216,7 @@ describe("TemplatesWhatsappService — cache e falha de consulta", () => {
 });
 
 describe("hash do conteúdo (idempotência)", () => {
-  const base = { idempotencyKey: "k", destinatario: { tipo: "CLIENTE" as const, id: "65f1a2b3c4d5e6f7a8b9c0d1" }, template: "aniversario_v1" };
+  const base = { idempotencyKey: "k", destinatario: { tipo: "CLIENTE" as const, id: "65f1a2b3c4d5e6f7a8b9c0d1" }, template: "aniversario_v2" };
 
   it("estável para o mesmo pedido e independente da chave", () => {
     expect(hashConteudoEnvio({ ...base })).toBe(hashConteudoEnvio({ ...base, idempotencyKey: "outra" }));
@@ -236,7 +236,7 @@ describe("DTO de envio (mesmo ValidationPipe global da API)", () => {
   const valido = {
     idempotencyKey: "6f1c2b8e-3d4a-4f5b-9c6d-7e8f9a0b1c2d",
     destinatario: { tipo: "CLIENTE", id: "65f1a2b3c4d5e6f7a8b9c0d1" },
-    template: "aniversario_v1",
+    template: "aniversario_v2",
   };
 
   it("aceita o contrato mínimo", async () => {

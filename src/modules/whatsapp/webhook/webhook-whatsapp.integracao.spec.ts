@@ -80,8 +80,8 @@ describe("Webhook WhatsApp (integração — MongoDB real)", () => {
         destinatarioTipo: "CLIENTE",
         destinatarioId: new Types.ObjectId(),
         telefoneE164,
-        templateChave: "aniversario_v1",
-        templateNomeMeta: "mariela_aniversario_v1",
+        templateChave: "aniversario_v2",
+        templateNomeMeta: "mariela_aniversario_v2",
         templateIdioma: "pt_BR",
         templateCategoria: "MARKETING",
         origem: "INDIVIDUAL",
@@ -267,7 +267,7 @@ describe("Webhook WhatsApp (integração — MongoDB real)", () => {
       const cliente = await clientes.criar({ nome: "Opt Out Teste", telefone: `839${String(++contador).padStart(8, "0")}` }, null);
       await notificarPreferencia(`55${cliente.telefone}`);
       expect(await bloqueios.bloqueioAtivo(`+55${cliente.telefone}`)).not.toBeNull();
-      await expect(envios.enviar({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: cliente.id }, template: "aniversario_v1" }, null)).rejects.toMatchObject({
+      await expect(envios.enviar({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: cliente.id }, template: "aniversario_v2" }, null)).rejects.toMatchObject({
         code: "WHATSAPP_CONTATO_BLOQUEADO",
       });
       expect(provedor.chamadas).toBe(0);
@@ -320,7 +320,7 @@ describe("Webhook WhatsApp (integração — MongoDB real)", () => {
       const c = await clientes.criar({ nome: "Responde Sair", telefone: `839${String(++contador).padStart(8, "0")}` }, null);
       await notificarTexto(`55${c.telefone}`, "Sair");
       expect((await bloqueios.statusDoCliente(c.id)).bloqueado).toBe(false);
-      await envios.enviar({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: c.id }, template: "aniversario_v1" }, null);
+      await envios.enviar({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: c.id }, template: "aniversario_v2" }, null);
       expect(provedor.chamadas).toBe(1);
     });
 
@@ -328,7 +328,7 @@ describe("Webhook WhatsApp (integração — MongoDB real)", () => {
       const c = await clientes.criar({ nome: "Historico Palavra", telefone: `839${String(++contador).padStart(8, "0")}` }, null);
       // Mesmo formato que o mecanismo removido gravava: chave WAID, sem cliente, origem PALAVRA_CHAVE.
       await bloqueios.bloquearWaId(`55${c.telefone}`, "PALAVRA_CHAVE", "Webhook Meta: palavra-chave de opt-out.");
-      const pedido = () => ({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE" as const, id: c.id }, template: "aniversario_v1" });
+      const pedido = () => ({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE" as const, id: c.id }, template: "aniversario_v2" });
       await expect(envios.enviar(pedido(), null)).rejects.toMatchObject({ code: "WHATSAPP_CONTATO_BLOQUEADO" });
       expect(provedor.chamadas).toBe(0);
       const lista = await bloqueios.listar(true, 1, 20);
@@ -357,7 +357,7 @@ describe("Webhook WhatsApp (integração — MongoDB real)", () => {
       const original = provedor.enviarTemplate;
       provedor.enviarTemplate = async (i) => ({ resultado: "aceita", wamid: `wamid.W${i.referenciaInterna}`, waId: waIdSemNono });
       try {
-        await envios.enviar({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: c.id }, template: "aniversario_v1" }, null);
+        await envios.enviar({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: c.id }, template: "aniversario_v2" }, null);
       } finally {
         provedor.enviarTemplate = original;
       }
@@ -409,7 +409,7 @@ describe("Webhook WhatsApp (integração — MongoDB real)", () => {
   describe("regressão do envio por template", () => {
     it("envio + idempotência continuam: aceite com wamid, repetição sem nova chamada; o webhook atualiza a mesma mensagem", async () => {
       const cliente = await clientes.criar({ nome: "Regressao Webhook", telefone: `839${String(++contador).padStart(8, "0")}` }, null);
-      const pedido = { idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE" as const, id: cliente.id }, template: "aniversario_v1" };
+      const pedido = { idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE" as const, id: cliente.id }, template: "aniversario_v2" };
       const { mensagem } = await envios.enviar(pedido, null);
       await envios.enviar(pedido, null);
       expect(provedor.chamadas).toBe(1);

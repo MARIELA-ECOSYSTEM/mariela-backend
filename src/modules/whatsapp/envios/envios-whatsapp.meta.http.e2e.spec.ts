@@ -85,7 +85,7 @@ describe("HTTP — envio por template com o adaptador Meta (Graph API falsa)", (
     chamadas.push({ url, metodo: init.method ?? "GET", corpo: (init.body as string | undefined) ?? null });
     if (init.method === "GET") {
       return json(200, {
-        data: [{ name: "mariela_aniversario_v1", language: "pt_BR", status: "APPROVED", category: "MARKETING", id: "1", components: [{ type: "BODY", text: "Olá, {{1}}!" }] }],
+        data: [{ name: "mariela_aniversario_v2", language: "pt_BR", status: "APPROVED", category: "MARKETING", id: "1", components: [{ type: "BODY", text: "Olá, {{1}}!" }] }],
       });
     }
     return respostaEnvio();
@@ -95,7 +95,7 @@ describe("HTTP — envio por template com o adaptador Meta (Graph API falsa)", (
   const post = (caminho: string, corpo: unknown) =>
     fetch(url(caminho), { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(corpo) });
   const novoCliente = () => clientes.criar({ nome: "Marta Teste HTTP", telefone: `859${String(++contador).padStart(8, "0")}` }, null);
-  const corpoEnvio = (clienteId: string) => ({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: clienteId }, template: "aniversario_v1" });
+  const corpoEnvio = (clienteId: string) => ({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: clienteId }, template: "aniversario_v2" });
 
   beforeAll(async () => {
     ({ app, baseUrl, connection, token } = await subirApp(criarProvedorEnvioWhatsapp(CONFIG, fetchFalso)));
@@ -118,7 +118,7 @@ describe("HTTP — envio por template com o adaptador Meta (Graph API falsa)", (
     const r = await fetch(url("/templates"), { headers: { authorization: `Bearer ${token}` } });
     expect(r.status).toBe(200);
     const corpo = (await r.json()) as { data: { chave: string; estadoAprovacao: string }[] };
-    expect(corpo.data.find((t) => t.chave === "aniversario_v1")?.estadoAprovacao).toBe("APROVADO");
+    expect(corpo.data.find((t) => t.chave === "aniversario_v2")?.estadoAprovacao).toBe("APROVADO");
   });
 
   it("POST /envios: 201 aceita; repetição 200 sem novo POST à Meta; resposta sem telefone, token, wamid nem texto", async () => {
@@ -196,7 +196,7 @@ describe("HTTP — provedor PADRÃO do AppModule (sem configuração da Meta)", 
     const r = await fetch(`${ctx.baseUrl}/api/v1/integracoes/whatsapp/envios`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${ctx.token}` },
-      body: JSON.stringify({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: cliente.id }, template: "aniversario_v1" }),
+      body: JSON.stringify({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: cliente.id }, template: "aniversario_v2" }),
     });
     expect(r.status).toBe(503);
     expect(((await r.json()) as { code: string }).code).toBe("WHATSAPP_NOT_CONFIGURED");

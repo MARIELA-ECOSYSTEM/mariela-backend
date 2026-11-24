@@ -1,6 +1,6 @@
 import { Prop, Schema, SchemaFactory } from "@nestjs/mongoose";
 import type { HydratedDocument, Schema as MongooseSchema } from "mongoose";
-import { CAMPOS_LISTA, type CampoLista } from "../configuracoes.constants.js";
+import { CAMPOS_LISTA, LIMITES_MENSAGEM_WHATSAPP, type CampoLista } from "../configuracoes.constants.js";
 
 /** Subdocumento embutido — nunca uma collection própria (`_id: false`, mesmo padrão de `TarifaAplicada` em Vendas). */
 @Schema({ _id: false })
@@ -84,6 +84,24 @@ export class RemocaoPendente {
   em!: Date;
 }
 export const RemocaoPendenteSchema = SchemaFactory.createForClass(RemocaoPendente);
+
+/** Fase 22.8.9.10.7.3 — mensagem padrão de WhatsApp (texto de apoio editável; ver `LIMITES_MENSAGEM_WHATSAPP`). */
+@Schema({ _id: false })
+export class MensagemWhatsappPadrao {
+  /** UUID v4 — identifica a mensagem para edição/exclusão. */
+  @Prop({ type: String, required: true })
+  id!: string;
+
+  @Prop({ type: String, required: true, trim: true, maxlength: LIMITES_MENSAGEM_WHATSAPP.titulo })
+  titulo!: string;
+
+  @Prop({ type: String, required: true, maxlength: LIMITES_MENSAGEM_WHATSAPP.conteudo })
+  conteudo!: string;
+
+  @Prop({ type: Date, required: true })
+  atualizadoEm!: Date;
+}
+export const MensagemWhatsappPadraoSchema = SchemaFactory.createForClass(MensagemWhatsappPadrao);
 
 /**
  * Configuração ADMINISTRATIVA global e única da loja (Etapa 11.2) — contrato
@@ -173,6 +191,13 @@ export class Configuracao {
   @Prop({ type: [RemocaoPendenteSchema], default: [] })
   remocoesPendentes!: RemocaoPendente[];
 
+  /**
+   * Fase 22.8.9.10.7.3 — mensagens padrão de WhatsApp. `default: undefined` de propósito: campo AUSENTE = nunca
+   * inicializado (recebe `MENSAGENS_WHATSAPP_INICIAIS` uma única vez); lista vazia = o ADMIN excluiu todas.
+   */
+  @Prop({ type: [MensagemWhatsappPadraoSchema], default: undefined })
+  mensagensWhatsapp?: MensagemWhatsappPadrao[];
+
   criadoEm!: Date;
   atualizadoEm!: Date;
 }
@@ -205,6 +230,13 @@ function aplicarSerializacaoDeConfiguracao(schema: MongooseSchema): void {
       tamanhos: ret["tamanhos"],
       cores: ret["cores"],
       formasPagamento: ret["formasPagamento"],
+      // Fase 22.8.9.10.7.3 — só os campos públicos de cada mensagem.
+      mensagensWhatsapp: ((ret["mensagensWhatsapp"] as MensagemWhatsappPadrao[] | undefined) ?? []).map((m) => ({
+        id: m.id,
+        titulo: m.titulo,
+        conteudo: m.conteudo,
+        atualizadoEm: m.atualizadoEm,
+      })),
       atualizadoEm: ret["atualizadoEm"],
     }),
   });

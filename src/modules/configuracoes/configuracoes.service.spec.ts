@@ -717,7 +717,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       await service.adicionarItem("categorias", chave, USUARIO_ID);
       const documento = await service.obter();
       const serializado: object = documento.toJSON();
-      expect(Object.keys(serializado).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "tamanhos"].sort());
+      expect(Object.keys(serializado).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "mensagensWhatsapp", "tamanhos"].sort());
       expect(Reflect.get(serializado, "categoriasNormalizadas")).toBeUndefined();
     });
 
@@ -790,7 +790,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       await service.adicionarItem("formasPagamento", chave, USUARIO_ID);
       const documento = await service.obter();
       const serializado: object = documento.toJSON();
-      expect(Object.keys(serializado).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "tamanhos"].sort());
+      expect(Object.keys(serializado).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "mensagensWhatsapp", "tamanhos"].sort());
       expect(Reflect.get(serializado, "formasPagamentoNormalizadas")).toBeUndefined();
     });
 
@@ -2415,7 +2415,7 @@ describe("ConfiguracoesService (integração — MongoDB real)", () => {
       const { chave } = await corComVizinhas("T15");
       await pendenciaInterrompida(chave);
       const serializado: Record<string, unknown> = JSON.parse(JSON.stringify(await service.obter()));
-      expect(Object.keys(serializado).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "tamanhos"]);
+      expect(Object.keys(serializado).sort()).toEqual(["atualizadoEm", "categorias", "cores", "formasPagamento", "loja", "mensagensWhatsapp", "tamanhos"]);
     });
 
     it("pendência malformada: reportada e registrada em log, NUNCA apagada; as válidas continuam sendo processadas", async () => {

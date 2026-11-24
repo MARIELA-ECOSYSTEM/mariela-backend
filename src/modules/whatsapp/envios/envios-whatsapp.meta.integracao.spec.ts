@@ -71,7 +71,7 @@ class GraphFalsa {
       return json(200, {
         data: [
           {
-            name: "mariela_aniversario_v1",
+            name: "mariela_aniversario_v2",
             language: "pt_BR",
             status: this.statusTemplate,
             category: "MARKETING",
@@ -123,7 +123,7 @@ describe("Envio por template com o adaptador Meta (integração — MongoDB real
   const pedido = (clienteId: string): EnviarTemplateWhatsappDto => ({
     idempotencyKey: randomUUID(),
     destinatario: { tipo: "CLIENTE", id: clienteId },
-    template: "aniversario_v1",
+    template: "aniversario_v2",
   });
 
   beforeAll(async () => {
@@ -146,7 +146,7 @@ describe("Envio por template com o adaptador Meta (integração — MongoDB real
     graph.chamadas = [];
     graph.statusTemplate = "APPROVED";
     graph.restaurarEnvio();
-    templates.invalidar("aniversario_v1");
+    templates.invalidar("aniversario_v2");
     logs = [];
     spies = (["log", "warn", "error", "debug", "verbose"] as const).map((nivel) =>
       spyOn(Logger.prototype, nivel).mockImplementation((...args: unknown[]) => {
@@ -183,10 +183,10 @@ describe("Envio por template com o adaptador Meta (integração — MongoDB real
     expect(nova).toBe(true);
     expect(mensagem.estado).toBe("aceita");
     expect(graph.chamadas.map((c) => c.metodo)).toEqual(["GET", "POST"]);
-    expect(graph.chamadas[0]!.url).toBe("https://graph.facebook.com/v26.0/200000000000002/message_templates?name=mariela_aniversario_v1");
+    expect(graph.chamadas[0]!.url).toBe("https://graph.facebook.com/v26.0/200000000000002/message_templates?name=mariela_aniversario_v2");
     const post = graph.posts()[0]!;
     expect(post.url).toBe("https://graph.facebook.com/v26.0/100000000000001/messages");
-    expect(post.corpo).toMatchObject({ to: `+55${cliente.telefone}`, type: "template", template: { name: "mariela_aniversario_v1", language: { code: "pt_BR" } } });
+    expect(post.corpo).toMatchObject({ to: `+55${cliente.telefone}`, type: "template", template: { name: "mariela_aniversario_v2", language: { code: "pt_BR" } } });
     expect(JSON.stringify(post.corpo)).toContain('"text":"Joana"');
 
     const doc = await mensagemModel.findById(mensagem.id).lean();
@@ -324,7 +324,7 @@ describe("Envio por template com o provedor DESATIVADO (padrão) — integraçã
       const clientes = ref.get(ClientesService);
       const cliente = await clientes.criar({ nome: "Desativado Teste", telefone: `879${String(Date.now()).slice(-8)}` }, null);
       await expect(
-        ref.get(EnviosWhatsappService).enviar({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: cliente.id }, template: "aniversario_v1" }, null),
+        ref.get(EnviosWhatsappService).enviar({ idempotencyKey: randomUUID(), destinatario: { tipo: "CLIENTE", id: cliente.id }, template: "aniversario_v2" }, null),
       ).rejects.toMatchObject({ code: "WHATSAPP_NOT_CONFIGURED" });
       expect(await ref.get<Model<MensagemWhatsappDocument>>(getModelToken(MensagemWhatsapp.name)).countDocuments({ destinatarioId: cliente._id })).toBe(0);
       expect(chamadas).toBe(0);

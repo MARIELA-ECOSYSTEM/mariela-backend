@@ -38,7 +38,7 @@ const whatsappConfig = (extra: Partial<WhatsappConfig> = {}, meta: Partial<MetaW
 
 const ENTRADA: EnviarTemplateWhatsappInput = {
   telefoneE164: TELEFONE,
-  nomeMeta: "mariela_aniversario_v1",
+  nomeMeta: "mariela_aniversario_v2",
   idioma: "pt_BR",
   parametros: [NOME],
   referenciaInterna: "65f1a2b3c4d5e6f7a8b9c0d1",
@@ -134,7 +134,7 @@ describe("contrato de envio (endpoint, versão, Phone Number ID, autenticação 
       to: TELEFONE,
       type: "template",
       template: {
-        name: "mariela_aniversario_v1",
+        name: "mariela_aniversario_v2",
         language: { code: "pt_BR" },
         components: [{ type: "body", parameters: [{ type: "text", text: NOME }] }],
       },
@@ -346,38 +346,38 @@ describe("entrada fora do contrato: recusada SEM chamada de rede", () => {
 });
 
 describe("consulta de template (aprovação) — GET /{WABA-ID}/message_templates", () => {
-  const DEF = obterTemplateDoCatalogo("aniversario_v1")!;
+  const DEF = obterTemplateDoCatalogo("aniversario_v2")!;
   const tpl = (extra: Record<string, unknown> = {}) => ({
-    name: "mariela_aniversario_v1",
+    name: "mariela_aniversario_v2",
     language: "pt_BR",
     status: "APPROVED",
     category: "MARKETING",
     id: "1",
-    components: [{ type: "BODY", text: "Olá, {{1}}! Feliz aniversário." }, { type: "FOOTER", text: "Responda SAIR." }],
+    components: [{ type: "BODY", text: "Olá, {{1}}! Feliz aniversário." }, { type: "FOOTER", text: "Loja MARIELA." }],
     ...extra,
   });
 
   it("endpoint, filtro por nome e Bearer; nome+idioma exatos → info com parâmetros contados", async () => {
     const { provedor, chamadas } = provedorCom(() => json(200, { data: [tpl({ language: "en_US" }), tpl()] }));
-    const info = await provedor.consultarTemplate("mariela_aniversario_v1", "pt_BR");
-    expect(chamadas[0]!.url).toBe("https://graph.facebook.com/v26.0/200000000000002/message_templates?name=mariela_aniversario_v1");
+    const info = await provedor.consultarTemplate("mariela_aniversario_v2", "pt_BR");
+    expect(chamadas[0]!.url).toBe("https://graph.facebook.com/v26.0/200000000000002/message_templates?name=mariela_aniversario_v2");
     expect(chamadas[0]!.init.method).toBe("GET");
     expect((chamadas[0]!.init.headers as Record<string, string>)["Authorization"]).toBe(`Bearer ${TOKEN}`);
-    expect(info).toEqual({ nomeMeta: "mariela_aniversario_v1", idioma: "pt_BR", status: "APPROVED", categoria: "MARKETING", quantidadeParametros: 1, estruturaCompativel: true });
+    expect(info).toEqual({ nomeMeta: "mariela_aniversario_v2", idioma: "pt_BR", status: "APPROVED", categoria: "MARKETING", quantidadeParametros: 1, estruturaCompativel: true });
     expect(avaliarAprovacaoTemplate(DEF, info)).toBe("APROVADO");
   });
 
   it("não encontrado (lista completa) → null; paginado sem o template → exceção (DESCONHECIDO)", async () => {
-    expect(await provedorCom(() => json(200, { data: [tpl({ name: "mariela_aniversario_v10" })] })).provedor.consultarTemplate("mariela_aniversario_v1", "pt_BR")).toBeNull();
+    expect(await provedorCom(() => json(200, { data: [tpl({ name: "mariela_aniversario_v20" })] })).provedor.consultarTemplate("mariela_aniversario_v2", "pt_BR")).toBeNull();
     await expect(
-      provedorCom(() => json(200, { data: [], paging: { next: "https://graph.facebook.com/next" } })).provedor.consultarTemplate("mariela_aniversario_v1", "pt_BR"),
+      provedorCom(() => json(200, { data: [], paging: { next: "https://graph.facebook.com/next" } })).provedor.consultarTemplate("mariela_aniversario_v2", "pt_BR"),
     ).rejects.toThrow();
   });
 
   it("erro HTTP, timeout, JSON inválido ou registro incompleto → exceção sem token nem corpo", async () => {
     for (const responder of [() => erroMeta(190, 401), () => json(200, "{"), () => json(200, { data: [tpl({ status: undefined })] }), () => json(500, "x")]) {
       const { provedor } = provedorCom(responder);
-      const erro = await provedor.consultarTemplate("mariela_aniversario_v1", "pt_BR").catch((e: Error) => e);
+      const erro = await provedor.consultarTemplate("mariela_aniversario_v2", "pt_BR").catch((e: Error) => e);
       expect(erro).toBeInstanceOf(Error);
       expect((erro as Error).message).not.toContain(TOKEN);
       expect((erro as Error).message).not.toContain("algo sobre");

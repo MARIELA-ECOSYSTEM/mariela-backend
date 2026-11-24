@@ -7,7 +7,7 @@ import { MovimentosCaixaRepository } from "../caixas/movimentos-caixa.repository
 import { ProdutosRepository } from "../produtos/produtos.repository.js";
 import { normalizarCategoria, normalizarCor, normalizarFormaPagamento, normalizarTamanho } from "../produtos/utils/normalizacao.util.js";
 import { VendasRepository } from "../vendas/vendas.repository.js";
-import { CAMPOS_LISTA, type CampoLista } from "./configuracoes.constants.js";
+import { CAMPOS_LISTA, LIMITES_MENSAGEM_WHATSAPP, type CampoLista } from "./configuracoes.constants.js";
 import {
   ConfiguracoesRepository,
   normalizarItemLista,
@@ -16,6 +16,7 @@ import {
 } from "./configuracoes.repository.js";
 import type { DadosLoja } from "./configuracoes.types.js";
 import type { AtualizarLojaDto } from "./dto/atualizar-loja.dto.js";
+import type { SalvarMensagemWhatsappDto } from "./dto/salvar-mensagem-whatsapp.dto.js";
 import type { ConfiguracaoDocument } from "./schemas/configuracao.schema.js";
 import { EventoConfiguracao, type EventoConfiguracaoDocument } from "./schemas/evento-configuracao.schema.js";
 
@@ -594,6 +595,53 @@ export class ConfiguracoesService {
         : { "variantes.tamanhos.tamanho": normalizarTamanho(valor) };
     const vinculados = await this.produtosRepository.listarTodosAtivos(filtro);
     return vinculados.length > 0;
+  }
+
+  // ─── Fase 22.8.9.10.7.3 — mensagens padrão de WhatsApp ────────────────────────────────────────────────────────────
+
+  async criarMensagemWhatsapp(dto: SalvarMensagemWhatsappDto, usuarioId: string | null): Promise<ConfiguracaoDocument> {
+    const { titulo, conteudo } = this.validarMensagemWhatsapp(dto);
+    const id = randomUUID();
+    const resultado = await this.configuracoesRepository.criarMensagemWhatsapp({ id, titulo, conteudo, atualizadoEm: new Date() });
+    if (!resultado) {
+      const atuais = await this.configuracoesRepository.lerMensagensWhatsapp();
+      if (atuais.length >= LIMITES_MENSAGEM_WHATSAPP.quantidade) {
+        throw ApiException.validation(`Limite de ${LIMITES_MENSAGEM_WHATSAPP.quantidade} mensagens padrão atingido. Exclua uma antes de criar outra.`);
+      }
+      throw ApiException.conflict(`Já existe uma mensagem padrão com o título "${titulo}".`);
+    }
+    await this.registrarEvento("configuracao.mensagem_whatsapp_criada", usuarioId, { id });
+    return resultado;
+  }
+
+  async atualizarMensagemWhatsapp(id: string, dto: SalvarMensagemWhatsappDto, usuarioId: string | null): Promise<ConfiguracaoDocument> {
+    const { titulo, conteudo } = this.validarMensagemWhatsapp(dto);
+    const resultado = await this.configuracoesRepository.atualizarMensagemWhatsapp(id, titulo, conteudo, new Date());
+    if (!resultado) {
+      const atuais = await this.configuracoesRepository.lerMensagensWhatsapp();
+      if (!atuais.some((m) => m.id === id)) throw ApiException.notFound("Mensagem padrão não encontrada.");
+      throw ApiException.conflict(`Já existe uma mensagem padrão com o título "${titulo}".`);
+    }
+    await this.registrarEvento("configuracao.mensagem_whatsapp_atualizada", usuarioId, { id });
+    return resultado;
+  }
+
+  async excluirMensagemWhatsapp(id: string, usuarioId: string | null): Promise<ConfiguracaoDocument> {
+    const resultado = await this.configuracoesRepository.excluirMensagemWhatsapp(id);
+    if (!resultado) throw ApiException.notFound("Mensagem padrão não encontrada.");
+    await this.registrarEvento("configuracao.mensagem_whatsapp_excluida", usuarioId, { id });
+    return resultado;
+  }
+
+  /** Apara e exige título e conteúdo não vazios (o DTO já limita tamanho e tipo). */
+  private validarMensagemWhatsapp(dto: SalvarMensagemWhatsappDto): { titulo: string; conteudo: string } {
+    const titulo = dto.titulo.trim();
+    const conteudo = dto.conteudo.trim();
+    const erros: { field: string; message: string }[] = [];
+    if (!titulo) erros.push({ field: "titulo", message: "Informe um título." });
+    if (!conteudo) erros.push({ field: "conteudo", message: "Informe o texto da mensagem." });
+    if (erros.length > 0) throw ApiException.validation("Dados inválidos.", erros);
+    return { titulo, conteudo };
   }
 
   private async registrarEvento(tipo: string, usuarioId: string | null, detalhes: Record<string, unknown>): Promise<void> {

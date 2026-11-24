@@ -44,7 +44,7 @@ class ProvedorEnvioFalso implements ProvedorEnvioWhatsapp {
     waId: i.telefoneE164.slice(1),
   });
   info: () => Promise<InfoTemplateProvedorWhatsapp | null> = async () => ({
-    nomeMeta: "mariela_aniversario_v1",
+    nomeMeta: "mariela_aniversario_v2",
     idioma: "pt_BR",
     status: "APPROVED",
     categoria: "MARKETING",
@@ -88,7 +88,7 @@ describe("Envio de WhatsApp por template (integração — MongoDB real, provedo
   const pedido = (clienteId: string, extra: Partial<EnviarTemplateWhatsappDto> = {}): EnviarTemplateWhatsappDto => ({
     idempotencyKey: randomUUID(),
     destinatario: { tipo: "CLIENTE", id: clienteId },
-    template: "aniversario_v1",
+    template: "aniversario_v2",
     ...extra,
   });
 
@@ -126,7 +126,7 @@ describe("Envio de WhatsApp por template (integração — MongoDB real, provedo
     provedor.chamadas = [];
     provedor.resultado = new ProvedorEnvioFalso().resultado;
     provedor.info = new ProvedorEnvioFalso().info;
-    templates.invalidar("aniversario_v1");
+    templates.invalidar("aniversario_v2");
     agora = new Date("2026-11-23T15:00:00Z");
   });
 
@@ -160,8 +160,8 @@ describe("Envio de WhatsApp por template (integração — MongoDB real, provedo
         destinatarioTipo: "CLIENTE" as const,
         destinatarioId: cliente._id,
         telefoneE164: e164(cliente.telefone),
-        templateChave: "aniversario_v1",
-        templateNomeMeta: "mariela_aniversario_v1",
+        templateChave: "aniversario_v2",
+        templateNomeMeta: "mariela_aniversario_v2",
         templateIdioma: "pt_BR",
         templateCategoria: "MARKETING",
         origem: "INDIVIDUAL" as const,
@@ -284,12 +284,12 @@ describe("Envio de WhatsApp por template (integração — MongoDB real, provedo
   describe("templates: aprovação confirmada no provedor", () => {
     it("pendente, divergente ou consulta falhando → 422 sem gravar nem enviar", async () => {
       const cliente = await novoCliente();
-      provedor.info = async () => ({ nomeMeta: "mariela_aniversario_v1", idioma: "pt_BR", status: "PENDING", categoria: "MARKETING", quantidadeParametros: 1 });
+      provedor.info = async () => ({ nomeMeta: "mariela_aniversario_v2", idioma: "pt_BR", status: "PENDING", categoria: "MARKETING", quantidadeParametros: 1 });
       await expect(service.enviar(pedido(cliente.id), null)).rejects.toMatchObject({ code: "WHATSAPP_TEMPLATE_INDISPONIVEL" });
-      templates.invalidar("aniversario_v1");
-      provedor.info = async () => ({ nomeMeta: "mariela_aniversario_v1", idioma: "pt_BR", status: "APPROVED", categoria: "UTILITY", quantidadeParametros: 1 });
+      templates.invalidar("aniversario_v2");
+      provedor.info = async () => ({ nomeMeta: "mariela_aniversario_v2", idioma: "pt_BR", status: "APPROVED", categoria: "UTILITY", quantidadeParametros: 1 });
       await expect(service.enviar(pedido(cliente.id), null)).rejects.toMatchObject({ code: "WHATSAPP_TEMPLATE_INDISPONIVEL" });
-      templates.invalidar("aniversario_v1");
+      templates.invalidar("aniversario_v2");
       provedor.info = async () => {
         throw new Error("rede");
       };
@@ -356,8 +356,8 @@ describe("Envio de WhatsApp por template (integração — MongoDB real, provedo
           destinatarioTipo: "CLIENTE",
           destinatarioId: cliente._id,
           telefoneE164: e164(cliente.telefone),
-          templateChave: "aniversario_v1",
-          templateNomeMeta: "mariela_aniversario_v1",
+          templateChave: "aniversario_v2",
+          templateNomeMeta: "mariela_aniversario_v2",
           templateIdioma: "pt_BR",
           templateCategoria: "MARKETING",
           origem: "INDIVIDUAL",

@@ -57,7 +57,7 @@ describe("HTTP — WhatsApp por template e bloqueios (servidor real, provedor du
   const corpoEnvio = (clienteId: string, extra: Record<string, unknown> = {}) => ({
     idempotencyKey: randomUUID(),
     destinatario: { tipo: "CLIENTE", id: clienteId },
-    template: "aniversario_v1",
+    template: "aniversario_v2",
     ...extra,
   });
   const post = (caminho: string, corpo: unknown) => fetch(url(caminho), { method: "POST", headers: h(), body: JSON.stringify(corpo) });
@@ -191,9 +191,9 @@ describe("HTTP — WhatsApp por template e bloqueios (servidor real, provedor du
 
   it("GET /templates e POST /templates/:chave/previa (primeiro nome do cadastro)", async () => {
     const templates = (await (await fetch(url("/templates"), { headers: h() })).json()) as { data: { chave: string; estadoAprovacao: string }[] };
-    expect(templates.data).toContainEqual(expect.objectContaining({ chave: "aniversario_v1", estadoAprovacao: "APROVADO" }));
+    expect(templates.data).toContainEqual(expect.objectContaining({ chave: "aniversario_v2", estadoAprovacao: "APROVADO" }));
     const c = await novoCliente("Fernanda Lima");
-    const previa = await post("/templates/aniversario_v1/previa", { clienteId: c.id });
+    const previa = await post("/templates/aniversario_v2/previa", { clienteId: c.id });
     expect(previa.status).toBe(200);
     expect(((await previa.json()) as { data: { texto: string } }).data.texto).toStartWith("Olá, Fernanda!");
     expect((await post("/templates/nao_existe/previa", { clienteId: c.id })).status).toBe(422);
