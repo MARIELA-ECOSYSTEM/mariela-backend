@@ -9,7 +9,6 @@ import { TemplatesWhatsappService } from "../templates/templates-whatsapp.servic
 import { CONFIG_WEBHOOK_WHATSAPP, type ConfiguracaoWebhookMeta } from "./configuracao-webhook-meta.js";
 import type { ContagemWebhookMeta, EventoStatusMeta, NotificacaoWebhookMeta, PedidoOptOutMeta } from "./contrato-webhook-meta.js";
 import { interpretarNotificacaoMeta } from "./contrato-webhook-meta.js";
-import { criarReconhecedorOptOut, PALAVRAS_CHAVE_OPT_OUT } from "./opt-out-palavras-chave.js";
 import { TENTATIVAS_TRANSICAO_STATUS } from "./webhook-meta.constants.js";
 
 export type ResultadoStatusWebhook = "aplicado" | "ignorado" | "anomalia" | "desconhecida";
@@ -37,26 +36,24 @@ export class ConcorrenciaEsgotadaWebhook extends Error {
  *   cria nada.
  * - Efeitos de `failed` (bloqueio por opt-out de marketing, descarte do cache de aprovação) são idempotentes e
  *   acontecem ANTES da transição: se o processo cair entre os dois, a reentrega da Meta reaplica tudo sem duplicar.
- * - Opt-out: bloqueio por `wa_id` (`whatsapp_bloqueios`), idempotente pelo índice único de bloqueio ativo.
+ * - Opt-out: só o OFICIAL da Meta (`user_preferences` → `stop`), bloqueio por `wa_id` (`whatsapp_bloqueios`),
+ *   idempotente pelo índice único de bloqueio ativo. Mensagens recebidas não geram efeito (Fase 22.8.9.10.7.2: o
+ *   reconhecimento de palavras-chave foi removido).
  * - Nenhuma mensagem é enviada; nenhum cliente/fornecedor/vendedor é criado ou alterado.
  * - Logs só com contagens, ids internos, estados e códigos — nunca número, texto, payload, assinatura ou segredo.
  */
 @Injectable()
 export class WebhookWhatsappService {
   private readonly logger = new Logger(WebhookWhatsappService.name);
-  private readonly reconhecerOptOut: (texto: string) => boolean;
   /** Relógio substituível nos testes. */
   relogio: () => Date = () => new Date();
 
   constructor(
     @Inject(CONFIG_WEBHOOK_WHATSAPP) private readonly config: ConfiguracaoWebhookMeta | null,
-    @Inject(PALAVRAS_CHAVE_OPT_OUT) palavrasChave: readonly string[],
     private readonly mensagens: MensagensWhatsappRepository,
     private readonly bloqueios: BloqueiosWhatsappService,
     private readonly templates: TemplatesWhatsappService,
-  ) {
-    this.reconhecerOptOut = criarReconhecedorOptOut(palavrasChave);
-  }
+  ) {}
 
   /** `null` = webhook desativado (configuração ausente/incompleta). */
   configuracao(): ConfiguracaoWebhookMeta | null {
@@ -66,7 +63,7 @@ export class WebhookWhatsappService {
   /** Lança `ErroContratoWebhookMeta` se o envelope estiver fora do contrato. */
   interpretar(json: unknown): NotificacaoWebhookMeta {
     if (!this.config) throw new Error("Webhook desativado.");
-    return interpretarNotificacaoMeta(json, this.config.phoneNumberId, this.reconhecerOptOut);
+    return interpretarNotificacaoMeta(json, this.config.phoneNumberId);
   }
 
   async processar(notificacao: NotificacaoWebhookMeta): Promise<ResumoWebhookWhatsapp> {
@@ -140,8 +137,7 @@ export class WebhookWhatsappService {
   }
 
   private async registrarOptOut(pedido: PedidoOptOutMeta): Promise<{ criado: boolean }> {
-    const motivo = pedido.origem === "META_OPT_OUT" ? "Webhook Meta: parar mensagens de marketing." : "Webhook Meta: palavra-chave de opt-out.";
-    const { criado } = await this.bloqueios.bloquearWaId(pedido.waId, pedido.origem, motivo);
+    const { criado } = await this.bloqueios.bloquearWaId(pedido.waId, pedido.origem, "Webhook Meta: parar mensagens de marketing.");
     return { criado };
   }
 }

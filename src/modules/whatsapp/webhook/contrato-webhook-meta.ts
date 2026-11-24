@@ -19,10 +19,15 @@ export interface EventoStatusMeta {
   codigoErro: number | null;
 }
 
-export type OrigemOptOutWebhook = "META_OPT_OUT" | "PALAVRA_CHAVE";
+/**
+ * Fase 22.8.9.10.7.2 — o único opt-out lido do webhook é o OFICIAL da Meta (`user_preferences` → `stop`). O
+ * reconhecimento de palavras-chave em mensagens recebidas (Fases 22.8.9.10.5/22.8.9.10.7.1) foi REMOVIDO: mensagem
+ * recebida não bloqueia nada. A origem `PALAVRA_CHAVE` continua existindo só para os registros históricos de bloqueio.
+ */
+export type OrigemOptOutWebhook = "META_OPT_OUT";
 
 export interface PedidoOptOutMeta {
-  /** Identificador do WhatsApp do usuário (`wa_id`/`from`), só dígitos, EXATAMENTE como a Meta enviou. */
+  /** Identificador do WhatsApp do usuário (`wa_id`), só dígitos, EXATAMENTE como a Meta enviou. */
   waId: string;
   origem: OrigemOptOutWebhook;
 }
@@ -60,13 +65,9 @@ function instante(v: unknown): Date | null {
  * Fase 22.8.9.10.5 — interpreta uma notificação JÁ AUTENTICADA (assinatura validada antes). Função pura:
  * - envelope (`object`, `entry[]`, `changes[]`, `field`, `value`) fora do contrato → `ErroContratoWebhookMeta`;
  * - eventos de outro Phone Number ID, campos não suportados e itens malformados são IGNORADOS e só contados;
- * - o texto de mensagens recebidas é usado SÓ para `reconhecerOptOut` e nunca sai desta função.
+ * - mensagens recebidas são só CONTADAS (Fase 22.8.9.10.7.2): o conteúdo nunca é lido nem gera efeito algum.
  */
-export function interpretarNotificacaoMeta(
-  json: unknown,
-  phoneNumberIdEsperado: string,
-  reconhecerOptOut: (texto: string) => boolean,
-): NotificacaoWebhookMeta {
+export function interpretarNotificacaoMeta(json: unknown, phoneNumberIdEsperado: string): NotificacaoWebhookMeta {
   const raiz = objeto(json);
   if (!raiz || raiz["object"] !== "whatsapp_business_account" || !Array.isArray(raiz["entry"])) throw new ErroContratoWebhookMeta();
 
@@ -104,7 +105,7 @@ export function interpretarNotificacaoMeta(
       if (campo === "messages") {
         if (Array.isArray(valor["errors"])) contagem.errosNoValor += valor["errors"].length;
         lerStatuses(valor["statuses"], statuses, contagem);
-        lerMensagensRecebidas(valor["messages"], optOuts, contagem, reconhecerOptOut);
+        contarMensagensRecebidas(valor["messages"], contagem);
       } else {
         lerPreferencias(valor["user_preferences"], optOuts, contagem);
       }
@@ -142,34 +143,16 @@ function lerStatuses(lista: unknown, saida: EventoStatusMeta[], contagem: Contag
   }
 }
 
-function lerMensagensRecebidas(
-  lista: unknown,
-  saida: PedidoOptOutMeta[],
-  contagem: ContagemWebhookMeta,
-  reconhecerOptOut: (texto: string) => boolean,
-): void {
+/** Mensagens recebidas: só contadas (nenhum efeito; o conteúdo não é lido). */
+function contarMensagensRecebidas(lista: unknown, contagem: ContagemWebhookMeta): void {
   if (lista === undefined) return;
   if (!Array.isArray(lista)) {
     contagem.itensInvalidos += 1;
     return;
   }
   for (const bruto of lista) {
-    const m = objeto(bruto);
-    if (!m) {
-      contagem.itensInvalidos += 1;
-      continue;
-    }
-    contagem.mensagensRecebidas += 1;
-    // Só mensagens de TEXTO são candidatas a opt-out por palavra-chave; qualquer outro tipo é ignorado.
-    const corpo = m["type"] === "text" ? objeto(m["text"])?.["body"] : undefined;
-    if (typeof corpo !== "string" || !reconhecerOptOut(corpo)) continue;
-    const from = m["from"];
-    if (typeof from !== "string" || !FORMATO_WA_ID.test(from)) {
-      // Usuário com nome de usuário/BSUID sem telefone: não há número a bloquear.
-      contagem.semIdentificadorTelefone += 1;
-      continue;
-    }
-    saida.push({ waId: from, origem: "PALAVRA_CHAVE" });
+    if (objeto(bruto)) contagem.mensagensRecebidas += 1;
+    else contagem.itensInvalidos += 1;
   }
 }
 

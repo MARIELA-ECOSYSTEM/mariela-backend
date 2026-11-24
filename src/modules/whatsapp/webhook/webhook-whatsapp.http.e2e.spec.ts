@@ -218,7 +218,7 @@ describe("HTTP — webhook WhatsApp configurado (Meta simulada)", () => {
       expect(await connection.collection("whatsapp_bloqueios").countDocuments({ ativo: true })).toBe(1);
     });
 
-    describe("Fase 22.8.9.10.7.1 — opt-out por palavra-chave (lista aprovada, AppModule real)", () => {
+    describe("Fase 22.8.9.10.7.2 — mensagens recebidas não geram bloqueio (palavras-chave removidas, AppModule real)", () => {
       const REMETENTE = "5583912349999";
       const mensagemTexto = (body: string, from = REMETENTE) =>
         JSON.stringify({
@@ -242,12 +242,13 @@ describe("HTTP — webhook WhatsApp configurado (Meta simulada)", () => {
         });
       const bloqueiosAtivos = () => connection.collection("whatsapp_bloqueios").countDocuments({ chave: REMETENTE, ativo: true });
 
-      it("assinatura válida + ' Sair ' → 200 e bloqueio PALAVRA_CHAVE; reentrega não duplica; logs sem texto, número ou nome", async () => {
-        const corpo = mensagemTexto(" Sair ");
-        expect((await postar(corpo)).status).toBe(200);
-        expect((await postar(corpo)).status).toBe(200);
-        expect(await bloqueiosAtivos()).toBe(1);
-        expect(await connection.collection("whatsapp_bloqueios").findOne({ chave: REMETENTE })).toMatchObject({ tipoChave: "WAID", origem: "PALAVRA_CHAVE", clienteId: null });
+      it("assinatura válida + SAIR/PARAR/CANCELAR/STOP/UNSUBSCRIBE → 200 e NENHUM bloqueio; logs sem texto, número ou nome", async () => {
+        for (const t of [" Sair ", "SAIR", "PARAR", "Cancelar", "STOP", "unsubscribe"]) {
+          const corpo = mensagemTexto(t);
+          expect((await postar(corpo)).status).toBe(200);
+          expect((await postar(corpo)).status).toBe(200);
+        }
+        expect(await connection.collection("whatsapp_bloqueios").countDocuments({})).toBe(0);
         semSegredosNosLogs(REMETENTE, REMETENTE.slice(2), "Sair", "Contato Ficticio");
       });
 

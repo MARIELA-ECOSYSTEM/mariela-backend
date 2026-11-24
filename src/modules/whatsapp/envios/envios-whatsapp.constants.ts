@@ -46,6 +46,10 @@ export type TipoCampanhaWhatsapp = (typeof TIPOS_CAMPANHA_WHATSAPP)[number];
 export const TIPOS_DESTINATARIO_ENVIO_WHATSAPP = ["CLIENTE"] as const;
 export type TipoDestinatarioEnvioWhatsapp = (typeof TIPOS_DESTINATARIO_ENVIO_WHATSAPP)[number];
 
+/**
+ * `PALAVRA_CHAVE` é LEGADO (Fase 22.8.9.10.7.2): nenhum código cria mais bloqueios com essa origem. Continua aceita
+ * para que registros históricos sigam válidos, consultáveis (`origem: "PALAVRA_CHAVE"`) e desbloqueáveis pelo ADMIN.
+ */
 export const ORIGENS_BLOQUEIO_WHATSAPP = ["ADMIN", "PALAVRA_CHAVE", "META_OPT_OUT"] as const;
 export type OrigemBloqueioWhatsapp = (typeof ORIGENS_BLOQUEIO_WHATSAPP)[number];
 

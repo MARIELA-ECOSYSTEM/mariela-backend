@@ -10,6 +10,10 @@ import type { OrigemMensagemWhatsapp } from "../envios/envios-whatsapp.constants
  *
  * ⚠️ Os textos abaixo são RASCUNHOS a serem revisados e submetidos à Meta pela loja (decisão pendente, spec
  * 22.8.9.10.2 §16). `previa` precisa ser IDÊNTICA ao corpo submetido; mudar o texto exige nova versão (`_v2`).
+ *
+ * ⚠️ Fase 22.8.9.10.7.2 — o MARIELA NÃO reconhece mais respostas como "SAIR" (palavras-chave removidas). A frase
+ * "responda SAIR" do rascunho abaixo precisa ser revista ANTES da submissão à Meta, para não prometer um efeito que
+ * não existe (decisão de conteúdo pendente; texto mantido sem alteração nesta fase).
  */
 export type CategoriaTemplateWhatsapp = "MARKETING" | "UTILITY";
 

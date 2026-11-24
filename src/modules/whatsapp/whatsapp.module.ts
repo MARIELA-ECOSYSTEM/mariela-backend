@@ -18,7 +18,6 @@ import { BloqueioWhatsapp, BloqueioWhatsappSchema } from "./schemas/bloqueio-wha
 import { MensagemWhatsapp, MensagemWhatsappSchema } from "./schemas/mensagem-whatsapp.schema.js";
 import { TemplatesWhatsappService } from "./templates/templates-whatsapp.service.js";
 import { CONFIG_WEBHOOK_WHATSAPP, lerConfiguracaoWebhookMeta } from "./webhook/configuracao-webhook-meta.js";
-import { PALAVRAS_CHAVE_OPT_OUT, PALAVRAS_CHAVE_OPT_OUT_APROVADAS } from "./webhook/opt-out-palavras-chave.js";
 import { WebhookWhatsappController } from "./webhook/webhook-whatsapp.controller.js";
 import { WebhookWhatsappService } from "./webhook/webhook-whatsapp.service.js";
 import { WHATSAPP_PROVIDER } from "./whatsapp.constants.js";
@@ -70,7 +69,6 @@ import { WhatsappService } from "./whatsapp.service.js";
       },
       inject: [{ token: ConfigService, optional: true }],
     },
-    { provide: PALAVRAS_CHAVE_OPT_OUT, useValue: PALAVRAS_CHAVE_OPT_OUT_APROVADAS },
     WebhookWhatsappService,
   ],
   exports: [WhatsappService],

@@ -4,12 +4,6 @@ import type { WhatsappConfig } from "../../../config/configuration.js";
 import { assinaturaWebhookValida, verificarDesafioGet } from "./assinatura-webhook-meta.js";
 import { lerConfiguracaoWebhookMeta } from "./configuracao-webhook-meta.js";
 import { ErroContratoWebhookMeta, interpretarNotificacaoMeta } from "./contrato-webhook-meta.js";
-import {
-  criarReconhecedorOptOut,
-  normalizarTextoOptOut,
-  PALAVRAS_CHAVE_OPT_OUT_APROVADAS,
-  TAMANHO_MAXIMO_MENSAGEM_OPT_OUT,
-} from "./opt-out-palavras-chave.js";
 
 /**
  * Fase 22.8.9.10.5 — regras PURAS do webhook (sem rede, sem MongoDB). Segredos são marcadores fictícios evidentes.
@@ -88,95 +82,14 @@ describe("configuração do webhook", () => {
   });
 });
 
-describe("palavras-chave de opt-out (Fase 22.8.9.10.7.1)", () => {
-  const r = criarReconhecedorOptOut(PALAVRAS_CHAVE_OPT_OUT_APROVADAS);
-
-  it("lista APROVADA: SAIR, PARAR, CANCELAR, STOP, UNSUBSCRIBE (congelada)", () => {
-    expect(PALAVRAS_CHAVE_OPT_OUT_APROVADAS).toEqual(["SAIR", "PARAR", "CANCELAR", "STOP", "UNSUBSCRIBE"]);
-    expect(Object.isFrozen(PALAVRAS_CHAVE_OPT_OUT_APROVADAS)).toBe(true);
-  });
-
-  it("cada palavra-chave, em qualquer caixa, é reconhecida", () => {
-    for (const p of PALAVRAS_CHAVE_OPT_OUT_APROVADAS) {
-      const minuscula = p.toLowerCase();
-      const capitalizada = p[0] + p.slice(1).toLowerCase();
-      for (const t of [p, minuscula, capitalizada, minuscula.replace(/^./, (c) => c.toUpperCase()).replace(/.$/, (c) => c.toUpperCase())]) {
-        expect([t, r(t)]).toEqual([t, true]);
-      }
-    }
-  });
-
-  it("exemplos da especificação: 'SAIR', 'sair', ' PARAR ', 'Cancelar' bloqueiam", () => {
-    for (const t of ["SAIR", "sair", " PARAR ", "Cancelar"]) expect([t, r(t)]).toEqual([t, true]);
-  });
-
-  it("espaços e caracteres invisíveis nas pontas: tabulação, quebra de linha, espaço não separável, zero-width, BOM", () => {
-    for (const t of ["\tSAIR\n", "\n\n parar \r\n", " Stop ", "​sair​", "﻿CANCELAR", "unsubscribe⁠"]) {
-      expect([JSON.stringify(t), r(t)]).toEqual([JSON.stringify(t), true]);
-    }
-  });
-
-  it("acentos normalizados (e forma decomposta Unicode)", () => {
-    for (const t of ["SAÍR", "sáir", "Párar", "CANCELÁR", "Sáir", "ｓａｉｒ"]) expect([t, r(t)]).toEqual([t, true]);
-  });
-
-  it("uma pontuação final de afirmação é tolerada ('.', '!', até 3)", () => {
-    for (const t of ["Sair.", "PARAR!", "stop!!!", "Cancelar !", "SAIR.!"]) expect([t, r(t)]).toEqual([t, true]);
-  });
-
-  it("FALSOS POSITIVOS: palavra dentro de frase, pergunta, repetição, letras separadas, prefixo/sufixo, outra pontuação → NÃO", () => {
-    for (const t of [
-      "Quero saber como sair da promoção",
-      "Não quero cancelar meu pedido",
-      "Esse produto é ótimo",
-      "quero SAIR",
-      "SAIR da lista por favor",
-      "Sair?",
-      "parar?",
-      "SAIR SAIR",
-      "S A I R",
-      "S-A-I-R",
-      "#SAIR",
-      "SAIR123",
-      "sairr",
-      "SAIRE",
-      "Desistir",
-      "stop!!!!",
-      "\"SAIR\"",
-      "SAIR 😀",
-      "pare",
-      "não",
-      "cancela",
-      "unsubscribe me",
-      "",
-      "   ",
-      "!!!",
-      "SAIR".padEnd(80, " ") + "x",
-    ]) {
-      expect([t, r(t)]).toEqual([t, false]);
-    }
-  });
-
-  it("texto longo nunca é analisado; lista vazia não reconhece nada; listas de teste usam a mesma normalização", () => {
-    expect(normalizarTextoOptOut(`SAIR${" ".repeat(TAMANHO_MAXIMO_MENSAGEM_OPT_OUT)}`)).toBeNull();
-    expect(normalizarTextoOptOut("  sáir. ")).toBe("SAIR");
-    const vazia = criarReconhecedorOptOut([]);
-    for (const t of ["SAIR", "sair", "PARAR", "STOP", ""]) expect(vazia(t)).toBe(false);
-    const teste = criarReconhecedorOptOut(["Sair"]);
-    expect(teste("SAIR")).toBe(true);
-    expect(teste("PARAR")).toBe(false);
-  });
-});
-
 describe("contrato da notificação (POST)", () => {
-  const reconhecer = criarReconhecedorOptOut(["SAIR"]);
   const envelope = (changes: unknown[]) => ({ object: "whatsapp_business_account", entry: [{ id: "200000000000002", changes }] });
   const meta = { display_phone_number: "15550000000", phone_number_id: PHONE_ID };
   const statusValor = (statuses: unknown[], phone = PHONE_ID) => ({ field: "messages", value: { messaging_product: "whatsapp", metadata: { ...meta, phone_number_id: phone }, statuses } });
 
   it("envelope fora do contrato → ErroContratoWebhookMeta", () => {
     for (const json of [null, [], "x", {}, { object: "page", entry: [] }, { object: "whatsapp_business_account" }, { object: "whatsapp_business_account", entry: [{}] }, envelope([{ field: 1, value: {} }]), envelope([{ field: "messages" }])]) {
-      expect(() => interpretarNotificacaoMeta(json, PHONE_ID, reconhecer)).toThrow(ErroContratoWebhookMeta);
+      expect(() => interpretarNotificacaoMeta(json, PHONE_ID)).toThrow(ErroContratoWebhookMeta);
     }
   });
 
@@ -190,7 +103,6 @@ describe("contrato da notificação (POST)", () => {
         ]),
       ]),
       PHONE_ID,
-      reconhecer,
     );
     expect(n.statuses).toEqual([
       { wamid: "wamid.A", status: "delivered", ocorridoEm: new Date(1750263773000), codigoErro: null },
@@ -207,29 +119,35 @@ describe("contrato da notificação (POST)", () => {
         { field: "account_update", value: { x: 1 } },
       ]),
       PHONE_ID,
-      reconhecer,
     );
     expect(n.statuses).toEqual([]);
     expect(n.contagem).toMatchObject({ statusIgnorados: 1, itensInvalidos: 3, outroNumero: 1, camposIgnorados: 1 });
   });
 
-  it("mensagem de texto com palavra-chave → opt-out pelo `from` exato; outras mensagens/tipos não", () => {
+  it("Fase 22.8.9.10.7.2 — mensagens recebidas (inclusive SAIR/PARAR/CANCELAR/STOP/UNSUBSCRIBE) só são contadas: nenhum opt-out", () => {
     const msgs = (messages: unknown[]) => ({ field: "messages", value: { messaging_product: "whatsapp", metadata: meta, contacts: [{ wa_id: "5583912345678" }], messages } });
     const n = interpretarNotificacaoMeta(
       envelope([
         msgs([
-          { from: "5583912345678", id: "wamid.1", timestamp: "1", type: "text", text: { body: "SAIR" } },
-          { from: "5583900000001", id: "wamid.2", timestamp: "1", type: "text", text: { body: "Oi, tudo bem?" } },
-          { from: "5583900000002", id: "wamid.3", timestamp: "1", type: "button", button: { text: "SAIR", payload: "SAIR" } },
-          { from_user_id: "BR.123", id: "wamid.4", timestamp: "1", type: "text", text: { body: "SAIR" } },
+          ...["SAIR", "sair", " Parar ", "CANCELAR", "STOP", "unsubscribe", "Oi, tudo bem?"].map((body, i) => ({
+            from: "5583912345678",
+            id: `wamid.${i}`,
+            timestamp: "1",
+            type: "text",
+            text: { body },
+          })),
+          { from: "5583900000002", id: "wamid.b", timestamp: "1", type: "button", button: { text: "SAIR", payload: "SAIR" } },
+          { from_user_id: "BR.123", id: "wamid.u", timestamp: "1", type: "text", text: { body: "SAIR" } },
+          "malformada",
         ]),
       ]),
       PHONE_ID,
-      reconhecer,
     );
-    expect(n.optOuts).toEqual([{ waId: "5583912345678", origem: "PALAVRA_CHAVE" }]);
-    expect(n.contagem).toMatchObject({ mensagensRecebidas: 4, semIdentificadorTelefone: 1 });
+    expect(n.optOuts).toEqual([]);
+    expect(n.statuses).toEqual([]);
+    expect(n.contagem).toMatchObject({ mensagensRecebidas: 9, itensInvalidos: 1, semIdentificadorTelefone: 0 });
     expect(JSON.stringify(n)).not.toContain("Oi, tudo bem");
+    expect(JSON.stringify(n)).not.toContain("SAIR");
   });
 
   it("user_preferences: só stop de marketing_messages bloqueia; resume e outras categorias são ignorados", () => {
@@ -244,7 +162,6 @@ describe("contrato da notificação (POST)", () => {
         ]),
       ]),
       PHONE_ID,
-      reconhecer,
     );
     expect(n.optOuts).toEqual([{ waId: "5583912345678", origem: "META_OPT_OUT" }]);
     expect(n.contagem).toMatchObject({ preferenciasIgnoradas: 2, semIdentificadorTelefone: 1 });
