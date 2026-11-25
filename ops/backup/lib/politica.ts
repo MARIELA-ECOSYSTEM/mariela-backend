@@ -102,8 +102,14 @@ export const ASSINATURA_POR_COLECAO: Record<ColecaoBackup, { estrategia: "timest
   whatsapp_bloqueios: { estrategia: "conteudo", camposData: ["criadoEm", "desbloqueadoEm"] },
 };
 
-/** Sessões: nunca entram no backup. O backend recria as coleções e os índices (inclusive TTL) no boot; todos fazem login de novo. */
-export const COLECOES_EXCLUIDAS = ["refresh_tokens", "vendedor_refresh_tokens"] as const;
+/**
+ * Sessões: nunca entram no backup. O backend recria as coleções e os índices (inclusive TTL) no boot; todos fazem login de novo.
+ *
+ * Fase 22.8.9.10.7.4 (aprovado pelo operador) — `whatsapp_janelas`: instante da última mensagem recebida de cada contato
+ * (janela de atendimento de 24 h, com TTL). Dado de vida curta, recriado pelo webhook: depois de um restore, a janela de
+ * cada contato fica FECHADA até ele escrever de novo (falha segura — nenhum texto livre é liberado indevidamente).
+ */
+export const COLECOES_EXCLUIDAS = ["refresh_tokens", "vendedor_refresh_tokens", "whatsapp_janelas"] as const;
 
 /**
  * Referência INFORMATIVA (estado lido em 09/11/2026): 103 índices nas 27 coleções de então. A validação usa os índices

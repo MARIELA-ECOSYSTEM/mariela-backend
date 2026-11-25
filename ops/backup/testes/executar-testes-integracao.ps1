@@ -107,11 +107,11 @@ try {
     $exatas.detalhe
   }
 
-  Caso "T04" "tokens excluídos (refresh_tokens e vendedor_refresh_tokens fora do archive; existiam na origem)" {
+  Caso "T04" "excluídas (refresh_tokens, vendedor_refresh_tokens e whatsapp_janelas fora do archive; existiam na origem)" {
     $nomes = @($manA.archive.documentosPorColecao.PSObject.Properties.Name)
-    Exigir ($nomes.Count -eq 29 -and $nomes -notcontains "refresh_tokens" -and $nomes -notcontains "vendedor_refresh_tokens") "tokens presentes"
-    Exigir (@($manA.politica.colecoesExcluidas) -join "," -eq "refresh_tokens,vendedor_refresh_tokens") "política divergente"
-    "origem tinha 31 coleções (com 1 documento em cada token); archive tem 29"
+    Exigir ($nomes.Count -eq 29 -and $nomes -notcontains "refresh_tokens" -and $nomes -notcontains "vendedor_refresh_tokens" -and $nomes -notcontains "whatsapp_janelas") "excluídas presentes"
+    Exigir (@($manA.politica.colecoesExcluidas) -join "," -eq "refresh_tokens,vendedor_refresh_tokens,whatsapp_janelas") "política divergente"
+    "origem tinha 32 coleções (com 1 documento em cada excluída); archive tem 29"
   }
 
   Caso "T05" "manifesto completo e coerente" {

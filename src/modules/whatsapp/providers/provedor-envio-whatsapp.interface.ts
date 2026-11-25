@@ -23,6 +23,18 @@ export interface EnviarTemplateWhatsappInput {
   referenciaInterna: string;
 }
 
+/**
+ * Fase 22.8.9.10.7.4 — texto livre (`type: "text"`). Só é pedido pelo fluxo depois de confirmar, no backend, a janela
+ * de atendimento de 24 h; o provedor não decide janela, bloqueio nem destinatário.
+ */
+export interface EnviarTextoWhatsappInput {
+  /** Destinatário em E.164, sempre resolvido do cadastro pelo backend. */
+  telefoneE164: string;
+  /** Texto já validado (não vazio, até `LIMITE_TEXTO_LIVRE_WHATSAPP`). */
+  texto: string;
+  referenciaInterna: string;
+}
+
 export type ResultadoEnvioProvedorWhatsapp =
   | { resultado: "aceita"; wamid: string; waId: string | null }
   | { resultado: "recusada"; codigo: CodigoRecusaProvedor; codigoProvedor: string | null }
@@ -51,6 +63,8 @@ export interface ProvedorEnvioWhatsapp {
   /** Configuração completa presente? Falso → as rotas de envio respondem `WHATSAPP_NOT_CONFIGURED`. */
   configurado(): boolean;
   enviarTemplate(input: EnviarTemplateWhatsappInput): Promise<ResultadoEnvioProvedorWhatsapp>;
+  /** Mesma classificação de `enviarTemplate` (aceita/recusada/indeterminada), uma chamada, sem retry. */
+  enviarTexto(input: EnviarTextoWhatsappInput): Promise<ResultadoEnvioProvedorWhatsapp>;
   /** `null` = template não existe no provedor. Exceção = não foi possível consultar (aprovação DESCONHECIDA). */
   consultarTemplate(nomeMeta: string, idioma: string): Promise<InfoTemplateProvedorWhatsapp | null>;
 }

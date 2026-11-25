@@ -37,6 +37,9 @@ class ProvedorEnvioFalso implements ProvedorEnvioWhatsapp {
     this.chamadas.push(input);
     return { resultado: "aceita", wamid: `wamid.${input.referenciaInterna}`, waId: null };
   }
+  async enviarTexto(): Promise<ResultadoEnvioProvedorWhatsapp> {
+    throw new Error("texto livre não é usado nesta suíte");
+  }
   async consultarTemplate(nomeMeta: string, idioma: string): Promise<InfoTemplateProvedorWhatsapp | null> {
     return { nomeMeta, idioma, status: "APPROVED", categoria: "MARKETING", quantidadeParametros: 1 };
   }

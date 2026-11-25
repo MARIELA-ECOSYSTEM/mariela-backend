@@ -50,10 +50,11 @@ function colecoesDosSchemas(): string[] {
 }
 
 describe("política de backup", () => {
-  it("29 incluídas + 2 excluídas = exatamente as coleções declaradas nos schemas, sem sobreposição", () => {
+  it("29 incluídas + 3 excluídas = exatamente as coleções declaradas nos schemas, sem sobreposição", () => {
     expect(COLECOES_BACKUP).toHaveLength(29);
     expect(new Set(COLECOES_BACKUP).size).toBe(COLECOES_BACKUP.length); // sem repetição
-    expect(COLECOES_EXCLUIDAS).toEqual(["refresh_tokens", "vendedor_refresh_tokens"]);
+    // Fase 22.8.9.10.7.4 (aprovado pelo operador): `whatsapp_janelas` é dado de vida curta, fora do backup.
+    expect(COLECOES_EXCLUIDAS).toEqual(["refresh_tokens", "vendedor_refresh_tokens", "whatsapp_janelas"]);
     expect(COLECOES_BACKUP.filter((c) => (COLECOES_EXCLUIDAS as readonly string[]).includes(c))).toEqual([]);
     const declaradas: string[] = [...COLECOES_BACKUP, ...COLECOES_EXCLUIDAS].sort();
     expect(declaradas).toEqual(colecoesDosSchemas());

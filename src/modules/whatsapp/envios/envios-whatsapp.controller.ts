@@ -8,6 +8,7 @@ import { JwtAuthGuard } from "../../../common/guards/jwt-auth.guard.js";
 import { RolesGuard } from "../../../common/guards/roles.guard.js";
 import {
   EnviarTemplateWhatsappDto,
+  EnviarTextoWhatsappDto,
   LiberarReenvioWhatsappDto,
   ListarMensagensWhatsappQueryDto,
   PreviaTemplateWhatsappDto,
@@ -37,8 +38,27 @@ export class EnviosWhatsappController {
     return { data: mensagem };
   }
 
+  /**
+   * Fase 22.8.9.10.7.4 — texto livre a um cliente cadastrado, só dentro da janela de 24 h (conferida aqui, pelo backend).
+   * 201 = mensagem criada por esta requisição; 200 = repetição da mesma chave (nada é reenviado).
+   */
+  @Throttle({ default: { limit: WHATSAPP_SEND_THROTTLE_LIMITE, ttl: WHATSAPP_SEND_THROTTLE_TTL_MS } })
+  @Post("envios/texto")
+  @ApiOperation({ summary: "Envia um texto livre a um cliente (só na janela de 24 h; idempotente pela chave)." })
+  async enviarTexto(@Body() dto: EnviarTextoWhatsappDto, @CurrentUser("sub") usuarioId: string, @Res({ passthrough: true }) res: Response) {
+    const { mensagem, nova } = await this.service.enviarTexto(dto, usuarioId ?? null);
+    res.status(nova ? HttpStatus.CREATED : HttpStatus.OK);
+    return { data: mensagem };
+  }
+
+  @Get("clientes/:id/texto-livre")
+  @ApiOperation({ summary: "Se o texto livre pode ser enviado agora a este cliente (janela de 24 h, bloqueio, configuração)." })
+  async elegibilidadeTexto(@Param("id") id: string) {
+    return { data: await this.service.elegibilidadeTexto(id) };
+  }
+
   @Get("mensagens")
-  @ApiOperation({ summary: "Histórico de mensagens por template (paginado)." })
+  @ApiOperation({ summary: "Histórico de mensagens (modelos e texto livre), paginado." })
   async listar(@Query() query: ListarMensagensWhatsappQueryDto) {
     return this.service.listar(query);
   }

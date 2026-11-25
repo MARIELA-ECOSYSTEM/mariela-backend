@@ -59,6 +59,9 @@ class ProvedorEnvioFalso implements ProvedorEnvioWhatsapp {
     if (this.atrasoMs) await new Promise((r) => setTimeout(r, this.atrasoMs));
     return this.resultado(input);
   }
+  async enviarTexto(): Promise<ResultadoEnvioProvedorWhatsapp> {
+    throw new Error("texto livre é coberto por envios-texto-whatsapp.integracao.spec.ts");
+  }
   async consultarTemplate(): Promise<InfoTemplateProvedorWhatsapp | null> {
     this.consultas += 1;
     return this.info();

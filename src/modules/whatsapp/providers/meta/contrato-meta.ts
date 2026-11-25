@@ -1,6 +1,7 @@
 import type { CodigoRecusaProvedor } from "../../envios/envios-whatsapp.constants.js";
 import type {
   EnviarTemplateWhatsappInput,
+  EnviarTextoWhatsappInput,
   InfoTemplateProvedorWhatsapp,
   ResultadoEnvioProvedorWhatsapp,
 } from "../provedor-envio-whatsapp.interface.js";
@@ -29,6 +30,20 @@ export function montarPayloadTemplate(input: EnviarTemplateWhatsappInput): Recor
     to: input.telefoneE164,
     type: "template",
     template,
+  };
+}
+
+/**
+ * Fase 22.8.9.10.7.4 — corpo do `POST /{Version}/{Phone-Number-ID}/messages` para TEXTO livre (`type: "text"`).
+ * `preview_url: false`: nenhum link do texto vira prévia (o operador não escolheu enviar prévia).
+ */
+export function montarPayloadTexto(input: EnviarTextoWhatsappInput): Record<string, unknown> {
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: input.telefoneE164,
+    type: "text",
+    text: { preview_url: false, body: input.texto },
   };
 }
 

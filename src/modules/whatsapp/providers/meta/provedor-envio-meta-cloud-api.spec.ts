@@ -198,7 +198,7 @@ describe("classificação: recusada (determinística)", () => {
     [131050, "OPT_OUT_MARKETING"],
     [131049, "LIMITE_MARKETING_DESTINATARIO"],
     [131021, "RECUSADA"], // remetente = destinatário
-    [131047, "RECUSADA"],
+    [131047, "JANELA_FECHADA"], // Fase 22.8.9.10.7.4 — texto livre fora da janela de 24 h
     [368, "RECUSADA"],
     [100, "RECUSADA"],
     [131009, "RECUSADA"],
@@ -342,6 +342,65 @@ describe("entrada fora do contrato: recusada SEM chamada de rede", () => {
     expect((await provedor.enviarTemplate({ ...ENTRADA, parametros: ["  "] })).resultado).toBe("recusada");
     expect(chamadas).toHaveLength(0);
     semDadosSensiveis();
+  });
+});
+
+describe("Fase 22.8.9.10.7.4 — texto livre (type: text)", () => {
+  const TEXTO = "Olá! Seu pedido ficou pronto. Veja https://exemplo.invalid/pedido";
+  const ENTRADA_TEXTO = { telefoneE164: TELEFONE, texto: TEXTO, referenciaInterna: "65f1a2b3c4d5e6f7a8b9c0d2" };
+
+  it("POST no mesmo endpoint, payload `text` com preview_url false; aceite com wamid e wa_id; texto nunca em log", async () => {
+    const { provedor, chamadas } = provedorCom(() => json(200, ACEITE));
+    const r = await provedor.enviarTexto(ENTRADA_TEXTO);
+    expect(r).toEqual({ resultado: "aceita", wamid: "wamid.HBgMNTU4MzkxMjM0NTY3OBUCABEYEjQ2", waId: "5583912345678" });
+    expect(chamadas).toHaveLength(1);
+    expect(chamadas[0]!.url).toBe("https://graph.facebook.com/v26.0/100000000000001/messages");
+    expect(JSON.parse(chamadas[0]!.init.body as string)).toEqual({
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: TELEFONE,
+      type: "text",
+      text: { preview_url: false, body: TEXTO },
+    });
+    expect(logs.join("\n")).not.toContain("Seu pedido");
+    semDadosSensiveis();
+  });
+
+  it("131047 (fora da janela) → recusada JANELA_FECHADA; timeout → indeterminada; sempre UMA chamada", async () => {
+    const fora = provedorCom(() => erroMeta(131047));
+    expect(await fora.provedor.enviarTexto(ENTRADA_TEXTO)).toEqual({ resultado: "recusada", codigo: "JANELA_FECHADA", codigoProvedor: "131047" });
+    expect(fora.chamadas).toHaveLength(1);
+
+    const lento = provedorCom(
+      (c) =>
+        new Promise<Response>((_, rejeitar) => {
+          c.init.signal!.addEventListener("abort", () => rejeitar(new DOMException("The operation was aborted.", "AbortError")));
+        }),
+      null,
+      { timeoutMs: 1_000 },
+    );
+    expect(await lento.provedor.enviarTexto(ENTRADA_TEXTO)).toEqual({ resultado: "indeterminada", codigoProvedor: "TIMEOUT" });
+    expect(lento.chamadas).toHaveLength(1);
+    semDadosSensiveis();
+  });
+
+  it("texto vazio/só espaços/acima de 4096, destinatário fora de E.164 ou número da loja → recusada SEM rede", async () => {
+    const { provedor, chamadas } = provedorCom(() => json(200, ACEITE), "+5583900000000");
+    for (const entrada of [
+      { ...ENTRADA_TEXTO, texto: "" },
+      { ...ENTRADA_TEXTO, texto: "   \n " },
+      { ...ENTRADA_TEXTO, texto: "a".repeat(4097) },
+      { ...ENTRADA_TEXTO, telefoneE164: "83912345678" },
+      { ...ENTRADA_TEXTO, telefoneE164: "+5583900000000" },
+    ]) {
+      expect((await provedor.enviarTexto(entrada)).resultado).toBe("recusada");
+    }
+    expect((await provedor.enviarTexto({ ...ENTRADA_TEXTO, texto: "a".repeat(4096) })).resultado).toBe("aceita");
+    expect(chamadas).toHaveLength(1);
+  });
+
+  it("provedor desativado nunca envia texto", async () => {
+    await expect(new ProvedorEnvioDesativado().enviarTexto(ENTRADA_TEXTO)).rejects.toThrow();
   });
 });
 

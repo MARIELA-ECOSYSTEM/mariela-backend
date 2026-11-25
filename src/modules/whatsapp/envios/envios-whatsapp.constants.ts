@@ -29,12 +29,46 @@ export const CODIGOS_ERRO_ENVIO_WHATSAPP = [
   "LIMITE_TAXA",
   "CREDENCIAL_INVALIDA",
   "RECUSADA",
+  /** Fase 22.8.9.10.7.4 — a Meta recusou texto livre fora da janela de atendimento (código 131047). */
+  "JANELA_FECHADA",
   "INDETERMINADO",
 ] as const;
 export type CodigoErroEnvioWhatsapp = (typeof CODIGOS_ERRO_ENVIO_WHATSAPP)[number];
 
 /** Recusas que o PROVEDOR pode devolver (as outras duas são decididas pelo próprio MARIELA). */
 export type CodigoRecusaProvedor = Exclude<CodigoErroEnvioWhatsapp, "NAO_ENVIADA" | "INDETERMINADO">;
+
+/**
+ * Fase 22.8.9.10.7.4 — `TEMPLATE`: modelo aprovado do catálogo (parâmetros do cadastro). `TEXTO`: texto livre escrito
+ * pelo operador, só dentro da janela de atendimento de 24 h. Registros anteriores a esta fase não têm o campo e são
+ * lidos como `TEMPLATE` (padrão do schema).
+ */
+export const TIPOS_MENSAGEM_WHATSAPP = ["TEMPLATE", "TEXTO"] as const;
+export type TipoMensagemWhatsapp = (typeof TIPOS_MENSAGEM_WHATSAPP)[number];
+
+/** Limite do corpo de uma mensagem de texto na Cloud API (`text.body`: 4096 caracteres). Medido em unidades UTF-16. */
+export const LIMITE_TEXTO_LIVRE_WHATSAPP = 4096;
+
+/**
+ * Janela de atendimento (customer service window) da Meta: texto livre só pode ser enviado até 24 h depois da ÚLTIMA
+ * mensagem recebida do contato. A margem de segurança fecha a janela um pouco antes, para cobrir a diferença de relógio
+ * entre o backend e a Meta e o tempo entre a verificação e a chamada.
+ */
+export const JANELA_ATENDIMENTO_MS = 24 * 60 * 60_000;
+export const MARGEM_SEGURANCA_JANELA_MS = 10 * 60_000;
+/** Registros de janela sem mensagem nova há mais que isto são removidos pelo MongoDB (índice TTL). */
+export const RETENCAO_JANELA_SEGUNDOS = 30 * 24 * 60 * 60;
+
+/** Por que o texto livre NÃO pode ser enviado agora (`null` quando pode). */
+export const MOTIVOS_TEXTO_LIVRE_INDISPONIVEL = [
+  "PROVEDOR_NAO_CONFIGURADO",
+  "WEBHOOK_NAO_CONFIGURADO",
+  "TELEFONE_INVALIDO",
+  "CONTATO_BLOQUEADO",
+  "SEM_MENSAGEM_RECEBIDA",
+  "JANELA_EXPIRADA",
+] as const;
+export type MotivoTextoLivreIndisponivel = (typeof MOTIVOS_TEXTO_LIVRE_INDISPONIVEL)[number];
 
 export const ORIGENS_MENSAGEM_WHATSAPP = ["INDIVIDUAL", "CAMPANHA_ANIVERSARIO"] as const;
 export type OrigemMensagemWhatsapp = (typeof ORIGENS_MENSAGEM_WHATSAPP)[number];

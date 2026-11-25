@@ -194,4 +194,11 @@ export class ApiException extends HttpException {
   static whatsappLiberacaoNaoPermitida(message = "Esta mensagem não pode ser liberada para reenvio."): ApiException {
     return new ApiException({ statusCode: HttpStatus.CONFLICT, code: ERROR_CODES.WHATSAPP_LIBERACAO_NAO_PERMITIDA, message });
   }
+
+  /** Fase 22.8.9.10.7.4 — texto livre pedido sem janela de atendimento aberta (nada foi gravado nem enviado). */
+  static whatsappJanelaFechada(
+    message = "Mensagens de texto livre só podem ser enviadas até 24 horas depois da última mensagem do cliente.",
+  ): ApiException {
+    return new ApiException({ statusCode: HttpStatus.UNPROCESSABLE_ENTITY, code: ERROR_CODES.WHATSAPP_JANELA_FECHADA, message });
+  }
 }

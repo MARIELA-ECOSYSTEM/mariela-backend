@@ -1,6 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import type {
   EnviarTemplateWhatsappInput,
+  EnviarTextoWhatsappInput,
   InfoTemplateProvedorWhatsapp,
   ProvedorEnvioWhatsapp,
   ResultadoEnvioProvedorWhatsapp,
@@ -21,6 +22,10 @@ export class ProvedorEnvioDesativado implements ProvedorEnvioWhatsapp {
 
   async enviarTemplate(_input: EnviarTemplateWhatsappInput): Promise<ResultadoEnvioProvedorWhatsapp> {
     throw new Error("Provedor de envio por template não configurado.");
+  }
+
+  async enviarTexto(_input: EnviarTextoWhatsappInput): Promise<ResultadoEnvioProvedorWhatsapp> {
+    throw new Error("Provedor de envio não configurado.");
   }
 
   async consultarTemplate(_nomeMeta: string, _idioma: string): Promise<InfoTemplateProvedorWhatsapp | null> {

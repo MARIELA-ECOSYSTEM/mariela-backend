@@ -150,6 +150,47 @@ describe("contrato da notificação (POST)", () => {
     expect(JSON.stringify(n)).not.toContain("SAIR");
   });
 
+  it("Fase 22.8.9.10.7.4 — mensagem recebida válida vira evidência de janela (wa_id + timestamp), sem conteúdo", () => {
+    const msg = (extra: Record<string, unknown>) => ({ from: "5583912345678", id: "wamid.IN1", timestamp: "1764000000", type: "text", text: { body: "Quero saber do pedido" }, ...extra });
+    const n = interpretarNotificacaoMeta(
+      envelope([
+        {
+          field: "messages",
+          value: {
+            messaging_product: "whatsapp",
+            metadata: meta,
+            messages: [
+              msg({}),
+              msg({ type: "image", image: { id: "1" } }),
+              msg({ type: "button", button: { text: "Ver" } }),
+              msg({ type: "reaction" }), // reação não conta
+              msg({ type: "system" }), // aviso da plataforma não conta
+              msg({ type: "unsupported" }),
+              msg({ type: "tipo_novo" }),
+              msg({ from: "15550000000" }), // o próprio número da loja
+              msg({ from: "+5583912345678" }), // fora do formato
+              msg({ from: undefined, from_user_id: "BR.1" }),
+              msg({ id: "<script>" }),
+              msg({ timestamp: "agora" }),
+              msg({ timestamp: undefined }),
+            ],
+          },
+        },
+        { field: "messages", value: { messaging_product: "whatsapp", metadata: { ...meta, phone_number_id: "999999999999999" }, messages: [msg({})] } },
+      ]),
+      PHONE_ID,
+    );
+    const quando = new Date(1764000000 * 1000);
+    expect(n.mensagensRecebidas).toEqual([
+      { waId: "5583912345678", enviadaEm: quando },
+      { waId: "5583912345678", enviadaEm: quando },
+      { waId: "5583912345678", enviadaEm: quando },
+    ]);
+    expect(n.contagem).toMatchObject({ mensagensRecebidas: 13, mensagensIgnoradas: 10, outroNumero: 1 });
+    expect(n.optOuts).toEqual([]);
+    expect(JSON.stringify(n)).not.toContain("Quero saber");
+  });
+
   it("user_preferences: só stop de marketing_messages bloqueia; resume e outras categorias são ignorados", () => {
     const pref = (user_preferences: unknown[]) => ({ field: "user_preferences", value: { messaging_product: "whatsapp", metadata: meta, user_preferences } });
     const n = interpretarNotificacaoMeta(

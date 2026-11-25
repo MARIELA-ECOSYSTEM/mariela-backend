@@ -32,9 +32,38 @@ export interface PedidoOptOutMeta {
   origem: OrigemOptOutWebhook;
 }
 
+/**
+ * Fase 22.8.9.10.7.4 — evidência da janela de atendimento: QUEM escreveu (`wa_id`) e QUANDO (timestamp da Meta). O
+ * conteúdo da mensagem nunca é lido.
+ */
+export interface MensagemRecebidaMeta {
+  waId: string;
+  enviadaEm: Date;
+}
+
+/**
+ * Tipos de mensagem que contam como "o contato escreveu" (abrem a janela). Conservador: ficam de fora `system` (aviso
+ * da plataforma, ex.: troca de número), `unsupported`, `reaction`, `request_welcome`, `errors` e qualquer tipo novo.
+ */
+export const TIPOS_MENSAGEM_QUE_ABREM_JANELA: ReadonlySet<string> = new Set([
+  "text",
+  "image",
+  "video",
+  "audio",
+  "document",
+  "sticker",
+  "location",
+  "contacts",
+  "interactive",
+  "button",
+  "order",
+]);
+
 export interface ContagemWebhookMeta {
   statusIgnorados: number;
   mensagensRecebidas: number;
+  /** Mensagens recebidas que NÃO servem como evidência de janela (tipo fora da lista, sem `from`, id/timestamp inválido). */
+  mensagensIgnoradas: number;
   preferenciasIgnoradas: number;
   outroNumero: number;
   camposIgnorados: number;
@@ -46,6 +75,7 @@ export interface ContagemWebhookMeta {
 export interface NotificacaoWebhookMeta {
   statuses: EventoStatusMeta[];
   optOuts: PedidoOptOutMeta[];
+  mensagensRecebidas: MensagemRecebidaMeta[];
   contagem: ContagemWebhookMeta;
 }
 
@@ -65,7 +95,8 @@ function instante(v: unknown): Date | null {
  * Fase 22.8.9.10.5 — interpreta uma notificação JÁ AUTENTICADA (assinatura validada antes). Função pura:
  * - envelope (`object`, `entry[]`, `changes[]`, `field`, `value`) fora do contrato → `ErroContratoWebhookMeta`;
  * - eventos de outro Phone Number ID, campos não suportados e itens malformados são IGNORADOS e só contados;
- * - mensagens recebidas são só CONTADAS (Fase 22.8.9.10.7.2): o conteúdo nunca é lido nem gera efeito algum.
+ * - mensagens recebidas: o conteúdo nunca é lido (Fase 22.8.9.10.7.2 — nenhum reconhecimento de palavra-chave); só
+ *   `from` e `timestamp` viram evidência da janela de atendimento (Fase 22.8.9.10.7.4).
  */
 export function interpretarNotificacaoMeta(json: unknown, phoneNumberIdEsperado: string): NotificacaoWebhookMeta {
   const raiz = objeto(json);
@@ -73,9 +104,11 @@ export function interpretarNotificacaoMeta(json: unknown, phoneNumberIdEsperado:
 
   const statuses: EventoStatusMeta[] = [];
   const optOuts: PedidoOptOutMeta[] = [];
+  const mensagensRecebidas: MensagemRecebidaMeta[] = [];
   const contagem: ContagemWebhookMeta = {
     statusIgnorados: 0,
     mensagensRecebidas: 0,
+    mensagensIgnoradas: 0,
     preferenciasIgnoradas: 0,
     outroNumero: 0,
     camposIgnorados: 0,
@@ -97,7 +130,8 @@ export function interpretarNotificacaoMeta(json: unknown, phoneNumberIdEsperado:
         contagem.camposIgnorados += 1;
         continue;
       }
-      if (objeto(valor["metadata"])?.["phone_number_id"] !== phoneNumberIdEsperado) {
+      const metadata = objeto(valor["metadata"]);
+      if (metadata?.["phone_number_id"] !== phoneNumberIdEsperado) {
         contagem.outroNumero += 1;
         continue;
       }
@@ -105,13 +139,14 @@ export function interpretarNotificacaoMeta(json: unknown, phoneNumberIdEsperado:
       if (campo === "messages") {
         if (Array.isArray(valor["errors"])) contagem.errosNoValor += valor["errors"].length;
         lerStatuses(valor["statuses"], statuses, contagem);
-        contarMensagensRecebidas(valor["messages"], contagem);
+        const numeroDaLoja = typeof metadata["display_phone_number"] === "string" ? metadata["display_phone_number"].replace(/\D/g, "") : "";
+        lerMensagensRecebidas(valor["messages"], numeroDaLoja, mensagensRecebidas, contagem);
       } else {
         lerPreferencias(valor["user_preferences"], optOuts, contagem);
       }
     }
   }
-  return { statuses, optOuts, contagem };
+  return { statuses, optOuts, mensagensRecebidas, contagem };
 }
 
 function lerStatuses(lista: unknown, saida: EventoStatusMeta[], contagem: ContagemWebhookMeta): void {
@@ -143,16 +178,41 @@ function lerStatuses(lista: unknown, saida: EventoStatusMeta[], contagem: Contag
   }
 }
 
-/** Mensagens recebidas: só contadas (nenhum efeito; o conteúdo não é lido). */
-function contarMensagensRecebidas(lista: unknown, contagem: ContagemWebhookMeta): void {
+/**
+ * Mensagens recebidas: o conteúdo NÃO é lido. Viram evidência de janela só com `from` (dígitos), `id` (wamid),
+ * `timestamp` válidos e tipo da lista; uma mensagem cujo remetente é o próprio número da loja nunca conta.
+ */
+function lerMensagensRecebidas(lista: unknown, numeroDaLoja: string, saida: MensagemRecebidaMeta[], contagem: ContagemWebhookMeta): void {
   if (lista === undefined) return;
   if (!Array.isArray(lista)) {
     contagem.itensInvalidos += 1;
     return;
   }
   for (const bruto of lista) {
-    if (objeto(bruto)) contagem.mensagensRecebidas += 1;
-    else contagem.itensInvalidos += 1;
+    const m = objeto(bruto);
+    if (!m) {
+      contagem.itensInvalidos += 1;
+      continue;
+    }
+    contagem.mensagensRecebidas += 1;
+    const from = m["from"];
+    const id = m["id"];
+    const tipo = m["type"];
+    const enviadaEm = instante(m["timestamp"]);
+    const valida =
+      typeof from === "string" &&
+      FORMATO_WA_ID.test(from) &&
+      from !== numeroDaLoja &&
+      typeof id === "string" &&
+      FORMATO_WAMID.test(id) &&
+      typeof tipo === "string" &&
+      TIPOS_MENSAGEM_QUE_ABREM_JANELA.has(tipo) &&
+      enviadaEm !== null;
+    if (!valida) {
+      contagem.mensagensIgnoradas += 1;
+      continue;
+    }
+    saida.push({ waId: from, enviadaEm });
   }
 }
 

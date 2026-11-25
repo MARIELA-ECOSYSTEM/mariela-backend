@@ -19,6 +19,7 @@ import {
   ESTADOS_MENSAGEM_WHATSAPP,
   LIMITE_MAXIMO_WHATSAPP,
   LIMITE_PADRAO_WHATSAPP,
+  LIMITE_TEXTO_LIVRE_WHATSAPP,
   PAGINA_PADRAO_WHATSAPP,
   TIPOS_CAMPANHA_WHATSAPP,
   TIPOS_DESTINATARIO_ENVIO_WHATSAPP,
@@ -70,6 +71,29 @@ export class EnviarTemplateWhatsappDto {
   @ValidateNested()
   @Type(() => CampanhaEnvioWhatsappDto)
   campanha?: CampanhaEnvioWhatsappDto;
+}
+
+/**
+ * Fase 22.8.9.10.7.4 — envio de TEXTO livre a um cliente cadastrado. Só chave, destinatário (id do cadastro) e texto:
+ * telefone, `waId`, dados de janela ou credenciais são recusados pelo `forbidNonWhitelisted`. Vazio, só espaços e
+ * caracteres de controle são recusados pelo service (que também apara o texto).
+ */
+export class EnviarTextoWhatsappDto {
+  @ApiProperty({ description: "UUID v4 gerado pelo Backoffice — um por mensagem." })
+  @IsUUID("4", { message: "idempotencyKey deve ser um UUID v4." })
+  idempotencyKey!: string;
+
+  @ApiProperty({ type: DestinatarioEnvioWhatsappDto })
+  @IsDefined({ message: "destinatario é obrigatório." })
+  @ValidateNested()
+  @Type(() => DestinatarioEnvioWhatsappDto)
+  destinatario!: DestinatarioEnvioWhatsappDto;
+
+  @ApiProperty({ maxLength: LIMITE_TEXTO_LIVRE_WHATSAPP, example: "Olá! Seu pedido já está pronto para retirada." })
+  @IsString({ message: "texto deve ser um texto." })
+  @MinLength(1, { message: "Escreva a mensagem." })
+  @MaxLength(LIMITE_TEXTO_LIVRE_WHATSAPP, { message: `A mensagem pode ter no máximo ${LIMITE_TEXTO_LIVRE_WHATSAPP} caracteres.` })
+  texto!: string;
 }
 
 export class ListarMensagensWhatsappQueryDto {

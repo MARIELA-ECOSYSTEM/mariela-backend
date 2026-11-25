@@ -116,11 +116,15 @@ async function base(c: MongoClient): Promise<void> {
     { chave: "+5500900000003", tipoChave: "E164", ativo: false, clienteId: clienteSintetico, origem: "ADMIN", motivo: "sintético", usuarioId: "usuario-sintetico", criadoEm: antigo, desbloqueadoEm: antigo, desbloqueadoPor: "usuario-sintetico", motivoDesbloqueio: "sintético" },
   ]);
   for (const ev of COLECOES_BACKUP.filter((n) => n.startsWith("eventos_"))) await db.collection(ev).insertOne({ tipo: "sintetico", criadoEm: antigo });
-  for (const tok of COLECOES_EXCLUIDAS) {
+  for (const tok of COLECOES_EXCLUIDAS.filter((c) => c !== "whatsapp_janelas")) {
     await db.collection(tok).insertOne({ tokenHash: `hash-${tok}`, expiresAt: new Date(Date.now() + 86400_000), criadoEm: antigo });
     await db.collection(tok).createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
     await db.collection(tok).createIndex({ tokenHash: 1 }, { unique: true });
   }
+  // Fase 22.8.9.10.7.4 — janela de atendimento (excluída do backup), com a forma e os índices reais.
+  await db.collection("whatsapp_janelas").insertOne({ phoneNumberId: "100000000000001", waId: "5500900000004", ultimaMensagemEm: antigo, criadoEm: antigo });
+  await db.collection("whatsapp_janelas").createIndex({ phoneNumberId: 1, waId: 1 }, { unique: true, name: "contato_unico" });
+  await db.collection("whatsapp_janelas").createIndex({ ultimaMensagemEm: 1 }, { name: "expiracao", expireAfterSeconds: 30 * 24 * 60 * 60 });
   // Índices representativos (únicos, parciais, esparsos) — os mesmos tipos da produção.
   await db.collection("produtos").createIndex({ codProduto: 1 }, { unique: true });
   await db.collection("produtos").createIndex({ "variantes.codVariante": 1 }, { unique: true, sparse: true });

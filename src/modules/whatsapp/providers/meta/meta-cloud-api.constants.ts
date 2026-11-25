@@ -86,6 +86,9 @@ export const META_CODIGOS_RECUSA: ReadonlyMap<number, CodigoRecusaProvedor> = ne
   [131050, "OPT_OUT_MARKETING"],
   // Limite/política da Meta ("to maintain healthy ecosystem engagement"; "Try sending at a later time"): NUNCA bloqueia.
   [131049, "LIMITE_MARKETING_DESTINATARIO"],
+  // Fase 22.8.9.10.7.4 — "Re-engagement message: more than 24 hours have passed since the recipient last replied":
+  // texto livre fora da janela de atendimento. Nada saiu; nunca gera bloqueio.
+  [131047, "JANELA_FECHADA"],
 ]);
 
 /** Faixa 200–299 = permissão não concedida ou removida. */

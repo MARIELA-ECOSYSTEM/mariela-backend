@@ -7,9 +7,13 @@ import { BloqueiosWhatsappService } from "../bloqueios/bloqueios-whatsapp.servic
 import { ehChaveDuplicada } from "../bloqueios/bloqueios-whatsapp.repository.js";
 import type {
   EnviarTemplateWhatsappDto,
+  EnviarTextoWhatsappDto,
   LiberarReenvioWhatsappDto,
   ListarMensagensWhatsappQueryDto,
 } from "../dto/envios-whatsapp.dto.js";
+import { avaliarJanela, type SituacaoJanela } from "../janela/janela-atendimento.js";
+import { JanelasWhatsappRepository } from "../janela/janelas-whatsapp.repository.js";
+import { CONFIG_WEBHOOK_WHATSAPP, type ConfiguracaoWebhookMeta } from "../webhook/configuracao-webhook-meta.js";
 import {
   PROVEDOR_ENVIO_WHATSAPP,
   type ProvedorEnvioWhatsapp,
@@ -22,21 +26,29 @@ import { anoCivilDoEnvio, chaveDeduplicacaoCampanha } from "../utils/ano-campanh
 import { mascararTelefone } from "../utils/mascarar-telefone.util.js";
 import { normalizarTelefoneParaWhatsapp } from "../utils/normalizar-telefone-whatsapp.util.js";
 import {
+  LIMITE_TEXTO_LIVRE_WHATSAPP,
   PRAZO_MINIMO_LIBERAR_INDETERMINADA_MS,
   type CodigoErroEnvioWhatsapp,
   type EstadoMensagemWhatsapp,
+  type MotivoTextoLivreIndisponivel,
   type OrigemMensagemWhatsapp,
   type TipoCampanhaWhatsapp,
+  type TipoMensagemWhatsapp,
 } from "./envios-whatsapp.constants.js";
 import { podeLiberarReenvio } from "./maquina-estados-whatsapp.js";
 import { MensagensWhatsappRepository } from "./mensagens-whatsapp.repository.js";
 
-/** Resposta pública de uma mensagem — telefone sempre mascarado; sem texto nem valores de parâmetros. */
+/**
+ * Resposta pública de uma mensagem — telefone sempre mascarado; nunca valores de parâmetros de template. `texto` só
+ * existe em `TEXTO` (o texto livre que o operador pediu); `template` só em `TEMPLATE`.
+ */
 export interface MensagemWhatsappDto {
   id: string;
   idempotencyKey: string;
+  tipo: TipoMensagemWhatsapp;
   destinatario: { tipo: "CLIENTE"; id: string; telefoneMascarado: string };
-  template: { chave: string; categoria: string };
+  template: { chave: string; categoria: string } | null;
+  texto: string | null;
   estado: EstadoMensagemWhatsapp;
   erro: { codigo: CodigoErroEnvioWhatsapp; mensagem: string } | null;
   origem: OrigemMensagemWhatsapp;
@@ -60,6 +72,7 @@ const MENSAGEM_ERRO: Record<CodigoErroEnvioWhatsapp, string> = {
   LIMITE_TAXA: "Limite de envio atingido; a mensagem não foi enviada.",
   CREDENCIAL_INVALIDA: "A integração de WhatsApp está com a credencial inválida.",
   RECUSADA: "O WhatsApp recusou a mensagem.",
+  JANELA_FECHADA: "O WhatsApp recusou o texto livre: a janela de 24 horas desde a última mensagem do cliente estava fechada.",
   INDETERMINADO: "Não foi possível confirmar se a mensagem foi enviada. Ela não será reenviada automaticamente.",
 };
 
@@ -71,8 +84,10 @@ export function paraMensagemDto(m: MensagemWhatsappDocument): MensagemWhatsappDt
   return {
     id: String(m._id),
     idempotencyKey: m.idempotencyKey,
+    tipo: m.tipo ?? "TEMPLATE",
     destinatario: { tipo: m.destinatarioTipo, id: String(m.destinatarioId), telefoneMascarado: mascararTelefone(m.telefoneE164) },
-    template: { chave: m.templateChave, categoria: m.templateCategoria },
+    template: m.templateChave !== null && m.templateCategoria !== null ? { chave: m.templateChave, categoria: m.templateCategoria } : null,
+    texto: m.tipo === "TEXTO" ? m.texto : null,
     estado: m.estado,
     erro: m.erroCodigo ? { codigo: m.erroCodigo, mensagem: MENSAGEM_ERRO[m.erroCodigo] } : null,
     origem: m.origem,
@@ -99,6 +114,63 @@ export function hashConteudoEnvio(dto: EnviarTemplateWhatsappDto): string {
 }
 
 /**
+ * Fase 22.8.9.10.7.4 — hash do pedido de TEXTO livre (destinatário + texto já aparado). Forma diferente da do template
+ * (campo `tipo`): a mesma chave nunca serve para um template e um texto.
+ */
+export function hashConteudoTexto(destinatarioId: string, texto: string): string {
+  return createHash("sha256").update(JSON.stringify({ tipo: "TEXTO", destinatarioTipo: "CLIENTE", destinatarioId, texto })).digest("hex");
+}
+
+/** Caracteres de controle (exceto tabulação e quebras de linha) e surrogates isolados: nunca são texto legítimo. */
+const CONTROLE_PROIBIDO = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const SURROGATE_ISOLADO = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/**
+ * Fase 22.8.9.10.7.4 — valida e apara o texto livre (o DTO já exige string de 1 a 4096 caracteres). O texto aparado é o
+ * que é gravado, conferido pela idempotência e enviado. Lança `VALIDATION_ERROR` (nada é gravado nem enviado).
+ */
+export function validarTextoLivre(bruto: string): string {
+  const texto = bruto.trim();
+  const erro = (message: string) => ApiException.validation("Texto inválido.", [{ field: "texto", message }]);
+  if (texto === "") throw erro("Escreva a mensagem.");
+  if (texto.length > LIMITE_TEXTO_LIVRE_WHATSAPP) throw erro(`A mensagem pode ter no máximo ${LIMITE_TEXTO_LIVRE_WHATSAPP} caracteres.`);
+  if (CONTROLE_PROIBIDO.test(texto) || SURROGATE_ISOLADO.test(texto)) throw erro("A mensagem contém caracteres inválidos.");
+  return texto;
+}
+
+/** Elegibilidade do texto livre para um cliente — calculada SÓ pelo backend; o Backoffice apenas exibe. */
+export interface ElegibilidadeTextoWhatsappDto {
+  permitido: boolean;
+  motivo: MotivoTextoLivreIndisponivel | null;
+  mensagem: string;
+  telefoneMascarado: string | null;
+  ultimaMensagemRecebidaEm: string | null;
+  /** Até quando o texto livre pode ser enviado (já com a margem de segurança). */
+  janelaExpiraEm: string | null;
+  limiteCaracteres: number;
+  verificadoEm: string;
+}
+
+const MENSAGEM_ELEGIBILIDADE: Record<MotivoTextoLivreIndisponivel | "PERMITIDO", string> = {
+  PERMITIDO: "O cliente escreveu nas últimas 24 horas: o texto livre pode ser enviado.",
+  PROVEDOR_NAO_CONFIGURADO: "O WhatsApp oficial não está configurado neste servidor.",
+  WEBHOOK_NAO_CONFIGURADO:
+    "O recebimento de mensagens do WhatsApp (webhook) não está configurado neste servidor. Sem ele não há como confirmar a janela de 24 horas.",
+  TELEFONE_INVALIDO: "O telefone cadastrado não é válido para envio de WhatsApp.",
+  CONTATO_BLOQUEADO: "Este contato pediu para não receber mensagens de WhatsApp.",
+  SEM_MENSAGEM_RECEBIDA:
+    "Não há mensagem recebida deste cliente nas últimas 24 horas. Pelas regras do WhatsApp, texto livre só pode ser enviado depois que o cliente escreve; use um modelo aprovado.",
+  JANELA_EXPIRADA:
+    "Já passaram 24 horas desde a última mensagem do cliente. Pelas regras do WhatsApp, texto livre não pode ser enviado agora; use um modelo aprovado.",
+};
+
+interface VerificacaoTextoLivre {
+  motivo: MotivoTextoLivreIndisponivel | null;
+  telefoneE164: string | null;
+  janela: SituacaoJanela | null;
+}
+
+/**
  * Fase 22.8.9.10.3 — envio de WhatsApp por TEMPLATE (spec 22.8.9.10.2 consolidada). O backend valida, resolve o
  * destinatário pelo cadastro, normaliza o número, aplica bloqueio, idempotência e deduplicação de campanha, persiste
  * ANTES de chamar o provedor e classifica o resultado. Nesta fase o provedor real não existe: o padrão é o provedor
@@ -122,6 +194,9 @@ export class EnviosWhatsappService {
     private readonly clientesRepository: ClientesRepository,
     private readonly bloqueiosService: BloqueiosWhatsappService,
     private readonly templatesService: TemplatesWhatsappService,
+    private readonly janelasRepository: JanelasWhatsappRepository,
+    /** Fase 22.8.9.10.7.4 — `null` = webhook desativado: sem evidência de janela, o texto livre nunca é permitido. */
+    @Inject(CONFIG_WEBHOOK_WHATSAPP) private readonly configWebhook: ConfiguracaoWebhookMeta | null,
   ) {}
 
   /** `nova: false` = repetição da mesma chave (HTTP 200); `true` = mensagem criada por esta requisição (HTTP 201). */
@@ -182,26 +257,153 @@ export class EnviosWhatsappService {
       throw ApiException.whatsappJaEnviadaCampanha();
     }
 
-    // Passo 2 — posse condicional do envio. Sem posse, ninguém chama o provedor.
-    if (!(await this.repository.assumirEnvio(mensagem._id, this.relogio()))) {
-      return { mensagem: paraMensagemDto(await this.recarregar(mensagem)), nova: true };
+    return {
+      mensagem: await this.concluirEnvio(mensagem, usuarioId, () =>
+        this.provedor.enviarTemplate({
+          telefoneE164,
+          nomeMeta: def.nomeMeta,
+          idioma: def.idioma,
+          parametros: resolverParametros(def, cliente),
+          referenciaInterna: String(mensagem._id),
+        }),
+      ),
+      nova: true,
+    };
+  }
+
+  /**
+   * Fase 22.8.9.10.7.4 — envio de TEXTO livre a UM cliente cadastrado, pelas mesmas garantias do template (reserva antes
+   * do provedor, posse condicional, uma chamada por chave, `indeterminada` sem reenvio automático). O backend é a única
+   * autoridade: destinatário pelo cadastro, bloqueio e janela de 24 h conferidos AQUI, a cada pedido.
+   */
+  async enviarTexto(dto: EnviarTextoWhatsappDto, usuarioId: string | null): Promise<{ mensagem: MensagemWhatsappDto; nova: boolean }> {
+    if (!this.provedor.configurado()) throw ApiException.whatsappNotConfigured();
+
+    const texto = validarTextoLivre(dto.texto);
+    const hash = hashConteudoTexto(dto.destinatario.id, texto);
+
+    // Repetição da mesma chave: só LÊ (mesmo que a janela tenha fechado depois) — nunca chama o provedor.
+    const repetida = await this.repetir(dto.idempotencyKey, hash);
+    if (repetida) return { mensagem: repetida, nova: false };
+
+    const cliente = await this.clientesRepository.encontrarPorIdOuFalhar(dto.destinatario.id);
+    const verificacao = await this.verificarTextoLivre(cliente.telefone);
+    switch (verificacao.motivo) {
+      case null:
+        break;
+      case "PROVEDOR_NAO_CONFIGURADO":
+        throw ApiException.whatsappNotConfigured();
+      case "TELEFONE_INVALIDO":
+        normalizarTelefoneParaWhatsapp(cliente.telefone); // lança o erro padrão (WHATSAPP_INVALID_NUMBER)
+        throw ApiException.whatsappInvalidNumber();
+      case "CONTATO_BLOQUEADO":
+        throw ApiException.whatsappContatoBloqueado();
+      default:
+        throw ApiException.whatsappJanelaFechada(MENSAGEM_ELEGIBILIDADE[verificacao.motivo]);
+    }
+    const telefoneE164 = verificacao.telefoneE164!;
+
+    let mensagem: MensagemWhatsappDocument;
+    try {
+      mensagem = await this.repository.reservar(
+        {
+          idempotencyKey: dto.idempotencyKey,
+          hashConteudo: hash,
+          tipo: "TEXTO",
+          texto,
+          destinatarioTipo: "CLIENTE",
+          destinatarioId: cliente._id,
+          telefoneE164,
+          templateChave: null,
+          templateNomeMeta: null,
+          templateIdioma: null,
+          templateCategoria: null,
+          origem: "INDIVIDUAL",
+          campanhaTipo: null,
+          campanhaAno: null,
+          chaveDeduplicacao: null,
+          usuarioId,
+        },
+        this.relogio(),
+      );
+    } catch (erro) {
+      if (!ehChaveDuplicada(erro)) throw erro;
+      // Requisição simultânea com a mesma chave venceu a reserva: devolve o registro dela (sem chamar o provedor).
+      const repetidaNaCorrida = await this.repetir(dto.idempotencyKey, hash);
+      if (repetidaNaCorrida) return { mensagem: repetidaNaCorrida, nova: false };
+      throw erro;
     }
 
-    // Passo 3 — chamada única ao provedor e registro do resultado.
+    return {
+      mensagem: await this.concluirEnvio(mensagem, usuarioId, () =>
+        this.provedor.enviarTexto({ telefoneE164, texto, referenciaInterna: String(mensagem._id) }),
+      ),
+      nova: true,
+    };
+  }
+
+  /** Fase 22.8.9.10.7.4 — o texto livre pode ser enviado AGORA a este cliente? (consulta; o envio confere de novo). */
+  async elegibilidadeTexto(clienteId: string): Promise<ElegibilidadeTextoWhatsappDto> {
+    const cliente = await this.clientesRepository.encontrarPorIdOuFalhar(clienteId);
+    const agora = this.relogio();
+    const v = await this.verificarTextoLivre(cliente.telefone);
+    const janela = v.janela && v.janela.tipo !== "sem_mensagem" ? v.janela : null;
+    return {
+      permitido: v.motivo === null,
+      motivo: v.motivo,
+      mensagem: MENSAGEM_ELEGIBILIDADE[v.motivo ?? "PERMITIDO"],
+      telefoneMascarado: v.telefoneE164 ? mascararTelefone(v.telefoneE164) : null,
+      ultimaMensagemRecebidaEm: janela ? janela.ultimaMensagemEm.toISOString() : null,
+      janelaExpiraEm: janela ? janela.expiraEm.toISOString() : null,
+      limiteCaracteres: LIMITE_TEXTO_LIVRE_WHATSAPP,
+      verificadoEm: agora.toISOString(),
+    };
+  }
+
+  /**
+   * Condições do texto livre, na ordem: provedor configurado → telefone do cadastro válido → sem bloqueio → webhook
+   * configurado (única fonte de evidência da janela) → janela aberta. A janela é procurada pelos MESMOS identificadores
+   * do bloqueio: os dígitos do E.164 e os `waId`s já devolvidos pela Meta para esse número (igualdade exata).
+   */
+  private async verificarTextoLivre(telefoneCadastro: string): Promise<VerificacaoTextoLivre> {
+    if (!this.provedor.configurado()) return { motivo: "PROVEDOR_NAO_CONFIGURADO", telefoneE164: null, janela: null };
+    let telefoneE164: string;
+    try {
+      telefoneE164 = normalizarTelefoneParaWhatsapp(telefoneCadastro);
+    } catch {
+      return { motivo: "TELEFONE_INVALIDO", telefoneE164: null, janela: null };
+    }
+    if (await this.bloqueiosService.bloqueioAtivo(telefoneE164)) return { motivo: "CONTATO_BLOQUEADO", telefoneE164, janela: null };
+    if (!this.configWebhook) return { motivo: "WEBHOOK_NAO_CONFIGURADO", telefoneE164, janela: null };
+
+    const identificadores = [...new Set([telefoneE164.replace(/^\+/, ""), ...(await this.repository.waIdsConhecidos(telefoneE164))])];
+    const ultima = await this.janelasRepository.ultimaMensagemEm(this.configWebhook.phoneNumberId, identificadores);
+    const janela = avaliarJanela(ultima, this.relogio());
+    if (janela.tipo === "sem_mensagem") return { motivo: "SEM_MENSAGEM_RECEBIDA", telefoneE164, janela };
+    if (janela.tipo === "expirada") return { motivo: "JANELA_EXPIRADA", telefoneE164, janela };
+    return { motivo: null, telefoneE164, janela };
+  }
+
+  /**
+   * Passos 2 e 3, comuns a template e texto: posse condicional (sem posse, ninguém chama o provedor), UMA chamada,
+   * registro do resultado. Exceção inesperada do provedor = `indeterminada` (nunca reenviar automaticamente).
+   */
+  private async concluirEnvio(
+    mensagem: MensagemWhatsappDocument,
+    usuarioId: string | null,
+    chamarProvedor: () => Promise<ResultadoEnvioProvedorWhatsapp>,
+  ): Promise<MensagemWhatsappDto> {
+    if (!(await this.repository.assumirEnvio(mensagem._id, this.relogio()))) {
+      return paraMensagemDto(await this.recarregar(mensagem));
+    }
+
     let resultado: ResultadoEnvioProvedorWhatsapp;
     try {
-      resultado = await this.provedor.enviarTemplate({
-        telefoneE164,
-        nomeMeta: def.nomeMeta,
-        idioma: def.idioma,
-        parametros: resolverParametros(def, cliente),
-        referenciaInterna: String(mensagem._id),
-      });
+      resultado = await chamarProvedor();
     } catch {
-      // Exceção inesperada: não se sabe se o pedido saiu. Nunca reenviar automaticamente.
       resultado = { resultado: "indeterminada", codigoProvedor: null };
     }
-    await this.registrarResultado(mensagem, resultado, def.chave);
+    await this.registrarResultado(mensagem, resultado);
 
     const final = await this.recarregar(mensagem);
     this.logger.log(
@@ -209,16 +411,17 @@ export class EnviosWhatsappService {
         evento: "whatsapp.envio.resultado",
         mensagemId: String(final._id),
         clienteId: String(final.destinatarioId),
+        tipo: final.tipo ?? "TEMPLATE",
         template: final.templateChave,
         estado: final.estado,
         erro: final.erroCodigo,
         usuarioId,
       }),
     );
-    return { mensagem: paraMensagemDto(final), nova: true };
+    return paraMensagemDto(final);
   }
 
-  private async registrarResultado(mensagem: MensagemWhatsappDocument, resultado: ResultadoEnvioProvedorWhatsapp, templateChave: string): Promise<void> {
+  private async registrarResultado(mensagem: MensagemWhatsappDocument, resultado: ResultadoEnvioProvedorWhatsapp): Promise<void> {
     const agora = this.relogio();
     switch (resultado.resultado) {
       case "aceita":
@@ -226,7 +429,7 @@ export class EnviosWhatsappService {
         return;
       case "recusada":
         await this.repository.registrarRecusa(mensagem._id, resultado.codigo, resultado.codigoProvedor, agora);
-        if (resultado.codigo === "TEMPLATE_INVALIDO") this.templatesService.invalidar(templateChave);
+        if (resultado.codigo === "TEMPLATE_INVALIDO" && mensagem.templateChave) this.templatesService.invalidar(mensagem.templateChave);
         if (resultado.codigo === "OPT_OUT_MARKETING") {
           // O próprio destinatário pediu para não receber marketing: entra na lista de bloqueio.
           await this.bloqueiosService.bloquearNumero(mensagem.telefoneE164, mensagem.destinatarioId, "META_OPT_OUT", null);

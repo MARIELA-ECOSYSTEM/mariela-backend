@@ -7,18 +7,29 @@ import {
   ORIGENS_MENSAGEM_WHATSAPP,
   TIPOS_CAMPANHA_WHATSAPP,
   TIPOS_DESTINATARIO_ENVIO_WHATSAPP,
+  TIPOS_MENSAGEM_WHATSAPP,
   type CodigoErroEnvioWhatsapp,
   type EstadoMensagemWhatsapp,
   type OrigemMensagemWhatsapp,
   type TipoCampanhaWhatsapp,
   type TipoDestinatarioEnvioWhatsapp,
+  type TipoMensagemWhatsapp,
 } from "../envios/envios-whatsapp.constants.js";
+
+function exigidoEmTemplate(this: { tipo?: TipoMensagemWhatsapp }): boolean {
+  return (this.tipo ?? "TEMPLATE") === "TEMPLATE";
+}
+
+function exigidoEmTexto(this: { tipo?: TipoMensagemWhatsapp }): boolean {
+  return this.tipo === "TEXTO";
+}
 
 /**
  * Fase 22.8.9.10.3 — registro de CADA mensagem de WhatsApp por template (`mensagens_whatsapp`). Gravado ANTES de
  * qualquer chamada ao provedor (reserva), e nunca apagado — inclusive depois de uma liberação de reenvio.
  *
- * Não guarda o texto renderizado nem os valores dos parâmetros (deriváveis do catálogo + cadastro). `telefoneE164` é
+ * Template: não guarda o texto renderizado nem os valores dos parâmetros (deriváveis do catálogo + cadastro). Texto
+ * livre (Fase 22.8.9.10.7.4): guarda o texto enviado, que não é derivável de nada. `telefoneE164` é
  * o número usado NAQUELE envio (rastreabilidade se o cadastro mudar): fica só no banco — respostas o mascaram e logs
  * nunca o recebem. `waId` é o identificador devolvido pelo provedor e pode diferir do E.164.
  */
@@ -44,17 +55,29 @@ export class MensagemWhatsapp {
   @Prop({ type: String, default: null })
   waId!: string | null;
 
-  @Prop({ type: String, required: true })
-  templateChave!: string;
+  /** Fase 22.8.9.10.7.4 — registros anteriores não têm o campo e são lidos como `TEMPLATE`. */
+  @Prop({ type: String, required: true, enum: TIPOS_MENSAGEM_WHATSAPP, default: "TEMPLATE" })
+  tipo!: TipoMensagemWhatsapp;
 
-  @Prop({ type: String, required: true })
-  templateNomeMeta!: string;
+  // Obrigatórios só para `TEMPLATE`; `null` em `TEXTO`.
+  @Prop({ type: String, default: null, required: exigidoEmTemplate })
+  templateChave!: string | null;
 
-  @Prop({ type: String, required: true })
-  templateIdioma!: string;
+  @Prop({ type: String, default: null, required: exigidoEmTemplate })
+  templateNomeMeta!: string | null;
 
-  @Prop({ type: String, required: true })
-  templateCategoria!: string;
+  @Prop({ type: String, default: null, required: exigidoEmTemplate })
+  templateIdioma!: string | null;
+
+  @Prop({ type: String, default: null, required: exigidoEmTemplate })
+  templateCategoria!: string | null;
+
+  /**
+   * Fase 22.8.9.10.7.4 — o texto livre EXATO pedido pelo operador (só em `TEXTO`; não é derivável de catálogo nem de
+   * cadastro, por isso fica no registro para rastreabilidade). Nunca vai para log.
+   */
+  @Prop({ type: String, default: null, required: exigidoEmTexto })
+  texto!: string | null;
 
   /** Id da mensagem no provedor (`wamid`) — único quando presente. */
   @Prop({ type: String, default: null })

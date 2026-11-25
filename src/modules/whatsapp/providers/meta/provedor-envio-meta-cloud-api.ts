@@ -1,13 +1,15 @@
 import { Logger } from "@nestjs/common";
+import { LIMITE_TEXTO_LIVRE_WHATSAPP } from "../../envios/envios-whatsapp.constants.js";
 import type {
   EnviarTemplateWhatsappInput,
+  EnviarTextoWhatsappInput,
   InfoTemplateProvedorWhatsapp,
   ProvedorEnvioWhatsapp,
   ResultadoEnvioProvedorWhatsapp,
 } from "../provedor-envio-whatsapp.interface.js";
 import type { ClienteHttpMetaWhatsapp } from "./cliente-http-meta.js";
 import type { ConfiguracaoMetaValida } from "./configuracao-meta.js";
-import { classificarRespostaEnvio, lerConsultaTemplate, montarPayloadTemplate } from "./contrato-meta.js";
+import { classificarRespostaEnvio, lerConsultaTemplate, montarPayloadTemplate, montarPayloadTexto } from "./contrato-meta.js";
 
 /** Formatos aceitos na entrada — defesa em profundidade: o fluxo já entrega tudo resolvido do cadastro e do catálogo. */
 const DESTINATARIO_E164 = /^\+[1-9]\d{7,14}$/;
@@ -47,15 +49,29 @@ export class ProvedorEnvioMetaCloudApi implements ProvedorEnvioWhatsapp {
       return recusaLocal;
     }
 
+    return this.postarMensagem(input.referenciaInterna, montarPayloadTemplate(input));
+  }
+
+  /** Fase 22.8.9.10.7.4 — texto livre. Mesma chamada única e mesma classificação conservadora do template. */
+  async enviarTexto(input: EnviarTextoWhatsappInput): Promise<ResultadoEnvioProvedorWhatsapp> {
+    const recusaLocal = this.validarDestinatario(input.telefoneE164) ?? this.validarTexto(input.texto);
+    if (recusaLocal) {
+      this.registrar(input.referenciaInterna, recusaLocal, null, null, null);
+      return recusaLocal;
+    }
+    return this.postarMensagem(input.referenciaInterna, montarPayloadTexto(input));
+  }
+
+  private async postarMensagem(referencia: string, corpo: Record<string, unknown>): Promise<ResultadoEnvioProvedorWhatsapp> {
     const resposta = await this.cliente.requisitar({
       metodo: "POST",
       caminho: `/${this.config.graphApiVersion}/${this.config.phoneNumberId}/messages`,
-      corpo: montarPayloadTemplate(input),
+      corpo,
       token: this.config.accessToken,
       timeoutMs: this.config.timeoutMs,
     });
     const { resultado, diagnostico } = classificarRespostaEnvio(resposta);
-    this.registrar(input.referenciaInterna, resultado, diagnostico.httpStatus, diagnostico.fbtraceId, diagnostico.statusMensagem);
+    this.registrar(referencia, resultado, diagnostico.httpStatus, diagnostico.fbtraceId, diagnostico.statusMensagem);
     return resultado;
   }
 
@@ -73,18 +89,31 @@ export class ProvedorEnvioMetaCloudApi implements ProvedorEnvioWhatsapp {
 
   /** Recusa SEM chamada de rede (comprovadamente não enviada) quando a entrada viola o contrato. */
   private validarEntrada(input: EnviarTemplateWhatsappInput): ResultadoEnvioProvedorWhatsapp | null {
-    if (!DESTINATARIO_E164.test(input.telefoneE164)) {
-      return { resultado: "recusada", codigo: "RECUSADA", codigoProvedor: "DESTINATARIO_INVALIDO" };
-    }
-    if (this.numeroDaLojaE164 !== null && input.telefoneE164 === this.numeroDaLojaE164) {
-      return { resultado: "recusada", codigo: "RECUSADA", codigoProvedor: "DESTINATARIO_PROPRIA_LOJA" };
-    }
+    const destinatario = this.validarDestinatario(input.telefoneE164);
+    if (destinatario) return destinatario;
     if (
       !NOME_TEMPLATE.test(input.nomeMeta) ||
       !IDIOMA_TEMPLATE.test(input.idioma) ||
       input.parametros.some((p) => typeof p !== "string" || p.trim() === "" || p.length > TAMANHO_MAXIMO_PARAMETRO)
     ) {
       return { resultado: "recusada", codigo: "TEMPLATE_INVALIDO", codigoProvedor: "PARAMETROS_INVALIDOS" };
+    }
+    return null;
+  }
+
+  private validarDestinatario(telefoneE164: string): ResultadoEnvioProvedorWhatsapp | null {
+    if (!DESTINATARIO_E164.test(telefoneE164)) {
+      return { resultado: "recusada", codigo: "RECUSADA", codigoProvedor: "DESTINATARIO_INVALIDO" };
+    }
+    if (this.numeroDaLojaE164 !== null && telefoneE164 === this.numeroDaLojaE164) {
+      return { resultado: "recusada", codigo: "RECUSADA", codigoProvedor: "DESTINATARIO_PROPRIA_LOJA" };
+    }
+    return null;
+  }
+
+  private validarTexto(texto: string): ResultadoEnvioProvedorWhatsapp | null {
+    if (typeof texto !== "string" || texto.trim() === "" || texto.length > LIMITE_TEXTO_LIVRE_WHATSAPP) {
+      return { resultado: "recusada", codigo: "RECUSADA", codigoProvedor: "TEXTO_INVALIDO" };
     }
     return null;
   }

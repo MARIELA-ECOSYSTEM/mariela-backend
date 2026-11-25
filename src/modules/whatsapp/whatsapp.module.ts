@@ -11,10 +11,12 @@ import { BloqueiosWhatsappService } from "./bloqueios/bloqueios-whatsapp.service
 import { EnviosWhatsappController } from "./envios/envios-whatsapp.controller.js";
 import { EnviosWhatsappService } from "./envios/envios-whatsapp.service.js";
 import { MensagensWhatsappRepository } from "./envios/mensagens-whatsapp.repository.js";
+import { JanelasWhatsappRepository } from "./janela/janelas-whatsapp.repository.js";
 import { EvolutionApiProvider } from "./providers/evolution-api.provider.js";
 import { PROVEDOR_ENVIO_WHATSAPP } from "./providers/provedor-envio-whatsapp.interface.js";
 import { criarProvedorEnvioWhatsapp } from "./providers/selecionar-provedor-envio.js";
 import { BloqueioWhatsapp, BloqueioWhatsappSchema } from "./schemas/bloqueio-whatsapp.schema.js";
+import { JanelaWhatsapp, JanelaWhatsappSchema } from "./schemas/janela-whatsapp.schema.js";
 import { MensagemWhatsapp, MensagemWhatsappSchema } from "./schemas/mensagem-whatsapp.schema.js";
 import { TemplatesWhatsappService } from "./templates/templates-whatsapp.service.js";
 import { CONFIG_WEBHOOK_WHATSAPP, lerConfiguracaoWebhookMeta } from "./webhook/configuracao-webhook-meta.js";
@@ -43,6 +45,8 @@ import { WhatsappService } from "./whatsapp.service.js";
     MongooseModule.forFeature([
       { name: MensagemWhatsapp.name, schema: MensagemWhatsappSchema },
       { name: BloqueioWhatsapp.name, schema: BloqueioWhatsappSchema },
+      // Fase 22.8.9.10.7.4 — janela de atendimento de 24 h (fora do backup: dado de vida curta).
+      { name: JanelaWhatsapp.name, schema: JanelaWhatsappSchema },
     ]),
   ],
   controllers: [WhatsappController, EnviosWhatsappController, BloqueiosWhatsappController, WebhookWhatsappController],
@@ -51,6 +55,7 @@ import { WhatsappService } from "./whatsapp.service.js";
     { provide: WHATSAPP_PROVIDER, useClass: EvolutionApiProvider },
     MensagensWhatsappRepository,
     BloqueiosWhatsappRepository,
+    JanelasWhatsappRepository,
     BloqueiosWhatsappService,
     TemplatesWhatsappService,
     EnviosWhatsappService,

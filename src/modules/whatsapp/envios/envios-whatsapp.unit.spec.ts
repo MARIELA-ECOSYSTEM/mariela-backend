@@ -152,6 +152,9 @@ describe("TemplatesWhatsappService — cache e falha de consulta", () => {
       enviarTemplate: async () => {
         throw new Error("não usado");
       },
+      enviarTexto: async () => {
+        throw new Error("não usado");
+      },
       consultarTemplate: async () => {
         consultas += 1;
         return consulta();

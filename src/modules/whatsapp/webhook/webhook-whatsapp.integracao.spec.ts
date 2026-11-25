@@ -36,6 +36,10 @@ const provedor: ProvedorEnvioWhatsapp & { chamadas: number } = {
     provedor.chamadas += 1;
     return { resultado: "aceita", wamid: `wamid.ENVIO${i.referenciaInterna}`, waId: i.telefoneE164.slice(1) };
   },
+  async enviarTexto(i) {
+    provedor.chamadas += 1;
+    return { resultado: "aceita", wamid: `wamid.TEXTO${i.referenciaInterna}`, waId: i.telefoneE164.slice(1) };
+  },
   async consultarTemplate(nomeMeta, idioma) {
     return { nomeMeta, idioma, status: "APPROVED", categoria: "MARKETING", quantidadeParametros: 1 };
   },

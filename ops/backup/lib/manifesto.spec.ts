@@ -63,7 +63,7 @@ describe("validarBackup / montarManifesto", () => {
     const m = manifesto(validacoes);
     expect(m.estado).toBe("VALIDO_LOCAL");
     expect(m.consistencia).toContain("não é snapshot transacional");
-    expect(m.politica.colecoesExcluidas).toEqual(["refresh_tokens", "vendedor_refresh_tokens"]);
+    expect(m.politica.colecoesExcluidas).toEqual(["refresh_tokens", "vendedor_refresh_tokens", "whatsapp_janelas"]);
   });
 
   it("escrita durante o dump (assinatura depois ≠ antes) → INVALIDO", () => {

@@ -31,6 +31,8 @@ export const ERROR_CODES = {
   WHATSAPP_CONTATO_BLOQUEADO: "WHATSAPP_CONTATO_BLOQUEADO",
   WHATSAPP_TEMPLATE_INDISPONIVEL: "WHATSAPP_TEMPLATE_INDISPONIVEL",
   WHATSAPP_LIBERACAO_NAO_PERMITIDA: "WHATSAPP_LIBERACAO_NAO_PERMITIDA",
+  // Fase 22.8.9.10.7.4 — texto livre fora da janela de atendimento de 24 h (recusado ANTES de gravar ou enviar).
+  WHATSAPP_JANELA_FECHADA: "WHATSAPP_JANELA_FECHADA",
   // Storage de mídia (Fase 40) — R2 não configurado neste ambiente.
   STORAGE_NOT_CONFIGURED: "STORAGE_NOT_CONFIGURED",
   // Fase 60.1 — R2 configurado, mas a chamada ao provedor falhou (rede, credencial recusada, erro do serviço).

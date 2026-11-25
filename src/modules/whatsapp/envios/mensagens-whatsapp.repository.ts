@@ -26,7 +26,9 @@ export type DadosReservaMensagemWhatsapp = Pick<
   | "campanhaAno"
   | "chaveDeduplicacao"
   | "usuarioId"
->;
+> &
+  // Fase 22.8.9.10.7.4 — ausentes = `TEMPLATE` (padrão do schema), como em todos os envios anteriores.
+  Partial<Pick<MensagemWhatsapp, "tipo" | "texto">>;
 
 export interface FiltrosListagemMensagensWhatsapp {
   clienteId?: string;

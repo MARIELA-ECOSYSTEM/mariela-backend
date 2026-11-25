@@ -7,7 +7,7 @@
     1. Pré-condições locais: config do mongodump e pasta de destino com ACL restrita (conta atual + SYSTEM),
        trava contra execução concorrente.
     2. Pré-backup (só leitura na origem): banco exatamente marielaDB; coleções da origem = lista positiva
-       (29) + excluídas (refresh_tokens, vendedor_refresh_tokens), nada a mais/a menos; backup diário devido
+       (29) + excluídas (refresh_tokens, vendedor_refresh_tokens, whatsapp_janelas), nada a mais/a menos; backup diário devido
        (23:45; retomada quando o computador for ligado); janela sem escrita (15 min), caixas fechados,
        nenhuma reconciliação de estoque com retry vencido/próximo; assinaturas, índices, referências, sequências.
        Não elegível ⇒ nada é coletado (ADIADO / JA_REALIZADO) ou o backup é BLOQUEADO (política divergente).

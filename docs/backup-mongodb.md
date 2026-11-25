@@ -23,12 +23,15 @@ Fonte de verdade dos parâmetros: [`ops/backup/lib/politica.ts`](../ops/backup/l
 ## Política (resumo)
 
 - **Banco:** só `marielaDB`. Qualquer outro (inclusive `test`) aborta antes do dump (`BANCO_DIVERGENTE`).
-- **Coleções:** o banco tem **31**; o backup leva **29** (lista positiva em `politica.ts`). Excluídas: `refresh_tokens` e
+- **Coleções:** o banco tem **32**; o backup leva **29** (lista positiva em `politica.ts`). Excluídas: `refresh_tokens` e
   `vendedor_refresh_tokens` — o backend recria as coleções e os índices (inclusive TTL) no boot; **todos fazem login de
   novo** após um restore. Fase 22.8.9.10.3.1: 27 → 29 com `mensagens_whatsapp` (histórico de envios por template) e
-  `whatsapp_bloqueios` (pedidos de não contato — evidência que não pode se perder num restore).
+  `whatsapp_bloqueios` (pedidos de não contato — evidência que não pode se perder num restore). Fase 22.8.9.10.7.4
+  (aprovado pelo operador): `whatsapp_janelas` também é **excluída** — guarda só o instante da última mensagem recebida
+  de cada contato (janela de 24 h, com TTL); após um restore, a janela de cada contato fica fechada até ele escrever de
+  novo (nenhum texto livre é liberado indevidamente).
 - **Lista positiva aplicada:** o `mongodump` 100.17.0 **não tem `--nsInclude`**. Por isso o backup (1) recusa a origem
-  (BLOQUEADO) se ela tiver coleção fora de 29+2 ou se faltar alguma das 29, (2) passa `--excludeCollection` só para as 2
+  (BLOQUEADO) se ela tiver coleção fora de 29+3 ou se faltar alguma das 29, (2) passa `--excludeCollection` só para as 3
   excluídas e (3) confere no archive que os namespaces são **exatamente** os 29 de `marielaDB`. Um teste unitário
   (`politica.spec.ts`) quebra se o código ganhar uma coleção nova sem revisão da política.
 - **Índices:** 103 nas 27 coleções de então, em 09/11/2026 (referência informativa, **não** atualizada na 22.8.9.10.3.1:
