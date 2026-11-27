@@ -45,9 +45,37 @@ bunx nest build                                  # build de produção
 
 A suíte é majoritariamente de integração (MongoDB real via `mongodb://127.0.0.1:27017` — banco `mariela_test`, nunca `mariela_dev`/produção). É necessário um MongoDB acessível localmente para rodar os testes.
 
-## Primeiro administrador (seed)
+## Criar um administrador (interativo)
 
-Não existe rota HTTP para criar usuário ADMIN, de propósito. Use o script local:
+Criar ADMIN é operação **exclusiva do desenvolvedor**, na máquina local. Não existe rota HTTP, tela no Backoffice nem no PDV para isto, de propósito. O jeito simples:
+
+```bash
+bun run admin:criar
+```
+
+O comando pergunta, nesta ordem:
+
+1. E-mail do novo ADMIN, nome, senha e a repetição da senha. A senha **não aparece na tela** (nem asteriscos). Cada campo tem até 3 tentativas e as regras são as mesmas do `seed:admin`: e-mail válido, nome de até 120 caracteres, senha de 8 a 200 caracteres.
+2. Mostra o **nome do banco de destino** (nunca a URI), se ele é de teste ou **PROTEGIDO**, e de onde veio a configuração. Pede para digitar o nome do banco; num banco protegido (produção ou desconhecido), pede o nome **de novo**.
+3. Faz uma consulta somente leitura. Se o e-mail já existe, avisa e termina sem alterar nada (código 1). Senão, mostra o resumo (e-mail, nome, perfil, código previsto, banco; a senha só como "definida") e pede para digitar `CRIAR`. Qualquer outra resposta cancela.
+
+- **Cancelar:** Ctrl+C em qualquer pergunta, ou não digitar `CRIAR` no fim. Nada é gravado antes da confirmação final (código 4).
+- **Não é preciso definir `ADMIN_EMAIL`, `ADMIN_NAME`, `ADMIN_PASSWORD` nem `ADMIN_SEED_CONFIRM`:** essas variáveis são ignoradas por este comando.
+- **Banco:** usa a `MONGODB_URI` do terminal. Na falta dela, lê **somente** a chave `MONGODB_URI` do `.env` do backend; nenhuma outra chave do arquivo é carregada.
+- **Proteções e criação:** as mesmas do `seed:admin`, com o mesmo serviço de criação:
+  - recusa rodar a partir de `dist/`, com `NODE_ENV=production`, no Render ou em container;
+  - recusa `mariela_dev_local`;
+  - o nome digitado precisa ser exatamente o banco da URI;
+  - banco protegido exige a segunda confirmação;
+  - hash Argon2id;
+  - não cria duplicado;
+  - grava o evento `ADMIN_CREATED`.
+- **Terminal:** exige um terminal interativo; entrada por arquivo ou pipe é recusada. Para automação, use o `seed:admin` abaixo.
+- **Códigos de saída:** `0` criado, `1` já existe, `2` recusado, `3` falha, `4` cancelado.
+
+## Primeiro administrador (seed, não interativo)
+
+Não existe rota HTTP para criar usuário ADMIN, de propósito. Além do `admin:criar` acima, há o script não interativo:
 
 ```bash
 # dry-run (padrão, somente leitura): diz se o e-mail já existe e qual seria o código USR-####

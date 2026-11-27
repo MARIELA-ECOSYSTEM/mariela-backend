@@ -64,15 +64,41 @@ export interface PedidoSeed {
   executor: string | null;
 }
 
+/**
+ * Regras de cada campo, compartilhadas com o comando interativo `admin:criar` (`criar-admin.comando.ts`). `rotulo` só
+ * muda o nome do campo na mensagem (variável aqui, pergunta lá); a regra é a mesma. Nenhuma mensagem ecoa a senha.
+ */
+export function validarEmailDoAdmin(valor: string, rotulo: string): Resultado<string> {
+  const email = normalizarEmailAdmin(valor);
+  if (!email || email.length > LIMITES.emailMaximo || !FORMATO_EMAIL_ADMIN.test(email)) return { ok: false, erro: `${rotulo} não tem formato de e-mail válido.` };
+  return { ok: true, valor: email };
+}
+
+export function validarNomeDoAdmin(valor: string, rotulo: string): Resultado<string> {
+  const nome = valor.trim();
+  if (!nome) return { ok: false, erro: `${rotulo} não pode ficar vazio.` };
+  if (nome.length > LIMITES.nomeMaximo) return { ok: false, erro: `${rotulo} excede ${LIMITES.nomeMaximo} caracteres.` };
+  return { ok: true, valor: nome };
+}
+
+export function validarSenhaDoAdmin(senha: string, rotulo: string): Resultado<string> {
+  if (senha.length < LIMITES.senhaMinima || senha.length > LIMITES.senhaMaxima) {
+    return { ok: false, erro: `${rotulo} deve ter de ${LIMITES.senhaMinima} a ${LIMITES.senhaMaxima} caracteres (o valor não é exibido).` };
+  }
+  return { ok: true, valor: senha };
+}
+
 /** Valida as variáveis `ADMIN_*`. Nenhuma mensagem ecoa a senha. */
 export function interpretarVariaveis(variaveis: Readonly<Record<string, string | undefined>>, aplicar: boolean): Resultado<PedidoSeed> {
-  const email = normalizarEmailAdmin(variaveis["ADMIN_EMAIL"] ?? "");
-  if (!email) return { ok: false, erro: "Defina ADMIN_EMAIL com o e-mail do novo ADMIN." };
-  if (email.length > LIMITES.emailMaximo || !FORMATO_EMAIL_ADMIN.test(email)) return { ok: false, erro: "ADMIN_EMAIL não tem formato de e-mail válido." };
+  if (!normalizarEmailAdmin(variaveis["ADMIN_EMAIL"] ?? "")) return { ok: false, erro: "Defina ADMIN_EMAIL com o e-mail do novo ADMIN." };
+  const emailValidado = validarEmailDoAdmin(variaveis["ADMIN_EMAIL"] ?? "", "ADMIN_EMAIL");
+  if (!emailValidado.ok) return emailValidado;
+  const email = emailValidado.valor;
 
-  const nome = (variaveis["ADMIN_NAME"] ?? "").trim();
-  if (!nome) return { ok: false, erro: "Defina ADMIN_NAME com o nome do novo ADMIN." };
-  if (nome.length > LIMITES.nomeMaximo) return { ok: false, erro: `ADMIN_NAME excede ${LIMITES.nomeMaximo} caracteres.` };
+  if (!(variaveis["ADMIN_NAME"] ?? "").trim()) return { ok: false, erro: "Defina ADMIN_NAME com o nome do novo ADMIN." };
+  const nomeValidado = validarNomeDoAdmin(variaveis["ADMIN_NAME"] ?? "", "ADMIN_NAME");
+  if (!nomeValidado.ok) return nomeValidado;
+  const nome = nomeValidado.valor;
 
   const executorBruto = (variaveis["ADMIN_SEED_EXECUTOR"] ?? "").trim();
   if (executorBruto.length > LIMITES.executorMaximo) return { ok: false, erro: `ADMIN_SEED_EXECUTOR excede ${LIMITES.executorMaximo} caracteres.` };
@@ -80,8 +106,9 @@ export function interpretarVariaveis(variaveis: Readonly<Record<string, string |
 
   const senhaInformada = variaveis["ADMIN_PASSWORD"];
   const senha = senhaInformada === undefined || senhaInformada === "" ? null : senhaInformada;
-  if (senha !== null && (senha.length < LIMITES.senhaMinima || senha.length > LIMITES.senhaMaxima)) {
-    return { ok: false, erro: `ADMIN_PASSWORD deve ter de ${LIMITES.senhaMinima} a ${LIMITES.senhaMaxima} caracteres (o valor não é exibido).` };
+  if (senha !== null) {
+    const senhaValidada = validarSenhaDoAdmin(senha, "ADMIN_PASSWORD");
+    if (!senhaValidada.ok) return senhaValidada;
   }
   if (!aplicar) return { ok: true, valor: { email, nome, senha, executor } };
 
