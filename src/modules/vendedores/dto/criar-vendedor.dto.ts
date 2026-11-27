@@ -1,7 +1,7 @@
 import { ApiPropertyOptional, ApiProperty } from "@nestjs/swagger";
 import { Type } from "class-transformer";
 import { IsBoolean, IsDateString, IsNotEmpty, IsOptional, IsString, MaxLength, MinLength } from "class-validator";
-import { SENHA_TAMANHO_MINIMO } from "../vendedores.constants.js";
+import { SENHA_TAMANHO_MAXIMO, SENHA_TAMANHO_MINIMO } from "../vendedores.constants.js";
 
 /**
  * Espelha `VendedorPayload` do Backoffice (`src/types/vendedor.ts`): código e
@@ -49,9 +49,11 @@ export class CriarVendedorDto {
   @ApiPropertyOptional({
     description: "Obrigatória na criação; omitida na atualização = mantém a senha atual.",
     minLength: SENHA_TAMANHO_MINIMO,
+    maxLength: SENHA_TAMANHO_MAXIMO,
   })
   @IsOptional()
   @IsString()
   @MinLength(SENHA_TAMANHO_MINIMO, { message: `A senha deve ter ao menos ${SENHA_TAMANHO_MINIMO} caracteres.` })
+  @MaxLength(SENHA_TAMANHO_MAXIMO, { message: `A senha deve ter no máximo ${SENHA_TAMANHO_MAXIMO} caracteres.` })
   senha?: string;
 }

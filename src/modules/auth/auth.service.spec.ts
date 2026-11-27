@@ -382,6 +382,44 @@ describe("AuthService (integração — MongoDB real)", () => {
       expect(resultado.status).toBe("nao_admin");
       expect(depois!["senhaHash"]).toBe(antes!["senhaHash"]);
       expect(depois).toEqual(antes);
+      expect(await connection.collection("eventos_auth").countDocuments({ usuarioId: antes!["_id"], tipo: "ADMIN_PASSWORD_RESET" })).toBe(0);
+    });
+
+    it("auditoria: grava ADMIN_PASSWORD_RESET (origem, sessões revogadas) sem senha, hash ou token", async () => {
+      const email = emailUnico("RESET-AUDITORIA");
+      await service.criarAdminSeed({ nome: "Reset Auditoria", email, senha: "senha-antiga-123" });
+      const sessao = await service.login({ usuario: email, senha: "senha-antiga-123" }, contextoTeste);
+      const usuario = await connection.collection("usuarios").findOne({ email });
+
+      await service.redefinirSenhaAdmin({ email, senha: "senha-nova-auditada-456" });
+
+      const eventos = await connection.collection("eventos_auth").find({ usuarioId: usuario!["_id"], tipo: "ADMIN_PASSWORD_RESET" }).toArray();
+      expect(eventos).toHaveLength(1);
+      expect(eventos[0]).toMatchObject({ tipo: "ADMIN_PASSWORD_RESET", ip: null, userAgent: null, origem: "comando:admin:reset-password", sessoesRevogadas: 1 });
+      expect(eventos[0]!["criadoEm"]).toBeInstanceOf(Date);
+      expect(eventos[0]).not.toHaveProperty("executor");
+      const depois = await connection.collection("usuarios").findOne({ email });
+      const serializado = JSON.stringify(eventos);
+      for (const segredo of ["senha-nova-auditada-456", "senha-antiga-123", String(depois!["senhaHash"]), sessao.refreshToken, sessao.accessToken, "argon2"]) {
+        expect(serializado).not.toContain(segredo);
+      }
+    });
+  });
+
+  describe("auditoria de criação de ADMIN", () => {
+    it("criarAdminSeed grava ADMIN_CREATED uma única vez, sem senha nem hash; a repetição idempotente não grava outro", async () => {
+      const email = emailUnico("CRIACAO-AUDITORIA");
+      const { usuario } = await service.criarAdminSeed({ nome: "Criação Auditoria", email, senha: "senha-da-criacao-789" });
+      await service.criarAdminSeed({ nome: "Criação Auditoria", email, senha: "senha-da-criacao-789" });
+
+      const eventos = await connection.collection("eventos_auth").find({ usuarioId: new Types.ObjectId(usuario.id), tipo: "ADMIN_CREATED" }).toArray();
+      expect(eventos).toHaveLength(1);
+      expect(eventos[0]).toMatchObject({ tipo: "ADMIN_CREATED", ip: null, userAgent: null, origem: "comando:seed:admin" });
+      const documento = await connection.collection("usuarios").findOne({ email });
+      const serializado = JSON.stringify(eventos);
+      expect(serializado).not.toContain("senha-da-criacao-789");
+      expect(serializado).not.toContain(String(documento!["senhaHash"]));
+      expect(serializado).not.toContain("argon2");
     });
   });
 

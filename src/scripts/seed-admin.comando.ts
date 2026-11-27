@@ -2,7 +2,7 @@ import type { INestApplicationContext } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { getConnectionToken } from "@nestjs/mongoose";
 import type { Connection } from "mongoose";
-import { ProvisionamentoAdminService, type AvaliacaoProvisionamento } from "../modules/auth/provisionamento-admin.service.js";
+import { FalhaAuditoriaCriacaoAdmin, ProvisionamentoAdminService, type AvaliacaoProvisionamento } from "../modules/auth/provisionamento-admin.service.js";
 import { FORMATO_EMAIL_ADMIN, normalizarEmailAdmin, TAMANHO_MAXIMO_EMAIL } from "../modules/auth/usuario-admin.util.js";
 import {
   interpretarArgumentosDeEscrita,
@@ -21,7 +21,8 @@ import { ComandoSeedAdminModule } from "./seed-admin.modulo.js";
  * acontece ANTES de qualquer conexão.
  *
  * Variáveis: `ADMIN_EMAIL` e `ADMIN_NAME` (sempre); com `--apply`, também `ADMIN_PASSWORD` e `ADMIN_SEED_CONFIRM`
- * (o MESMO e-mail, repetido). Nunca imprime a senha, o hash, a URI ou credenciais.
+ * (o MESMO e-mail, repetido). `ADMIN_SEED_EXECUTOR` é opcional (quem executou, gravado no evento `ADMIN_CREATED`).
+ * Nunca imprime a senha, o hash, a URI ou credenciais.
  */
 
 export const CODIGOS_DE_SAIDA = {
@@ -42,6 +43,7 @@ export const USO = [
   "  ADMIN_NAME                   obrigatória: nome (até 120 caracteres)",
   "  ADMIN_PASSWORD               obrigatória com --apply: senha (8 a 200 caracteres; nunca exibida)",
   "  ADMIN_SEED_CONFIRM           obrigatória com --apply: repita EXATAMENTE o mesmo e-mail",
+  "  ADMIN_SEED_EXECUTOR          opcional: identificação de quem executa (até 120 caracteres), gravada na auditoria",
   "  --banco <nome>               obrigatório; precisa ser EXATAMENTE o banco da MONGODB_URI configurada",
   "  --apply                      cria o ADMIN (sem ele: dry-run, somente leitura)",
   "  --confirmar-producao <nome>  obrigatório junto com --apply em banco protegido (produção ou desconhecido); repita o nome exato",
@@ -52,13 +54,14 @@ export const USO = [
 const ENTRADA_LOCAL_ESPERADA = "src/scripts/seed-admin.ts";
 
 /** `senhaMaxima` = limite do `LoginDto` (uma senha maior nunca conseguiria fazer login). */
-export const LIMITES = { emailMaximo: TAMANHO_MAXIMO_EMAIL, nomeMaximo: 120, senhaMinima: 8, senhaMaxima: 200 } as const;
+export const LIMITES = { emailMaximo: TAMANHO_MAXIMO_EMAIL, nomeMaximo: 120, senhaMinima: 8, senhaMaxima: 200, executorMaximo: 120 } as const;
 
 export interface PedidoSeed {
   email: string;
   nome: string;
   /** Presente sempre no modo apply; no dry-run, só se informada (e então já validada). */
   senha: string | null;
+  executor: string | null;
 }
 
 /** Valida as variáveis `ADMIN_*`. Nenhuma mensagem ecoa a senha. */
@@ -71,12 +74,16 @@ export function interpretarVariaveis(variaveis: Readonly<Record<string, string |
   if (!nome) return { ok: false, erro: "Defina ADMIN_NAME com o nome do novo ADMIN." };
   if (nome.length > LIMITES.nomeMaximo) return { ok: false, erro: `ADMIN_NAME excede ${LIMITES.nomeMaximo} caracteres.` };
 
+  const executorBruto = (variaveis["ADMIN_SEED_EXECUTOR"] ?? "").trim();
+  if (executorBruto.length > LIMITES.executorMaximo) return { ok: false, erro: `ADMIN_SEED_EXECUTOR excede ${LIMITES.executorMaximo} caracteres.` };
+  const executor = executorBruto || null;
+
   const senhaInformada = variaveis["ADMIN_PASSWORD"];
   const senha = senhaInformada === undefined || senhaInformada === "" ? null : senhaInformada;
   if (senha !== null && (senha.length < LIMITES.senhaMinima || senha.length > LIMITES.senhaMaxima)) {
     return { ok: false, erro: `ADMIN_PASSWORD deve ter de ${LIMITES.senhaMinima} a ${LIMITES.senhaMaxima} caracteres (o valor não é exibido).` };
   }
-  if (!aplicar) return { ok: true, valor: { email, nome, senha } };
+  if (!aplicar) return { ok: true, valor: { email, nome, senha, executor } };
 
   if (senha === null) return { ok: false, erro: "--apply exige ADMIN_PASSWORD." };
   const confirmacao = variaveis["ADMIN_SEED_CONFIRM"];
@@ -84,7 +91,7 @@ export function interpretarVariaveis(variaveis: Readonly<Record<string, string |
     return { ok: false, erro: "--apply exige ADMIN_SEED_CONFIRM com o MESMO e-mail de ADMIN_EMAIL (confirmação explícita)." };
   }
   if (normalizarEmailAdmin(confirmacao) !== email) return { ok: false, erro: "ADMIN_SEED_CONFIRM não corresponde EXATAMENTE a ADMIN_EMAIL." };
-  return { ok: true, valor: { email, nome, senha } };
+  return { ok: true, valor: { email, nome, senha, executor } };
 }
 
 export interface ContextoSeed {
@@ -180,15 +187,23 @@ export async function executarComando(dependencias: DependenciasComando): Promis
     const { senha } = pedido.valor;
     // `interpretarVariaveis` garante a senha no modo apply; a checagem só protege contra uma regressão futura.
     if (senha === null) throw new Error("Senha ausente no modo apply.");
-    const resultado = await contexto.service.criar({ nome: pedido.valor.nome, email: pedido.valor.email, senha });
+    const resultado = await contexto.service.criar({ nome: pedido.valor.nome, email: pedido.valor.email, senha, executor: pedido.valor.executor });
     if (!resultado.criado) {
       escrever(`Já existe um usuário com este e-mail (${resultado.usuario.codigo}) — nada foi feito.`);
       return CODIGOS_DE_SAIDA.jaExiste;
     }
     escrever(`Administrador criado: ${resultado.usuario.codigo} <${resultado.usuario.email}>`);
     escrever(`  Perfil: ${resultado.usuario.tipo}; ativo: ${resultado.usuario.ativo}`);
+    escrever("  Auditoria: ADMIN_CREATED registrado em eventos_auth.");
     return CODIGOS_DE_SAIDA.sucesso;
   } catch (erro) {
+    if (erro instanceof FalhaAuditoriaCriacaoAdmin) {
+      const causa = erro.causa instanceof Error ? `${erro.causa.name}: ${erro.causa.message}` : String(erro.causa);
+      escrever(`Administrador criado: ${erro.usuario.codigo} <${erro.usuario.email}> — o usuário EXISTE e já pode entrar.`);
+      escrever(`ERRO na auditoria: o evento ADMIN_CREATED não foi gravado (${ocultarSegredos(causa, execucao.uri)}).`);
+      escrever("Uma nova execução NÃO grava o evento (o e-mail já existe): registre a criação manualmente.");
+      return CODIGOS_DE_SAIDA.falha;
+    }
     const descricao = erro instanceof Error ? `${erro.name}: ${erro.message}` : String(erro);
     escrever(`ERRO durante a execução: ${ocultarSegredos(descricao, execucao.uri)}`);
     return CODIGOS_DE_SAIDA.falha;

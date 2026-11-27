@@ -373,7 +373,8 @@ describe("Família de sessão do refresh token (Fase 22.8.7.1 — integração, 
       await codigoDoErro(refresh(s.refreshToken)); // REFRESH_REUSED
       await service.logout({ refreshToken: R2 });
       const lista = await connection.collection("eventos_auth").find({ usuarioId: u.id }).toArray();
-      expect(lista.map((e) => e["tipo"])).toEqual(["LOGIN_SUCCESS", "REFRESH", "REFRESH_REUSED"]);
+      // `ADMIN_CREATED` = auditoria da criação do usuário de teste (`criarAdminSeed`).
+      expect(lista.map((e) => e["tipo"])).toEqual(["ADMIN_CREATED", "LOGIN_SUCCESS", "REFRESH", "REFRESH_REUSED"]);
       const serializado = JSON.stringify(lista);
       for (const segredoProibido of [s.refreshToken, s.accessToken, R2, hash(s.refreshToken), hash(R2), (await familiaDe(R2))!]) {
         expect(serializado).not.toContain(segredoProibido);

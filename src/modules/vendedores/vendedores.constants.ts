@@ -52,6 +52,8 @@ export type Ordem = "asc" | "desc";
 export const TELEFONE_DIGITOS_VALIDOS = [10, 11];
 
 export const SENHA_TAMANHO_MINIMO = 6;
+/** Mesmo limite do `LoginPdvDto`: uma senha maior seria gravada mas nunca permitiria login no PDV. */
+export const SENHA_TAMANHO_MAXIMO = 200;
 
 /**
  * Parâmetros do Argon2id (via `Bun.password`) — mesmos valores de

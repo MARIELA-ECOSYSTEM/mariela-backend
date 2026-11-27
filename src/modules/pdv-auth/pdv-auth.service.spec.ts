@@ -259,6 +259,50 @@ describe("PdvAuthService (integração — MongoDB real)", () => {
       const renovado = await service.refresh({ refreshToken: loginNovo.refreshToken }, CONTEXTO);
       expect(renovado.accessToken).toBeTruthy();
     });
+
+    it("edição (PUT) COM senha nova revoga as sessões PDV anteriores e registra vendedor.senha_redefinida sem a senha nem o hash", async () => {
+      const vendedor = await criarVendedor();
+      const loginAntigo = await service.login({ codigo: vendedor.codigo, senha: "senha123" }, CONTEXTO);
+      const outraSessao = await service.login({ codigo: vendedor.codigo, senha: "senha123" }, CONTEXTO);
+
+      await vendedoresService.atualizar(
+        vendedor.id,
+        { nome: vendedor.nome, telefone: vendedor.telefone, ativo: true, senha: "senhaNovaPeloPut" },
+        "admin-teste",
+      );
+
+      // Nenhuma sessão anterior continua válida no banco; nenhuma delas renova.
+      expect(await connection.collection("vendedor_refresh_tokens").countDocuments({ vendedorId: new Types.ObjectId(vendedor.id), revogadoEm: null })).toBe(0);
+      await expect(service.refresh({ refreshToken: loginAntigo.refreshToken }, CONTEXTO)).rejects.toThrow(ApiException);
+      await expect(service.refresh({ refreshToken: outraSessao.refreshToken }, CONTEXTO)).rejects.toThrow(ApiException);
+      // A senha antiga deixa de funcionar; a nova funciona.
+      await expect(service.login({ codigo: vendedor.codigo, senha: "senha123" }, CONTEXTO)).rejects.toThrow(ApiException);
+      expect((await service.login({ codigo: vendedor.codigo, senha: "senhaNovaPeloPut" }, CONTEXTO)).vendedor.id).toBe(vendedor.id);
+
+      const eventos = await connection
+        .collection("eventos_vendedor")
+        .find({ vendedorId: new Types.ObjectId(vendedor.id), tipo: { $in: ["vendedor.atualizado", "vendedor.senha_redefinida"] } })
+        .toArray();
+      expect(eventos.map((evento) => evento["tipo"]).sort()).toEqual(["vendedor.atualizado", "vendedor.senha_redefinida"]);
+      const serializado = JSON.stringify(eventos);
+      expect(serializado).not.toContain("senhaNovaPeloPut");
+      expect(serializado).not.toContain("argon2");
+      // Mesmo formato do evento de `redefinirSenha` (PATCH): só quem fez, sem detalhes.
+      expect(eventos.find((evento) => evento["tipo"] === "vendedor.senha_redefinida")).toMatchObject({ usuarioId: "admin-teste" });
+      expect(eventos.find((evento) => evento["tipo"] === "vendedor.senha_redefinida")?.["detalhes"] ?? {}).toEqual({});
+    });
+
+    it("edição (PUT) SEM senha não revoga sessões nem registra redefinição de senha; a senha atual continua valendo", async () => {
+      const vendedor = await criarVendedor();
+      const login = await service.login({ codigo: vendedor.codigo, senha: "senha123" }, CONTEXTO);
+
+      await vendedoresService.atualizar(vendedor.id, { nome: `${vendedor.nome} Editado`, telefone: vendedor.telefone, ativo: true }, "admin-teste");
+
+      const renovado = await service.refresh({ refreshToken: login.refreshToken }, CONTEXTO);
+      expect(renovado.accessToken).toBeTruthy();
+      expect(await connection.collection("eventos_vendedor").countDocuments({ vendedorId: new Types.ObjectId(vendedor.id), tipo: "vendedor.senha_redefinida" })).toBe(0);
+      expect((await service.login({ codigo: vendedor.codigo, senha: "senha123" }, CONTEXTO)).vendedor.id).toBe(vendedor.id);
+    });
   });
 
   describe("logout", () => {

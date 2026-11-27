@@ -2,6 +2,7 @@ import { Module, type DynamicModule } from "@nestjs/common";
 import { MongooseModule } from "@nestjs/mongoose";
 import type { Connection } from "mongoose";
 import { ProvisionamentoAdminService } from "../modules/auth/provisionamento-admin.service.js";
+import { EventoAuth, EventoAuthSchema } from "../modules/auth/schemas/evento-auth.schema.js";
 import { Usuario, UsuarioSchema } from "../modules/auth/schemas/usuario.schema.js";
 import { UsuariosRepository } from "../modules/auth/usuarios.repository.js";
 import { Sequencia, SequenciaSchema } from "../modules/sequencias/schemas/sequencia.schema.js";
@@ -13,7 +14,8 @@ import { SequenciasService } from "../modules/sequencias/sequencias.service.js";
  * Antes o seed subia o `AppModule` inteiro, o que no banco de destino criava coleções e índices de TODOS os models
  * (`autoCreate`/`autoIndex`, padrão do Mongoose) e rodava os `syncIndexes()` de caixas e movimentos. Aqui só existem
  * os dois models que a criação usa (`usuarios` e `sequencias`), numa conexão própria com `autoIndex`/`autoCreate`
- * desligados; nenhum controller, JWT, configuração da aplicação ou hook de outro módulo.
+ * desligados; nenhum controller, JWT, configuração da aplicação ou hook de outro módulo. O model `eventos_auth` entra só
+ * para o evento de auditoria `ADMIN_CREATED`.
  */
 export const OPCOES_DE_CONEXAO_DO_COMANDO = {
   autoIndex: false,
@@ -42,6 +44,7 @@ export class ComandoSeedAdminModule {
         MongooseModule.forFeature([
           { name: Usuario.name, schema: UsuarioSchema },
           { name: Sequencia.name, schema: SequenciaSchema },
+          { name: EventoAuth.name, schema: EventoAuthSchema },
         ]),
       ],
       providers: [ProvisionamentoAdminService, UsuariosRepository, SequenciasService, SequenciasRepository],

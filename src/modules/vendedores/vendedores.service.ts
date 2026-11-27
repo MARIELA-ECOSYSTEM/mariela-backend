@@ -162,6 +162,12 @@ export class VendedoresService {
     });
 
     await this.registrarEvento(vendedor.id, "vendedor.atualizado", usuarioId, {});
+    // Senha trocada pelo formulário de edição: mesmos efeitos de `redefinirSenha` (evento sem a senha nem o hash e
+    // revogação de TODAS as sessões PDV anteriores). Sem senha no corpo, nada disto acontece.
+    if (senhaHash) {
+      await this.registrarEvento(vendedor.id, "vendedor.senha_redefinida", usuarioId, {});
+      await this.pdvAuthRepository.revogarTodosDoVendedor(vendedor._id as Types.ObjectId, new Date());
+    }
     return vendedor;
   }
 

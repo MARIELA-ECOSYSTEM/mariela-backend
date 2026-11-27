@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { Connection } from "mongoose";
 import { AppModule } from "../app.module.js";
 import { AuthService } from "../modules/auth/auth.service.js";
+import { FalhaAuditoriaCriacaoAdmin } from "../modules/auth/provisionamento-admin.service.js";
 import { MONGODB_URI_TESTE } from "../test-utils/mongo-teste.util.js";
 import { analisarUri, type AmbienteDeExecucao } from "./comando-local.util.js";
 import {
@@ -147,6 +148,7 @@ describe("comando seed:admin em contexto mínimo (Fase 60.4.3.2.1)", () => {
         { ADMIN_NAME: undefined },
         { ADMIN_NAME: "   " },
         { ADMIN_NAME: "x".repeat(LIMITES.nomeMaximo + 1) },
+        { ADMIN_SEED_EXECUTOR: "x".repeat(LIMITES.executorMaximo + 1) },
       ];
       for (const extras of casos) {
         const abridor = abridorQueNaoConecta();
@@ -225,6 +227,25 @@ describe("comando seed:admin em contexto mínimo (Fase 60.4.3.2.1)", () => {
       expect(await processo.exited).toBe(CODIGOS_DE_SAIDA.recusado);
       expect(saida).toContain("Defina ADMIN_EMAIL");
     });
+
+    it("ADMIN criado mas ADMIN_CREATED não gravado: relata que o usuário existe e sai com 3, sem senha nem URI", async () => {
+      const usuario = { id: "u1", codigo: "USR-9999", nome: NOME, email, tipo: "ADMIN" as const, ativo: true };
+      const contexto = {
+        service: {
+          avaliar: async () => ({ status: "existe" as const, usuario }),
+          criar: async () => {
+            throw new FalhaAuditoriaCriacaoAdmin(usuario, new Error(`falhou em ${MONGODB_URI_TESTE}`));
+          },
+        },
+        conexao: { name: BANCO_DE_TESTE } as Connection,
+        fechar: async () => undefined,
+      };
+      const { codigo, texto } = await executar(ARGS_APPLY, variaveisDeCriacao(email), async () => contexto);
+      expect(codigo).toBe(CODIGOS_DE_SAIDA.falha);
+      expect(texto).toContain("Administrador criado: USR-9999");
+      expect(texto).toContain("o evento ADMIN_CREATED não foi gravado");
+      expect(texto).not.toContain(MONGODB_URI_TESTE);
+    });
   });
 
   describe("integração com mariela_test (contexto real e mínimo do comando)", () => {
@@ -244,6 +265,8 @@ describe("comando seed:admin em contexto mínimo (Fase 60.4.3.2.1)", () => {
     });
 
     afterAll(async () => {
+      const criados = await connection.collection("usuarios").find({ email: { $regex: `^${PREFIXO_EMAIL.replaceAll(".", "\\.")}` } }).toArray();
+      await connection.collection("eventos_auth").deleteMany({ usuarioId: { $in: criados.map((usuario) => usuario["_id"]) } });
       await connection.collection("usuarios").deleteMany({ email: { $regex: `^${PREFIXO_EMAIL.replaceAll(".", "\\.")}` } });
       await moduleRef.close();
     });
@@ -282,25 +305,27 @@ describe("comando seed:admin em contexto mínimo (Fase 60.4.3.2.1)", () => {
       expect(instr.conexoes.map((conexao) => conexao.readyState)).toEqual([0]);
     });
 
-    it("--apply: cria o ADMIN (USR-####, Argon2id, ativo) escrevendo SÓ o usuário e a sequência; o login funciona", async () => {
+    it("--apply: cria o ADMIN (USR-####, Argon2id, ativo) escrevendo SÓ o usuário, a sequência e o evento ADMIN_CREATED; o login funciona", async () => {
       const email = emailUnico("apply");
       const antes = await fotografia();
       const sequenciaAntes = await valorDaSequencia();
       const instr = instrumentado();
 
-      const { codigo, texto } = await executar(ARGS_APPLY, variaveisDeCriacao(`  ${email.toUpperCase()}  `), instr.abrir);
+      const { codigo, texto } = await executar(ARGS_APPLY, variaveisDeCriacao(`  ${email.toUpperCase()}  `, { ADMIN_SEED_EXECUTOR: "  Dev Responsável  " }), instr.abrir);
 
       const codigoEsperado = `USR-${String(sequenciaAntes + 1).padStart(4, "0")}`;
       expect(codigo).toBe(CODIGOS_DE_SAIDA.sucesso);
       expect(texto).toContain(`Administrador criado: ${codigoEsperado} <${email}>`);
       expect(texto).toContain("Perfil: ADMIN; ativo: true");
+      expect(texto).toContain("Auditoria: ADMIN_CREATED registrado");
 
-      // Comandos: nenhum de estrutura; as únicas escritas são a sequência (findAndModify) e o usuário (insert).
+      // Comandos: nenhum de estrutura; as únicas escritas são a sequência (findAndModify), o usuário e o evento (insert).
       expect(instr.inicializacao()).toEqual([]);
       expect(instr.comandos.filter((comando) => COMANDOS_DE_ESTRUTURA.includes(comando.nome))).toEqual([]);
       expect(instr.comandos.filter((comando) => COMANDOS_DE_ESCRITA.includes(comando.nome))).toEqual([
         { nome: "findAndModify", colecao: "sequencias" },
         { nome: "insert", colecao: "usuarios" },
+        { nome: "insert", colecao: "eventos_auth" },
       ]);
       expect(instr.metodos.filter((metodo) => METODOS_MONGOOSE_DE_ESTRUTURA.includes(metodo))).toEqual([]);
 
@@ -313,12 +338,20 @@ describe("comando seed:admin em contexto mínimo (Fase 60.4.3.2.1)", () => {
       expect(String(usuario?.["senhaHash"])).not.toContain(SENHA);
       expect(await valorDaSequencia()).toBe(sequenciaAntes + 1);
 
+      // Auditoria: um único ADMIN_CREATED, com origem e executor, sem senha nem hash.
+      const eventos = await connection.collection("eventos_auth").find({ usuarioId: usuario?.["_id"] }).toArray();
+      expect(eventos).toHaveLength(1);
+      expect(eventos[0]).toMatchObject({ tipo: "ADMIN_CREATED", origem: "comando:seed:admin", executor: "Dev Responsável", ip: null, userAgent: null });
+      expect(JSON.stringify(eventos)).not.toContain(SENHA);
+      expect(JSON.stringify(eventos)).not.toContain(String(usuario?.["senhaHash"]));
+
       // Nenhuma outra coleção, documento ou índice mudou; nenhuma coleção nova.
       const depois = await fotografia();
       expect(depois.colecoes).toEqual(antes.colecoes);
       expect(depois.indices).toEqual(antes.indices);
-      expect({ ...depois.contagens, usuarios: 0, sequencias: 0 }).toEqual({ ...antes.contagens, usuarios: 0, sequencias: 0 });
+      expect({ ...depois.contagens, usuarios: 0, sequencias: 0, eventos_auth: 0 }).toEqual({ ...antes.contagens, usuarios: 0, sequencias: 0, eventos_auth: 0 });
       expect(depois.contagens["usuarios"]).toBe((antes.contagens["usuarios"] ?? 0) + 1);
+      expect(depois.contagens["eventos_auth"]).toBe((antes.contagens["eventos_auth"] ?? 0) + 1);
 
       // O hash é o do login: autentica com a senha (e o e-mail em qualquer caixa).
       const sessao = await auth.login({ usuario: email.toUpperCase(), senha: SENHA }, contextoLogin);
@@ -341,6 +374,7 @@ describe("comando seed:admin em contexto mínimo (Fase 60.4.3.2.1)", () => {
       expect(repeticao.texto).toContain("Já existe um usuário com este e-mail");
       expect(await connection.collection("usuarios").findOne({ email })).toEqual(documento);
       expect(await valorDaSequencia()).toBe(sequencia);
+      expect(await connection.collection("eventos_auth").countDocuments({ usuarioId: documento?.["_id"], tipo: "ADMIN_CREATED" })).toBe(1);
     });
 
     it("o AuthService.criarAdminSeed (usado pelos testes e pelo login) segue o mesmo contrato via o serviço extraído", async () => {

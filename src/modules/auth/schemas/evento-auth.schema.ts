@@ -6,6 +6,9 @@ import { aplicarSerializacaoPadrao } from "../../../database/mongoose-json.util.
  * Fase 60.4.3.1.5 — `ADMIN_DEACTIVATED` (desativação administrativa, gravado UMA vez por usuário desativado) e
  * `ADMIN_SESSIONS_REVOKED` (revogação de sessões remanescentes de um usuário que já estava inativo), ambos só pelo
  * comando local `admin:desativar`.
+ *
+ * Fase de segurança do ciclo de usuários — `ADMIN_CREATED` (criação de ADMIN, `seed:admin`) e `ADMIN_PASSWORD_RESET`
+ * (redefinição de senha de ADMIN, `admin:reset-password`). Nenhum dos dois grava senha, hash ou token.
  */
 export type TipoEventoAuth =
   | "LOGIN_SUCCESS"
@@ -15,6 +18,8 @@ export type TipoEventoAuth =
   | "REFRESH_REUSED"
   | "ADMIN_DEACTIVATED"
   | "ADMIN_SESSIONS_REVOKED"
+  | "ADMIN_CREATED"
+  | "ADMIN_PASSWORD_RESET"
   // Fase 22.8.7.2 — recuperação idempotente: concedida; recusada por janela vencida; recusada por falha de
   // integridade (selo adulterado/inconsistente). Nenhum deles carrega token, hash, chave ou família.
   | "REFRESH_RECOVERED"

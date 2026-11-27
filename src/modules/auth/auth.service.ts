@@ -33,7 +33,8 @@ import type { ResultadoAutenticacao, UsuarioPublico } from "./types/usuario-publ
 import { UsuariosRepository } from "./usuarios.repository.js";
 import { LoginThrottleService } from "./login-throttle.service.js";
 import { ProvisionamentoAdminService } from "./provisionamento-admin.service.js";
-import { gerarHashDeSenha, normalizarEmailAdmin, paraUsuarioPublico } from "./usuario-admin.util.js";
+import { RedefinicaoSenhaAdminService } from "./redefinicao-senha-admin.service.js";
+import { normalizarEmailAdmin, paraUsuarioPublico } from "./usuario-admin.util.js";
 
 export interface ContextoRequisicao {
   ip: string | null;
@@ -70,6 +71,7 @@ export class AuthService implements OnModuleInit {
     private readonly usuariosRepository: UsuariosRepository,
     private readonly refreshTokensRepository: RefreshTokensRepository,
     private readonly provisionamentoAdminService: ProvisionamentoAdminService,
+    private readonly redefinicaoSenhaAdminService: RedefinicaoSenhaAdminService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService<Configuration>,
     private readonly loginThrottleService: LoginThrottleService,
@@ -106,11 +108,9 @@ export class AuthService implements OnModuleInit {
   }
 
   /**
-   * Usado SÓ pelo script de recuperação (`bun run admin:reset-password`) —
-   * mesma decisão de não expor rota HTTP pública (§19, ver `criarAdminSeed`).
-   * Nunca cria, nunca apaga, nunca altera qualquer campo além de `senhaHash`
-   * — reaproveita o MESMO `hashSenha` (Argon2id) usado no cadastro e no
-   * login, para a nova senha ser verificável pelo `login` normalmente.
+   * Redefinição de senha de ADMIN — sem rota HTTP (§19, ver `criarAdminSeed`). A regra (hash novo, revogação de TODAS
+   * as sessões — Fase 60.4.3.4.12/F08 — e o evento `ADMIN_PASSWORD_RESET`) mora em `RedefinicaoSenhaAdminService`, que
+   * o comando `admin:reset-password` usa num contexto mínimo; este método só delega, com o contrato de antes.
    */
   async redefinirSenhaAdmin(dados: {
     email: string;
@@ -120,21 +120,9 @@ export class AuthService implements OnModuleInit {
     | { status: "nao_admin"; usuario: UsuarioPublico }
     | { status: "atualizado"; usuario: UsuarioPublico }
   > {
-    const emailNormalizado = this.normalizarEmail(dados.email);
-    const usuario = await this.usuariosRepository.encontrarPorEmail(emailNormalizado);
-    if (!usuario) return { status: "nao_encontrado" };
-    if (usuario.role !== "ADMIN") return { status: "nao_admin", usuario: this.paraUsuarioPublico(usuario) };
-
-    const senhaHash = await this.hashSenha(dados.senha);
-    await this.usuariosRepository.atualizarSenhaHash(usuario.id, senhaHash);
-    // Fase 60.4.3.4.12 (F08) — redefinir a senha (tipicamente por suspeita de comprometimento) encerra TODAS as sessões
-    // do administrador: sem isto, um refresh token emitido antes continuaria renovando a sessão por até
-    // `JWT_REFRESH_EXPIRES_IN`. Mesma regra já aplicada ao vendedor (`VendedoresService.redefinirSenha`). A revogação vem
-    // DEPOIS de gravar a senha nova: um login concorrente com a senha antiga que tenha passado antes disso tem a sessão
-    // alcançada por esta revogação; um login posterior já exige a senha nova. Resta só o access token stateless (até
-    // `JWT_ACCESS_EXPIRES_IN`), mesma janela já aceita na desativação.
-    await this.refreshTokensRepository.revogarTodosDoUsuario(usuario._id, new Date());
-    return { status: "atualizado", usuario: this.paraUsuarioPublico(usuario) };
+    const resultado = await this.redefinicaoSenhaAdminService.redefinir({ email: dados.email, senha: dados.senha, executor: null });
+    if (resultado.status === "nao_encontrado") return resultado;
+    return { status: resultado.status, usuario: await this.me(resultado.alvo.id) };
   }
 
   async login(dto: LoginDto, contexto: ContextoRequisicao): Promise<ResultadoAutenticacao> {
@@ -539,11 +527,7 @@ export class AuthService implements OnModuleInit {
     return createHmac("sha256", segredo).update(tokenBruto).digest("hex");
   }
 
-  /** Fase 60.4.3.2.1 — as três regras abaixo vivem em `usuario-admin.util.ts`, compartilhadas com os comandos locais. */
-  private async hashSenha(senha: string): Promise<string> {
-    return gerarHashDeSenha(senha);
-  }
-
+  /** Fase 60.4.3.2.1 — as regras abaixo vivem em `usuario-admin.util.ts`, compartilhadas com os comandos locais. */
   private normalizarEmail(valor: string): string {
     return normalizarEmailAdmin(valor);
   }

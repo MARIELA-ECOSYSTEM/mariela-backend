@@ -378,7 +378,8 @@ describe("Recuperação idempotente da rotação (Fase 22.8.7.2 — integração
       await service.logout({ refreshToken: R2 });
       await codigo(refresh(R1, randomUUID()));
       const lista = await connection.collection("eventos_auth").find({ usuarioId: u.id }).toArray();
-      expect(lista.map((e) => e["tipo"])).toEqual(["LOGIN_SUCCESS", "REFRESH", "REFRESH_RECOVERED", "LOGOUT", "REFRESH_REUSED"]);
+      // `ADMIN_CREATED` = auditoria da criação do usuário de teste (`criarAdminSeed`).
+      expect(lista.map((e) => e["tipo"])).toEqual(["ADMIN_CREATED", "LOGIN_SUCCESS", "REFRESH", "REFRESH_RECOVERED", "LOGOUT", "REFRESH_REUSED"]);
       const d1 = (await doc(R1))!;
       const serializado = JSON.stringify(lista);
       const proibidos = [R1, R2, K, recuperado.accessToken, hash(R1), hash(R2), d1["chaveHash"] as string, familia, JSON.stringify(d1["sucessorSelado"] ?? "∅")];

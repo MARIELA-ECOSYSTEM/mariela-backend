@@ -147,6 +147,30 @@ describe("HTTP — Vendedores (integração — servidor real)", () => {
     expect(corpo.errors.some((erro) => erro.field === "senha")).toBe(true);
   });
 
+  it("senha da vendedora: 200 caracteres são aceitos e 201 recusados (400) na criação, na edição e na redefinição; o valor não é ecoado", async () => {
+    const senhaNoLimite = "s".repeat(200);
+    const senhaLonga = "L".repeat(201);
+    const esperarRecusa = async (resposta: Response) => {
+      const texto = await resposta.text();
+      expect(resposta.status).toBe(400);
+      expect((JSON.parse(texto) as { errors: { field: string }[] }).errors.some((erro) => erro.field === "senha")).toBe(true);
+      expect(texto).not.toContain(senhaLonga);
+    };
+    const telefone = telefoneUnico();
+
+    await esperarRecusa(await fetch(`${baseUrl}/api/v1/vendedores`, { method: "POST", headers: authHeaders(), body: JSON.stringify({ nome: "Senha Longa", telefone, ativo: true, senha: senhaLonga }) }));
+
+    const criado = await fetch(`${baseUrl}/api/v1/vendedores`, { method: "POST", headers: authHeaders(), body: JSON.stringify({ nome: "Senha No Limite", telefone, ativo: true, senha: senhaNoLimite }) });
+    expect(criado.status).toBe(201);
+    const id = ((await criado.json()) as { data: { id: string } }).data.id;
+
+    await esperarRecusa(await fetch(`${baseUrl}/api/v1/vendedores/${id}`, { method: "PUT", headers: authHeaders(), body: JSON.stringify({ nome: "Senha No Limite", telefone, ativo: true, senha: senhaLonga }) }));
+    await esperarRecusa(await fetch(`${baseUrl}/api/v1/vendedores/${id}/senha`, { method: "PATCH", headers: authHeaders(), body: JSON.stringify({ senha: senhaLonga }) }));
+
+    expect((await fetch(`${baseUrl}/api/v1/vendedores/${id}`, { method: "PUT", headers: authHeaders(), body: JSON.stringify({ nome: "Senha No Limite", telefone, ativo: true, senha: senhaNoLimite }) })).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/v1/vendedores/${id}/senha`, { method: "PATCH", headers: authHeaders(), body: JSON.stringify({ senha: senhaNoLimite }) })).status).toBe(200);
+  });
+
   // Etapa 18.12 — mass assignment de PRIORIDADE MÁXIMA: `senhaHash` é o campo
   // mais sensível do módulo e NUNCA pode ser aceito diretamente do cliente
   // (a única forma de definir a senha é o campo `senha`, transformado em hash

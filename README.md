@@ -60,8 +60,26 @@ ADMIN_SEED_CONFIRM=admin@mariela.com bun run seed:admin --banco <banco> --apply 
 
 - **Não lê o `.env`** (`bun --no-env-file`): `MONGODB_URI` e as `ADMIN_*` vêm só do processo — uma senha esquecida num `.env` nunca é usada sem querer.
 - Mesmas guardas de `admin:desativar`: `--banco` igual ao banco da URI, `mariela_dev_local` recusado, dry-run por padrão, `--confirmar-producao <nome-exato>` para escrever em banco protegido, recusa em `dist/`/`NODE_ENV=production`/Render/container.
-- Contexto mínimo (Fase 60.4.3.2.1): só os models `usuarios` e `sequencias`, sem `AppModule`, sem criar coleções nem índices (`autoIndex`/`autoCreate` desligados, nenhum `syncIndexes`). O `--apply` escreve só o incremento da sequência `usuario` e o documento do usuário.
-- Idempotente — com o e-mail já existente não altera nada (nem consome a sequência) e sai com **código 1**. Senha de 8 a 200 caracteres; nunca impressa. Códigos de saída: `0` criado (ou seria), `1` já existe, `2` recusado antes de conectar, `3` falha.
+- Contexto mínimo (Fase 60.4.3.2.1): só os models `usuarios`, `sequencias` e `eventos_auth`, sem `AppModule`, sem criar coleções nem índices (`autoIndex`/`autoCreate` desligados, nenhum `syncIndexes`). O `--apply` escreve só o incremento da sequência `usuario`, o documento do usuário e o evento de auditoria `ADMIN_CREATED` (origem e, se informado, `ADMIN_SEED_EXECUTOR` — nunca senha ou hash).
+- Idempotente — com o e-mail já existente não altera nada (nem consome a sequência nem grava evento) e sai com **código 1**. Senha de 8 a 200 caracteres; nunca impressa. Códigos de saída: `0` criado (ou seria), `1` já existe, `2` recusado antes de conectar, `3` falha.
+
+## Redefinir a senha de um administrador
+
+Também sem rota HTTP. `bun run admin:reset-password` grava a nova senha (Argon2id), revoga **todas** as sessões (refresh tokens) do usuário e registra o evento `ADMIN_PASSWORD_RESET` em `eventos_auth` (origem, executor, sessões revogadas — nunca senha, hash ou token). Só altera `senhaHash`; só atua sobre ADMIN.
+
+```bash
+# dry-run (padrão, somente leitura): mostra o alvo, se está ativo e quantas sessões seriam revogadas
+MONGODB_URI=... ADMIN_EMAIL=alvo@exemplo.com bun run admin:reset-password --banco <banco-da-MONGODB_URI>
+
+# aplica — a confirmação repete o MESMO e-mail
+MONGODB_URI=... ADMIN_EMAIL=alvo@exemplo.com ADMIN_PASSWORD="nova-senha-forte" ADMIN_RESET_CONFIRM=alvo@exemplo.com \
+[ADMIN_RESET_EXECUTOR="quem executa"] bun run admin:reset-password --banco <banco> --apply [--confirmar-producao <banco>]
+```
+
+- Mesmas guardas de `seed:admin`/`admin:desativar`: não lê o `.env`, `--banco` igual ao banco da URI, `mariela_dev_local` recusado, dry-run por padrão, `--confirmar-producao <nome-exato>` para escrever em banco protegido, recusa em `dist/`/`NODE_ENV=production`/Render/container. Contexto mínimo (`usuarios`, `refresh_tokens`, `eventos_auth`), sem `AppModule` nem workers.
+- Senha de 8 a 200 caracteres; nunca impressa. Repetir é seguro (mesmo estado final; cada execução fica auditada).
+- Códigos de saída: `0` redefinida (ou seria), `1` alvo inexistente/não ADMIN ou sessões remanescentes, `2` recusado antes de conectar, `3` falha (a saída diz se a senha já foi gravada).
+- **Limitação:** um access token JWT já emitido continua válido até expirar (`JWT_ACCESS_EXPIRES_IN`). Um ADMIN inativo recebe a senha nova, mas continua sem login.
 
 ## Desativar um administrador
 
