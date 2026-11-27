@@ -113,7 +113,8 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
   async function fecharCaixaAbertoSeExistir(): Promise<void> {
     const caixasService = app.get(CaixasService);
     const atual = await caixasService.obterAtual();
-    if (atual) await caixasService.fechar(atual.id, { valorInformado: atual.resumo.saldoEsperado }, null);
+    // Fase 22.8.9.12 — o fechamento confere o dinheiro físico (`dinheiroEsperado`), não o saldo de todas as formas.
+    if (atual) await caixasService.fechar(atual.id, { valorInformado: atual.resumo.dinheiroEsperado }, null);
   }
 
   /**
@@ -302,7 +303,62 @@ describe("HTTP — PDV Vendas (integração — servidor real)", () => {
     expect(vendedorAtualizado.vendas).toBe(1);
     expect(vendedorAtualizado.totalVendido).toBe(399.8);
 
-    await caixasService.fechar(caixaId, { valorInformado: 1399.8 }, null);
+    // Fase 22.8.9.12 — a venda foi em PIX: a gaveta continua com os 1000 da abertura (antes: 1399.8, "falta" falsa).
+    expect(detalheCaixa.resumo.dinheiroEsperado).toBe(1000);
+    const fechado = await caixasService.fechar(caixaId, { valorInformado: 1000 }, null);
+    expect(fechado.fechamento?.diferenca).toBe(0);
+  });
+
+  it("Fase 22.8.9.12 — venda real com pagamento combinado (Dinheiro + PIX + Crédito): só o dinheiro entra na gaveta; fechamento via HTTP sem falta falsa", async () => {
+    await fecharCaixaAbertoSeExistir();
+    const vendedor = await criarELogarVendedor();
+    const caixaId = await abrirCaixaViaPdv(vendedor.accessToken, 100);
+    const produto = await criarProdutoComEstoque(150, 5);
+
+    const respostaVenda = await fetch(`${baseUrl}/api/v1/pdv/vendas`, {
+      method: "POST",
+      headers: jsonHeaders(vendedor.accessToken),
+      body: JSON.stringify({
+        idempotencyKey: randomUUID(),
+        itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 2 }],
+        pagamentos: [
+          { forma: "Dinheiro", valor: 100 },
+          { forma: "PIX", valor: 134 },
+          { forma: "Crédito", valor: 66 },
+        ],
+      }),
+    });
+    expect(respostaVenda.status).toBe(201);
+
+    const respostaCaixa = await fetch(`${baseUrl}/api/v1/caixas/${caixaId}`, { headers: jsonHeaders(adminAccessToken) });
+    expect(respostaCaixa.status).toBe(200);
+    const { data: caixa } = (await respostaCaixa.json()) as {
+      data: {
+        resumo: {
+          saldoEsperado: number;
+          dinheiroEsperado: number;
+          porFormaPagamento: { forma: string; dinheiroFisico: boolean; entradas: number; saidas: number; saldo: number }[];
+        };
+      };
+    };
+    expect(caixa.resumo.saldoEsperado).toBe(400); // todas as formas — significado inalterado
+    expect(caixa.resumo.dinheiroEsperado).toBe(200); // 100 de abertura + 100 em dinheiro
+    expect(caixa.resumo.porFormaPagamento).toEqual([
+      { forma: "Dinheiro", dinheiroFisico: true, entradas: 100, saidas: 0, saldo: 100 },
+      { forma: "Crédito", dinheiroFisico: false, entradas: 66, saidas: 0, saldo: 66 },
+      { forma: "PIX", dinheiroFisico: false, entradas: 134, saidas: 0, saldo: 134 },
+    ]);
+
+    // A operadora conta 200 na gaveta: fecha conferido, sem justificativa (antes: 400 esperado, "falta" de 200).
+    const respostaFechamento = await fetch(`${baseUrl}/api/v1/caixas/${caixaId}/fechamento`, {
+      method: "POST",
+      headers: jsonHeaders(adminAccessToken),
+      body: JSON.stringify({ valorInformado: 200 }),
+    });
+    expect(respostaFechamento.status).toBe(201);
+    const { data: fechado } = (await respostaFechamento.json()) as { data: { status: string; fechamento: { valorEsperado: number; valorInformado: number; diferenca: number } } };
+    expect(fechado.status).toBe("fechado");
+    expect(fechado.fechamento).toMatchObject({ valorEsperado: 200, valorInformado: 200, diferenca: 0 });
   });
 
   it("idempotência: retry sequencial com a mesma chave devolve a MESMA venda (201 nas duas vezes)", async () => {

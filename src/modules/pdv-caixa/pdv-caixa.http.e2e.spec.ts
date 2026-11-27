@@ -90,7 +90,8 @@ describe("HTTP — PDV Caixa (integração — servidor real)", () => {
   async function fecharCaixaAbertoSeExistir(): Promise<void> {
     const caixasService = app.get(CaixasService);
     const atual: CaixaDetalheResposta | null = await caixasService.obterAtual();
-    if (atual) await caixasService.fechar(atual.id, { valorInformado: atual.resumo.saldoEsperado }, null);
+    // Fase 22.8.9.12 — o fechamento confere o dinheiro físico (`dinheiroEsperado`), não o saldo de todas as formas.
+    if (atual) await caixasService.fechar(atual.id, { valorInformado: atual.resumo.dinheiroEsperado }, null);
   }
 
   /**
@@ -244,7 +245,7 @@ describe("HTTP — PDV Caixa (integração — servidor real)", () => {
     const respostaFechamento = await fetch(`${baseUrl}/api/v1/caixas/${aberto!.id}/fechamento`, {
       method: "POST",
       headers: jsonHeaders(adminAccessToken),
-      body: JSON.stringify({ valorInformado: aberto!.resumo.saldoEsperado }),
+      body: JSON.stringify({ valorInformado: aberto!.resumo.dinheiroEsperado }),
     });
     expect(respostaFechamento.status).toBe(201);
 

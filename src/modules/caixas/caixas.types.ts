@@ -58,9 +58,28 @@ export interface ResumoCaixaCalculado {
   saidasManuais: number;
   devolucoes: number;
   totalSaidas: number;
+  /** Saldo de TODAS as formas de pagamento (abertura + entradas − saídas). Usado em listas, filtros e ordenação. */
   saldoEsperado: number;
   quantidadeVendas: number;
   quantidadeMovimentacoes: number;
+  /**
+   * Fase 22.8.9.12 — dinheiro FÍSICO esperado na gaveta: abertura + movimentos em "Dinheiro" (ver `gaveta.util.ts`).
+   * É a base do `valorEsperado`/`diferenca` dos fechamentos a partir desta fase.
+   */
+  dinheiroEsperado: number;
+  /** Fase 22.8.9.12 — totais informativos por forma de pagamento; não entram no `dinheiroEsperado`. */
+  porFormaPagamento: ResumoFormaPagamentoCaixa[];
+}
+
+export interface ResumoFormaPagamentoCaixa {
+  /** Nome da forma como registrada no movimento. */
+  forma: string;
+  /** `true` só para "Dinheiro": a única forma que movimenta a gaveta. */
+  dinheiroFisico: boolean;
+  entradas: number;
+  saidas: number;
+  /** `entradas − saidas`. */
+  saldo: number;
 }
 
 /**

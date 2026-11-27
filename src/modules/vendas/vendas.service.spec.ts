@@ -123,6 +123,17 @@ describe("VendasService (integração — MongoDB real)", () => {
     return caixasService.abrir({ valorInicial: 1000, observacao: "" }, null);
   }
 
+  /**
+   * Fase 22.8.9.12 — antes, `fechar(id, { valorInformado: saldoTotal })` sem observação também conferia o saldo de
+   * TODAS as formas (o fechamento recusava qualquer diferença). O fechamento agora confere só o dinheiro físico, então
+   * a mesma verificação do saldo total é feita explicitamente e o caixa fecha com o dinheiro que estaria na gaveta.
+   */
+  async function fecharConferindoSaldo(caixaId: string, saldoTotalEsperado: number) {
+    const { resumo } = await caixasService.obterDetalhe(caixaId);
+    expect(resumo.saldoEsperado).toBe(saldoTotalEsperado);
+    await caixasService.fechar(caixaId, { valorInformado: resumo.dinheiroEsperado }, null);
+  }
+
   async function criarAdquirente(extra: Partial<CriarAdquirenteDto> = {}) {
     const s = sufixo();
     return adquirentesService.criar({ nome: `Adquirente Venda ${s}`, ...extra }, null);
@@ -186,7 +197,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(relida!.itens[0]!.foto).toBe("https://legado.exemplo.com/azul.jpg");
       } finally {
         // Fecha o caixa mesmo se uma asserção falhar: um caixa aberto contaminaria os demais testes do arquivo.
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 + vendidas.reduce((total, valor) => total + valor, 0) }, null);
+        await fecharConferindoSaldo(caixa.id, 1000 + vendidas.reduce((total, valor) => total + valor, 0));
       }
     });
   });
@@ -215,7 +226,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(8);
-      await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+      await fecharConferindoSaldo(caixa.id, 1200);
     });
 
     it("o código usa a data LOCAL (America/Sao_Paulo) da venda, não a UTC — 22:30 de 10/03 local é 11/03 em UTC", async () => {
@@ -246,7 +257,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         if (tzOriginal === undefined) delete process.env["TZ"];
         else process.env["TZ"] = tzOriginal;
       }
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("marca EM_PAGAMENTO com uma parcela cobrindo o valor pendente quando o pagamento é parcial", async () => {
@@ -271,7 +282,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.parcelas).toHaveLength(1);
       expect(venda.parcelas[0]?.valor).toBe(200);
       expect(venda.parcelas[0]?.pagoEm).toBeNull();
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("gera N parcelas quando totalParcelas é solicitado (estilo Crediário)", async () => {
@@ -295,7 +306,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.parcelas).toHaveLength(3);
       const somaParcelas = venda.parcelas.reduce((total, p) => total + p.valor, 0);
       expect(Number(somaParcelas.toFixed(2))).toBe(300);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("preço praticado usa a promoção quando ativa (preço vigente, não o de tabela)", async () => {
@@ -318,7 +329,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.itens[0]?.emPromocao).toBe(true);
       expect(venda.descontoPromocional).toBe(50);
       expect(venda.temPromocao).toBe(true);
-      await caixasService.fechar(caixa.id, { valorInformado: 1150 }, null);
+      await fecharConferindoSaldo(caixa.id, 1150);
     });
 
     it("aplica e valida descontoVenda contra o subtotal", async () => {
@@ -351,7 +362,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       ).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1090 }, null);
+      await fecharConferindoSaldo(caixa.id, 1090);
     });
 
     it("rejeita estoque insuficiente e não baixa nenhum item", async () => {
@@ -374,7 +385,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("rejeita vendedor inativo", async () => {
@@ -393,14 +404,14 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       ).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("rejeita caixa fechado", async () => {
       const produto = await criarProdutoComEstoque(100, 5);
       const vendedor = await criarVendedor();
       const caixa = await abrirCaixa();
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
 
       await expect(
         service.criar(
@@ -435,7 +446,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(4);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("duas vendas concorrentes disputando a última unidade: só uma consegue baixar o estoque", async () => {
@@ -457,7 +468,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(0);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
   });
 
@@ -479,7 +490,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.itens[0]?.descontoItem).toBe(0);
       expect(venda.itens[0]?.subtotal).toBe(200);
       expect(venda.temDesconto).toBe(false);
-      await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+      await fecharConferindoSaldo(caixa.id, 1200);
     });
 
     it("desconto por item em R$ (valor absoluto)", async () => {
@@ -508,7 +519,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.itens[0]?.subtotal).toBe(85);
       expect(venda.valorFinal).toBe(85);
       expect(venda.temDesconto).toBe(true);
-      await caixasService.fechar(caixa.id, { valorInformado: 1085 }, null);
+      await fecharConferindoSaldo(caixa.id, 1085);
     });
 
     it("desconto por item em % — considera a quantidade (preço praticado × quantidade é a base, não o unitário)", async () => {
@@ -538,7 +549,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // base = 50 × 3 = 150; 10% = 15; subtotal = 135 (seção 7 do pedido).
       expect(venda.itens[0]?.descontoItem).toBe(15);
       expect(venda.itens[0]?.subtotal).toBe(135);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("desconto por item sobre produto em promoção incide sobre o preço PRATICADO, nunca sobre o de tabela", async () => {
@@ -574,7 +585,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.itens[0]?.descontoItem).toBe(8);
       expect(venda.itens[0]?.subtotal).toBe(72);
       expect(venda.descontoPromocional).toBe(20);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("desconto da venda em R$ (objeto {tipo:'valor', valor})", async () => {
@@ -594,7 +605,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       );
       expect(venda.descontoVenda).toBe(20);
       expect(venda.valorFinal).toBe(80);
-      await caixasService.fechar(caixa.id, { valorInformado: 1080 }, null);
+      await fecharConferindoSaldo(caixa.id, 1080);
     });
 
     it("desconto da venda em % (objeto {tipo:'percentual', valor})", async () => {
@@ -617,7 +628,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // subtotalVenda=200; 15% = 30; valorFinal = 170.
       expect(venda.descontoVenda).toBe(30);
       expect(venda.valorFinal).toBe(170);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("payload legado: descontoVenda como number puro continua funcionando (retrocompatibilidade)", async () => {
@@ -637,7 +648,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       );
       expect(venda.descontoVenda).toBe(25);
       expect(venda.valorFinal).toBe(75);
-      await caixasService.fechar(caixa.id, { valorInformado: 1075 }, null);
+      await fecharConferindoSaldo(caixa.id, 1075);
     });
 
     it("desconto de 100% (item) zera o subtotal daquela linha, sem ficar negativo", async () => {
@@ -665,7 +676,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.itens[0]?.descontoItem).toBe(100);
       expect(venda.itens[0]?.subtotal).toBe(0);
       expect(venda.valorFinal).toBe(0);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("desconto de item acima de 100% é rejeitado", async () => {
@@ -692,7 +703,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       ).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("desconto de venda acima de 100% é rejeitado", async () => {
@@ -712,7 +723,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       ).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("desconto monetário de item maior que a base (preço praticado × quantidade) é rejeitado", async () => {
@@ -739,7 +750,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       ).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("desconto monetário da venda maior que o subtotal é rejeitado", async () => {
@@ -759,7 +770,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       ).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("desconto de item negativo é rejeitado", async () => {
@@ -786,7 +797,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       ).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("desconto da venda negativo é rejeitado", async () => {
@@ -806,7 +817,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       ).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("desconto por item + desconto da venda combinados: aplica na ordem correta (item primeiro, depois venda)", async () => {
@@ -841,7 +852,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.descontoVenda).toBe(18);
       expect(venda.valorFinal).toBe(162);
       expect(venda.descontoTotal).toBe(38); // 20 (item) + 18 (venda), sem promoção
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("múltiplos itens com descontos diferentes: cada um calculado independentemente", async () => {
@@ -883,7 +894,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(itemB.descontoItem).toBe(10); // valor fixo sobre a base 100 (50×2)
       expect(itemB.subtotal).toBe(90);
       expect(venda.valorFinal).toBe(170); // 80 + 90
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("ignora valorFinal forjado no payload e recalcula do zero (backend é a autoridade)", async () => {
@@ -904,7 +915,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const venda = await service.criar(dadosForjados, null);
       expect(venda.valorFinal).toBe(100);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("arredondamento determinístico: percentual com dízima resulta em 2 casas decimais, sem resíduo negativo", async () => {
@@ -936,7 +947,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(Number.isInteger(venda.itens[0]!.descontoItem * 100)).toBe(true); // no máximo 2 casas decimais
       expect(venda.itens[0]!.subtotal).toBeGreaterThanOrEqual(0);
       expect(venda.valorFinal).toBeGreaterThanOrEqual(0);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("Etapa 18.17 — arredondamento de meio-centavo exato usa Math.round (arredondarMoeda), nunca Number(toFixed(2))", async () => {
@@ -968,7 +979,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         null,
       );
       expect(venda.itens[0]?.descontoItem).toBe(0.02);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("snapshot: descontoItem persiste no documento e é recuperável via obterPorId", async () => {
@@ -999,7 +1010,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const recarregada = await service.obterPorId(venda.id);
       expect(recarregada.itens[0]?.descontoItem).toBe(12);
       expect(recarregada.itens[0]?.subtotal).toBe(88);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
   });
 
@@ -1021,7 +1032,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         );
         expect(venda.status).toBe("concluida");
         expect(venda.pagamentos[0]?.modalidade).toBe("dinheiro");
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("pix válido", async () => {
@@ -1039,7 +1050,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         );
         expect(venda.pagamentos[0]?.modalidade).toBe("pix");
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("débito válido", async () => {
@@ -1058,7 +1069,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         );
         expect(venda.pagamentos[0]?.modalidade).toBe("debito");
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("crédito válido", async () => {
@@ -1078,7 +1089,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         );
         expect(venda.pagamentos[0]?.modalidade).toBe("credito");
         expect(venda.pagamentos[0]?.parcelas).toBe(3);
-        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixa.id, 1300);
       });
 
       it("modalidade inválida é rejeitada (nunca confia no que o cliente enviou)", async () => {
@@ -1097,7 +1108,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
     });
 
@@ -1118,7 +1129,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("crédito sem adquirenteId é rejeitado", async () => {
@@ -1137,7 +1148,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("adquirente inexistente → NOT_FOUND", async () => {
@@ -1156,7 +1167,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("adquirente inativa → VALIDATION_ERROR", async () => {
@@ -1179,7 +1190,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("dinheiro com adquirenteId é rejeitado", async () => {
@@ -1199,7 +1210,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("pix com adquirenteId é rejeitado", async () => {
@@ -1219,7 +1230,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
     });
 
@@ -1240,7 +1251,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         );
         expect(venda.pagamentos[0]?.parcelas).toBe(1);
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("débito 2x é rejeitado (débito é sempre 1x)", async () => {
@@ -1260,7 +1271,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("débito sem tarifa configurada para esta adquirente é rejeitado", async () => {
@@ -1280,7 +1291,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
     });
 
@@ -1302,7 +1313,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("crédito 0x é rejeitado", async () => {
@@ -1322,7 +1333,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("crédito 25x é rejeitado", async () => {
@@ -1342,7 +1353,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("crédito 1x válido se configurado", async () => {
@@ -1361,7 +1372,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         );
         expect(venda.pagamentos[0]?.parcelas).toBe(1);
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("crédito 6x válido se configurado", async () => {
@@ -1385,7 +1396,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         );
         expect(venda.pagamentos[0]?.parcelas).toBe(6);
-        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixa.id, 1300);
       });
 
       it("crédito 5x é rejeitado se NÃO configurado (mesmo dentro do intervalo 1–24 — a configuração é a autoridade)", async () => {
@@ -1412,7 +1423,7 @@ describe("VendasService (integração — MongoDB real)", () => {
             null,
           ),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("crédito 24x válido se configurado", async () => {
@@ -1431,7 +1442,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         );
         expect(venda.pagamentos[0]?.parcelas).toBe(24);
-        await caixasService.fechar(caixa.id, { valorInformado: 3400 }, null);
+        await fecharConferindoSaldo(caixa.id, 3400);
       });
     });
 
@@ -1456,7 +1467,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         );
         expect(venda.valorPago).toBe(300);
         expect(venda.status).toBe("concluida");
-        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixa.id, 1300);
       });
 
       it("dinheiro + débito", async () => {
@@ -1478,7 +1489,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         );
         expect(venda.valorPago).toBe(300);
-        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixa.id, 1300);
       });
 
       it("crédito + crédito com adquirentes diferentes", async () => {
@@ -1503,7 +1514,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(venda.pagamentos[0]?.adquirenteId).toBe(adquirenteA.id);
         expect(venda.pagamentos[1]?.adquirenteId).toBe(adquirenteB.id);
         expect(venda.valorPago).toBe(300);
-        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixa.id, 1300);
       });
 
       it("soma dos pagamentos continua funcionando com pagamentos estruturados e legados misturados", async () => {
@@ -1527,7 +1538,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(venda.valorPago).toBe(300);
         expect(venda.pagamentos[0]?.modalidade).toBeNull();
         expect(venda.pagamentos[1]?.modalidade).toBe("credito");
-        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixa.id, 1300);
       });
     });
 
@@ -1549,7 +1560,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(venda.status).toBe("concluida");
         expect(venda.pagamentos[0]?.modalidade).toBeNull();
         expect(venda.pagamentos[0]?.adquirenteId).toBeNull();
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("venda legada (sem nenhum campo novo em nenhum pagamento) continua funcionando ponta a ponta", async () => {
@@ -1568,7 +1579,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         );
         expect(venda.valorFinal).toBe(200);
         expect(venda.status).toBe("concluida");
-        await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+        await fecharConferindoSaldo(caixa.id, 1200);
       });
 
       it("descontos da Etapa 10.3 continuam funcionando junto com pagamento estruturado", async () => {
@@ -1597,7 +1608,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(venda.itens[0]?.descontoItem).toBe(10);
         expect(venda.valorFinal).toBe(90);
         expect(venda.valorPago).toBe(90);
-        await caixasService.fechar(caixa.id, { valorInformado: 1090 }, null);
+        await fecharConferindoSaldo(caixa.id, 1090);
       });
 
       it("idempotência continua funcionando com pagamento estruturado", async () => {
@@ -1617,7 +1628,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const primeira = await service.criar(dados, null);
         const segunda = await service.criar(dados, null);
         expect(segunda.id).toBe(primeira.id);
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("estoque continua protegido contra concorrência com pagamento estruturado", async () => {
@@ -1641,7 +1652,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const atualizado = await produtosService.obterPorId(produto.produtoId);
         const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
         expect(tamanho.quantidade).toBe(0);
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
     });
 
@@ -1666,7 +1677,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(recarregada.pagamentos[0]?.modalidade).toBe("credito");
         expect(recarregada.pagamentos[0]?.adquirenteId).toBe(adquirente.id);
         expect(recarregada.pagamentos[0]?.parcelas).toBe(4);
-        await caixasService.fechar(caixa.id, { valorInformado: 1400 }, null);
+        await fecharConferindoSaldo(caixa.id, 1400);
       });
 
       // As duas linhas abaixo eram testes de FRONTEIRA da Etapa 10.4 ("nenhum
@@ -1693,7 +1704,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(venda.pagamentos[0]?.tarifaAplicada?.adquirenteId).toBe(adquirente.id);
         expect(venda.pagamentos[0]?.tarifaAplicada?.adquirenteNome).toBe(adquirente.nome);
         expect(venda.pagamentos[0]?.tarifaAplicada?.percentual).toBe(3.49);
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("valorLiquido só existe DENTRO de tarifaAplicada — nunca como campo solto no pagamento — e nunca reduz valorPago", async () => {
@@ -1717,7 +1728,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         // Valor pago pelo cliente continua sendo o BRUTO — tarifa nunca reduz o que o cliente pagou (seção 1 do pedido).
         expect(venda.valorPago).toBe(100);
         expect(venda.pagamentos[0]?.valor).toBe(100);
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
     });
   });
@@ -1741,7 +1752,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const tarifa = venda.pagamentos[0]?.tarifaAplicada;
       expect(tarifa?.valorTarifa).toBe(3.49);
       expect(tarifa?.valorLiquido).toBe(96.51);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("B. crédito 6x: configurado a 5%, R$300 → tarifa R$15, líquido R$285", async () => {
@@ -1763,7 +1774,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(tarifa?.percentual).toBe(5);
       expect(tarifa?.valorTarifa).toBe(15);
       expect(tarifa?.valorLiquido).toBe(285);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("C. crédito 12x usa a tarifa de 12x, nunca a de 1x", async () => {
@@ -1790,7 +1801,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(tarifa?.percentual).toBe(7.99);
       expect(tarifa?.percentual).not.toBe(3.49);
       expect(tarifa?.valorTarifa).toBe(95.88); // 1200 × 7,99% = 95,88
-      await caixasService.fechar(caixa.id, { valorInformado: 2200 }, null);
+      await fecharConferindoSaldo(caixa.id, 2200);
     });
 
     it("D. débito: configurado a 1,99%, R$500 → tarifa R$9,95, líquido R$490,05", async () => {
@@ -1811,7 +1822,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const tarifa = venda.pagamentos[0]?.tarifaAplicada;
       expect(tarifa?.valorTarifa).toBe(9.95);
       expect(tarifa?.valorLiquido).toBe(490.05);
-      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+      await fecharConferindoSaldo(caixa.id, 1500);
     });
 
     it("E. PIX: tarifaAplicada é null", async () => {
@@ -1829,7 +1840,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         null,
       );
       expect(venda.pagamentos[0]?.tarifaAplicada).toBeNull();
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("F. Dinheiro: tarifaAplicada é null", async () => {
@@ -1847,7 +1858,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         null,
       );
       expect(venda.pagamentos[0]?.tarifaAplicada).toBeNull();
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("G. múltiplos pagamentos: PIX sem tarifa, débito e crédito com tarifas PRÓPRIAS — nunca uma tarifa sobre o total combinado", async () => {
@@ -1875,7 +1886,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.pagamentos[1]?.tarifaAplicada?.valorTarifa).toBe(2);
       expect(venda.pagamentos[2]?.tarifaAplicada?.valorBruto).toBe(100); // Crédito — idem
       expect(venda.pagamentos[2]?.tarifaAplicada?.valorTarifa).toBe(4);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("H. snapshot histórico: alterar a tabela de tarifas do adquirente NÃO afeta uma venda já criada", async () => {
@@ -1901,7 +1912,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const vendaRecarregada = await service.obterPorId(venda.id);
       expect(vendaRecarregada.pagamentos[0]?.tarifaAplicada?.percentual).toBe(5); // continua 5%, nunca 7%
       expect(vendaRecarregada.pagamentos[0]?.tarifaAplicada?.valorTarifa).toBe(15); // continua R$15, nunca R$21
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("I. valorPago é sempre a soma dos valores BRUTOS — a tarifa nunca reduz o que o cliente pagou", async () => {
@@ -1923,7 +1934,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.valorPago).toBe(300);
       expect(venda.valorFinal).toBe(300);
       expect(venda.status).toBe("concluida");
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("J. valor pendente calculado sobre o bruto: venda R$500, pagamento crédito R$300 (5% tarifa) → pendente R$200", async () => {
@@ -1948,7 +1959,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.pagamentos[0]?.tarifaAplicada?.valorTarifa).toBe(15);
       expect(venda.pagamentos[0]?.tarifaAplicada?.valorLiquido).toBe(285);
       expect(venda.status).toBe("em_pagamento");
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("K. venda legada (sem modalidade/adquirenteId) → tarifaAplicada null, comportamento inalterado", async () => {
@@ -1968,7 +1979,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.pagamentos[0]?.tarifaAplicada).toBeNull();
       expect(venda.pagamentos[0]?.modalidade).toBeNull();
       expect(venda.valorFinal).toBe(100);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("L. precisão decimal: vários valores/percentuais não sofrem truncamento", async () => {
@@ -2002,7 +2013,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(tarifa?.valorLiquido).toBe(valorLiquidoEsperado);
         // Nunca truncado (ex.: parseInt/Math.floor produziriam sempre um inteiro).
         expect(Number.isInteger(tarifa!.valorTarifa * 100)).toBe(true); // no máximo 2 casas decimais
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 + caso.valorBruto }, null);
+        await fecharConferindoSaldo(caixa.id, 1000 + caso.valorBruto);
       }
     });
 
@@ -2029,7 +2040,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const total = await connection.collection("vendas").countDocuments({ idempotencyKey: chave });
       expect(total).toBe(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("N. concorrência: duas requisições concorrentes disputando a última unidade continuam funcionando com pagamento tarifado", async () => {
@@ -2056,7 +2067,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(0);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
   });
 
@@ -2082,7 +2093,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const movimentos = await movimentosDaVenda(venda.id);
       expect(movimentos).toHaveLength(1);
       expect(movimentos[0]?.["valor"]).toBe(100);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("B. venda com 2 pagamentos → 2 movimentos", async () => {
@@ -2104,7 +2115,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       );
       const movimentos = await movimentosDaVenda(venda.id);
       expect(movimentos).toHaveLength(2);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("C. venda com 3 pagamentos → 3 movimentos", async () => {
@@ -2127,7 +2138,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       );
       const movimentos = await movimentosDaVenda(venda.id);
       expect(movimentos).toHaveLength(3);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("D. PIX + débito + crédito → 3 movimentos independentes, cada um com sua forma/valor corretos", async () => {
@@ -2155,7 +2166,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const valores = movimentos.map((m) => m["valor"]).sort((a, b) => (a as number) - (b as number));
       expect(valores).toEqual([150, 150, 200]);
       expect(movimentos.every((m) => m["tipo"] === "venda" && m["sentido"] === "entrada")).toBe(true);
-      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+      await fecharConferindoSaldo(caixa.id, 1500);
     });
 
     it("E. crédito parcelado: 1 movimento com o valor BRUTO — parcelas continuam disponíveis via a Venda, não duplicadas no movimento", async () => {
@@ -2179,7 +2190,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // parcelas continuam recuperáveis via a Venda (snapshot completo) — o movimento não duplica esse dado.
       expect(venda.pagamentos[0]?.parcelas).toBe(6);
       expect(movimentos[0]?.["parcelas"]).toBeUndefined();
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("F. crédito com tarifa: tarifa/valor líquido NÃO alteram o valor do movimento nem valorPago", async () => {
@@ -2205,7 +2216,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
       expect(detalheCaixa.resumo.totalVendas).toBe(300); // nunca 285
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("G. pagamento parcial: só o valor efetivamente recebido gera movimento — nenhum movimento do saldo pendente", async () => {
@@ -2232,7 +2243,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(movimentos[0]?.["valor"]).toBe(200);
       const somaMovimentos = movimentos.reduce((total, m) => total + (m["valor"] as number), 0);
       expect(somaMovimentos).toBe(200); // nunca 500, nunca 300
-      await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+      await fecharConferindoSaldo(caixa.id, 1200);
     });
 
     it("H. múltiplos pagamentos + saldo pendente: N movimentos, nenhum do saldo pendente", async () => {
@@ -2261,7 +2272,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(movimentos).toHaveLength(2);
       const soma = movimentos.reduce((total, m) => total + (m["valor"] as number), 0);
       expect(soma).toBe(250); // exatamente o pago; o pendente nunca vira movimento
-      await caixasService.fechar(caixa.id, { valorInformado: 1250 }, null);
+      await fecharConferindoSaldo(caixa.id, 1250);
     });
 
     it("I. venda legada sem modalidade continua funcionando: cada pagamento ainda gera seu movimento com formaPagamento preservada", async () => {
@@ -2285,7 +2296,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(movimentos).toHaveLength(2);
       const formas = movimentos.map((m) => m["formaPagamento"]).sort();
       expect(formas).toEqual(["Cartão", "Dinheiro"]);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("J. retry com a mesma idempotencyKey (múltiplos pagamentos): nenhuma venda duplicada, movimentos permanecem os mesmos N", async () => {
@@ -2317,7 +2328,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const movimentosDepois = await movimentosDaVenda(primeira.id);
       expect(movimentosDepois).toHaveLength(2); // não duplicou
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("K. retry após venda criada mas com movimentos INCOMPLETOS: recria só o que falta, nunca duplica o que já existe", async () => {
@@ -2367,7 +2378,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(movimentosDinheiro).toHaveLength(1);
       expect(String(movimentosDinheiro[0]!["_id"])).toBe(movimentoDinheiroOriginalId);
 
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("L. concorrência real: duas chamadas concorrentes registrando o MESMO pagamento (mesma idempotencyKey) resultam em exatamente 1 movimento", async () => {
@@ -2398,7 +2409,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const movimentos = await connection.collection("movimentos_caixa").find({ idempotencyKey: chaveMovimento }).toArray();
       expect(movimentos).toHaveLength(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("M. resumo do caixa continua somando corretamente todos os movimentos de uma venda multi-pagamento", async () => {
@@ -2424,7 +2435,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(detalheCaixa.resumo.saldoEsperado).toBe(1500);
       expect(detalheCaixa.resumo.quantidadeMovimentacoes).toBe(3);
       expect(detalheCaixa.resumo.quantidadeVendas).toBe(1); // 3 movimentos, mas 1 única venda (dedupe por vendaId)
-      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+      await fecharConferindoSaldo(caixa.id, 1500);
     });
 
     it("N. listagem de movimentos do caixa exibe os múltiplos movimentos da mesma venda corretamente", async () => {
@@ -2449,7 +2460,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const daVenda = listagem.data.filter((m) => m.vendaId === venda.id);
       expect(daVenda).toHaveLength(2);
       expect(listagem.meta.total).toBeGreaterThanOrEqual(2);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
   });
 
@@ -2474,7 +2485,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
       expect(detalheCaixa.resumo.totalVendas).toBe(200);
       expect(detalheCaixa.resumo.saldoEsperado).toBe(1200);
-      await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+      await fecharConferindoSaldo(caixa.id, 1200);
     });
 
     it("venda sem nenhum pagamento no ato não lança nada no caixa", async () => {
@@ -2497,7 +2508,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
       expect(detalheCaixa.resumo.totalVendas).toBe(0);
       expect(detalheCaixa.resumo.saldoEsperado).toBe(1000);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
   });
 
@@ -2527,7 +2538,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const vendedorAtualizado = await vendedoresService.obterPorId(vendedor.id);
       expect(vendedorAtualizado.vendas).toBe(1);
       expect(vendedorAtualizado.totalVendido).toBe(150);
-      await caixasService.fechar(caixa.id, { valorInformado: 1150 }, null);
+      await fecharConferindoSaldo(caixa.id, 1150);
     });
 
     it("EM_PAGAMENTO também conta nos agregados (só cancelada não conta)", async () => {
@@ -2550,7 +2561,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const vendedorAtualizado = await vendedoresService.obterPorId(vendedor.id);
       expect(vendedorAtualizado.vendas).toBe(1);
       expect(vendedorAtualizado.totalVendido).toBe(150);
-      await caixasService.fechar(caixa.id, { valorInformado: 1050 }, null);
+      await fecharConferindoSaldo(caixa.id, 1050);
     });
   });
 
@@ -2585,7 +2596,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // `tipo: "venda"`, somados em `totalVendas`. `recebimentos` é sempre 0.
       expect(detalheCaixa.resumo.totalVendas).toBe(300);
       expect(detalheCaixa.resumo.recebimentos).toBe(0);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("rejeita baixar uma parcela já paga", async () => {
@@ -2606,7 +2617,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const parcelaId = String(venda.parcelas[0]!._id);
       await service.baixarParcela(venda.id, parcelaId, {}, null);
       await expect(service.baixarParcela(venda.id, parcelaId, {}, null)).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("lança NOT_FOUND para parcela inexistente", async () => {
@@ -2625,7 +2636,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         null,
       );
       await expect(service.baixarParcela(venda.id, "65f1a2b3c4d5e6f7a8b9c0d1", {}, null)).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
   });
 
@@ -2668,7 +2679,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
       expect(detalheCaixa.resumo.devolucoes).toBe(400);
       expect(detalheCaixa.resumo.saldoEsperado).toBe(1000);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("cancelamento nunca devolve ao caixa mais do que foi recebido", async () => {
@@ -2696,7 +2707,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(detalheCaixa.resumo.totalVendas).toBe(50);
       expect(detalheCaixa.resumo.devolucoes).toBe(50);
       expect(detalheCaixa.resumo.saldoEsperado).toBe(1000);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("devolução parcial devolve só o item solicitado, mantém a venda ativa e não mexe nos agregados", async () => {
@@ -2737,7 +2748,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(vendedorAtualizado.vendas).toBe(1);
       expect(vendedorAtualizado.totalVendido).toBe(150);
       // Recebeu 100 (venda) e devolveu 50 (devolução parcial, limitado ao pago) → saldo 1000 + 100 - 50.
-      await caixasService.fechar(caixa.id, { valorInformado: 1050 }, null);
+      await fecharConferindoSaldo(caixa.id, 1050);
     });
 
     it("rejeita cancelar uma venda já cancelada", async () => {
@@ -2755,7 +2766,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       );
       await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste" }, null);
       await expect(service.cancelar(venda.id, { tipo: "integral", motivo: "De novo" }, null)).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
   });
 
@@ -2775,7 +2786,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       );
       const resultado = await service.listar(queryPadrao({ busca: venda.codigo }));
       expect(resultado.data).toHaveLength(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 1120 }, null);
+      await fecharConferindoSaldo(caixa.id, 1120);
     });
 
     it("filtro status=concluida e facet de vendedor funcionam", async () => {
@@ -2795,7 +2806,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(resultado.data.length).toBeGreaterThanOrEqual(1);
       const facetVendedor = resultado.facets["vendedor"] ?? [];
       expect(facetVendedor.some((opcao) => opcao.valor === vendedor.id)).toBe(true);
-      await caixasService.fechar(caixa.id, { valorInformado: 1120 }, null);
+      await fecharConferindoSaldo(caixa.id, 1120);
     });
 
     it("Fase 29B.2 — página 1 e página 2 trazem vendas diferentes, com meta consistente", async () => {
@@ -2812,7 +2823,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           },
           null,
         );
-        await caixasService.fechar(caixa.id, { valorInformado: 1060 }, null);
+        await fecharConferindoSaldo(caixa.id, 1060);
       }
 
       // `busca` de Vendas casa por vendedorNome (entre outros) — um vendedor
@@ -2845,7 +2856,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(resultado.meta.total).toBe(1);
       expect(resultado.meta.page).toBe(999);
       expect(resultado.meta.totalPages).toBe(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 1070 }, null);
+      await fecharConferindoSaldo(caixa.id, 1070);
     });
 
     it("Etapa 18.25 — listarTodas() devolve todas as vendas, sem paginar", async () => {
@@ -2866,7 +2877,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const todas = await service.listarTodas();
       expect(todas).toHaveLength(totalNoBanco);
       expect(todas.some((item) => item.id === venda.id)).toBe(true);
-      await caixasService.fechar(caixa.id, { valorInformado: 1090 }, null);
+      await fecharConferindoSaldo(caixa.id, 1090);
     });
 
     it("Etapa 18.25 — listarTodas() com mais de 20 vendas nunca trunca (nem cai no limite padrão de listar())", async () => {
@@ -2893,7 +2904,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const todas = await service.listarTodas();
       expect(todas).toHaveLength(totalNoBanco);
 
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 + totalNovas * 50 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000 + totalNovas * 50);
     });
 
     it("obterPorId lança NOT_FOUND para venda inexistente", async () => {
@@ -2924,7 +2935,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(depois.faturamentoLiquido).toBeCloseTo(antes.faturamentoLiquido - 80, 2);
       // Campo legado `faturamento` continua igual ao líquido (compatibilidade retroativa).
       expect(depois.faturamento).toBeCloseTo(depois.faturamentoLiquido, 2);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("devolução parcial reduz faturamentoLiquido em /vendas/estatisticas sem reduzir faturamentoBruto", async () => {
@@ -2959,7 +2970,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // valorFinal (200) continua contando inteiro no bruto — só o líquido cai 50.
       expect(depois.faturamentoBruto).toBeCloseTo(antes.faturamentoBruto, 2);
       expect(depois.faturamentoLiquido).toBeCloseTo(antes.faturamentoLiquido - 50, 2);
-      await caixasService.fechar(caixa.id, { valorInformado: 1150 }, null);
+      await fecharConferindoSaldo(caixa.id, 1150);
     });
   });
 
@@ -2999,7 +3010,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.clienteNome).toBe("Consumidor final");
       expect(venda.valorPendente).toBe(0);
       expect(venda.status).toBe("concluida");
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("B. venda totalmente paga com cliente → sucesso", async () => {
@@ -3020,7 +3031,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       );
       expect(venda.clienteId).toBe(cliente.id);
       expect(venda.valorPendente).toBe(0);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("C. venda parcial sem cliente → rejeitada com VALIDATION_ERROR no campo clienteId", async () => {
@@ -3039,7 +3050,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       );
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("D. venda parcial com cliente → sucesso", async () => {
@@ -3060,7 +3071,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       );
       expect(venda.valorPendente).toBe(200);
       expect(venda.status).toBe("em_pagamento");
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("E. múltiplos pagamentos + pendente sem cliente → rejeitada", async () => {
@@ -3082,7 +3093,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       );
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("F. múltiplos pagamentos + pendente com cliente → sucesso", async () => {
@@ -3106,7 +3117,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       );
       expect(venda.valorPago).toBe(250);
       expect(venda.valorPendente).toBe(250);
-      await caixasService.fechar(caixa.id, { valorInformado: 1250 }, null);
+      await fecharConferindoSaldo(caixa.id, 1250);
     });
 
     it("G. crédito com tarifa + pendente sem cliente → rejeitada", async () => {
@@ -3126,7 +3137,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       );
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("H. crédito com tarifa + pendente com cliente → sucesso (tarifa nunca entra no saldo devedor)", async () => {
@@ -3150,7 +3161,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.valorPendente).toBe(200);
       expect(venda.pagamentos[0]?.tarifaAplicada?.valorLiquido).toBe(285);
       expect(venda.valorPago).toBe(300);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("I. clienteId=null com pendente → rejeitada", async () => {
@@ -3170,7 +3181,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       );
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("J. clienteId ausente com pendente → rejeitada", async () => {
@@ -3189,7 +3200,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       );
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it('K. clienteId="" (string vazia) com pendente → rejeitada', async () => {
@@ -3209,7 +3220,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       );
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("L. clienteId inexistente → NOT_FOUND (nunca confundido com a validação de pendente)", async () => {
@@ -3234,7 +3245,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       }
       expect(erro).toBeInstanceOf(ApiException);
       expect((erro as ApiException).code).toBe("NOT_FOUND");
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("M. venda rejeitada por pendente sem cliente não baixa estoque", async () => {
@@ -3257,7 +3268,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(5); // estoque intacto
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("N. venda rejeitada por pendente sem cliente não cria movimento de caixa nem documento de venda", async () => {
@@ -3283,7 +3294,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const totalMovimentosDepois = await connection.collection("movimentos_caixa").countDocuments({});
       expect(totalVendasDepois).toBe(totalVendasAntes); // nenhum documento de venda criado
       expect(totalMovimentosDepois).toBe(totalMovimentosAntes); // nenhum movimento de caixa criado
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("O. venda válida parcial (com cliente) cria movimento SÓ dos pagamentos efetivamente recebidos", async () => {
@@ -3305,7 +3316,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const movimentos = await movimentosDaVenda(venda.id);
       expect(movimentos).toHaveLength(1);
       expect(movimentos[0]?.["valor"]).toBe(200); // nunca 500 (o pendente não vira movimento)
-      await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+      await fecharConferindoSaldo(caixa.id, 1200);
     });
 
     it("P. valorPago continua bruto, independente da tarifa, mesmo em venda fiada com cliente", async () => {
@@ -3327,7 +3338,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       );
       expect(venda.valorPago).toBe(300); // bruto, nunca 285 (líquido)
       expect(venda.pagamentos[0]?.valor).toBe(300);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("Q. valorPendente é sempre calculado contra o BRUTO, nunca contra o líquido", async () => {
@@ -3350,7 +3361,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // Bruto pago = 400 (líquido seria 360, com 10% de tarifa) → pendente = 1000-400 = 600, nunca 1000-360=640.
       expect(venda.pagamentos[0]?.tarifaAplicada?.valorLiquido).toBe(360);
       expect(venda.valorPendente).toBe(600);
-      await caixasService.fechar(caixa.id, { valorInformado: 1400 }, null);
+      await fecharConferindoSaldo(caixa.id, 1400);
     });
 
     it("R. venda exatamente quitada (valorPago === valorFinal) → cliente não é obrigatório", async () => {
@@ -3371,7 +3382,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.valorPendente).toBe(0);
       expect(venda.clienteId).toBeNull();
       expect(venda.status).toBe("concluida");
-      await caixasService.fechar(caixa.id, { valorInformado: 1150 }, null);
+      await fecharConferindoSaldo(caixa.id, 1150);
     });
 
     // S. Regressão da suíte inteira: verificada rodando este arquivo completo
@@ -3410,7 +3421,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.status).toBe("em_pagamento");
       expect(venda.valorPago).toBe(500);
       expect(venda.valorPendente).toBe(500);
-      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+      await fecharConferindoSaldo(caixa.id, 1500);
     });
 
     it("B. recebimento parcial reduz o pendente e mantém EM_PAGAMENTO", async () => {
@@ -3419,7 +3430,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(atualizada.valorPago).toBe(750);
       expect(atualizada.valorPendente).toBe(250);
       expect(atualizada.status).toBe("em_pagamento");
-      await caixasService.fechar(caixa.id, { valorInformado: 1750 }, null);
+      await fecharConferindoSaldo(caixa.id, 1750);
     });
 
     it("C. segundo recebimento continua reduzindo o pendente corretamente", async () => {
@@ -3429,7 +3440,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(depoisDoSegundo.valorPago).toBe(900);
       expect(depoisDoSegundo.valorPendente).toBe(100);
       expect(depoisDoSegundo.status).toBe("em_pagamento");
-      await caixasService.fechar(caixa.id, { valorInformado: 1900 }, null);
+      await fecharConferindoSaldo(caixa.id, 1900);
     });
 
     it("D. recebimento que quita exatamente o saldo conclui a venda", async () => {
@@ -3438,7 +3449,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(quitada.valorPago).toBe(1000);
       expect(quitada.valorPendente).toBe(0);
       expect(quitada.status).toBe("concluida");
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     it("E. recebimento acima do saldo é rejeitado sem alterar venda/estoque/caixa/pagamentos", async () => {
@@ -3459,7 +3470,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const movimentosDepois = await movimentosDaVenda(venda.id);
       expect(movimentosDepois).toHaveLength(movimentosAntes.length); // nenhum movimento novo
-      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+      await fecharConferindoSaldo(caixa.id, 1700);
     });
 
     it("F. recebimento em venda já CONCLUIDA é rejeitado, sem novo movimento de caixa", async () => {
@@ -3471,7 +3482,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const movimentosDepois = await movimentosDaVenda(venda.id);
       expect(movimentosDepois).toHaveLength(movimentosAntes.length);
-      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+      await fecharConferindoSaldo(caixa.id, 1500);
     });
 
     it("G. recebimento em venda CANCELADA é rejeitado", async () => {
@@ -3479,7 +3490,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste 10.8" }, null);
 
       await expect(service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 100 }, null)).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("H. recebimento em dinheiro não exige adquirente e tarifaAplicada é null", async () => {
@@ -3488,7 +3499,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const recebido = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
       expect(recebido.tarifaAplicada).toBeNull();
       expect(recebido.modalidade).toBe("dinheiro");
-      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+      await fecharConferindoSaldo(caixa.id, 1700);
     });
 
     it("I. recebimento em PIX não exige adquirente e tarifaAplicada é null", async () => {
@@ -3496,7 +3507,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizada = await service.receberPagamento(venda.id, { forma: "PIX", modalidade: "pix", valor: 200 }, null);
       const recebido = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
       expect(recebido.tarifaAplicada).toBeNull();
-      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+      await fecharConferindoSaldo(caixa.id, 1700);
     });
 
     it("J. recebimento em débito com adquirente calcula a tarifa corretamente", async () => {
@@ -3510,7 +3521,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const recebido = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
       expect(recebido.tarifaAplicada?.valorTarifa).toBe(9.95);
       expect(recebido.tarifaAplicada?.valorLiquido).toBe(490.05);
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     it("K. recebimento em crédito com adquirente exige parcelas e calcula a tarifa", async () => {
@@ -3524,7 +3535,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const recebido = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
       expect(recebido.tarifaAplicada?.parcelas).toBe(3);
       expect(recebido.tarifaAplicada?.valorTarifa).toBe(25);
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     it("L. tarifa é calculada sobre o valor BRUTO deste recebimento (nunca sobre o total da venda)", async () => {
@@ -3538,7 +3549,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const recebido = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
       expect(recebido.tarifaAplicada?.valorBruto).toBe(400); // nunca 1000
       expect(recebido.tarifaAplicada?.valorTarifa).toBe(40); // 10% de 400, nunca de 1000
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     it("M. tarifa nunca reduz valorPago — o recebimento soma sempre o BRUTO", async () => {
@@ -3550,7 +3561,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         null,
       );
       expect(atualizada.valorPago).toBe(1000); // 600 + 400 (bruto), nunca 600 + 360
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     it("N. tarifa nunca reduz valorPendente — pendente calculado contra o bruto", async () => {
@@ -3564,7 +3575,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // pago = 300 + 400 = 700 (bruto); pendente = 1000 - 700 = 300, nunca 1000 - (300+360)=340.
       expect(atualizada.valorPago).toBe(700);
       expect(atualizada.valorPendente).toBe(300);
-      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+      await fecharConferindoSaldo(caixa.id, 1700);
     });
 
     it("O. o movimento de Caixa do recebimento usa o valor BRUTO, nunca o líquido pós-tarifa", async () => {
@@ -3578,7 +3589,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // já que os 900 do ato geraram um movimento `tipo: "venda"` separado.
       const doRecebimento = movimentos.find((m) => m["tipo"] === "venda" && m["valor"] === 100);
       expect(doRecebimento?.["valor"]).toBe(100); // nunca 96.51
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     it("P. múltiplos recebimentos sucessivos convergem corretamente para a quitação", async () => {
@@ -3589,7 +3600,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(final.valorPago).toBe(1000);
       expect(final.valorPendente).toBe(0);
       expect(final.status).toBe("concluida");
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     it("Q. histórico preserva cada recebimento individualmente identificável (nunca agregado em um só)", async () => {
@@ -3606,7 +3617,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // Cada um com sua própria data — não uma data única compartilhada por engano.
       expect(final.pagamentos[0]?.dataPagamento).toBeInstanceOf(Date);
       expect(final.pagamentos[1]?.dataPagamento).toBeInstanceOf(Date);
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     it("R. idempotência: retry com a mesma idempotencyKey não duplica o pagamento nem recontabiliza valorPago", async () => {
@@ -3626,7 +3637,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // GLOBAL do índice de MovimentoCaixa (não mais por caixa).
       const doRecebimento = movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`);
       expect(doRecebimento).toHaveLength(1); // também não duplicou no caixa
-      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+      await fecharConferindoSaldo(caixa.id, 1700);
     });
 
     it("S. retry recupera um movimento de caixa faltante sem duplicar o pagamento já persistido", async () => {
@@ -3647,7 +3658,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const movimentosFinais = await movimentosDaVenda(retry.id);
       const recriado = movimentosFinais.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`);
       expect(recriado).toHaveLength(1); // recriou o que faltava, sem duplicar
-      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+      await fecharConferindoSaldo(caixa.id, 1700);
     });
 
     it("T. concorrência: duas requisições disputando o mesmo saldo nunca resultam em valorPendente negativo nem excedem valorFinal", async () => {
@@ -3667,7 +3678,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(final.valorPago).toBe(800); // 500 + 300, nunca 500+600=1100
       expect(final.valorPendente).toBe(200); // nunca negativo
       expect(final.valorPago).toBeLessThanOrEqual(final.valorFinal);
-      await caixasService.fechar(caixa.id, { valorInformado: 1800 }, null);
+      await fecharConferindoSaldo(caixa.id, 1800);
     });
 
     it("U. recebimento posterior não baixa estoque novamente", async () => {
@@ -3680,7 +3691,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const depois = await produtosService.obterPorId(produto.produtoId);
       const tamanhoDepois = depois.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!.quantidade;
       expect(tamanhoDepois).toBe(tamanhoAntes); // estoque inalterado pelo recebimento
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     it("V. recebimento posterior não recalcula desconto/valorFinal da venda (snapshot preservado)", async () => {
@@ -3707,7 +3718,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(atualizada.descontoVenda).toBe(100); // inalterado
       expect(atualizada.itens[0]?.precoPraticado).toBe(1000); // snapshot do item inalterado
       expect(atualizada.status).toBe("concluida");
-      await caixasService.fechar(caixa.id, { valorInformado: 1900 }, null);
+      await fecharConferindoSaldo(caixa.id, 1900);
     });
 
     it("W. tarifa de um pagamento anterior nunca é recalculada por um recebimento posterior diferente", async () => {
@@ -3742,7 +3753,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // O NOVO recebimento tem sua própria tarifa, independente.
       expect(final.pagamentos[1]?.tarifaAplicada?.valorTarifa).toBe(7.96); // 400 × 1,99%
       expect(final.pagamentos[1]?.tarifaAplicada?.percentual).toBe(1.99);
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     // X. Regressão completa: verificada rodando este arquivo inteiro (testes
@@ -3772,7 +3783,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste A" }, null);
       expect(cancelada.status).toBe("cancelada");
       expect(cancelada.valorDevolvido).toBe(100);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("B. cancelamento de venda EM_PAGAMENTO: devolução baseada no valor efetivo, nunca no saldo pendente", async () => {
@@ -3800,7 +3811,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(cancelada.valorDevolvido).toBe(1000);
       const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
       expect(detalheCaixa.resumo.devolucoes).toBe(600); // nunca 1000, nunca 400
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("C. cancelamento de venda CONCLUIDA restaura estoque uma única vez", async () => {
@@ -3822,7 +3833,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(5); // voltou exatamente ao original
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("D. venda já cancelada rejeita novo cancelamento sem efeitos colaterais", async () => {
@@ -3848,7 +3859,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(tamanho.quantidade).toBe(5); // não restaurou de novo
       const movimentosDepois = await movimentosDaVenda(venda.id);
       expect(movimentosDepois).toHaveLength(movimentosAntes.length); // nenhum movimento novo
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("E./F. restauração de estoque acontece e é única para múltiplos itens/quantidades (G/H)", async () => {
@@ -3877,7 +3888,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizadoB = await produtosService.obterPorId(produtoB.produtoId);
       const tamanhoB = atualizadoB.variantes[0]!.tamanhos.find((t) => String(t._id) === produtoB.tamanhoId)!;
       expect(tamanhoB.quantidade).toBe(8); // 6 (8-2) + 2 devolvidos
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("I. item com descontoItem em R$: devolução usa o valor efetivo (subtotal), nunca precoPraticado bruto", async () => {
@@ -3904,7 +3915,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.itens[0]?.subtotal).toBe(80);
       const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste I" }, null);
       expect(cancelada.valorDevolvido).toBe(80); // nunca 100
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("J. item com descontoItem em % já resolvido no snapshot: devolução parcial usa o valor unitário efetivo", async () => {
@@ -3934,7 +3945,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const devolvida = await service.cancelar(venda.id, { tipo: "parcial", motivo: "Teste J", itens: [{ itemId, quantidade: 1 }] }, null);
       expect(devolvida.valorDevolvido).toBe(90); // nunca 100 (precoOriginal) nem 100 (precoPraticado)
-      await caixasService.fechar(caixa.id, { valorInformado: 1090 }, null);
+      await fecharConferindoSaldo(caixa.id, 1090);
     });
 
     it("K. produto em promoção + descontoItem: devolução usa o valor efetivo pós-promoção e pós-desconto", async () => {
@@ -3966,7 +3977,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste K" }, null);
       expect(cancelada.valorDevolvido).toBe(72); // nunca 100, nunca 80
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("L. devolução parcial de 1 de 2 unidades devolve exatamente o valor efetivo unitário", async () => {
@@ -3997,7 +4008,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const devolvida = await service.cancelar(venda.id, { tipo: "parcial", motivo: "Teste L", itens: [{ itemId, quantidade: 1 }] }, null);
       expect(devolvida.valorDevolvido).toBe(72); // nunca 80, 100 ou 144
-      await caixasService.fechar(caixa.id, { valorInformado: 1072 }, null);
+      await fecharConferindoSaldo(caixa.id, 1072);
     });
 
     it("M. devolução integral (via tipo parcial pedindo tudo) devolve o valor total efetivo", async () => {
@@ -4025,7 +4036,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const devolvida = await service.cancelar(venda.id, { tipo: "parcial", motivo: "Teste M", itens: [{ itemId, quantidade: 2 }] }, null);
       expect(devolvida.valorDevolvido).toBe(180);
       expect(devolvida.status).toBe("cancelada"); // todos os itens devolvidos → venda cancelada
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("N. descontoVenda é rateado proporcionalmente ao valor efetivo de cada item", async () => {
@@ -4073,7 +4084,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(devolvidaB.cancelamentos[0]?.valorDevolvido).toBe(90);
       expect(devolvidaB.cancelamentos[1]?.valorDevolvido).toBe(180);
       expect(devolvidaB.valorDevolvido).toBe(270); // acumulado: 90 (A) + 180 (B)
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("O. múltiplos pagamentos (PIX + Débito + Crédito): cancelamento preserva todos e devolve o valor efetivo total", async () => {
@@ -4101,7 +4112,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(cancelada.valorDevolvido).toBe(300);
       expect(cancelada.pagamentos).toHaveLength(3); // histórico dos 3 pagamentos preservado
       expect(cancelada.pagamentos.map((p) => p.forma).sort()).toEqual(["Crédito", "Débito", "PIX"]);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("P. tarifa de adquirente não reduz o valor devolvido ao cliente", async () => {
@@ -4124,7 +4135,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(cancelada.valorDevolvido).toBe(1000); // bruto, nunca 900
       const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
       expect(detalheCaixa.resumo.devolucoes).toBe(1000); // nunca 900
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("Q. valorLiquido nunca é usado como valor devido ao cliente — pagamento histórico permanece intocado", async () => {
@@ -4146,7 +4157,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(cancelada.pagamentos[0]?.tarifaAplicada?.valorLiquido).toBe(475);
       expect(cancelada.pagamentos[0]?.valor).toBe(500);
       expect(cancelada.valorDevolvido).toBe(500);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("R. histórico (itens, pagamentos, tarifas, cliente, vendedor, caixa) é preservado após o cancelamento", async () => {
@@ -4177,7 +4188,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(cancelada.dataVenda).toEqual(venda.dataVenda);
       expect(cancelada.cancelamentos).toHaveLength(1);
       expect(cancelada.cancelamentos[0]?.itens[0]?.quantidade).toBe(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("S. retry: repetir o cancelamento (mesma chamada) é rejeitado sem duplicar efeitos", async () => {
@@ -4201,7 +4212,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(tamanho.quantidade).toBe(5);
       const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
       expect(detalheCaixa.resumo.devolucoes).toBe(150); // não dobrou
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("T./V./W. concorrência: duas requisições cancelando a MESMA venda — só uma vence, estoque e caixa refletem uma única devolução", async () => {
@@ -4238,7 +4249,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const decancelamento = movimentos.filter((m) => m["tipo"] === "cancelamento");
       expect(decancelamento).toHaveLength(1);
       expect(decancelamento[0]?.["valor"]).toBe(300);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("T2. concorrência: duas devoluções parciais do MESMO item disputando a mesma quantidade restante", async () => {
@@ -4267,7 +4278,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(5); // nunca 7 (restaurado só as 2 unidades reais)
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("U. venda CANCELADA continua rejeitando recebimento posterior (regressão Etapa 10.8)", async () => {
@@ -4288,7 +4299,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste U" }, null);
 
       await expect(service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 100 }, null)).rejects.toThrow(ApiException);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     // X. Regressão completa: verificada rodando este arquivo inteiro (testes
@@ -4321,7 +4332,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.caixaId).toBe(caixaOriginal.id);
 
       // Fecha o caixa da venda original — dias depois, o cliente volta para pagar.
-      await caixasService.fechar(caixaOriginal.id, { valorInformado: 1400 }, null);
+      await fecharConferindoSaldo(caixaOriginal.id, 1400);
       const caixaAtual = await abrirCaixa();
 
       const atualizada = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 600 }, null);
@@ -4342,7 +4353,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const detalheAtual = await caixasService.obterDetalhe(caixaAtual.id);
       expect(detalheAtual.resumo.totalVendas).toBe(600);
       expect(detalheAtual.resumo.recebimentos).toBe(0);
-      await caixasService.fechar(caixaAtual.id, { valorInformado: 1600 }, null);
+      await fecharConferindoSaldo(caixaAtual.id, 1600);
     });
 
     it("receberPagamento sem nenhum caixa aberto é rejeitado sem alterar a venda", async () => {
@@ -4370,7 +4381,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       // Deixa um caixa aberto de novo para não quebrar os testes seguintes do arquivo.
       const caixaFinal = await abrirCaixa();
-      await caixasService.fechar(caixaFinal.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixaFinal.id, 1000);
     });
 
     it("baixarParcela usa o caixa ATUALMENTE aberto quando o caixa original da venda já foi fechado", async () => {
@@ -4391,7 +4402,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       );
       const parcelaId = String(venda.parcelas[0]!._id);
 
-      await caixasService.fechar(caixaOriginal.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixaOriginal.id, 1100);
       const caixaAtual = await abrirCaixa();
 
       const atualizada = await service.baixarParcela(venda.id, parcelaId, { formaPagamento: "PIX" }, null);
@@ -4405,7 +4416,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(daBaixa).toBeTruthy();
       expect(String(daBaixa?.["caixaId"])).toBe(caixaAtual.id);
       expect(String(daBaixa?.["caixaId"])).not.toBe(caixaOriginal.id);
-      await caixasService.fechar(caixaAtual.id, { valorInformado: 1200 }, null);
+      await fecharConferindoSaldo(caixaAtual.id, 1200);
     });
 
     it("baixarParcela sem nenhum caixa aberto é rejeitado sem alterar a venda", async () => {
@@ -4424,7 +4435,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         null,
       );
       const parcelaId = String(venda.parcelas[0]!._id);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
 
       await expect(service.baixarParcela(venda.id, parcelaId, {}, null)).rejects.toThrow(ApiException);
 
@@ -4432,7 +4443,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(recarregada.parcelas[0]?.pagoEm).toBeNull(); // parcela não foi mutada antes de falhar
 
       const caixaFinal = await abrirCaixa();
-      await caixasService.fechar(caixaFinal.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixaFinal.id, 1000);
     });
 
     it("idempotência do recebimento continua segura mesmo com o caixa resolvido dinamicamente: retry não duplica nem recontabiliza", async () => {
@@ -4460,7 +4471,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const movimentos = await movimentosDaVenda(venda.id);
       const doRecebimento = movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`);
       expect(doRecebimento).toHaveLength(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     // Regressão completa (X): rodar este arquivo inteiro junto com a suíte
@@ -4492,7 +4503,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         );
         expect(venda.caixaId).toBe(caixaA.id); // venda.caixaId continua sendo o caixa ORIGINAL
 
-        await caixasService.fechar(caixaA.id, { valorInformado: 1200 }, null);
+        await fecharConferindoSaldo(caixaA.id, 1200);
         const caixaB = await abrirCaixa();
 
         const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste A" }, null);
@@ -4532,7 +4543,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(0);
 
         const caixaFinal = await abrirCaixa();
-        await caixasService.fechar(caixaFinal.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixaFinal.id, 1000);
       });
 
       it("C. cancelamento concorrente: estoque restaurado uma única vez (com caixa atual)", async () => {
@@ -4562,7 +4573,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
         const movimentos = await movimentosDaVenda(venda.id);
         expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("D. cancelamento com descontoItem devolve o valor efetivo (subtotal), no caixa atual", async () => {
@@ -4588,7 +4599,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         );
         const cancelada = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste D" }, null);
         expect(cancelada.valorDevolvido).toBe(80); // nunca 100
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("E. cancelamento com descontoVenda preserva o rateio proporcional (Etapa 10.9), no caixa atual", async () => {
@@ -4637,7 +4648,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(cancelada.valorDevolvido).toBe(1000); // bruto, nunca 900 (líquido)
         const detalhe = await caixasService.obterDetalhe(caixa.id);
         expect(detalhe.resumo.devolucoes).toBe(1000);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
     });
 
@@ -4667,7 +4678,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(atualizada.status).toBe("concluida");
         expect(atualizada.pagamentos[atualizada.pagamentos.length - 1]?.tarifaAplicada).toBeNull();
         expect(atualizada.pagamentos[atualizada.pagamentos.length - 1]?.modalidade).toBeNull();
-        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixa.id, 1300);
       });
 
       it("H. dinheiro: funciona, tarifaAplicada null", async () => {
@@ -4675,7 +4686,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const atualizada = await service.baixarParcela(venda.id, parcelaId, { modalidade: "dinheiro" }, null);
         expect(atualizada.status).toBe("concluida");
         expect(atualizada.pagamentos[atualizada.pagamentos.length - 1]?.tarifaAplicada).toBeNull();
-        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixa.id, 1300);
       });
 
       it("I. PIX: funciona, tarifaAplicada null", async () => {
@@ -4683,7 +4694,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const atualizada = await service.baixarParcela(venda.id, parcelaId, { modalidade: "pix" }, null);
         expect(atualizada.status).toBe("concluida");
         expect(atualizada.pagamentos[atualizada.pagamentos.length - 1]?.tarifaAplicada).toBeNull();
-        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixa.id, 1300);
       });
 
       it("J. débito + adquirente: tarifa calculada corretamente", async () => {
@@ -4693,7 +4704,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const pagamento = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
         expect(pagamento.tarifaAplicada?.valorTarifa).toBe(3.98); // 200 × 1,99%
         expect(pagamento.tarifaAplicada?.valorLiquido).toBe(196.02);
-        await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+        await fecharConferindoSaldo(caixa.id, 1500);
       });
 
       it("K. crédito 6x + adquirente: usa a tarifa da configuração 6x", async () => {
@@ -4713,7 +4724,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const pagamento = atualizada.pagamentos[atualizada.pagamentos.length - 1]!;
         expect(pagamento.tarifaAplicada?.percentual).toBe(5);
         expect(pagamento.tarifaAplicada?.valorTarifa).toBe(30); // 600 × 5%, nunca a de 1x (3,49%)
-        await caixasService.fechar(caixa.id, { valorInformado: 2200 }, null);
+        await fecharConferindoSaldo(caixa.id, 2200);
       });
 
       it("L. crédito sem adquirente é rejeitado (VALIDATION_ERROR)", async () => {
@@ -4728,7 +4739,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         await expect(
           service.baixarParcela(venda.id, parcelaId, { modalidade: "credito", adquirenteId: adquirente.id, parcelas: 3 }, null),
         ).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("N. adquirente inativa é rejeitada", async () => {
@@ -4737,7 +4748,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         await expect(service.baixarParcela(venda.id, parcelaId, { modalidade: "debito", adquirenteId: adquirente.id }, null)).rejects.toThrow(
           ApiException,
         );
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("O. adquirente inexistente retorna NOT_FOUND", async () => {
@@ -4750,7 +4761,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         }
         expect(erro).toBeInstanceOf(ApiException);
         expect((erro as ApiException).code).toBe("NOT_FOUND");
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("P. valor informado maior que o valor da parcela é rejeitado", async () => {
@@ -4758,7 +4769,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         await expect(service.baixarParcela(venda.id, parcelaId, { valor: 201 }, null)).rejects.toThrow(ApiException);
         const recarregada = await service.obterPorId(venda.id);
         expect(recarregada.parcelas[0]?.pagoEm).toBeNull(); // não baixou nada
-        await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixa.id, 1100);
       });
 
       it("Q. duas baixas concorrentes da mesma parcela: só uma consome o saldo", async () => {
@@ -4774,7 +4785,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(final.valorPago).toBe(300); // 100 + 200, nunca 100+400
         expect(final.valorPendente).toBe(0);
         expect(final.status).toBe("concluida");
-        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixa.id, 1300);
       });
 
       it("R. retry idempotente: não duplica pagamento nem movimento de caixa", async () => {
@@ -4790,12 +4801,12 @@ describe("VendasService (integração — MongoDB real)", () => {
         const movimentos = await movimentosDaVenda(venda.id);
         const daBaixa = movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave}`);
         expect(daBaixa).toHaveLength(1);
-        await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixa.id, 1300);
       });
 
       it("S. caixa original fechado + caixa atual aberto: movimento lançado no caixa atual", async () => {
         const { venda, parcelaId, caixa: caixaOriginal } = await venderComUmaParcela(300, 100);
-        await caixasService.fechar(caixaOriginal.id, { valorInformado: 1100 }, null);
+        await fecharConferindoSaldo(caixaOriginal.id, 1100);
         const caixaAtual = await abrirCaixa();
 
         const atualizada = await service.baixarParcela(venda.id, parcelaId, {}, null);
@@ -4807,7 +4818,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(daBaixa).toBeTruthy();
         expect(String(daBaixa?.["caixaId"])).toBe(caixaAtual.id);
         expect(String(daBaixa?.["caixaId"])).not.toBe(caixaOriginal.id);
-        await caixasService.fechar(caixaAtual.id, { valorInformado: 1200 }, null);
+        await fecharConferindoSaldo(caixaAtual.id, 1200);
       });
 
       it("T. nenhum caixa aberto: rejeição sem mutação", async () => {
@@ -4821,7 +4832,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(recarregada.status).toBe("em_pagamento");
 
         const caixaFinal = await abrirCaixa();
-        await caixasService.fechar(caixaFinal.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixaFinal.id, 1000);
       });
 
       it("U. tarifa não altera valorPago, valorPendente, valorFinal nem o valor do movimento de caixa", async () => {
@@ -4837,7 +4848,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const movimentos = await movimentosDaVenda(venda.id);
         const daBaixa = movimentos.find((m) => m["tipo"] === "venda" && m["valor"] === 400);
         expect(daBaixa?.["valor"]).toBe(400); // bruto, nunca 360 (líquido)
-        await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+        await fecharConferindoSaldo(caixa.id, 2000);
       });
 
       it("V. snapshot da tarifa permanece histórico mesmo após alterar a tabela do adquirente", async () => {
@@ -4851,7 +4862,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const pagamento = recarregada.pagamentos[recarregada.pagamentos.length - 1]!;
         expect(pagamento.tarifaAplicada?.percentual).toBe(5); // continua 5%, nunca 9%
         expect(pagamento.tarifaAplicada?.valorTarifa).toBe(10); // continua R$10, nunca R$18
-        await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+        await fecharConferindoSaldo(caixa.id, 1500);
       });
     });
   });
@@ -4913,7 +4924,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(final.valorPago).toBeLessThanOrEqual(final.valorFinal); // invariante fundamental
       expect(final.valorPendente).toBe(0); // nunca negativo
       expect(final.parcelas[1]?.pagoEm).toBeNull(); // não foi baixada
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     it("CRÍTICO: receberPagamento parcial reduz o quanto uma parcela subsequente pode cobrir", async () => {
@@ -4948,7 +4959,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const final = await service.obterPorId(venda.id);
       expect(final.valorPago).toBe(800); // nunca 1300
       expect(final.valorPago).toBeLessThanOrEqual(final.valorFinal);
-      await caixasService.fechar(caixa.id, { valorInformado: 1800 }, null);
+      await fecharConferindoSaldo(caixa.id, 1800);
     });
 
     it("valorPago nunca excede valorFinal mesmo sob concorrência entre receberPagamento e baixarParcela", async () => {
@@ -4986,7 +4997,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // acima, não necessariamente que as duas sempre sejam aceitas.
       const sucesso = resultados.filter((r) => r.status === "fulfilled");
       expect(sucesso.length).toBeGreaterThanOrEqual(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
 
     it("movimentos de caixa refletem exatamente o valorPago final, sem sobra nem falta", async () => {
@@ -5014,7 +5025,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const movimentos = await movimentosDaVenda(venda.id);
       const somaMovimentos = movimentos.reduce((total, m) => total + (m["valor"] as number), 0);
       expect(somaMovimentos).toBe(final.valorPago); // caixa reflete exatamente o pago, sem duplicar
-      await caixasService.fechar(caixa.id, { valorInformado: 2000 }, null);
+      await fecharConferindoSaldo(caixa.id, 2000);
     });
   });
 
@@ -5047,7 +5058,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const doRecebimento = movimentosAntes.find((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`);
         expect(String(doRecebimento?.["caixaId"])).toBe(caixaA.id);
 
-        await caixasService.fechar(caixaA.id, { valorInformado: 1700 }, null);
+        await fecharConferindoSaldo(caixaA.id, 1700);
         const caixaB = await abrirCaixa();
 
         const retry = await service.receberPagamento(venda.id, { forma: "Dinheiro", valor: 300, idempotencyKey: chave }, null);
@@ -5058,7 +5069,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(doRecebimentoTodos).toHaveLength(1); // exatamente 1 movimento no total
         expect(String(doRecebimentoTodos[0]?.["caixaId"])).toBe(caixaA.id); // continua no Caixa A
         expect(movimentosDepois.some((m) => String(m["caixaId"]) === caixaB.id)).toBe(false); // nada criado no Caixa B
-        await caixasService.fechar(caixaB.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixaB.id, 1000);
       });
 
       it("baixarParcela: retry após troca de caixa não cria um segundo movimento", async () => {
@@ -5082,7 +5093,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const primeira = await service.baixarParcela(venda.id, parcelaId, { idempotencyKey: chave }, null);
         expect(primeira.status).toBe("concluida");
 
-        await caixasService.fechar(caixaA.id, { valorInformado: 1300 }, null);
+        await fecharConferindoSaldo(caixaA.id, 1300);
         const caixaB = await abrirCaixa();
 
         const retry = await service.baixarParcela(venda.id, parcelaId, { idempotencyKey: chave }, null);
@@ -5093,7 +5104,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(daBaixa).toHaveLength(1);
         expect(String(daBaixa[0]?.["caixaId"])).toBe(caixaA.id);
         expect(movimentos.some((m) => String(m["caixaId"]) === caixaB.id)).toBe(false);
-        await caixasService.fechar(caixaB.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixaB.id, 1000);
       });
 
       it("cancelamento: retry após troca de caixa não cria um segundo movimento (estoque já restaurado permanece intacto)", async () => {
@@ -5114,7 +5125,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const primeira = await service.cancelar(venda.id, { tipo: "integral", motivo: "Teste cross-caixa", idempotencyKey: chave }, null);
         expect(primeira.status).toBe("cancelada");
 
-        await caixasService.fechar(caixaA.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixaA.id, 1000);
         const caixaB = await abrirCaixa();
 
         const retry = await service.cancelar(venda.id, { tipo: "integral", motivo: "Retry", idempotencyKey: chave }, null);
@@ -5129,7 +5140,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         const atualizado = await produtosService.obterPorId(produto.produtoId);
         const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
         expect(tamanho.quantidade).toBe(5); // restaurado uma única vez
-        await caixasService.fechar(caixaB.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixaB.id, 1000);
       });
     });
 
@@ -5165,7 +5176,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
         const final = await service.obterPorId(venda.id);
         expect(final.status).toBe("cancelada");
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("B. dois cancelamentos concorrentes com chaves DIFERENTES: só um vence, o outro é rejeitado", async () => {
@@ -5195,7 +5206,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
         const movimentos = await movimentosDaVenda(venda.id);
         expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("C./E./F. retry recupera cancelamento cujo estoque/movimento ainda não haviam sido concluídos (crash simulado)", async () => {
@@ -5259,7 +5270,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
         const movimentosFinais = await movimentosDaVenda(venda.id);
         expect(movimentosFinais.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1); // recriado, nunca duplicado
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("D. retry após cancelamento já 100% concluído (mesma chave) apenas reconhece o replay, sem efeito adicional", async () => {
@@ -5286,7 +5297,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         expect(atualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(4);
         const movimentos = await movimentosDaVenda(venda.id);
         expect(movimentos.filter((m) => m["tipo"] === "cancelamento")).toHaveLength(1);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
 
       it("venda cancelada por chave diferente/ausente continua rejeitando um segundo cancelamento (compatibilidade legada)", async () => {
@@ -5325,7 +5336,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         );
         await service.cancelar(venda2.id, { tipo: "integral", motivo: "Com chave", idempotencyKey: "alguma-chave" }, null);
         await expect(service.cancelar(venda2.id, { tipo: "integral", motivo: "Retry sem chave" }, null)).rejects.toThrow(ApiException);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
     });
 
@@ -5349,7 +5360,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
         const atualizado = await produtosService.obterPorId(produto.produtoId);
         expect(atualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(5);
-        await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+        await fecharConferindoSaldo(caixa.id, 1000);
       });
     });
   });
@@ -5394,7 +5405,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(produtoBAtualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(5);
       const totalVendas = await connection.collection("vendas").countDocuments({ idempotencyKey: chave });
       expect(totalVendas).toBe(1); // só a venda A
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("retry genuíno da MESMA venda (idênticos itens/vendedor/caixa) com a mesma chave continua funcionando como replay", async () => {
@@ -5413,7 +5424,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const primeira = await service.criar(dados, null);
       const segunda = await service.criar(dados, null);
       expect(segunda.id).toBe(primeira.id);
-      await caixasService.fechar(caixa.id, { valorInformado: 1150 }, null);
+      await fecharConferindoSaldo(caixa.id, 1150);
     });
 
     it("F. receberPagamento: mesma chave com valor DIFERENTE é rejeitado por conflito", async () => {
@@ -5442,7 +5453,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const final = await service.obterPorId(venda.id);
       expect(final.valorPago).toBe(600); // nunca 900 (o segundo valor nunca foi aplicado)
-      await caixasService.fechar(caixa.id, { valorInformado: 1600 }, null);
+      await fecharConferindoSaldo(caixa.id, 1600);
     });
 
     it("G. baixarParcela: mesma chave usada para uma PARCELA DIFERENTE é rejeitada por conflito", async () => {
@@ -5473,7 +5484,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const final = await service.obterPorId(venda.id);
       expect(final.parcelasPagas).toBe(1); // a parcela 2 nunca foi baixada
       expect(final.parcelas[1]?.pagoEm).toBeNull();
-      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+      await fecharConferindoSaldo(caixa.id, 1500);
     });
 
     it("H. cancelar: mesma chave com tipo/itens DIFERENTES é rejeitada por conflito", async () => {
@@ -5519,7 +5530,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // Caixa: 1000 inicial + 50 de entrada (pagamento parcial) - 50 de saída
       // (devolução do item A, limitada ao valorPago já recebido) = 1000. A
       // tentativa rejeitada de cancelamento integral nunca chega a mexer no caixa.
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("M./N. índice global do MovimentoCaixa: mesma chave em caixas diferentes nunca cria dois documentos", async () => {
@@ -5591,7 +5602,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       ]);
       expect(resultados.filter(Boolean)).toHaveLength(1); // só uma reivindicação vence
       // Caixa: 1000 inicial + 200 de entrada - 200 de saída (cancelamento integral) = 1000.
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("reivindicações de itens DIFERENTES nunca conflitam entre si", async () => {
@@ -5627,7 +5638,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(resultado1).toBe(true);
       expect(resultado2).toBe(true); // itens diferentes — ambas reivindicações vencem
       // Caixa: 1000 inicial + 200 de entrada - 200 de saída (cancelamento integral) = 1000.
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
   });
 
@@ -5665,7 +5676,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(4); // 5 - 2 (venda) + 1 (devolução) = 4
       // Caixa: 1000 inicial + 200 de entrada - 100 de saída (devolução de 1 de 2 unidades a 100 cada) = 1100.
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("TESTE 2/3: três devoluções parciais sucessivas do mesmo item acumulam 3 eventos — nenhum sobrescreve o anterior", async () => {
@@ -5703,7 +5714,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(6); // 6 - 3 (venda) + 3 (3 devoluções de 1 unidade cada) = 6
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("TESTE 4: replay da mesma idempotencyKey não cria um segundo evento nem duplica a restauração", async () => {
@@ -5733,7 +5744,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(4); // nenhuma segunda baixa/restauração: 5-2+1=4, nunca 5
       // Caixa: 1000 inicial + 200 de entrada - 100 de saída (devolução de 1 de 2 unidades a 100 cada, uma única vez) = 1100.
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("TESTE 5: duas devoluções parciais concorrentes de itens DIFERENTES são ambas preservadas, nenhum evento perdido", async () => {
@@ -5776,7 +5787,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const produtoBAtual = await produtosService.obterPorId(produtoB.produtoId);
       const tamanhoB = produtoBAtual.variantes[0]!.tamanhos.find((t) => String(t._id) === produtoB.tamanhoId)!;
       expect(tamanhoB.quantidade).toBe(5); // restaurado
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("TESTE 7/8: falha genuína na restauração física NUNCA marca restaurado=true e permanece retryable; retry posterior completa a restauração", async () => {
@@ -5840,7 +5851,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(eventoFinal.itens[0]!.restaurado).toBe(true);
       const produtoFinal = await produtosService.obterPorId(produto.produtoId);
       expect(produtoFinal.variantes[0]!.tamanhos[0]!.quantidade).toBe(2); // 0 + 2 restaurado, nunca duplicado
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
   });
 
@@ -5888,7 +5899,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const depoisDoRetry = await movimentosDaVenda(venda.id);
       expect(depoisDoRetry.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`)).toHaveLength(1); // recriado, nunca duplicado
-      await caixasService.fechar(caixa.id, { valorInformado: 1700 }, null);
+      await fecharConferindoSaldo(caixa.id, 1700);
     });
 
     it("baixarParcela: retry recupera um movimento de caixa ausente (crash simulado) sem duplicar o pagamento", async () => {
@@ -5924,7 +5935,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const depoisDoRetry = await movimentosDaVenda(venda.id);
       expect(depoisDoRetry.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave}`)).toHaveLength(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("baixarParcela: mesma chave reaproveitada para uma parcela DIFERENTE já paga por outro meio é rejeitada por conflito, nunca confunde as duas baixas", async () => {
@@ -5971,7 +5982,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const movimentos = await movimentosDaVenda(venda.id);
       expect(movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave1}`)).toHaveLength(1); // continua só o da parcela 1
       expect(movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave3}`)).toHaveLength(1); // continua só o da parcela 3
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 + final.valorPago }, null);
+      await fecharConferindoSaldo(caixa.id, 1000 + final.valorPago);
     });
   });
 
@@ -6018,7 +6029,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const movimentoCancelamento = await connection.collection("movimentos_caixa").find({ vendaId: venda.id, tipo: "cancelamento" }).toArray();
       expect(movimentoCancelamento).toHaveLength(final.valorPago > 0 ? 1 : 0);
       if (final.valorPago > 0) expect(movimentoCancelamento[0]!["valor"]).toBe(final.valorPago); // devolução nunca excede o que foi recebido
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("cancelar × baixarParcela concorrentes: invariantes financeiros seguros em qualquer ordem de corrida", async () => {
@@ -6054,7 +6065,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const movimentoCancelamento = await connection.collection("movimentos_caixa").find({ vendaId: venda.id, tipo: "cancelamento" }).toArray();
       expect(movimentoCancelamento).toHaveLength(final.valorPago > 0 ? 1 : 0);
       if (final.valorPago > 0) expect(movimentoCancelamento[0]!["valor"]).toBe(final.valorPago);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
   });
 
@@ -6094,7 +6105,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const movimentos = await movimentosDaVenda(venda.id);
       expect(movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:recebimento:${chave}`)).toHaveLength(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("baixarParcela: duas chamadas concorrentes com a MESMA chave nunca duplicam a baixa", async () => {
@@ -6129,7 +6140,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const movimentos = await movimentosDaVenda(venda.id);
       expect(movimentos.filter((m) => m["idempotencyKey"] === `${venda.id}:parcela:${chave}`)).toHaveLength(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+      await fecharConferindoSaldo(caixa.id, 1500);
     });
   });
 
@@ -6176,7 +6187,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const produtoAtualizado = await produtosService.obterPorId(produto.produtoId);
       expect(produtoAtualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(5); // estoque restaurado integralmente
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("cenário F: baixarParcela (operação separada) seguido de cancelar — histórico da parcela preservado, devolução integral", async () => {
@@ -6220,7 +6231,7 @@ describe("VendasService (integração — MongoDB real)", () => {
 
       const produtoAtualizado = await produtosService.obterPorId(produto.produtoId);
       expect(produtoAtualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(5);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
   });
 
@@ -6242,7 +6253,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         null,
       );
       expect(venda.pagamentos[0]!.forma).toBe("Dinheiro");
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("rejeita criar venda com forma de pagamento inexistente nas configurações, com a mensagem de negócio exata, sem efeito parcial", async () => {
@@ -6266,7 +6277,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // Nenhum efeito parcial: nem estoque baixado, nem venda criada.
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       expect(atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!.quantidade).toBe(10);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("reconhece variações de maiúsculas/minúsculas/acentos/espaços da mesma forma cadastrada", async () => {
@@ -6283,7 +6294,7 @@ describe("VendasService (integração — MongoDB real)", () => {
         null,
       );
       expect(venda.pagamentos[0]!.forma).toBe("  DINHEIRO  "); // apresentação original preservada, não reescrita
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("valida CADA forma em pagamentos[] individualmente — uma forma inexistente rejeita a venda mesmo com as demais válidas", async () => {
@@ -6306,7 +6317,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       ).rejects.toThrow(MENSAGEM_FORMA_NAO_CADASTRADA);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("rejeita informar uma forma inexistente em baixarParcela() (nova forma introduzida na baixa)", async () => {
@@ -6334,7 +6345,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const vendaFinal = await service.obterPorId(venda.id);
       expect(vendaFinal.parcelas[0]!.pagoEm).toBeNull(); // nada foi alterado
       // Só a venda à vista (100) entrou no caixa — a baixa da parcela foi rejeitada, nenhum segundo movimento.
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("rejeita informar uma forma inexistente em receberPagamento() (sempre validada, nunca um fallback histórico)", async () => {
@@ -6361,7 +6372,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const vendaFinal = await service.obterPorId(venda.id);
       expect(vendaFinal.valorPago).toBe(100); // nada foi alterado
       // Só a venda à vista (100) entrou no caixa — o recebimento foi rejeitado, nenhum segundo movimento.
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("preserva operação histórica: baixarParcela SEM informar formaPagamento nunca revalida, mesmo com a forma da venda já fora das configurações", async () => {
@@ -6394,7 +6405,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       const atualizada = await service.baixarParcela(venda.id, parcelaId, {}, null);
       expect(atualizada.status).toBe("concluida");
       expect(atualizada.parcelas[0]!.formaPagamento).toBe(formaHistorica);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("reenviar em baixarParcela() a MESMA forma já registrada na venda (comparação normalizada) nunca revalida, mesmo se ela estiver fora das configurações", async () => {
@@ -6423,7 +6434,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       // MESMO valor já salvo na venda: não é uma mudança efetiva, não revalida.
       const atualizada = await service.baixarParcela(venda.id, parcelaId, { formaPagamento: formaHistorica.toUpperCase() }, null);
       expect(atualizada.status).toBe("concluida");
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
 
     it("`modalidade` continua independente de `forma`: forma cadastrada + modalidade/adquirente inválidos é rejeitado pela regra de modalidade, nunca pela de forma", async () => {
@@ -6453,7 +6464,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       }
       expect(erroCapturado).toBeInstanceOf(ApiException);
       expect((erroCapturado as ApiException).message).not.toBe(MENSAGEM_FORMA_NAO_CADASTRADA);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("`modalidade` continua independente de `forma`: modalidade/adquirente válidos não dispensam a validação de forma — forma inexistente ainda é rejeitada", async () => {
@@ -6474,7 +6485,7 @@ describe("VendasService (integração — MongoDB real)", () => {
           null,
         ),
       ).rejects.toThrow(MENSAGEM_FORMA_NAO_CADASTRADA);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("uma venda com forma e modalidade válidas (crédito com adquirente/tarifa configurados) é criada normalmente — as duas regras convivem sem interferência", async () => {
@@ -6496,7 +6507,7 @@ describe("VendasService (integração — MongoDB real)", () => {
       expect(venda.pagamentos[0]!.modalidade).toBe("credito");
       expect(venda.pagamentos[0]!.tarifaAplicada?.percentual).toBe(3);
       // O movimento de caixa sempre usa o valor BRUTO do pagamento (300), nunca o líquido pós-tarifa.
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
   });
 

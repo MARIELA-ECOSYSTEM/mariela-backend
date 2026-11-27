@@ -269,6 +269,43 @@ describe("HTTP — Caixas (integração — servidor real)", () => {
     await fecharTudoQueEstiverAberto();
   });
 
+  it("Fase 22.8.9.12 — resumo traz dinheiroEsperado + porFormaPagamento; o fechamento confere só o dinheiro físico", async () => {
+    await fecharTudoQueEstiverAberto();
+    await garantirItemConfiguracao(app.get(ConfiguracoesService), "formasPagamento", "PIX");
+    const abertura = await fetch(`${baseUrl}/api/v1/caixas`, { method: "POST", headers: authHeaders(), body: JSON.stringify({ valorInicial: 100 }) });
+    const { data: caixa } = (await abertura.json()) as { data: { id: string; resumo: { dinheiroEsperado: number; porFormaPagamento: unknown[] } } };
+    expect(caixa.resumo.dinheiroEsperado).toBe(100);
+    expect(caixa.resumo.porFormaPagamento).toEqual([]);
+
+    for (const corpo of [
+      { descricao: "Suprimento", valor: 50, formaPagamento: "Dinheiro" },
+      { descricao: "Ajuste em PIX", valor: 30, formaPagamento: "PIX" },
+    ]) {
+      const resposta = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}/entrada`, { method: "POST", headers: authHeaders(), body: JSON.stringify(corpo) });
+      expect(resposta.status).toBe(201);
+    }
+
+    const detalhe = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}`, { headers: authHeaders() });
+    const { data } = (await detalhe.json()) as {
+      data: { resumo: { saldoEsperado: number; dinheiroEsperado: number; porFormaPagamento: { forma: string; dinheiroFisico: boolean; saldo: number }[] } };
+    };
+    expect(data.resumo.saldoEsperado).toBe(180);
+    expect(data.resumo.dinheiroEsperado).toBe(150);
+    expect(data.resumo.porFormaPagamento.map(({ forma, dinheiroFisico, saldo }) => ({ forma, dinheiroFisico, saldo }))).toEqual([
+      { forma: "Dinheiro", dinheiroFisico: true, saldo: 50 },
+      { forma: "PIX", dinheiroFisico: false, saldo: 30 },
+    ]);
+
+    // Diferença física real (140 contados de 150) continua exigindo justificativa.
+    const semObservacao = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}/fechamento`, { method: "POST", headers: authHeaders(), body: JSON.stringify({ valorInformado: 140 }) });
+    expect(semObservacao.status).toBe(400);
+
+    const fechamento = await fetch(`${baseUrl}/api/v1/caixas/${caixa.id}/fechamento`, { method: "POST", headers: authHeaders(), body: JSON.stringify({ valorInformado: 150 }) });
+    expect(fechamento.status).toBe(201);
+    const corpoFechamento = (await fechamento.json()) as { data: { fechamento: { valorEsperado: number; diferenca: number } } };
+    expect(corpoFechamento.data.fechamento).toMatchObject({ valorEsperado: 150, diferenca: 0 });
+  });
+
   describe("GET /caixas/:id/movimentacoes: contrato duplo (Etapa 20.01A)", () => {
     it("SEM page/limit: devolve TODO o histórico, nunca truncado pelo limite padrão (50)", async () => {
       const abertura = await fetch(`${baseUrl}/api/v1/caixas`, {

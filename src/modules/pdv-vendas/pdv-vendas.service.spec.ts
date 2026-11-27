@@ -145,6 +145,17 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
     return caixasService.abrir({ valorInicial: 1000, observacao: "" }, null);
   }
 
+  /**
+   * Fase 22.8.9.12 — antes, `fechar(id, { valorInformado: saldoTotal })` sem observação também conferia o saldo de
+   * TODAS as formas (o fechamento recusava qualquer diferença). O fechamento agora confere só o dinheiro físico, então
+   * a mesma verificação do saldo total é feita explicitamente e o caixa fecha com o dinheiro que estaria na gaveta.
+   */
+  async function fecharConferindoSaldo(caixaId: string, saldoTotalEsperado: number) {
+    const { resumo } = await caixasService.obterDetalhe(caixaId);
+    expect(resumo.saldoEsperado).toBe(saldoTotalEsperado);
+    await caixasService.fechar(caixaId, { valorInformado: resumo.dinheiroEsperado }, null);
+  }
+
   function payloadPadrao(extra: Partial<CriarVendaPdvDto> & Pick<CriarVendaPdvDto, "itens" | "pagamentos">): CriarVendaPdvDto {
     return { idempotencyKey: uuid(), ...extra };
   }
@@ -169,7 +180,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
         payloadPadrao({ itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }], pagamentos: [{ forma: "Dinheiro", valor: 100 }] }),
       );
       expect(venda.caixaId).toBe(caixa.id);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
   });
 
@@ -189,7 +200,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       );
       expect(venda.vendedorId).toBe(vendedor.id);
       expect(venda.vendedorId).not.toBe(outroVendedor.id);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("sem clienteId, a venda é registrada como Consumidor final", async () => {
@@ -203,7 +214,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       );
       expect(venda.clienteId).toBeNull();
       expect(venda.clienteNome).toBe("Consumidor final");
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("com clienteId válido, a venda usa o cliente real (nome vindo do banco, não do payload)", async () => {
@@ -218,7 +229,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       );
       expect(venda.clienteId).toBe(cliente.id);
       expect(venda.clienteNome).toBe(cliente.nome);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("clienteId inexistente propaga erro do domínio de Vendas (não cria venda)", async () => {
@@ -232,7 +243,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
           payloadPadrao({ clienteId: "65f1a2b3c4d5e6f7a8b9c0d1", itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }], pagamentos: [] }),
         ),
       );
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
   });
 
@@ -249,7 +260,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       );
       expect(venda.itens[0]?.precoPraticado).toBe(150);
       expect(venda.valorFinal).toBe(150);
-      await caixasService.fechar(caixa.id, { valorInformado: 1150 }, null);
+      await fecharConferindoSaldo(caixa.id, 1150);
     });
 
     it("estoque é baixado corretamente (confirmado no banco)", async () => {
@@ -265,7 +276,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       const tamanho = atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!;
       expect(tamanho.quantidade).toBe(3);
-      await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+      await fecharConferindoSaldo(caixa.id, 1200);
     });
 
     it("estoque insuficiente é rejeitado (400) e não baixa nada", async () => {
@@ -282,7 +293,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
 
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       expect(atualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(1);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("produto/variante/tamanho inexistentes são rejeitados", async () => {
@@ -291,7 +302,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       await esperarRejeicao(
         service.criar(vendedor.id, payloadPadrao({ itens: [{ produtoId: "65f1a2b3c4d5e6f7a8b9c0d1", varianteId: "x", tamanhoId: "y", quantidade: 1 }], pagamentos: [] })),
       );
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
   });
 
@@ -316,7 +327,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
 
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       expect(atualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(5);
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
   });
 
@@ -339,7 +350,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       expect(venda.valorBruto).toBe(100);
       expect(venda.descontoVenda).toBe(10);
       expect(venda.valorFinal).toBe(90);
-      await caixasService.fechar(caixa.id, { valorInformado: 1090 }, null);
+      await fecharConferindoSaldo(caixa.id, 1090);
     });
 
     it("desconto acima do subtotal é rejeitado", async () => {
@@ -353,7 +364,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
           payloadPadrao({ itens: [{ produtoId: produto.produtoId, varianteId: produto.varianteId, tamanhoId: produto.tamanhoId, quantidade: 1 }], descontoVenda: { tipo: "valor", valor: 1000 }, pagamentos: [] }),
         ),
       );
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
   });
 
@@ -380,7 +391,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
       expect(detalheCaixa.resumo.totalVendas).toBe(200);
       expect(detalheCaixa.resumo.saldoEsperado).toBe(1200);
-      await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+      await fecharConferindoSaldo(caixa.id, 1200);
     });
 
     it("pagamento total: status concluida, caixa recebe o valor cheio", async () => {
@@ -398,7 +409,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       const detalheCaixa = await caixasService.obterDetalhe(caixa.id);
       expect(detalheCaixa.resumo.totalVendas).toBe(500);
       expect(detalheCaixa.resumo.saldoEsperado).toBe(1500);
-      await caixasService.fechar(caixa.id, { valorInformado: 1500 }, null);
+      await fecharConferindoSaldo(caixa.id, 1500);
     });
   });
 
@@ -419,7 +430,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       expect(movimentos[0]!["sentido"]).toBe("entrada");
       expect(movimentos[0]!["valor"]).toBe(300);
       expect(String(movimentos[0]!["caixaId"])).toBe(caixa.id);
-      await caixasService.fechar(caixa.id, { valorInformado: 1300 }, null);
+      await fecharConferindoSaldo(caixa.id, 1300);
     });
   });
 
@@ -443,7 +454,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       const vendedorAtualizado = await vendedoresService.obterPorId(vendedor.id);
       expect(vendedorAtualizado.vendas).toBe(1);
       expect(vendedorAtualizado.totalVendido).toBe(150);
-      await caixasService.fechar(caixa.id, { valorInformado: 1150 }, null);
+      await fecharConferindoSaldo(caixa.id, 1150);
     });
   });
 
@@ -466,7 +477,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       expect(vendaFresca.itens[0]!.nome).toBe(nomeOriginal);
       expect(vendaFresca.itens[0]!.precoPraticado).toBe(precoOriginal);
       expect(vendaFresca.itens[0]!.nome).not.toBe("Nome Totalmente Diferente");
-      await caixasService.fechar(caixa.id, { valorInformado: 1200 }, null);
+      await fecharConferindoSaldo(caixa.id, 1200);
     });
   });
 
@@ -486,7 +497,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
 
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       expect(atualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(4);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
 
     it("duas requisições CONCORRENTES com a mesma chave: uma única venda, uma baixa de estoque, um movimento de caixa, um conjunto de agregados", async () => {
@@ -520,7 +531,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       expect(clienteAtualizado.compras).toBe(1);
       expect(clienteAtualizado.totalComprado).toBe(120);
 
-      await caixasService.fechar(caixa.id, { valorInformado: 1120 }, null);
+      await fecharConferindoSaldo(caixa.id, 1120);
     });
   });
 
@@ -544,7 +555,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
 
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       expect(atualizado.variantes[0]!.tamanhos[0]!.quantidade).toBe(0);
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
   });
 
@@ -572,7 +583,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
       expect(venda.vendedorNome).toBe(vendedor.nome);
       expect(venda.caixaId).toBe(caixa.id);
       expect(venda.caixaCodigo).toBe(caixa.codigo);
-      await caixasService.fechar(caixa.id, { valorInformado: 1080 }, null);
+      await fecharConferindoSaldo(caixa.id, 1080);
     });
   });
 
@@ -610,7 +621,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
 
       const atualizado = await produtosService.obterPorId(produto.produtoId);
       expect(atualizado.variantes[0]!.tamanhos.find((t) => String(t._id) === produto.tamanhoId)!.quantidade).toBe(5); // nenhum efeito parcial
-      await caixasService.fechar(caixa.id, { valorInformado: 1000 }, null);
+      await fecharConferindoSaldo(caixa.id, 1000);
     });
 
     it("cria venda normalmente quando a forma está cadastrada — comportamento idêntico ao de VendasService.criar", async () => {
@@ -626,7 +637,7 @@ describe("PdvVendasService (integração — MongoDB real)", () => {
         }),
       );
       expect(venda.pagamentos[0]!.forma).toBe("PIX");
-      await caixasService.fechar(caixa.id, { valorInformado: 1100 }, null);
+      await fecharConferindoSaldo(caixa.id, 1100);
     });
   });
 });

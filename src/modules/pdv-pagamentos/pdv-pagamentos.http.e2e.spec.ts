@@ -259,7 +259,8 @@ describe("HTTP — PDV Pagamentos (integração — servidor real)", () => {
   it("integridade: uma venda montada SÓ com o que as consultas devolvem (forma + adquirente + parcelas) é aceita, com a tarifa listada", async () => {
     const caixasService = app.get(CaixasService);
     const atual = await caixasService.obterAtual();
-    if (atual) await caixasService.fechar(atual.id, { valorInformado: atual.resumo.saldoEsperado }, null);
+    // Fase 22.8.9.12 — o fechamento confere o dinheiro físico (`dinheiroEsperado`), não o saldo de todas as formas.
+    if (atual) await caixasService.fechar(atual.id, { valorInformado: atual.resumo.dinheiroEsperado }, null);
 
     const nome = `Adq Venda ${sufixo()}`;
     await criarAdquirente(nome, [{ modalidade: "credito", parcelas: 3, percentual: 3.7 }]);
@@ -295,6 +296,7 @@ describe("HTTP — PDV Pagamentos (integração — servidor real)", () => {
     expect(corpo.data.pagamentos[0]?.forma).toBe("Crédito");
     expect(corpo.data.pagamentos[0]?.tarifaAplicada?.percentual).toBe(opcao?.tarifaPercentual ?? -1);
 
-    await caixasService.fechar(caixaId, { valorInformado: 300 }, null);
+    // Fase 22.8.9.12 — venda no crédito não põe dinheiro na gaveta: abertura 0 → dinheiro esperado 0.
+    await caixasService.fechar(caixaId, { valorInformado: 0 }, null);
   });
 });

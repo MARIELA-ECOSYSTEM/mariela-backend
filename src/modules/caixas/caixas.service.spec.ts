@@ -533,6 +533,172 @@ describe("CaixasService (integração — MongoDB real)", () => {
     });
   });
 
+  /**
+   * Fase 22.8.9.12 — o fechamento confere o DINHEIRO FÍSICO da gaveta. Só movimentos em "Dinheiro" afetam o
+   * `dinheiroEsperado`/`valorEsperado`; PIX, crédito, débito e formas desconhecidas aparecem só em `porFormaPagamento`.
+   * O `saldoEsperado` (todas as formas) continua como antes.
+   */
+  describe("Fase 22.8.9.12 — dinheiro físico esperado na gaveta", () => {
+    async function venda(caixaId: string, formaPagamento: string, valor: number, tipo: "venda" | "cancelamento" = "venda", vendaRef = vendaFake()) {
+      await service.registrarMovimentoDeVenda({
+        caixaId,
+        tipo,
+        descricao: tipo === "venda" ? `Venda em ${formaPagamento}` : `Cancelamento em ${formaPagamento}`,
+        referencia: vendaRef.vendaCodigo,
+        vendaId: vendaRef.vendaId,
+        vendaCodigo: vendaRef.vendaCodigo,
+        formaPagamento,
+        valor,
+        observacao: tipo === "cancelamento" ? "Cliente desistiu" : "",
+      });
+      return vendaRef;
+    }
+
+    it("cenário 1 — dinheiro: abertura 100 + venda em dinheiro 230 → 330 na gaveta", async () => {
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
+      await venda(caixa.id, "Dinheiro", 230);
+      const { resumo } = await service.obterDetalhe(caixa.id);
+      expect(resumo.dinheiroEsperado).toBe(330);
+      expect(resumo.saldoEsperado).toBe(330);
+      const fechado = await service.fechar(caixa.id, { valorInformado: 330 }, null);
+      expect(fechado.fechamento?.valorEsperado).toBe(330);
+      expect(fechado.fechamento?.diferenca).toBe(0);
+    });
+
+    for (const [cenario, forma, valor] of [
+      ["cenário 2 — PIX", "PIX", 134],
+      ["cenário 3 — crédito", "Crédito", 130],
+      ["cenário 4 — débito", "Débito", 130],
+    ] as const) {
+      it(`${cenario}: abertura 100 + venda de ${valor} → 100 na gaveta, fecha conferido SEM observação`, async () => {
+        const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
+        await venda(caixa.id, forma, valor);
+        const { resumo } = await service.obterDetalhe(caixa.id);
+        expect(resumo.dinheiroEsperado).toBe(100);
+        expect(resumo.saldoEsperado).toBe(100 + valor); // o saldo de todas as formas não muda de significado
+        expect(resumo.porFormaPagamento).toEqual([{ forma, dinheiroFisico: false, entradas: valor, saidas: 0, saldo: valor }]);
+        const fechado = await service.fechar(caixa.id, { valorInformado: 100 }, null);
+        expect(fechado.fechamento?.valorEsperado).toBe(100);
+        expect(fechado.fechamento?.diferenca).toBe(0);
+      });
+    }
+
+    it("cenário 5 — pagamento combinado: só a parte em dinheiro entra na gaveta (dados do CAIXA-0001 da Fase 22.8.9.11)", async () => {
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
+      const combinada = vendaFake();
+      await venda(caixa.id, "Dinheiro", 100, "venda", combinada);
+      await venda(caixa.id, "PIX", 134, "venda", combinada);
+      await venda(caixa.id, "Dinheiro", 130); // recebimento posterior de fiado em dinheiro
+      await venda(caixa.id, "Crédito", 130);
+      const debito = await venda(caixa.id, "Débito", 130);
+      await venda(caixa.id, "Débito", 130, "cancelamento", debito);
+
+      const { resumo } = await service.obterDetalhe(caixa.id);
+      expect(resumo.dinheiroEsperado).toBe(330);
+      expect(resumo.saldoEsperado).toBe(594); // o valor que antes era cobrado da gaveta
+      expect(resumo.quantidadeVendas).toBe(4);
+      expect(resumo.porFormaPagamento).toEqual([
+        { forma: "Dinheiro", dinheiroFisico: true, entradas: 230, saidas: 0, saldo: 230 },
+        { forma: "Crédito", dinheiroFisico: false, entradas: 130, saidas: 0, saldo: 130 },
+        { forma: "Débito", dinheiroFisico: false, entradas: 130, saidas: 130, saldo: 0 },
+        { forma: "PIX", dinheiroFisico: false, entradas: 134, saidas: 0, saldo: 134 },
+      ]);
+
+      // A gaveta conferida (330) fecha SEM falta e sem exigir justificativa — antes: "Falta de R$ 264,00".
+      const fechado = await service.fechar(caixa.id, { valorInformado: 330 }, null);
+      expect(fechado.fechamento?.valorEsperado).toBe(330);
+      expect(fechado.fechamento?.diferenca).toBe(0);
+    });
+
+    it("cenário 6 — cancelamento: o de venda em dinheiro tira da gaveta; o de venda eletrônica não; sem inversão nem duplicação", async () => {
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
+      const emDinheiro = await venda(caixa.id, "Dinheiro", 200);
+      const emPix = await venda(caixa.id, "PIX", 150);
+      expect((await service.obterDetalhe(caixa.id)).resumo.dinheiroEsperado).toBe(300);
+
+      await venda(caixa.id, "PIX", 150, "cancelamento", emPix);
+      expect((await service.obterDetalhe(caixa.id)).resumo.dinheiroEsperado).toBe(300); // estorno eletrônico: gaveta intacta
+
+      await venda(caixa.id, "Dinheiro", 80, "cancelamento", emDinheiro); // devolução parcial em dinheiro
+      const { resumo } = await service.obterDetalhe(caixa.id);
+      expect(resumo.dinheiroEsperado).toBe(220); // 100 + 200 − 80, subtraído uma única vez
+      expect(resumo.devolucoes).toBe(230);
+      expect(resumo.saldoEsperado).toBe(220); // 100 + 350 − 230
+      expect(resumo.porFormaPagamento.find((item) => item.forma === "PIX")).toEqual({ forma: "PIX", dinheiroFisico: false, entradas: 150, saidas: 150, saldo: 0 });
+      await fecharCaixasDoTeste();
+    });
+
+    it("cenário 7 — sangria em dinheiro reduz o dinheiro físico esperado (inclusive abaixo de zero, como o saldo)", async () => {
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
+      await venda(caixa.id, "Dinheiro", 50);
+      const atualizado = await service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria", valor: 120, formaPagamento: "Dinheiro", motivo: "Depósito" }, null);
+      expect(atualizado.resumo.dinheiroEsperado).toBe(30);
+      const negativo = await service.registrarMovimento(caixa.id, "saida", { descricao: "Sangria 2", valor: 50, formaPagamento: "Dinheiro", motivo: "Teste" }, null);
+      expect(negativo.resumo.dinheiroEsperado).toBe(-20);
+      await fecharCaixasDoTeste();
+    });
+
+    it("cenário 8 — suprimento em dinheiro aumenta o esperado; lançamento manual em outra forma não mexe na gaveta", async () => {
+      await garantirItemConfiguracao(moduleRef.get(ConfiguracoesService), "formasPagamento", "PIX");
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
+      const suprimento = await service.registrarMovimento(caixa.id, "entrada", { descricao: "Suprimento", valor: 40, formaPagamento: "Dinheiro" }, null);
+      expect(suprimento.resumo.dinheiroEsperado).toBe(140);
+      const emPix = await service.registrarMovimento(caixa.id, "entrada", { descricao: "Ajuste em PIX", valor: 25, formaPagamento: "PIX" }, null);
+      expect(emPix.resumo.dinheiroEsperado).toBe(140);
+      expect(emPix.resumo.saldoEsperado).toBe(165);
+      await fecharCaixasDoTeste();
+    });
+
+    it("cenário 9 — diferença física REAL continua identificada, exige observação e é registrada", async () => {
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
+      await venda(caixa.id, "Dinheiro", 230);
+      await venda(caixa.id, "PIX", 134);
+
+      await expect(service.fechar(caixa.id, { valorInformado: 320 }, null)).rejects.toThrow(ApiException);
+      const comFalta = await service.fechar(caixa.id, { valorInformado: 320, observacao: "Faltaram 10 reais na gaveta" }, null);
+      expect(comFalta.fechamento?.valorEsperado).toBe(330);
+      expect(comFalta.fechamento?.diferenca).toBe(-10);
+      expect(comFalta.fechamento?.observacao).toBe("Faltaram 10 reais na gaveta");
+
+      const outro = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
+      await venda(outro.id, "Crédito", 130);
+      const comSobra = await service.fechar(outro.id, { valorInformado: 105, observacao: "Sobra de 5" }, null);
+      expect(comSobra.fechamento?.diferenca).toBe(5);
+    });
+
+    it("cenário 10 — forma desconhecida nunca vira dinheiro físico; variações de escrita de 'Dinheiro' são reconhecidas", async () => {
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
+      await venda(caixa.id, "Vale-presente", 60);
+      await venda(caixa.id, "Espécie", 15);
+      await venda(caixa.id, "  DINHEIRO ", 20);
+      const { resumo } = await service.obterDetalhe(caixa.id);
+      expect(resumo.dinheiroEsperado).toBe(120); // só o "  DINHEIRO " (mesma normalização usada no resto da aplicação)
+      expect(resumo.saldoEsperado).toBe(195);
+      expect(resumo.porFormaPagamento).toEqual([
+        { forma: "DINHEIRO", dinheiroFisico: true, entradas: 20, saidas: 0, saldo: 20 },
+        { forma: "Espécie", dinheiroFisico: false, entradas: 15, saidas: 0, saldo: 15 },
+        { forma: "Vale-presente", dinheiroFisico: false, entradas: 60, saidas: 0, saldo: 60 },
+      ]);
+      await fecharCaixasDoTeste();
+    });
+
+    it("caixa JÁ FECHADO mantém valorEsperado/diferenca/observação gravados — nada é recalculado na leitura", async () => {
+      const caixa = await abrirCaixaDoTeste({ valorInicial: 100 }, null);
+      await venda(caixa.id, "PIX", 134);
+      await service.fechar(caixa.id, { valorInformado: 100 }, null);
+      // Simula um fechamento ANTERIOR a esta fase (regra antiga: esperado = todas as formas).
+      await connection
+        .collection("caixas")
+        .updateOne({ _id: new Types.ObjectId(caixa.id) }, { $set: { valorEsperado: 234, diferenca: -134, observacaoFechamento: "Fechado pela regra antiga" } });
+
+      const detalhe = await service.obterDetalhe(caixa.id);
+      expect(detalhe.fechamento?.valorEsperado).toBe(234);
+      expect(detalhe.fechamento?.diferenca).toBe(-134);
+      expect(detalhe.fechamento?.observacao).toBe("Fechado pela regra antiga");
+      expect(detalhe.resumo.dinheiroEsperado).toBe(100); // o resumo é só leitura derivada dos movimentos
+    });
+  });
+
   describe("consulta: atual, detalhe, estatísticas", () => {
     it("obterAtual devolve null quando nenhum caixa está aberto", async () => {
       await fecharCaixasDoTeste();

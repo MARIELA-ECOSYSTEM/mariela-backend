@@ -632,11 +632,12 @@ describe("HTTP — Vendas (integração — servidor real)", () => {
         // abre um caixa NOVO, que fica aberto ao final para não quebrar os
         // demais testes do arquivo.
         const detalheAntesDeFechar = await fetch(`${baseUrl}/api/v1/caixas/${caixaOriginal.id}`, { headers: authHeaders() });
-        const corpoAntesDeFechar = (await detalheAntesDeFechar.json()) as { data: { resumo: { saldoEsperado: number } } };
+        // Fase 22.8.9.12 — o fechamento confere o dinheiro físico (`dinheiroEsperado`), não o saldo de todas as formas.
+        const corpoAntesDeFechar = (await detalheAntesDeFechar.json()) as { data: { resumo: { dinheiroEsperado: number } } };
         const fechamento = await fetch(`${baseUrl}/api/v1/caixas/${caixaOriginal.id}/fechamento`, {
           method: "POST",
           headers: authHeaders(),
-          body: JSON.stringify({ valorInformado: corpoAntesDeFechar.data.resumo.saldoEsperado }),
+          body: JSON.stringify({ valorInformado: corpoAntesDeFechar.data.resumo.dinheiroEsperado }),
         });
         expect(fechamento.status).toBe(201);
 

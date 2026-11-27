@@ -33,6 +33,7 @@ import {
   type SelecaoFacetas,
 } from "./caixas-filtros.util.js";
 import { arredondar } from "./dinheiro.util.js";
+import { calcularDinheiroEsperado, resumirPorFormaPagamento } from "./gaveta.util.js";
 import { CaixasRepository } from "./caixas.repository.js";
 import { MovimentosCaixaRepository } from "./movimentos-caixa.repository.js";
 import type { AbrirCaixaDto } from "./dto/abrir-caixa.dto.js";
@@ -537,13 +538,17 @@ export class CaixasService {
    * `valorEsperado` continua SEMPRE recalculado pelo backend a partir de
    * `movimentos_caixa` — nunca aceito do payload (`FechamentoCaixaDto` não
    * tem esse campo).
+   *
+   * Fase 22.8.9.12 — `valorInformado` é o dinheiro CONTADO na gaveta, então `valorEsperado` passa a ser o dinheiro
+   * físico esperado (`dinheiroEsperado`: abertura + movimentos em "Dinheiro"). Antes era o saldo de todas as formas, e
+   * todo PIX/cartão virava "falta de caixa". Caixas já fechados mantêm os valores gravados (nada é recalculado).
    */
   async fechar(id: string, dto: FechamentoCaixaDto, usuarioId: string | null): Promise<CaixaDetalheResposta> {
     const caixa = await this.caixasRepository.encontrarPorIdOuFalhar(id);
     this.exigirAberto(caixa);
 
     const movimentos = await this.movimentosRepository.listarTodosPorCaixa(id);
-    const valorEsperado = this.calcularResumo(movimentos, caixa.valorInicial).saldoEsperado;
+    const valorEsperado = this.calcularResumo(movimentos, caixa.valorInicial).dinheiroEsperado;
     const diferenca = arredondar(dto.valorInformado - valorEsperado);
     const observacao = dto.observacao?.trim() ?? "";
 
@@ -676,6 +681,8 @@ export class CaixasService {
       saldoEsperado: arredondar(valorInicial + totalEntradas - totalSaidas),
       quantidadeVendas: new Set(movimentos.filter((item) => item.tipo === "venda").map((item) => item.vendaId)).size,
       quantidadeMovimentacoes: movimentos.length,
+      dinheiroEsperado: calcularDinheiroEsperado(movimentos, valorInicial),
+      porFormaPagamento: resumirPorFormaPagamento(movimentos),
     };
   }
 

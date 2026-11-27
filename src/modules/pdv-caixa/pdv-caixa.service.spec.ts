@@ -71,7 +71,8 @@ describe("PdvCaixaService (integração — MongoDB real)", () => {
 
   async function fecharSeAberto(): Promise<void> {
     const atual = await caixasService.obterAtual();
-    if (atual) await caixasService.fechar(atual.id, { valorInformado: atual.resumo.saldoEsperado }, null);
+    // Fase 22.8.9.12 — o fechamento confere o dinheiro físico (`dinheiroEsperado`), não o saldo de todas as formas.
+    if (atual) await caixasService.fechar(atual.id, { valorInformado: atual.resumo.dinheiroEsperado }, null);
   }
 
   describe("atual", () => {

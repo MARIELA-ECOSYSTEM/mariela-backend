@@ -104,12 +104,13 @@ async function criarInstancia(config: ReconciliacaoEstoqueConfig = CONFIG_TESTE)
  * Fase 60.4.3.4.18.6A — fecha um caixa com o saldo ESPERADO real, sem diferença artificial.
  * `CaixasService.fechar` recusa diferença ≥ tolerância sem justificativa, e o antigo `valorInformado: 0` era sempre
  * recusado (esperado 1000), deixando o caixa aberto e derrubando todo `caixas.abrir` seguinte. O valor vem de
- * `obterDetalhe(id).resumo.saldoEsperado`: a MESMA função (`calcularResumo`) sobre as MESMAS movimentações
- * (`listarTodosPorCaixa`) que o próprio `fechar` usa para conferir. Nenhum erro é engolido.
+ * `obterDetalhe(id).resumo.dinheiroEsperado`: a MESMA função (`calcularResumo`) sobre as MESMAS movimentações
+ * (`listarTodosPorCaixa`) que o próprio `fechar` usa para conferir (Fase 22.8.9.12: o fechamento confere o dinheiro
+ * físico, não o saldo de todas as formas). Nenhum erro é engolido.
  */
 async function fecharCaixa(inst: Instancia, caixaId: string): Promise<void> {
   const detalhe = await inst.caixas.obterDetalhe(caixaId);
-  await inst.caixas.fechar(caixaId, { valorInformado: detalhe.resumo.saldoEsperado }, null);
+  await inst.caixas.fechar(caixaId, { valorInformado: detalhe.resumo.dinheiroEsperado }, null);
 }
 
 /**
